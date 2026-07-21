@@ -1,0 +1,89 @@
+---
+name: SmartBoi (Evidence Synthesis, Paper-Only)
+version: "0.1.0"
+slug: smartboi
+description: >-
+  LLM-driven cross-company evidence synthesis for equity research: ingests
+  SEC EDGAR filings and news, builds a relationship graph (customer/
+  supplier/competitor/regulator), accumulates per-company evidence dossiers
+  with an adversarial skeptic pass, and logs hypothetical ("paper") trades
+  when evidence crosses a threshold. Contains no order-placement code
+  whatsoever -- it can never submit a real order, on any account, ever.
+url: https://github.com/Stullee/SmartBoi
+arch:
+  - amd64
+init: true
+startup: application
+boot: manual
+host_network: true
+ingress: true
+ingress_port: 8100
+map:
+  - config:rw
+panel_icon: mdi:graph-outline
+options:
+  symbols: ""
+  enable_edgar_ingestion: true
+  edgar_user_agent: ""
+  edgar_forms: "8-K,10-K,4"
+  edgar_poll_interval_sec: 3600
+  edgar_lookback_days: 14
+  enable_news_ingestion: true
+  finnhub_api_key: ""
+  news_poll_interval_sec: 900
+  news_lookback_days: 3
+  anthropic_api_key: ""
+  extraction_model: "claude-haiku-4-5-20251001"
+  dossier_model: "claude-haiku-4-5-20251001"
+  skeptic_model: "claude-haiku-4-5-20251001"
+  signal_confidence_threshold: 0.65
+  min_independent_sources: 2
+  max_horizon_days: 56
+  stop_loss_pct: 8.0
+  take_profit_pct: 16.0
+  enable_ib_price_feed: false
+  ib_host: "127.0.0.1"
+  ib_port: 7497
+  ib_client_id: 27
+  price_poll_interval_sec: 21600
+  enable_universe_autoscreen: true
+  universe_screen_interval_days: 30
+  universe_min_market_cap_musd: 100.0
+  universe_max_market_cap_musd: 5000.0
+  universe_max_analyst_count: 6
+  log_level: "info"
+  alert_webhook_url: ""
+  enable_dashboard: true
+schema:
+  symbols: str
+  enable_edgar_ingestion: bool
+  edgar_user_agent: str
+  edgar_forms: str
+  edgar_poll_interval_sec: int(60,86400)
+  edgar_lookback_days: int(1,90)
+  enable_news_ingestion: bool
+  finnhub_api_key: password
+  news_poll_interval_sec: int(60,86400)
+  news_lookback_days: int(1,30)
+  anthropic_api_key: password
+  extraction_model: str
+  dossier_model: str
+  skeptic_model: str
+  signal_confidence_threshold: float(0,1)
+  min_independent_sources: int(1,10)
+  max_horizon_days: int(1,180)
+  stop_loss_pct: float(0.1,50)
+  take_profit_pct: float(0.1,100)
+  enable_ib_price_feed: bool
+  ib_host: str
+  ib_port: port
+  ib_client_id: int(1,32)
+  price_poll_interval_sec: int(300,86400)
+  enable_universe_autoscreen: bool
+  universe_screen_interval_days: int(1,365)
+  universe_min_market_cap_musd: float(0,1000000)
+  universe_max_market_cap_musd: float(0,1000000)
+  universe_max_analyst_count: int(0,100)
+  log_level: list(debug|info|warning|error)
+  alert_webhook_url: str
+  enable_dashboard: bool
