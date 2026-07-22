@@ -63,7 +63,10 @@ class Settings(BaseSettings):
     # --- News ingestion (Finnhub company-news, free tier) ---
     enable_news_ingestion: bool = True
     finnhub_api_key: str = ""
-    news_poll_interval_sec: int = 900
+    # 15 minutes is unnecessarily tight for a strategy that holds positions
+    # for weeks (max_horizon_days) -- it just multiplies LLM call volume
+    # (and cost) for freshness this system has no use for. 1h is plenty.
+    news_poll_interval_sec: int = 3600
     news_lookback_days: int = 3
 
     # --- Claude: relationship extraction, dossier updates, skeptic pass ---
@@ -71,6 +74,27 @@ class Settings(BaseSettings):
     extraction_model: str = "claude-haiku-4-5-20251001"
     dossier_model: str = "claude-haiku-4-5-20251001"
     skeptic_model: str = "claude-haiku-4-5-20251001"
+
+    # --- Cost controls. Every LLM call (extraction/dossier-update/skeptic)
+    # checks these before spending anything -- see usage.py and
+    # ratelimit.py, both wired in via engine.py. ---
+    # Hard daily ceiling on Claude API calls across all three call sites,
+    # combined. Once reached, further evidence is deferred (not discarded --
+    # it's picked up again once the budget resets at UTC midnight, exactly
+    # like a transient API failure). Call-count-based rather than a dollar
+    # figure: per-call token sizes here are small and bounded by this
+    # codebase's own prompt construction, so this is a robust proxy for
+    # spend that won't rot when Anthropic's prices change. See the
+    # dashboard for actual calls/tokens used today.
+    max_daily_llm_calls: int = 3000
+    # Caps how many pieces of PROPAGATED evidence (about a linked company,
+    # never the dossier's own direct evidence) get forwarded to one target
+    # from one origin within a rolling window -- without this, a heavily-
+    # covered anchor linked to a target burns a dossier-update + skeptic
+    # call for every single article about it, even once the causal link has
+    # already been refused several times running for the same reason.
+    max_propagated_evidence_per_link: int = 3
+    propagated_evidence_cooldown_hours: int = 6
 
     # --- Evidence / signal thresholds ---
     # A dossier signals once confidence * magnitude clears this bar AND has

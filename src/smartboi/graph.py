@@ -16,6 +16,8 @@ from pathlib import Path
 
 from anthropic import AsyncAnthropic
 
+from smartboi.usage import UsageTracker
+
 log = logging.getLogger(__name__)
 
 REL_TYPES = ("customer", "supplier", "competitor", "regulator")
@@ -134,15 +136,24 @@ _SYSTEM_PROMPT = (
 
 
 class RelationshipExtractor:
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, usage: UsageTracker):
         self._client = AsyncAnthropic(api_key=api_key)
         self._model = model
+        self._usage = usage
 
     async def extract(
         self, filing_symbol: str, filing_form: str, filing_text: str, known_tickers: list[str]
-    ) -> list[dict]:
+    ) -> list[dict] | None:
+        """Returns None (retry later, same as engine.py's other transient-
+        failure paths) on an API error OR when the daily LLM call budget
+        (usage.py) is exhausted -- distinct from returning [] (genuinely no
+        relationships found), which must not be treated as a reason to
+        retry."""
         if not filing_text.strip():
             return []
+        if not self._usage.budget_remaining():
+            log.info("%s: daily LLM call budget reached -- deferring relationship extraction.", filing_symbol)
+            return None
         prompt = (
             f"Filing company: {filing_symbol} ({filing_form})\n"
             f"Known tickers you may match counterparties to: {', '.join(sorted(known_tickers))}\n\n"
@@ -159,7 +170,8 @@ class RelationshipExtractor:
             )
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the ingestion loop
             log.warning("%s: relationship extraction failed: %s", filing_symbol, exc)
-            return []
+            return None
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens)
         for block in response.content:
             if block.type == "tool_use":
                 return block.input.get("relationships", [])

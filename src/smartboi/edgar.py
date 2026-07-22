@@ -32,6 +32,17 @@ _REQUEST_GAP_SEC = 0.3
 # found") on a long-lived deployment.
 _CIK_CACHE_MAX_AGE = timedelta(days=7)
 
+# Legal-entity suffixes stripped when matching a filing's free-text company
+# name against SEC's registered title (see _normalize_company_name) --
+# filing text rarely spells out a counterparty's full registered name
+# ("ASML" vs "ASML Holding N.V."), so matching on the stripped core name is
+# what makes the lookup useful at all.
+_LEGAL_SUFFIXES = frozenset({
+    "the", "inc", "incorporated", "corp", "corporation", "co", "company",
+    "ltd", "limited", "llc", "lp", "plc", "holding", "holdings", "group",
+    "ag", "sa", "nv", "se", "spa", "srl", "gmbh", "kk", "ab",
+})
+
 # Form 4 transaction codes worth spelling out for the dossier engine -- the
 # raw code is kept alongside so nothing is lost for unmapped ones.
 _FORM4_TRANSACTION_CODES = {
@@ -96,6 +107,26 @@ def _fmt_shares(raw: str) -> str:
         return raw
 
 
+def _normalize_company_name(name: str) -> str:
+    """Lowercased, punctuation-stripped, legal-suffix-stripped core of a
+    company name -- "ASML Holding N.V." and "ASML" both normalize toward
+    "asml" (a leading/trailing suffix strip in each direction), which is
+    what makes matching a filing's free-text counterparty name against
+    SEC's registered title (see EdgarClient.find_ticker_by_name) actually
+    useful instead of requiring an exact string match that rarely occurs."""
+    # Periods are dropped outright (not turned into a space-separator) so
+    # "N.V." collapses to "nv" -- a real legal-suffix token -- rather than
+    # splitting into the two meaningless tokens "n" and "v".
+    text = name.lower().replace(".", "")
+    text = re.sub(r"[^\w\s]", " ", text)
+    words = re.sub(r"\s+", " ", text).strip().split()
+    while words and words[-1] in _LEGAL_SUFFIXES:
+        words.pop()
+    while words and words[0] in _LEGAL_SUFFIXES:
+        words.pop(0)
+    return " ".join(words)
+
+
 def summarize_form4(xml_text: str) -> str:
     """Compact, human/LLM-readable summary of a Form 4's non-derivative
     transactions ("insider X (CFO) open-market purchase of 10,000 shares at
@@ -154,6 +185,7 @@ class EdgarClient:
         self._client = httpx.AsyncClient(headers=headers, timeout=20.0)
         self._cache_path = cache_path
         self._cik_by_ticker: dict[str, str] | None = None
+        self._ticker_by_name: dict[str, str] | None = None
         self._map_loaded_at: datetime | None = None
         self._last_request = 0.0
 
@@ -167,49 +199,83 @@ class EdgarClient:
         response.raise_for_status()
         return response
 
-    async def _ticker_map(self) -> dict[str, str]:
+    async def _ticker_map(self) -> tuple[dict[str, str], dict[str, str]]:
+        """Returns (ticker -> CIK10, normalized_name -> ticker) -- both
+        built from the same cached company_tickers.json fetch, so the
+        name index used for find_ticker_by_name costs nothing extra."""
         now = datetime.now(timezone.utc)
         if self._cik_by_ticker is not None and self._map_loaded_at is not None:
             if now - self._map_loaded_at < _CIK_CACHE_MAX_AGE:
-                return self._cik_by_ticker
+                return self._cik_by_ticker, self._ticker_by_name
 
-        cached_map: dict[str, str] | None = None
+        cached: dict | None = None
         cache_fresh = False
         if self._cache_path.exists():
             try:
                 raw = json.loads(self._cache_path.read_text())
                 if isinstance(raw, dict) and "map" in raw:
-                    cached_map = raw["map"]
+                    cached = raw
                     fetched_at = raw.get("fetched_at", "")
                     cache_fresh = fetched_at >= (now - _CIK_CACHE_MAX_AGE).isoformat()
                 else:
-                    cached_map = raw  # legacy flat format with no timestamp -> refresh
+                    cached = {"map": raw, "names": {}}  # legacy flat format, no names yet -> refresh
             except (json.JSONDecodeError, OSError):
                 pass
 
-        if cached_map is not None and cache_fresh:
-            self._cik_by_ticker = cached_map
+        if cached is not None and cache_fresh:
+            self._cik_by_ticker = cached["map"]
+            self._ticker_by_name = cached.get("names", {})
             self._map_loaded_at = now
-            return cached_map
+            return self._cik_by_ticker, self._ticker_by_name
 
         try:
             response = await self._throttled_get(_TICKERS_URL)
             raw = response.json()
-            mapping = {row["ticker"].upper(): str(row["cik_str"]).zfill(10) for row in raw.values()}
+            ticker_map = {row["ticker"].upper(): str(row["cik_str"]).zfill(10) for row in raw.values()}
+            name_map = {}
+            for row in raw.values():
+                normalized = _normalize_company_name(row.get("title", ""))
+                if normalized:
+                    name_map.setdefault(normalized, row["ticker"].upper())
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._cache_path.write_text(json.dumps({"fetched_at": now.isoformat(), "map": mapping}))
+            self._cache_path.write_text(
+                json.dumps({"fetched_at": now.isoformat(), "map": ticker_map, "names": name_map})
+            )
         except (httpx.HTTPError, KeyError, ValueError) as exc:
-            if cached_map is None:
+            if cached is None:
                 raise
             log.warning("Could not refresh EDGAR's ticker map (%s) -- using the stale cached copy.", exc)
-            mapping = cached_map
-        self._cik_by_ticker = mapping
+            ticker_map, name_map = cached["map"], cached.get("names", {})
+        self._cik_by_ticker = ticker_map
+        self._ticker_by_name = name_map
         self._map_loaded_at = now
-        return mapping
+        return ticker_map, name_map
 
     async def cik_for(self, symbol: str) -> str | None:
-        mapping = await self._ticker_map()
-        return mapping.get(symbol.upper())
+        ticker_map, _ = await self._ticker_map()
+        return ticker_map.get(symbol.upper())
+
+    async def find_ticker_by_name(self, company_name: str) -> str | None:
+        """Best-effort match of a free-text company name (as written in a
+        filing, e.g. "ASML") against SEC's registered filer titles (e.g.
+        "ASML Holding N.V.") -- used to backfill a ticker for relationship-
+        extraction candidates the model didn't recognize (see engine.py's
+        _record_universe_candidate), using the same cached
+        company_tickers.json already fetched for CIK lookups, so this costs
+        no extra request. Best-effort and US-listed-SEC-filer only: private
+        companies, foreign private issuers that don't file with the SEC,
+        and generic entity descriptions never resolve, which is correct --
+        there is no ticker to find."""
+        _, name_map = await self._ticker_map()
+        normalized = _normalize_company_name(company_name)
+        if not normalized:
+            return None
+        if normalized in name_map:
+            return name_map[normalized]
+        for title, ticker in name_map.items():
+            if title.startswith(normalized + " ") or normalized.startswith(title + " "):
+                return ticker
+        return None
 
     async def recent_filings(self, symbol: str, forms: set[str], since_date: str) -> list[FilingEvent]:
         """Filings for `symbol` on/after `since_date` (YYYY-MM-DD), restricted

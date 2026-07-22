@@ -1,10 +1,17 @@
-"""Read-only dashboard: dossiers, the relationship graph, open/closed paper
-trades, and recent signals -- runs alongside the ingestion engine in the
-same process. Never places orders; every handler here only reads persisted
-state (see status.py). Reachable directly (http://<host>:dashboard_port/)
-and, for the Home Assistant add-on, as an Ingress tab -- see
-ha-addons/smartboi/config.yaml. Uses only relative URLs so it works
-unmodified behind Ingress's subpath proxying."""
+"""Dashboard: dossiers, the relationship graph, open/closed paper trades,
+recent signals, and discovered universe candidates -- runs alongside the
+ingestion engine in the same process. Reachable directly
+(http://<host>:dashboard_port/) and, for the Home Assistant add-on, as an
+Ingress tab -- see ha-addons/smartboi/config.yaml. Uses only relative URLs
+so it works unmodified behind Ingress's subpath proxying.
+
+Mostly read-only (every GET handler just reads persisted state, see
+status.py) with one deliberate exception: POST /api/candidates/accept lets
+a human add a discovered candidate into the live universe with one click
+(see engine.accept_candidate) -- its write surface is bounded to symbols
+the extraction pipeline itself already surfaced, never an arbitrary
+ticker, and it can only widen what's watched, never place an order or
+directly create a trade (see handle_accept_candidate's docstring)."""
 from __future__ import annotations
 
 import asyncio
@@ -21,6 +28,7 @@ from smartboi.status import (
     gather_paper_trade_stats,
     gather_recent_signals,
     gather_universe_candidates,
+    gather_usage,
 )
 
 log = logging.getLogger(__name__)
@@ -140,15 +148,25 @@ function renderSignals(rows) {
     }).join("") + "</table>";
 }
 
+function candidateAction(c) {
+  if (!c.ticker) return '<span style="opacity:0.5">no ticker</span>';
+  if (c.accepted_as) return '<span class="badge on">added: ' + esc(c.accepted_as) + '</span>';
+  return '<button class="accept-btn" data-symbol="' + esc(c.ticker) + '" data-as="tradeable">+ Tradeable</button> ' +
+    '<button class="accept-btn" data-symbol="' + esc(c.ticker) + '" data-as="anchor">+ Anchor</button>';
+}
+
 function renderCandidates(rows) {
   if (!rows.length) return '<div class="empty">None discovered yet -- candidates appear as filings disclose relationships to companies outside the universe.</div>';
-  return "<table><tr><th>Name</th><th>Ticker</th><th>Related to</th><th>Type</th><th>Mentions</th><th>Description</th></tr>" +
+  return "<table><tr><th>Name</th><th>Ticker</th><th>Related to</th><th>Type</th><th>Mentions</th><th>Description</th><th>Action</th></tr>" +
     rows.map(function(c) {
       return "<tr><td>" + esc(c.name) + "</td><td>" + esc(c.ticker || "?") + "</td><td>" +
         esc((c.related_to || []).join(", ")) + "</td><td>" + esc((c.rel_types || []).join(", ")) + "</td><td>" +
-        (c.seen_count || 0) + "</td><td style='max-width:32rem'>" + esc(c.description) + "</td></tr>";
+        (c.seen_count || 0) + "</td><td style='max-width:28rem'>" + esc(c.description) + "</td><td>" +
+        candidateAction(c) + "</td></tr>";
     }).join("") + "</table>" +
-    '<div class="empty">To accept a candidate into the universe, add its ticker to <b>symbols</b> (tradeable) or <b>anchor_symbols</b> (news source only) in the add-on configuration.</div>';
+    '<div class="empty">"+ Tradeable" adds it as a trade target; "+ Anchor" adds it purely as a news source (never traded). ' +
+    'Takes effect on the next poll, no restart needed. Candidates with no ticker resolved (private companies, ' +
+    'regulators, generic customer classes) can only be added manually via <b>symbols</b>/<b>anchor_symbols</b> if you have a ticker for them.</div>';
 }
 
 function renderGraph(g) {
@@ -172,6 +190,10 @@ function render(data) {
     (data.paper_stats.closed ? Math.round(data.paper_stats.win_rate * 100) + "%" : "-") + '</div></div>';
   html += '<div class="card"><div class="label">Paper avg R</div><div class="value ' + cls(data.paper_stats.avg_r) + '">' +
     (data.paper_stats.closed ? fmt(data.paper_stats.avg_r) : "-") + '</div></div>';
+  html += '<div class="card"><div class="label">LLM calls today</div><div class="value">' +
+    data.usage.calls + ' / ' + data.usage.daily_call_budget + '</div></div>';
+  html += '<div class="card"><div class="label">LLM tokens today (in/out)</div><div class="value" style="font-size:1rem">' +
+    (data.usage.input_tokens / 1000).toFixed(1) + 'k / ' + (data.usage.output_tokens / 1000).toFixed(1) + 'k</div></div>';
   html += "</div>";
 
   html += "<h2>Dossiers</h2>" + renderDossiers(data.dossiers);
@@ -188,8 +210,30 @@ function render(data) {
 // rather than a bare relative fetch() -- HA Ingress can deliver this page
 // at a per-install subpath with no trailing slash, which would otherwise
 // silently break the API URL.
-var API_STATUS_URL = location.pathname.replace(/\\/?$/, "/") + "api/status";
+var API_BASE = location.pathname.replace(/\\/?$/, "/") + "api/";
+var API_STATUS_URL = API_BASE + "status";
 var REFRESH_TIMEOUT_MS = 12000;
+
+document.addEventListener("click", function(ev) {
+  var btn = ev.target.closest(".accept-btn");
+  if (!btn) return;
+  btn.disabled = true;
+  fetch(API_BASE + "candidates/accept", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ symbol: btn.dataset.symbol, as: btn.dataset.as }),
+  }).then(function(r) { return r.json(); }).then(function(result) {
+    if (result.error) {
+      btn.disabled = false;
+      alert("Could not accept: " + result.error);
+      return;
+    }
+    refresh();
+  }).catch(function(err) {
+    btn.disabled = false;
+    alert("Could not accept: " + err);
+  });
+});
 
 function refresh() {
   var controller = new AbortController();
@@ -242,14 +286,15 @@ async def _status_payload(engine) -> dict:
             "anthropic": engine.updater is not None,
             "ib": engine.price_feed is not None,
         },
-        "universe_size": len(settings.symbol_list),
+        "universe_size": len(engine.symbol_list),
         "dossiers": gather_dossiers(engine.dossiers),
         "graph": gather_graph_stats(engine.graph),
         "open_paper_trades": open_trades,
         "closed_paper_trades": closed_trades,
         "paper_stats": paper_stats.__dict__,
         "recent_signals": gather_recent_signals(log_dir / "signals.jsonl"),
-        "universe_candidates": gather_universe_candidates(engine.candidates.data),
+        "universe_candidates": gather_universe_candidates(engine.candidates.data, engine.accepted_candidates.data),
+        "usage": gather_usage(engine.usage.snapshot()),
     }
 
 
@@ -271,9 +316,43 @@ def create_app(engine) -> web.Application:
         log.debug("Dashboard: /api/status responded in %.2fs", time.monotonic() - start)
         return web.json_response(data)
 
+    async def handle_accept_candidate(request: web.Request) -> web.Response:
+        """The dashboard's one-click Accept: adds a discovered universe
+        candidate into the live universe (see engine.accept_candidate).
+        The only write endpoint this otherwise-read-only dashboard exposes
+        -- its write surface is bounded to symbols the system ITSELF
+        already discovered and surfaced as a candidate (validated against
+        engine.candidates below), not an arbitrary ticker, so it can widen
+        what's watched but can't be used to inject something the
+        extraction pipeline never found. Widening the watch universe alone
+        can't create a trade either -- a dossier/signal still has to form
+        independently for the newly-added symbol."""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - a malformed body is a 400, not a 500
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        symbol = (body.get("symbol") or "").strip().upper()
+        as_type = body.get("as") or "tradeable"
+        if as_type not in ("tradeable", "anchor"):
+            return web.json_response({"error": "'as' must be 'tradeable' or 'anchor'"}, status=400)
+        if not symbol:
+            return web.json_response({"error": "'symbol' is required"}, status=400)
+        is_known_candidate = any(
+            key == symbol or (c.get("ticker") or "").upper() == symbol
+            for key, c in engine.candidates.data.items()
+        )
+        if not is_known_candidate:
+            return web.json_response(
+                {"error": f"{symbol} is not a discovered candidate -- use SYMBOLS/ANCHOR_SYMBOLS to add it manually."},
+                status=404,
+            )
+        spec = engine.accept_candidate(symbol, as_type)
+        return web.json_response({"ok": True, "symbol": spec.symbol, "as": as_type})
+
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_status)
+    app.router.add_post("/api/candidates/accept", handle_accept_candidate)
     return app
 
 

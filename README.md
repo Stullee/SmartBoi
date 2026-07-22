@@ -94,6 +94,8 @@ src/smartboi/
   skeptic.py                  adversarial second pass that tries to refute proposed updates
   signals.py                    evidence-threshold crossing -> SignalEvent (always logged)
   alerts.py                      optional webhook POST on signals / paper trade opens & closes
+  usage.py                        daily Claude API call/token budget tracker (cost control)
+  ratelimit.py                     sliding-window limiter (propagated-evidence cooldown)
   paper_journal.py                hypothetical trade open/mark/close -- NO order-placement code
   prices.py                        read-only IB price feed -- NO order-placement code, optional
   universe_screen.py                monthly market-cap/analyst-coverage prune-only recheck
@@ -137,8 +139,25 @@ instead of over a year of annual filings.
 When a filing discloses a relationship to a company OUTSIDE the universe,
 it's recorded as a **universe candidate** (`data/universe_candidates.json`,
 shown on the dashboard, webhook-alerted on first discovery) -- a proposal
-for you to review, never auto-added. Accept one by adding its ticker to
-`SYMBOLS` or `ANCHOR_SYMBOLS`.
+for you to review, never auto-added. If the model didn't recognize the
+counterparty's ticker, `EdgarClient.find_ticker_by_name` tries to resolve
+one from SEC's own filer list before giving up (matching on a normalized
+name, so "ASML" matches the registered "ASML Holding N.V.") -- this is
+what makes most real public companies show up with a ticker instead of
+"no ticker found." Government bodies, regulators, and generic customer-
+class descriptions ("public utilities") are filtered out entirely rather
+than shown as an unactionable dead end (see engine.py's
+`_NON_COMPANY_KEYWORDS` -- only ever applied after ticker resolution has
+already failed, so a real resolved candidate is never hidden by it).
+
+Accept a candidate with one click on the dashboard -- "+ Tradeable" or "+
+Anchor" -- and it's live immediately, no restart: EDGAR/news polling and
+the relationship backfill both read the current universe on their next
+cycle, not a value fixed at startup. Persisted in
+`data/accepted_candidates.json`, so it survives a restart without ever
+touching `SYMBOLS`/`ANCHOR_SYMBOLS` by hand (those still work too, if you
+prefer static config). A candidate that never resolved to a ticker has no
+button -- there's nothing to add without one.
 
 ## Entry timing: are we too late?
 
@@ -182,6 +201,36 @@ unopened dossier that decays below the signal threshold is expired back to
 `ACTIVE` the same way an entry-timing expiry would. See `dossier.py`'s
 `evidence_weight`/`evidence_is_stale`/`recompute_decay`.
 
+## Cost controls
+
+Every evidence item costs at least one Claude call (dossier update) plus a
+second (skeptic) if it's judged new -- and propagation multiplies that by
+however many linked targets an origin has, so a heavily-covered anchor with
+several links can generate real spend fast. Two guards, both in `config.py`:
+
+- **Daily LLM call budget** (`MAX_DAILY_LLM_CALLS`, default 3000): a hard
+  ceiling across extraction/dossier-update/skeptic calls combined. Once hit,
+  further evidence is deferred (not discarded) until the budget resets at
+  UTC midnight -- exactly the same "retry later" path as a transient API
+  failure. Call-count-based rather than a dollar figure on purpose: this
+  codebase's own prompt construction keeps each call's token size roughly
+  bounded, so a call cap is a robust proxy for spend that won't rot when
+  Anthropic's pricing changes. See the dashboard for actual calls/tokens
+  used today.
+- **Propagated-evidence cooldown** (`MAX_PROPAGATED_EVIDENCE_PER_LINK`,
+  default 3 per `PROPAGATED_EVIDENCE_COOLDOWN_HOURS`, default 6h): caps how
+  many pieces of evidence about one linked (non-direct) origin get scored
+  against one target within the window. Without this, a noisy anchor with
+  many articles about the same underlying story burns a full dossier-
+  update + skeptic call against a target for every one of them, even after
+  the causal link has already been refused several times running for the
+  same reason. Only throttles PROPAGATED fan-out to other dossiers --
+  evidence about a company's own dossier is never throttled.
+
+Also worth tuning down if spend matters more than freshness:
+`NEWS_POLL_INTERVAL_SEC` (default 3600 -- this strategy holds positions for
+weeks, so 15-minute freshness was pure waste) and `EDGAR_POLL_INTERVAL_SEC`.
+
 ## Setup
 
 ```bash
@@ -204,9 +253,12 @@ Recommended order to bring integrations online:
    without it, evidence is collected but never scored.
 4. Only once you want real hypothetical P&L: `ENABLE_IB_PRICE_FEED=true`
    plus `IB_HOST`/`IB_PORT` pointed at a running IB Gateway/TWS. Read-only,
-   never places an order. Until this is on, signals are still detected and
-   logged (`logs/signals.jsonl`), they just can't become a tracked
-   hypothetical trade yet.
+   never places an order. The connection is checked right at startup and
+   logged clearly either way (`CONNECTED`, or a warning with the retry
+   cadence) rather than only surfacing a failure hours later at the first
+   price poll. Until it's reachable, signals are still detected and logged
+   (`logs/signals.jsonl`), they just can't become a tracked hypothetical
+   trade yet.
 
 ## Running
 
@@ -220,11 +272,19 @@ polling EDGAR/news/prices on their own configured intervals.
 
 ## Dashboard
 
-A read-only dashboard (`ENABLE_DASHBOARD=true` by default) runs alongside
-the engine. Open `http://localhost:8100/` (or `DASHBOARD_PORT`): which
-integrations are enabled, the relationship graph, every company's dossier,
-open/closed hypothetical trades with win rate and average R, and recent
-signals. Auto-refreshes every 10 seconds. Never places orders.
+A dashboard (`ENABLE_DASHBOARD=true` by default) runs alongside the engine.
+Open `http://localhost:8100/` (or `DASHBOARD_PORT`): which integrations are
+enabled, the relationship graph, every company's dossier, open/closed
+hypothetical trades with win rate and average R, recent signals, today's
+LLM call/token usage against the daily budget, and discovered universe
+candidates. Auto-refreshes every 10 seconds. Never places orders.
+
+Almost entirely read-only, except one endpoint: `POST /api/candidates/accept`
+adds a discovered candidate into the live universe (the dashboard's "+
+Tradeable"/"+ Anchor" buttons) -- bounded to symbols the extraction
+pipeline itself already surfaced, never an arbitrary ticker, and it can
+only widen what's watched, never place an order or directly create a
+trade. See "Bring your own universe" above.
 
 ## Running on Home Assistant OS
 

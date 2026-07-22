@@ -9,6 +9,8 @@ import logging
 
 from anthropic import AsyncAnthropic
 
+from smartboi.usage import UsageTracker
+
 log = logging.getLogger(__name__)
 
 _TOOL = {
@@ -48,16 +50,21 @@ _SYSTEM_PROMPT = (
 
 
 class Skeptic:
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, usage: UsageTracker):
         self._client = AsyncAnthropic(api_key=api_key)
         self._model = model
+        self._usage = usage
 
     async def review(self, evidence_text: str, proposed: dict) -> dict | None:
-        """Returns the verdict dict, or None on a transient API failure --
-        the caller (engine.py) then leaves the evidence unregistered so a
-        later poll retries it, rather than permanently discarding evidence
-        because of a network blip. Evidence still never merges without an
-        actual verdict."""
+        """Returns the verdict dict, or None on a transient API failure OR
+        an exhausted daily LLM call budget (usage.py) -- the caller
+        (engine.py) then leaves the evidence unregistered so a later poll
+        retries it, rather than permanently discarding evidence because of
+        a network blip or a paused budget. Evidence still never merges
+        without an actual verdict."""
+        if not self._usage.budget_remaining():
+            log.info("Daily LLM call budget reached -- deferring skeptic review.")
+            return None
         prompt = (
             f"Proposed update: direction={proposed.get('direction')}, "
             f"magnitude={proposed.get('magnitude')}, confidence={proposed.get('confidence')}, "
@@ -76,6 +83,7 @@ class Skeptic:
         except Exception as exc:  # noqa: BLE001 - fail safe: nothing merges without a real verdict
             log.warning("Skeptic review failed (%s) -- will retry this evidence on a later poll.", exc)
             return None
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens)
         for block in response.content:
             if block.type == "tool_use":
                 return block.input

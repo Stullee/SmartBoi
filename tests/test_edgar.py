@@ -70,3 +70,65 @@ def test_raw_document_url_strips_xsl_rendering_prefix():
     assert filing.raw_document_url.endswith("000127501426000001/form4.xml")
     assert "xslF345X05" not in filing.raw_document_url
     assert "xslF345X05" in filing.document_url
+
+
+# --- Name-based ticker resolution (universe candidate backfill) ---
+
+import json
+
+from smartboi.edgar import EdgarClient, _normalize_company_name
+
+
+def test_normalize_company_name_strips_legal_suffixes():
+    assert _normalize_company_name("ASML Holding N.V.") == "asml"
+    assert _normalize_company_name("The Boeing Company") == "boeing"
+    assert _normalize_company_name("Applied Materials, Inc.") == "applied materials"
+
+
+def test_normalize_company_name_handles_plain_names():
+    assert _normalize_company_name("ASML") == "asml"
+    assert _normalize_company_name("") == ""
+
+
+async def _seed_cache(tmp_path, tickers_and_titles):
+    cache_path = tmp_path / "cik_cache.json"
+    ticker_map = {t.upper(): "0000000001" for t, _ in tickers_and_titles}
+    name_map = {}
+    for ticker, title in tickers_and_titles:
+        name_map[_normalize_company_name(title)] = ticker.upper()
+    cache_path.write_text(json.dumps({
+        "fetched_at": "2026-07-22T00:00:00+00:00",
+        "map": ticker_map,
+        "names": name_map,
+    }))
+    return cache_path
+
+
+async def test_find_ticker_by_name_exact_match(tmp_path):
+    cache_path = await _seed_cache(tmp_path, [("ASML", "ASML Holding N.V.")])
+    client = EdgarClient("test test@example.com", cache_path)
+    try:
+        ticker = await client.find_ticker_by_name("ASML")
+        assert ticker == "ASML"
+    finally:
+        await client.aclose()
+
+
+async def test_find_ticker_by_name_prefix_match(tmp_path):
+    cache_path = await _seed_cache(tmp_path, [("BA", "The Boeing Company")])
+    client = EdgarClient("test test@example.com", cache_path)
+    try:
+        ticker = await client.find_ticker_by_name("Boeing")
+        assert ticker == "BA"
+    finally:
+        await client.aclose()
+
+
+async def test_find_ticker_by_name_no_match_returns_none(tmp_path):
+    cache_path = await _seed_cache(tmp_path, [("ASML", "ASML Holding N.V.")])
+    client = EdgarClient("test test@example.com", cache_path)
+    try:
+        ticker = await client.find_ticker_by_name("Some Private Company LLC")
+        assert ticker is None
+    finally:
+        await client.aclose()

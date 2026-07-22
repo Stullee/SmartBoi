@@ -14,11 +14,11 @@ of whether IB is configured yet.
 Evidence is only marked as seen (dedup-registered) once it has been
 handled DEFINITIVELY -- scored into dossiers, judged not-new, or refuted
 by the skeptic. Evidence that can't be scored yet (no ANTHROPIC_API_KEY
-configured) or hits a transient LLM/API failure stays unregistered and is
-retried on later polls, so a missing key or a network blip never
-permanently burns evidence; per-dossier merging is idempotent
-(dossier.has_evidence) so retries of a partially-processed item never
-double-count."""
+configured), hits a transient LLM/API failure, or is deferred by the daily
+LLM call budget (usage.py) stays unregistered and is retried on a later
+poll, so none of those ever permanently burn evidence; per-dossier merging
+is idempotent (dossier.has_evidence) so retries of a partially-processed
+item never double-count."""
 from __future__ import annotations
 
 import asyncio
@@ -46,11 +46,13 @@ from smartboi.graph import RelationshipExtractor, RelationshipGraph, Relationshi
 from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal
 from smartboi.prices import ReadOnlyPriceFeed
+from smartboi.ratelimit import SlidingWindowLimiter
 from smartboi.signals import evaluate, favorable_drift_pct, log_signal, signal_expired
 from smartboi.skeptic import Skeptic
 from smartboi.state import JsonState
-from smartboi.universe import SEED_RELATIONSHIPS, spec_by_symbol
+from smartboi.universe import SEED_RELATIONSHIPS, CompanySpec, spec_by_symbol
 from smartboi.universe_screen import screen_universe
+from smartboi.usage import UsageTracker
 from smartboi.webapp import run_dashboard
 
 log = logging.getLogger(__name__)
@@ -70,6 +72,22 @@ DECAY_PASS_INTERVAL_SEC = 86400
 # and rarely restate customer/supplier relationships, so extraction time is
 # spent on the two disclosure-heavy forms.
 RELATIONSHIP_EXTRACTION_FORMS = ("10-K", "10-Q")
+# Best-effort filter on universe candidates that never resolve to a real
+# ticker (see _record_universe_candidate): government bodies, regulators,
+# generic customer-class descriptions ("public utilities"), and lenders are
+# never investable, so they're just noise in a list meant to be acted on.
+# Deliberately only applied AFTER ticker resolution has already failed --
+# this can never hide a candidate that actually resolved to a ticker.
+_NON_COMPANY_KEYWORDS = (
+    "government", "department", "agency", "administration", "bureau",
+    "army", "navy", "air force", "military", "board", "authority",
+    "commission", "ministry", "federal reserve", "internal revenue",
+    "regulatory", "utilities", "utility", "organizations", "organization",
+    "producers", "manufacturers", "operators", "owners", "customers",
+    "companies", "corporations", "brands", "institutions", "agencies",
+    "capital partners", "capital management", "bank", "financial",
+    "equipment finance",
+)
 
 
 class Engine:
@@ -84,10 +102,18 @@ class Engine:
         self.universe_screen_state = JsonState(DATA_DIR / "universe_screen_state.json")
         self.backfill_state = JsonState(DATA_DIR / "relationship_backfill.json")
         self.candidates = JsonState(DATA_DIR / "universe_candidates.json")
+        self.accepted_candidates = JsonState(DATA_DIR / "accepted_candidates.json")
         self.alerts = AlertSender(settings.alert_webhook_url)
+        self.usage = UsageTracker(DATA_DIR / "llm_usage.json", settings.max_daily_llm_calls)
 
-        self.universe = settings.universe
+        self.universe: list[CompanySpec] = list(settings.universe)
+        self._apply_accepted_candidates()
         self.spec_by_symbol = spec_by_symbol(self.universe)
+
+        self._propagation_limiter = SlidingWindowLimiter(
+            settings.max_propagated_evidence_per_link,
+            settings.propagated_evidence_cooldown_hours * 3600,
+        )
 
         self.edgar_client: EdgarClient | None = None
         self.finnhub: FinnhubClient | None = None
@@ -105,9 +131,49 @@ class Engine:
         self._last_news_poll: float | None = None
         self._last_price_poll: float | None = None
         self._last_decay_pass: float | None = None
-        self._backfill_ran = False  # once per process; per-symbol state persists in backfill_state
         self._dashboard_task: asyncio.Task | None = None
         self._closing = False
+
+    @property
+    def symbol_list(self) -> list[str]:
+        """The LIVE symbol list -- unlike settings.symbol_list (fixed at
+        startup from SYMBOLS/ANCHOR_SYMBOLS), this reflects self.universe,
+        which grows at runtime as candidates are accepted (see
+        accept_candidate) without requiring a restart."""
+        return [c.symbol for c in self.universe]
+
+    def _apply_accepted_candidates(self) -> None:
+        known = {c.symbol for c in self.universe}
+        for symbol, as_type in self.accepted_candidates.data.items():
+            if symbol in known:
+                continue
+            self.universe.append(
+                CompanySpec(symbol, symbol, "accepted", signal_source_only=(as_type == "anchor"),
+                            notes="Accepted from a discovered universe candidate")
+            )
+            known.add(symbol)
+
+    def accept_candidate(self, symbol: str, as_type: str) -> CompanySpec:
+        """Adds a discovered universe candidate (see
+        _record_universe_candidate) into the LIVE universe, no restart
+        required: EDGAR/news polling picks it up on their next due tick
+        (both iterate self.symbol_list, not a value fixed at startup), and
+        the relationship backfill runs it on the next tick too (see
+        _run_relationship_backfill, no longer gated to "once per process").
+        Persisted so it survives a restart without editing SYMBOLS/
+        ANCHOR_SYMBOLS by hand. Idempotent -- accepting an already-accepted
+        symbol just returns its existing spec."""
+        symbol = symbol.upper()
+        existing = self.spec_by_symbol.get(symbol)
+        if existing is not None:
+            return existing
+        spec = CompanySpec(symbol, symbol, "accepted", signal_source_only=(as_type == "anchor"),
+                            notes="Accepted from a discovered universe candidate")
+        self.universe.append(spec)
+        self.spec_by_symbol[symbol] = spec
+        self.accepted_candidates.set(symbol, as_type)
+        log.info("[CANDIDATE] %s accepted into the universe as %s -- polled starting next cycle.", symbol, as_type)
+        return spec
 
     def _warn_once(self, key: str, message: str) -> None:
         if key in self._warned:
@@ -145,10 +211,13 @@ class Engine:
             )
 
         if self.settings.anthropic_api_key:
-            self.extractor = RelationshipExtractor(self.settings.anthropic_api_key, self.settings.extraction_model)
-            self.updater = DossierUpdater(self.settings.anthropic_api_key, self.settings.dossier_model)
-            self.skeptic = Skeptic(self.settings.anthropic_api_key, self.settings.skeptic_model)
-            log.info("Dossier engine (Claude): ENABLED")
+            self.extractor = RelationshipExtractor(self.settings.anthropic_api_key, self.settings.extraction_model, self.usage)
+            self.updater = DossierUpdater(self.settings.anthropic_api_key, self.settings.dossier_model, self.usage)
+            self.skeptic = Skeptic(self.settings.anthropic_api_key, self.settings.skeptic_model, self.usage)
+            log.info(
+                "Dossier engine (Claude): ENABLED (daily LLM call budget: %d, see MAX_DAILY_LLM_CALLS)",
+                self.settings.max_daily_llm_calls,
+            )
         else:
             self._warn_once(
                 "anthropic",
@@ -160,11 +229,21 @@ class Engine:
             self.price_feed = ReadOnlyPriceFeed(
                 self.settings.ib_host, self.settings.ib_port, self.settings.ib_client_id
             )
-            log.info(
-                "Read-only IB price feed: ENABLED -- connects on the first price poll and "
-                "reconnects automatically (retries every %d min while the Gateway is unreachable).",
-                IB_RETRY_GAP_SEC // 60,
-            )
+            # Checked right away rather than waiting for the first price
+            # poll (up to price_poll_interval_sec, 6h by default) so a
+            # misconfigured host/port or a Gateway that's simply not up yet
+            # is visible in the startup log immediately, not silently hours
+            # later. Never blocks startup -- ensure_connected() itself never
+            # raises, and the poll loop keeps retrying regardless.
+            if await self.price_feed.ensure_connected():
+                log.info("Read-only IB price feed: CONNECTED to %s:%s.", self.settings.ib_host, self.settings.ib_port)
+            else:
+                log.warning(
+                    "Read-only IB price feed: could not connect to %s:%s at startup -- will keep retrying "
+                    "every %d min in the background. Signals are still detected and logged "
+                    "(logs/signals.jsonl) while unreachable.",
+                    self.settings.ib_host, self.settings.ib_port, IB_RETRY_GAP_SEC // 60,
+                )
         else:
             self._warn_once(
                 "ib",
@@ -192,7 +271,7 @@ class Engine:
 
     async def run_forever(self) -> None:
         await self.start()
-        log.info("SmartBoi engine running. Universe: %s", self.settings.symbol_list)
+        log.info("SmartBoi engine running. Universe: %s", self.symbol_list)
         try:
             while True:
                 try:
@@ -230,12 +309,16 @@ class Engine:
     async def _tick(self) -> None:
         now = time.monotonic()
         if (
-            not self._backfill_ran
-            and self.settings.enable_relationship_backfill
+            self.settings.enable_relationship_backfill
             and self.edgar_client is not None
             and self.extractor is not None
         ):
-            self._backfill_ran = True
+            # No longer gated to "once per process": _run_relationship_backfill
+            # itself no-ops cheaply (an in-memory list comprehension against
+            # backfill_state, no I/O) once nothing is pending, so calling it
+            # every tick is fine -- and it's what lets a symbol accepted at
+            # runtime (accept_candidate) get backfilled on the very next
+            # tick instead of only on the next process restart.
             await self._run_relationship_backfill()
         if self.edgar_client is not None and self._due(self._last_edgar_poll, self.settings.edgar_poll_interval_sec, now):
             self._last_edgar_poll = now
@@ -284,7 +367,7 @@ class Engine:
 
     async def _poll_edgar(self) -> None:
         since_date = (date.today() - timedelta(days=self.settings.edgar_lookback_days)).isoformat()
-        for symbol in self.settings.symbol_list:
+        for symbol in self.symbol_list:
             try:
                 filings = await self.edgar_client.recent_filings(symbol, self.settings.edgar_forms_set, since_date)
             except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
@@ -320,20 +403,29 @@ class Engine:
 
     async def _extract_relationships(self, symbol: str, filing: FilingEvent, text: str) -> None:
         """LLM relationship extraction from one filing's text into the
-        graph -- shared by regular 10-K polling and the one-time backfill.
-        graph.add dedupes on (from, to, rel_type), so re-extraction of a
-        filing can only ever add edges, never duplicate them."""
-        known = self.settings.symbol_list
+        graph -- shared by regular 10-K/10-Q polling and the one-time
+        backfill. graph.add dedupes on (from, to, rel_type), so
+        re-extraction of a filing can only ever add edges, never duplicate
+        them. Returns without acting if the daily LLM call budget is
+        exhausted (extract() returns None) -- retried whenever this filing
+        is next polled, same as any other transient-failure path."""
+        known = self.symbol_list
         relationships = await self.extractor.extract(symbol, filing.form, text, known)
+        if relationships is None:
+            return
         now = datetime.now(timezone.utc).isoformat()
         for rel in relationships:
             ticker = (rel.get("counterparty_ticker") or "").upper()
+            if not ticker and rel.get("rel_type") != "regulator":
+                # A regulator (government body, agency) can never be a
+                # ticker -- skip resolution and don't clutter candidates
+                # with something that will never be actionable.
+                resolved = await self.edgar_client.find_ticker_by_name(rel.get("counterparty_name") or "")
+                if resolved:
+                    ticker = resolved
             if not ticker or ticker not in known:
-                # A relationship to a company OUTSIDE the universe: not an
-                # edge (nothing to propagate to), but a discovery worth
-                # surfacing -- proposed as a watchlist candidate for human
-                # review, never auto-added (see _record_universe_candidate).
-                await self._record_universe_candidate(symbol, rel, filing)
+                if rel.get("rel_type") != "regulator":
+                    await self._record_universe_candidate(symbol, rel, filing, resolved_ticker=ticker)
                 continue
             if ticker == symbol:
                 continue
@@ -354,18 +446,32 @@ class Engine:
                     symbol, ticker, rel["rel_type"], rel["confidence"], rel["description"],
                 )
 
-    async def _record_universe_candidate(self, symbol: str, rel: dict, filing: FilingEvent) -> None:
+    @staticmethod
+    def _looks_like_non_company(name: str) -> bool:
+        lowered = name.lower()
+        return any(keyword in lowered for keyword in _NON_COMPANY_KEYWORDS)
+
+    async def _record_universe_candidate(self, symbol: str, rel: dict, filing: FilingEvent, resolved_ticker: str = "") -> None:
         """Persists a disclosed relationship to a company outside the
         universe as a WATCHLIST CANDIDATE (data/universe_candidates.json,
-        also on the dashboard), and alerts the first time each one is
-        discovered. Deliberately never auto-added to the universe: whether
-        a name belongs is an editorial judgment (same reasoning as the
-        prune-only auto-screen) -- accepting a candidate means adding its
-        ticker to SYMBOLS or ANCHOR_SYMBOLS yourself."""
+        also on the dashboard with a one-click Accept), and alerts the
+        first time each one is discovered. Deliberately never auto-added:
+        whether a name belongs is an editorial judgment (same reasoning as
+        the prune-only auto-screen). `resolved_ticker` is set when the
+        model didn't supply one but EdgarClient.find_ticker_by_name found a
+        match -- candidates are keyed by ticker when one exists (so the
+        dashboard's Accept button has something to act on), by name
+        otherwise. Regulators and names matching an obvious non-company
+        pattern (government bodies, generic customer-class descriptions,
+        lenders) are dropped rather than recorded -- see
+        _NON_COMPANY_KEYWORDS; this only ever filters candidates that were
+        ALREADY unresolvable to a ticker, never a resolved one."""
         name = (rel.get("counterparty_name") or "").strip()
         if not name:
             return
-        ticker = (rel.get("counterparty_ticker") or "").upper()
+        ticker = resolved_ticker or (rel.get("counterparty_ticker") or "").upper()
+        if not ticker and self._looks_like_non_company(name):
+            return
         key = ticker or name.upper()
         now = datetime.now(timezone.utc).isoformat()
         entry = self.candidates.get(key)
@@ -377,6 +483,8 @@ class Engine:
                 "description": "", "sources": [],
                 "seen_count": 0, "first_seen_at": now,
             }
+        elif ticker and not entry.get("ticker"):
+            entry["ticker"] = ticker  # a later pass resolved a ticker this one didn't have yet
         entry["seen_count"] += 1
         entry["last_seen_at"] = now
         entry["description"] = rel.get("description") or entry["description"]
@@ -396,7 +504,8 @@ class Engine:
                 f"Universe candidate: {name}" + (f" ({ticker})" if ticker else ""),
                 f"Disclosed as a {rel_type or 'counterparty'} of {symbol} in {filing.form} "
                 f"filed {filing.filing_date}. {entry['description']} "
-                "Add its ticker to SYMBOLS or ANCHOR_SYMBOLS to accept it into the universe.",
+                + ("Accept it from the dashboard, or add its ticker to SYMBOLS/ANCHOR_SYMBOLS."
+                   if ticker else "No ticker could be resolved -- likely private or not SEC-listed."),
                 entry,
             )
 
@@ -413,8 +522,9 @@ class Engine:
         discloses are durable, the sentiment is not). Anchors are skipped --
         a giant's 10-K never names its small suppliers, which is exactly why
         the graph is discovered from the small companies' filings. Each
-        symbol is backfilled once ever (persisted), so adding a new symbol
-        later backfills just that one."""
+        symbol is backfilled once ever (persisted), so a symbol accepted at
+        runtime (accept_candidate) gets backfilled on the very next tick
+        without needing a restart."""
         pending = [
             spec.symbol
             for spec in self.universe
@@ -437,14 +547,14 @@ class Engine:
                     continue
                 text = await self.edgar_client.fetch_text(filing)
                 if not text:
-                    continue  # fetch failed -- left pending, retried on the next process start
+                    continue  # fetch failed -- left pending, retried on the next tick
                 await self._extract_relationships(symbol, filing, text)
                 self.backfill_state.set(symbol, {"backfilled_at": datetime.now(timezone.utc).isoformat(),
                                                  "accession": filing.accession_number,
                                                  "filing_date": filing.filing_date})
                 done += 1
             except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
-                log.exception("%s: relationship backfill failed -- will retry on the next restart.", symbol)
+                log.exception("%s: relationship backfill failed -- will retry on a later tick.", symbol)
         log.info("Relationship backfill complete: %d/%d symbol(s) processed, graph now has %d edge(s).",
                  done, len(pending), len(self.graph.relationships))
 
@@ -453,7 +563,7 @@ class Engine:
     async def _poll_news(self) -> None:
         to_date = date.today().isoformat()
         from_date = (date.today() - timedelta(days=self.settings.news_lookback_days)).isoformat()
-        for symbol in self.settings.symbol_list:
+        for symbol in self.symbol_list:
             try:
                 articles = await self.finnhub.recent_news(symbol, from_date, to_date)
             except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
@@ -493,23 +603,45 @@ class Engine:
         """Returns True when the item was handled definitively (every
         affected dossier merged/rejected/refuted it, or nothing needed
         scoring); False when it should be retried on a later poll (no
-        dossier engine configured yet, or a transient LLM failure) -- the
-        caller then leaves its dedup fingerprint unregistered."""
+        dossier engine configured yet, a transient LLM failure, or the
+        daily LLM call budget was exhausted) -- the caller then leaves its
+        dedup fingerprint unregistered."""
         if self.updater is None or self.skeptic is None:
             return False  # collected but not scoreable yet -- retried once a key is configured
 
-        universe = set(self.settings.symbol_list)
+        universe = set(self.symbol_list)
         targets: list[tuple[str, str]] = []  # (target_symbol, relationship_note)
 
         origin_spec = self.spec_by_symbol.get(origin_symbol)
         if origin_spec is None or not origin_spec.signal_source_only:
             targets.append((origin_symbol, ""))
 
+        now = time.monotonic()
+        throttled = 0
         for linked_symbol, rel in self.graph.linked_symbols(origin_symbol, universe):
             linked_spec = self.spec_by_symbol.get(linked_symbol)
             if linked_spec is not None and linked_spec.signal_source_only:
                 continue
+            # Propagated-evidence cooldown: a heavily-covered origin (e.g. a
+            # noisy anchor) can generate many near-duplicate articles about
+            # the same underlying story in a short window; without this, each
+            # one burns a full dossier-update + skeptic LLM call against the
+            # SAME target even when the causal link keeps getting refused for
+            # the same reason. Direct evidence (target == origin, handled
+            # above) is never throttled -- only fan-out to OTHER dossiers.
+            if not self._propagation_limiter.allow(f"{origin_symbol}->{linked_symbol}", now):
+                throttled += 1
+                continue
             targets.append((linked_symbol, rel.description))
+        if throttled:
+            self._warn_once(
+                f"throttled:{origin_symbol}",
+                f"{origin_symbol}: propagated-evidence cooldown engaged for {throttled} linked symbol(s) "
+                f"(already sent {self.settings.max_propagated_evidence_per_link} items in the last "
+                f"{self.settings.propagated_evidence_cooldown_hours}h) -- further {origin_symbol} evidence won't "
+                "reach them until the window rolls off. Raise MAX_PROPAGATED_EVIDENCE_PER_LINK if this is "
+                "suppressing real signal.",
+            )
 
         all_definitive = True
         for target_symbol, relationship_note in targets:
@@ -533,8 +665,9 @@ class Engine:
         published_at: str,
     ) -> bool:
         """Returns True when this dossier handled the evidence definitively
-        (merged, not-new, or refuted); False on a transient failure that
-        warrants a retry on a later poll."""
+        (merged, not-new, or refuted); False on a transient failure or an
+        exhausted daily LLM call budget, either of which warrants a retry
+        on a later poll."""
         evidence_id = f"{source_type}:{url or headline}:{published_at}"
         dossier = self.dossiers.load(target_symbol)
         if has_evidence(dossier, evidence_id):
@@ -542,13 +675,13 @@ class Engine:
 
         proposed = await self.updater.propose_update(dossier, evidence_text, origin_symbol, relationship_note)
         if proposed is None:
-            return False  # transient LLM failure -- retry this evidence later
+            return False  # transient LLM failure or budget exhausted -- retry this evidence later
         if not proposed.get("is_new_information"):
             return True
 
         verdict = await self.skeptic.review(evidence_text, proposed)
         if verdict is None:
-            return False  # transient LLM failure -- retry this evidence later
+            return False  # transient LLM failure or budget exhausted -- retry this evidence later
         if verdict.get("refuted"):
             log.info("%s: evidence refuted by skeptic (%s)", target_symbol, verdict.get("reasoning", ""))
             return True

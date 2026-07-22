@@ -14,6 +14,8 @@ from pathlib import Path
 
 from anthropic import AsyncAnthropic
 
+from smartboi.usage import UsageTracker
+
 log = logging.getLogger(__name__)
 
 DIRECTIONS = ("LONG", "SHORT", "NONE")
@@ -267,13 +269,17 @@ _SYSTEM_PROMPT = (
 
 
 class DossierUpdater:
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, usage: UsageTracker):
         self._client = AsyncAnthropic(api_key=api_key)
         self._model = model
+        self._usage = usage
 
     async def propose_update(
         self, dossier: Dossier, evidence_text: str, origin_symbol: str, relationship_note: str
     ) -> dict | None:
+        if not self._usage.budget_remaining():
+            log.info("%s: daily LLM call budget reached -- deferring dossier update.", dossier.symbol)
+            return None
         current = (
             f"Direction={dossier.direction}, magnitude={dossier.magnitude:.2f}, "
             f"confidence={dossier.confidence:.2f}, thesis: {dossier.thesis_summary or '(none yet)'}"
@@ -304,6 +310,7 @@ class DossierUpdater:
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the ingestion loop
             log.warning("%s: dossier update proposal failed: %s", dossier.symbol, exc)
             return None
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens)
         for block in response.content:
             if block.type == "tool_use":
                 return block.input

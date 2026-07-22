@@ -30,11 +30,14 @@ Recommended order:
 4. Only once you want to see actual hypothetical P&L: set
    `enable_ib_price_feed: true` and point `ib_host`/`ib_port` at a running
    IB Gateway/TWS (the same one TradingBot uses, or a separate read-only
-   client id against it -- see the main repo's `DEPLOY.md`). This is used
-   **only** to read prices and mark hypothetical positions to market --
-   never to place an order. Until this is on, signals are still detected
-   and logged (`logs/signals.jsonl`, visible on the dashboard), they just
-   can't be turned into a tracked hypothetical trade yet.
+   client id against it -- see the main repo's `DEPLOY.md`). The connection
+   is checked and logged right at startup (`CONNECTED` or a clear warning
+   with a retry cadence), not silently discovered hours later at the first
+   price poll. This is used **only** to read prices and mark hypothetical
+   positions to market -- never to place an order. Until this is on,
+   signals are still detected and logged (`logs/signals.jsonl`, visible on
+   the dashboard), they just can't be turned into a tracked hypothetical
+   trade yet.
 
 ## Configuration options
 
@@ -50,6 +53,8 @@ Recommended order:
 | `news_poll_interval_sec` / `news_lookback_days` | How often to poll, and the rolling lookback window |
 | `anthropic_api_key` | Powers relationship extraction, dossier updates, and the skeptic pass -- without it, evidence is collected but not scored |
 | `extraction_model` / `dossier_model` / `skeptic_model` | Claude model ids for each LLM step (default: a fast/cheap Haiku model for all three) |
+| `max_daily_llm_calls` | Hard daily ceiling on Claude API calls, combined across extraction/dossier-update/skeptic. Deferred evidence retries once the budget resets at UTC midnight, never discarded. See the dashboard for actual calls/tokens used today |
+| `max_propagated_evidence_per_link` / `propagated_evidence_cooldown_hours` | Caps how many pieces of *propagated* evidence (about a linked company, not the dossier's own direct evidence) get forwarded from one origin to one target within the cooldown window -- prevents a noisy anchor from burning a call for every article about it once the causal link keeps getting refused |
 | `signal_confidence_threshold` | Minimum `confidence * magnitude` for a dossier to fire a signal |
 | `min_independent_sources` | Minimum distinct-domain corroborating sources required (dedup collapses syndicated republishes to one) |
 | `max_horizon_days` | Cap on how long a hypothetical position is held before a timeout close |
@@ -67,13 +72,24 @@ Recommended order:
 
 ## Dashboard
 
-A read-only dashboard runs alongside ingestion (same process), reachable
-directly or as this add-on's Ingress tab. Shows: which integrations are
-enabled, the relationship graph, every company's dossier (direction,
-confidence, magnitude, evidence count, thesis), open/closed hypothetical
-trades with win rate and average R, and recent signals. Auto-refreshes
-every 10 seconds. Never places orders -- every handler is a read of
-already-persisted state.
+A dashboard runs alongside ingestion (same process), reachable directly or
+as this add-on's Ingress tab. Shows: which integrations are enabled, the
+relationship graph, every company's dossier (direction, confidence,
+magnitude, evidence count, thesis, signal-time price), open/closed
+hypothetical trades with win rate and average R, recent signals, today's
+LLM call/token usage against the daily budget, and discovered **universe
+candidates** -- companies outside your universe that a filing disclosed a
+relationship to. Auto-refreshes every 10 seconds. Never places orders.
+
+Almost entirely read-only, with one exception: each universe candidate
+that resolved to a real ticker gets a one-click **"+ Tradeable"** / **"+
+Anchor"** button that adds it to the live universe immediately (no
+restart, no editing `symbols`/`anchor_symbols` by hand) -- EDGAR/news
+polling and the relationship backfill pick it up on their next cycle. The
+button can only accept something the extraction pipeline itself already
+discovered and surfaced as a candidate, never an arbitrary ticker, and
+widening the universe can't place an order or directly create a trade --
+a dossier/signal still has to form independently for the new symbol.
 
 ## Where things are stored
 
