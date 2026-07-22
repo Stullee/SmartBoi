@@ -99,7 +99,12 @@ _EXTRACTION_TOOL = {
                         "counterparty_name": {"type": "string"},
                         "counterparty_ticker": {
                             "type": ["string", "null"],
-                            "description": "Stock ticker if you recognize the counterparty from the provided list, else null. Never guess a ticker.",
+                            "description": (
+                                "Stock ticker if you recognize the counterparty from the provided list, "
+                                "or its public ticker if you know it confidently even though it's not on "
+                                "the list (used to propose new watchlist candidates). Null for private "
+                                "companies or when unsure -- never guess a ticker."
+                            ),
                         },
                         "rel_type": {"type": "string", "enum": list(REL_TYPES)},
                         "description": {"type": "string"},

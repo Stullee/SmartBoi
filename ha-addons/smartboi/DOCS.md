@@ -40,8 +40,10 @@ Recommended order:
 
 | Option | Description |
 |---|---|
-| `symbols` | Comma-separated tickers. Empty uses the built-in starter watchlist (semiconductor equipment, defense tier-2, grid/data-center, battery/storage ecosystems -- see `src/smartboi/universe.py`) |
+| `symbols` | Comma-separated TRADEABLE tickers (your small/mid-caps). Setting this (or `anchor_symbols`) replaces the built-in starter watchlist entirely; both empty uses the starter watchlist (see `src/smartboi/universe.py`) |
+| `anchor_symbols` | Comma-separated ANCHOR tickers -- big, heavily-covered giants (e.g. `AAPL,MSFT,TSM`) whose news should propagate to your tradeable names. Never trade targets themselves. Relationships between anchors and tradeables are discovered automatically from the tradeable companies' 10-K filings |
 | `enable_edgar_ingestion` / `edgar_user_agent` | SEC EDGAR filing ingestion (8-K/10-K/Form 4). Requires a descriptive User-Agent |
+| `enable_relationship_backfill` | One-time extraction from each tradeable company's most recent 10-K (regardless of age) so the relationship graph populates on first run instead of over a year of annual filings. Each symbol is only ever backfilled once |
 | `edgar_forms` | Comma-separated SEC form types to ingest |
 | `edgar_poll_interval_sec` / `edgar_lookback_days` | How often to poll, and the rolling lookback window each poll checks |
 | `enable_news_ingestion` / `finnhub_api_key` | Finnhub company-news ingestion (free tier) |

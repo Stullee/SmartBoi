@@ -22,3 +22,20 @@ def test_seed_relationships_reference_known_symbols():
         assert rel_type in ("customer", "supplier", "competitor", "regulator")
         assert 0.0 <= confidence <= 1.0
         assert description
+
+
+def test_build_universe_anchor_wins_on_overlap():
+    from smartboi.universe import build_universe
+
+    universe = build_universe(["UCTT", "AAPL"], ["AAPL"])
+    by_symbol = {c.symbol: c for c in universe}
+    assert len(universe) == 2
+    assert by_symbol["AAPL"].signal_source_only  # never accidentally tradeable
+    assert not by_symbol["UCTT"].signal_source_only
+
+
+def test_build_universe_normalizes_and_dedupes():
+    from smartboi.universe import build_universe
+
+    universe = build_universe([" uctt ", "UCTT", "ichr"], ["msft "])
+    assert [c.symbol for c in universe] == ["MSFT", "UCTT", "ICHR"]

@@ -89,3 +89,12 @@ def gather_paper_trade_stats(log_path: Path) -> tuple[PaperTradeStats, list[dict
 
 def gather_recent_signals(log_path: Path, limit: int = 25) -> list[dict]:
     return _read_jsonl(log_path)[-limit:]
+
+
+def gather_universe_candidates(candidates: dict) -> list[dict]:
+    """Companies outside the universe that filings disclosed relationships
+    to (see engine._record_universe_candidate) -- most-corroborated first,
+    for human review; the dashboard shows them but nothing auto-adds them."""
+    rows = list(candidates.values())
+    rows.sort(key=lambda c: c.get("seen_count", 0), reverse=True)
+    return rows

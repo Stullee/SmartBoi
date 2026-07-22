@@ -108,7 +108,28 @@ exactly what should propagate to the smaller names via the relationship
 graph. See `src/smartboi/universe.py` for the full list and
 `SEED_RELATIONSHIPS` for the manually-seeded, well-documented edges
 (the rest are left for the extraction pipeline to find in actual filings
-rather than asserted as fact). Override entirely via `SYMBOLS` in `.env`.
+rather than asserted as fact).
+
+### Bring your own universe
+
+The starter watchlist is just a default. Set `SYMBOLS` (your tradeable
+small/mid-caps) and `ANCHOR_SYMBOLS` (the big, heavily-covered giants
+whose news should propagate to them -- never trade targets themselves)
+and the built-in list is replaced entirely. You do NOT configure the
+relationships between them: those are discovered automatically from the
+tradeable companies' 10-K filings -- a small supplier must disclose its
+dominant customers, which is why the graph is learned from the small
+companies' filings, not the giants'. On first run (and once for each
+newly added symbol) a one-time backfill extracts from each tradeable
+company's most recent 10-K regardless of age
+(`ENABLE_RELATIONSHIP_BACKFILL`), so the graph populates immediately
+instead of over a year of annual filings.
+
+When a filing discloses a relationship to a company OUTSIDE the universe,
+it's recorded as a **universe candidate** (`data/universe_candidates.json`,
+shown on the dashboard, webhook-alerted on first discovery) -- a proposal
+for you to review, never auto-added. Accept one by adding its ticker to
+`SYMBOLS` or `ANCHOR_SYMBOLS`.
 
 ## Setup
 

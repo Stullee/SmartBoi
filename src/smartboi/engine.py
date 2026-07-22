@@ -47,7 +47,7 @@ from smartboi.prices import ReadOnlyPriceFeed
 from smartboi.signals import evaluate, log_signal
 from smartboi.skeptic import Skeptic
 from smartboi.state import JsonState
-from smartboi.universe import DEFAULT_UNIVERSE, SEED_RELATIONSHIPS, spec_by_symbol
+from smartboi.universe import SEED_RELATIONSHIPS, spec_by_symbol
 from smartboi.universe_screen import screen_universe
 from smartboi.webapp import run_dashboard
 
@@ -72,9 +72,12 @@ class Engine:
         self.dossiers = DossierStore(DATA_DIR / "dossiers")
         self.journal = PaperTradeJournal(log_dir / "paper_trades.jsonl")
         self.universe_screen_state = JsonState(DATA_DIR / "universe_screen_state.json")
+        self.backfill_state = JsonState(DATA_DIR / "relationship_backfill.json")
+        self.candidates = JsonState(DATA_DIR / "universe_candidates.json")
         self.alerts = AlertSender(settings.alert_webhook_url)
 
-        self.spec_by_symbol = spec_by_symbol(DEFAULT_UNIVERSE)
+        self.universe = settings.universe
+        self.spec_by_symbol = spec_by_symbol(self.universe)
 
         self.edgar_client: EdgarClient | None = None
         self.finnhub: FinnhubClient | None = None
@@ -91,6 +94,7 @@ class Engine:
         self._last_edgar_poll: float | None = None
         self._last_news_poll: float | None = None
         self._last_price_poll: float | None = None
+        self._backfill_ran = False  # once per process; per-symbol state persists in backfill_state
         self._dashboard_task: asyncio.Task | None = None
         self._closing = False
 
@@ -214,6 +218,14 @@ class Engine:
 
     async def _tick(self) -> None:
         now = time.monotonic()
+        if (
+            not self._backfill_ran
+            and self.settings.enable_relationship_backfill
+            and self.edgar_client is not None
+            and self.extractor is not None
+        ):
+            self._backfill_ran = True
+            await self._run_relationship_backfill()
         if self.edgar_client is not None and self._due(self._last_edgar_poll, self.settings.edgar_poll_interval_sec, now):
             self._last_edgar_poll = now
             await self._poll_edgar()
@@ -277,29 +289,7 @@ class Engine:
             return  # fetch failed/empty -- unregistered, so the next poll retries it
 
         if filing.form == "10-K" and self.extractor is not None:
-            known = self.settings.symbol_list
-            relationships = await self.extractor.extract(symbol, filing.form, text, known)
-            now = datetime.now(timezone.utc).isoformat()
-            for rel in relationships:
-                ticker = (rel.get("counterparty_ticker") or "").upper()
-                if not ticker or ticker not in known or ticker == symbol:
-                    continue
-                added = self.graph.add(
-                    Relationship(
-                        from_symbol=symbol,
-                        to_symbol=ticker,
-                        rel_type=rel["rel_type"],
-                        description=rel["description"],
-                        source=filing.document_url,
-                        confidence=float(rel["confidence"]),
-                        extracted_at=now,
-                    )
-                )
-                if added:
-                    log.info(
-                        "[GRAPH] %s -> %s (%s, confidence=%.2f): %s",
-                        symbol, ticker, rel["rel_type"], rel["confidence"], rel["description"],
-                    )
+            await self._extract_relationships(symbol, filing, text)
 
         evidence_text = f"SEC {filing.form} filed {filing.filing_date} for {symbol}:\n{text[:4000]}"
         scored = await self._process_evidence(
@@ -313,6 +303,136 @@ class Engine:
         )
         if scored:
             self.dedup.register(fp, "sec.gov")
+
+    async def _extract_relationships(self, symbol: str, filing: FilingEvent, text: str) -> None:
+        """LLM relationship extraction from one filing's text into the
+        graph -- shared by regular 10-K polling and the one-time backfill.
+        graph.add dedupes on (from, to, rel_type), so re-extraction of a
+        filing can only ever add edges, never duplicate them."""
+        known = self.settings.symbol_list
+        relationships = await self.extractor.extract(symbol, filing.form, text, known)
+        now = datetime.now(timezone.utc).isoformat()
+        for rel in relationships:
+            ticker = (rel.get("counterparty_ticker") or "").upper()
+            if not ticker or ticker not in known:
+                # A relationship to a company OUTSIDE the universe: not an
+                # edge (nothing to propagate to), but a discovery worth
+                # surfacing -- proposed as a watchlist candidate for human
+                # review, never auto-added (see _record_universe_candidate).
+                await self._record_universe_candidate(symbol, rel, filing)
+                continue
+            if ticker == symbol:
+                continue
+            added = self.graph.add(
+                Relationship(
+                    from_symbol=symbol,
+                    to_symbol=ticker,
+                    rel_type=rel["rel_type"],
+                    description=rel["description"],
+                    source=filing.document_url,
+                    confidence=float(rel["confidence"]),
+                    extracted_at=now,
+                )
+            )
+            if added:
+                log.info(
+                    "[GRAPH] %s -> %s (%s, confidence=%.2f): %s",
+                    symbol, ticker, rel["rel_type"], rel["confidence"], rel["description"],
+                )
+
+    async def _record_universe_candidate(self, symbol: str, rel: dict, filing: FilingEvent) -> None:
+        """Persists a disclosed relationship to a company outside the
+        universe as a WATCHLIST CANDIDATE (data/universe_candidates.json,
+        also on the dashboard), and alerts the first time each one is
+        discovered. Deliberately never auto-added to the universe: whether
+        a name belongs is an editorial judgment (same reasoning as the
+        prune-only auto-screen) -- accepting a candidate means adding its
+        ticker to SYMBOLS or ANCHOR_SYMBOLS yourself."""
+        name = (rel.get("counterparty_name") or "").strip()
+        if not name:
+            return
+        ticker = (rel.get("counterparty_ticker") or "").upper()
+        key = ticker or name.upper()
+        now = datetime.now(timezone.utc).isoformat()
+        entry = self.candidates.get(key)
+        is_new = entry is None
+        if is_new:
+            entry = {
+                "name": name, "ticker": ticker,
+                "related_to": [], "rel_types": [],
+                "description": "", "sources": [],
+                "seen_count": 0, "first_seen_at": now,
+            }
+        entry["seen_count"] += 1
+        entry["last_seen_at"] = now
+        entry["description"] = rel.get("description") or entry["description"]
+        if symbol not in entry["related_to"]:
+            entry["related_to"].append(symbol)
+        rel_type = rel.get("rel_type") or ""
+        if rel_type and rel_type not in entry["rel_types"]:
+            entry["rel_types"].append(rel_type)
+        if filing.document_url not in entry["sources"]:
+            entry["sources"] = (entry["sources"] + [filing.document_url])[-5:]
+        self.candidates.set(key, entry)
+        if is_new:
+            log.info("[CANDIDATE] %s (%s) is a %s of %s -- proposed as a universe candidate (never auto-added).",
+                     name, ticker or "no ticker", rel_type or "counterparty", symbol)
+            await self.alerts.send(
+                "universe_candidate",
+                f"Universe candidate: {name}" + (f" ({ticker})" if ticker else ""),
+                f"Disclosed as a {rel_type or 'counterparty'} of {symbol} in {filing.form} "
+                f"filed {filing.filing_date}. {entry['description']} "
+                "Add its ticker to SYMBOLS or ANCHOR_SYMBOLS to accept it into the universe.",
+                entry,
+            )
+
+    # --- One-time relationship backfill ---
+
+    async def _run_relationship_backfill(self) -> None:
+        """Extracts relationships from each tradeable symbol's MOST RECENT
+        10-K, regardless of age -- regular polling only sees filings from
+        the last edgar_lookback_days and 10-Ks are annual, so a fresh
+        deployment would otherwise take up to a year to populate its graph.
+
+        Graph extraction only: an old 10-K is NOT fed to the dossier engine
+        as evidence (year-old 'news' is long priced in; the relationships it
+        discloses are durable, the sentiment is not). Anchors are skipped --
+        a giant's 10-K never names its small suppliers, which is exactly why
+        the graph is discovered from the small companies' filings. Each
+        symbol is backfilled once ever (persisted), so adding a new symbol
+        later backfills just that one."""
+        pending = [
+            spec.symbol
+            for spec in self.universe
+            if not spec.signal_source_only and not self.backfill_state.get(spec.symbol)
+        ]
+        if not pending:
+            return
+        log.info("Relationship backfill: extracting from the most recent 10-K of %d symbol(s): %s",
+                 len(pending), ", ".join(pending))
+        done = 0
+        for symbol in pending:
+            try:
+                filing = await self.edgar_client.latest_filing(symbol, "10-K")
+                if filing is None:
+                    # No 10-K on record (foreign issuer, fresh IPO) -- mark done,
+                    # there is nothing to extract from and never will be here.
+                    log.info("%s: no 10-K available to backfill from.", symbol)
+                    self.backfill_state.set(symbol, {"backfilled_at": datetime.now(timezone.utc).isoformat(),
+                                                     "accession": None})
+                    continue
+                text = await self.edgar_client.fetch_text(filing)
+                if not text:
+                    continue  # fetch failed -- left pending, retried on the next process start
+                await self._extract_relationships(symbol, filing, text)
+                self.backfill_state.set(symbol, {"backfilled_at": datetime.now(timezone.utc).isoformat(),
+                                                 "accession": filing.accession_number,
+                                                 "filing_date": filing.filing_date})
+                done += 1
+            except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
+                log.exception("%s: relationship backfill failed -- will retry on the next restart.", symbol)
+        log.info("Relationship backfill complete: %d/%d symbol(s) processed, graph now has %d edge(s).",
+                 done, len(pending), len(self.graph.relationships))
 
     # --- News ingestion ---
 
@@ -518,7 +638,7 @@ class Engine:
 
     async def _run_universe_screen(self) -> None:
         results = await screen_universe(
-            DEFAULT_UNIVERSE, self.finnhub,
+            self.universe, self.finnhub,
             self.settings.universe_min_market_cap_musd,
             self.settings.universe_max_market_cap_musd,
             self.settings.universe_max_analyst_count,

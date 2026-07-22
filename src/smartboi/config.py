@@ -14,20 +14,35 @@ from __future__ import annotations
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from smartboi.universe import DEFAULT_UNIVERSE
+from smartboi.universe import DEFAULT_UNIVERSE, CompanySpec, build_universe
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # Universe: comma-separated tickers. Empty uses the built-in starter
-    # watchlist (see universe.py) -- ecosystem/anchor/seed-relationship
-    # metadata only applies to symbols that are actually in that list.
+    # Universe: comma-separated tickers. SYMBOLS are the tradeable small/
+    # mid-caps; ANCHOR_SYMBOLS are the big, heavily-covered giants whose
+    # news should propagate to them (never trade targets themselves).
+    # Setting EITHER replaces the built-in starter watchlist entirely with
+    # your two lists; leaving both empty uses the starter watchlist (see
+    # universe.py). Relationships between your symbols are discovered
+    # automatically from the tradeable companies' 10-K filings -- including
+    # a one-time backfill of each company's most recent 10-K on first run
+    # (see enable_relationship_backfill below).
     symbols: str = ""
+    anchor_symbols: str = ""
 
     # --- SEC EDGAR ingestion (8-K material events, 10-K customer/supplier
     # disclosures, Form 4 insider transactions) ---
     enable_edgar_ingestion: bool = True
+    # One-time relationship backfill: on first run (and once per newly
+    # added symbol), extract relationships from each tradeable company's
+    # MOST RECENT 10-K regardless of age. Regular polling only sees filings
+    # from the last edgar_lookback_days and 10-Ks are annual, so without
+    # this the graph would take up to a year to populate. Requires EDGAR
+    # and ANTHROPIC_API_KEY; each symbol is only ever backfilled once
+    # (tracked in data/relationship_backfill.json).
+    enable_relationship_backfill: bool = True
     # SEC requires a descriptive User-Agent with real contact info on every
     # request ("Your Name your@email.com") or it will block/rate-limit --
     # not a secret, just informational, but required for EDGAR ingestion to
@@ -98,10 +113,16 @@ class Settings(BaseSettings):
     dashboard_port: int = 8100
 
     @property
+    def universe(self) -> list[CompanySpec]:
+        custom_tradeable = [s for s in self.symbols.split(",") if s.strip()]
+        custom_anchors = [s for s in self.anchor_symbols.split(",") if s.strip()]
+        if custom_tradeable or custom_anchors:
+            return build_universe(custom_tradeable, custom_anchors)
+        return DEFAULT_UNIVERSE
+
+    @property
     def symbol_list(self) -> list[str]:
-        if self.symbols.strip():
-            return [s.strip().upper() for s in self.symbols.split(",") if s.strip()]
-        return [c.symbol for c in DEFAULT_UNIVERSE]
+        return [c.symbol for c in self.universe]
 
     @property
     def edgar_forms_set(self) -> set[str]:

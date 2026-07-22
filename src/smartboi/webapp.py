@@ -20,6 +20,7 @@ from smartboi.status import (
     gather_graph_stats,
     gather_paper_trade_stats,
     gather_recent_signals,
+    gather_universe_candidates,
 )
 
 log = logging.getLogger(__name__)
@@ -138,6 +139,17 @@ function renderSignals(rows) {
     }).join("") + "</table>";
 }
 
+function renderCandidates(rows) {
+  if (!rows.length) return '<div class="empty">None discovered yet -- candidates appear as filings disclose relationships to companies outside the universe.</div>';
+  return "<table><tr><th>Name</th><th>Ticker</th><th>Related to</th><th>Type</th><th>Mentions</th><th>Description</th></tr>" +
+    rows.map(function(c) {
+      return "<tr><td>" + esc(c.name) + "</td><td>" + esc(c.ticker || "?") + "</td><td>" +
+        esc((c.related_to || []).join(", ")) + "</td><td>" + esc((c.rel_types || []).join(", ")) + "</td><td>" +
+        (c.seen_count || 0) + "</td><td style='max-width:32rem'>" + esc(c.description) + "</td></tr>";
+    }).join("") + "</table>" +
+    '<div class="empty">To accept a candidate into the universe, add its ticker to <b>symbols</b> (tradeable) or <b>anchor_symbols</b> (news source only) in the add-on configuration.</div>';
+}
+
 function renderGraph(g) {
   if (!g.edges.length) return '<div class="empty">No relationships extracted yet.</div>';
   return "<table><tr><th>From</th><th>Type</th><th>To</th><th>Confidence</th><th>Description</th></tr>" +
@@ -165,6 +177,7 @@ function render(data) {
   html += renderPaperTrades(data.closed_paper_trades, data.open_paper_trades);
   html += "<h2>Recent Signals</h2>" + renderSignals(data.recent_signals);
   html += "<h2>Relationship Graph</h2>" + renderGraph(data.graph);
+  html += "<h2>Universe Candidates (discovered, awaiting your review)</h2>" + renderCandidates(data.universe_candidates || []);
 
   document.getElementById("app").innerHTML = html;
   document.getElementById("updated").textContent = "Updated " + new Date().toLocaleTimeString();
@@ -235,6 +248,7 @@ async def _status_payload(engine) -> dict:
         "closed_paper_trades": closed_trades,
         "paper_stats": paper_stats.__dict__,
         "recent_signals": gather_recent_signals(log_dir / "signals.jsonl"),
+        "universe_candidates": gather_universe_candidates(engine.candidates.data),
     }
 
 

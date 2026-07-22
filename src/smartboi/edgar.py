@@ -241,6 +241,33 @@ class EdgarClient:
             events.append(FilingEvent(symbol, cik10, form, filing_date, accession, primary_doc))
         return events
 
+    async def latest_filing(self, symbol: str, form: str) -> FilingEvent | None:
+        """The most recent filing of `form` for `symbol`, REGARDLESS of age
+        (within the submissions endpoint's ~1000-filing recent block) --
+        used by the one-time relationship backfill (engine.py), which needs
+        last year's 10-K, not just whatever landed inside the rolling
+        poll lookback window."""
+        cik10 = await self.cik_for(symbol)
+        if cik10 is None:
+            log.warning("%s: no CIK found in EDGAR's ticker map -- cannot backfill.", symbol)
+            return None
+        try:
+            response = await self._throttled_get(_SUBMISSIONS_URL.format(cik10=cik10))
+        except httpx.HTTPError as exc:
+            log.warning("%s: EDGAR submissions fetch failed: %s", symbol, exc)
+            return None
+        recent = response.json().get("filings", {}).get("recent", {})
+        # The recent block is newest-first, so the first match is the latest.
+        for filing_form, filing_date, accession, primary_doc in zip(
+            recent.get("form", []),
+            recent.get("filingDate", []),
+            recent.get("accessionNumber", []),
+            recent.get("primaryDocument", []),
+        ):
+            if filing_form == form:
+                return FilingEvent(symbol, cik10, filing_form, filing_date, accession, primary_doc)
+        return None
+
     async def fetch_evidence_text(self, filing: FilingEvent) -> str:
         """Evidence-ready text for a filing. Form 4s get a structured
         summary of the insider transactions (the raw filing is XML --

@@ -1,6 +1,6 @@
 ---
 name: SmartBoi (Evidence Synthesis, Paper-Only)
-version: "0.2.0"
+version: "0.3.0"
 slug: smartboi
 description: >-
   LLM-driven cross-company evidence synthesis for equity research: ingests
@@ -23,7 +23,9 @@ map:
 panel_icon: mdi:graph-outline
 options:
   symbols: ""
+  anchor_symbols: ""
   enable_edgar_ingestion: true
+  enable_relationship_backfill: true
   edgar_user_agent: ""
   edgar_forms: "8-K,10-K,4"
   edgar_poll_interval_sec: 3600
@@ -56,7 +58,9 @@ options:
   enable_dashboard: true
 schema:
   symbols: str
+  anchor_symbols: str
   enable_edgar_ingestion: bool
+  enable_relationship_backfill: bool
   edgar_user_agent: str
   edgar_forms: str
   edgar_poll_interval_sec: int(60,86400)

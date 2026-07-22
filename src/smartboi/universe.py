@@ -125,6 +125,39 @@ SEED_RELATIONSHIPS: list[tuple[str, str, str, str, float]] = [
 ]
 
 
+def build_universe(symbols: list[str], anchor_symbols: list[str]) -> list[CompanySpec]:
+    """Custom universe from plain ticker lists (the SYMBOLS / ANCHOR_SYMBOLS
+    settings): `symbols` become tradeable targets, `anchor_symbols` become
+    signal-source-only anchors -- large names whose news feeds the
+    relationship graph but which are never trade targets themselves. A
+    ticker appearing in both lists is treated as an anchor (the safe
+    reading: never accidentally trade something you meant as a news
+    source). Relationships between them are NOT configured here -- they're
+    discovered automatically by the extraction pipeline from the tradeable
+    companies' 10-K filings (a small supplier must disclose its dominant
+    customers; the giant's own filings never name its small suppliers),
+    including a one-time backfill of each tradeable company's most recent
+    10-K on first run (see engine.py)."""
+    anchors: list[str] = []
+    for raw in anchor_symbols:
+        symbol = raw.strip().upper()
+        if symbol and symbol not in anchors:
+            anchors.append(symbol)
+    specs = [
+        CompanySpec(symbol, symbol, "custom", signal_source_only=True,
+                    notes="Anchor from ANCHOR_SYMBOLS: news source, not a trade target")
+        for symbol in anchors
+    ]
+    seen = set(anchors)
+    for raw in symbols:
+        symbol = raw.strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        specs.append(CompanySpec(symbol, symbol, "custom", notes="Tradeable from SYMBOLS"))
+    return specs
+
+
 def tradeable_symbols(universe: list[CompanySpec] | None = None) -> list[str]:
     """Symbols this system may open a hypothetical trade on -- excludes
     signal-source-only anchors, which exist purely to feed evidence into
