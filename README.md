@@ -34,17 +34,20 @@ that specific inefficiency, not to race anyone on speed:
    covered second-order name with a lag. See `src/smartboi/universe.py`.
 2. **Second-order effects, not headlines** -- a relationship graph
    (customer/supplier/competitor/regulator edges, seeded from known
-   industry relationships and extracted from 10-K filings) means every
-   piece of evidence is checked against "who else does this affect,"
+   industry relationships and extracted from 10-K/10-Q filings) means
+   every piece of evidence is checked against "who else does this affect,"
    not just the company it's literally about. See `graph.py`.
 3. **Accumulated evidence, not reactive headlines** -- each company has a
    living dossier: direction, magnitude, confidence, horizon, and cited
    evidence. The signal is accumulated, corroborated evidence crossing a
    threshold, not any single article. Syndicated republishes of the same
-   story are deduped to one data point. See `dossier.py` and `dedup.py`.
+   story are deduped to one data point, and evidence itself decays over
+   time so an old, unconfirmed claim can't prop up confidence forever --
+   see `dossier.py` and `dedup.py`.
 4. **Reads what nobody parses** -- SEC EDGAR full-text filings (8-Ks,
-   10-K customer/supplier disclosures, Form 4 insider transactions) as a
-   first-class evidence source, not an afterthought. See `edgar.py`.
+   10-K/10-Q customer/supplier disclosures, Form 4 insider transactions,
+   parsed into readable transaction summaries) as a first-class evidence
+   source, not an afterthought. See `edgar.py`.
 5. **Adversarial to itself** -- every proposed dossier update is reviewed
    by a second, skeptical LLM pass trying to refute it before it counts.
    See `skeptic.py`.
@@ -56,6 +59,12 @@ that specific inefficiency, not to race anyone on speed:
    on news it was trained after already "knows" how the story ended. This
    system only ever runs forward, logging every hypothetical trade it
    would make as it happens, so its track record means something.
+8. **Checks whether it's already too late** -- a signal firing doesn't mean
+   entering blind. At entry time, if the price already moved past
+   `MAX_FAVORABLE_DRIFT_PCT` in the signal's favorable direction since it
+   fired, the correction likely already happened between signal and entry
+   and the trade is skipped rather than chasing a move that's largely over
+   (requires `ENABLE_IB_PRICE_FEED`). See "Entry timing" below.
 
 ## Paper-only, by construction
 
@@ -130,6 +139,48 @@ it's recorded as a **universe candidate** (`data/universe_candidates.json`,
 shown on the dashboard, webhook-alerted on first discovery) -- a proposal
 for you to review, never auto-added. Accept one by adding its ticker to
 `SYMBOLS` or `ANCHOR_SYMBOLS`.
+
+## Entry timing: are we too late?
+
+A signal firing (evidence crossed the confidence/magnitude/corroboration
+bar) and a paper trade opening are deliberately two separate moments --
+the price feed only polls every `PRICE_POLL_INTERVAL_SEC` (6h by default),
+so time passes between "the evidence justified a position" and "we're
+about to actually take it." Two guards close that gap (both require
+`ENABLE_IB_PRICE_FEED=true` -- without a price feed there's no price to
+check a signal against, and signals just log as before):
+
+- **Favorable drift** (`MAX_FAVORABLE_DRIFT_PCT`, default 5%): the price
+  the moment a dossier flips to SIGNALED is snapshotted
+  (`Dossier.signaled_price`). At entry time, if the price has already
+  moved this many percent in the signal's favorable direction (up for
+  LONG, down for SHORT) since that snapshot, the correction likely already
+  happened -- the trade is skipped rather than chasing a move that's
+  largely over. Alerted once per signal, not every poll.
+- **Entry deadline** (`SIGNAL_ENTRY_DEADLINE_DAYS`, default 5): a signal
+  stuck unopened this long (drift-blocked every poll, or IB briefly
+  unreachable) is expired back to `ACTIVE` instead of waiting forever on an
+  increasingly stale opportunity -- fresh evidence can re-signal it later
+  with a clean baseline. A thesis that flips direction while still
+  SIGNALED-but-unopened also gets a fresh baseline immediately, since the
+  old one no longer means anything.
+
+Both are visible on the dashboard's Dossiers table (Signaled @ column).
+
+## Evidence time-decay
+
+Evidence doesn't count forever. Each item stays at full weight through its
+own predicted `horizon_days` (it hasn't had a chance to prove out yet),
+then decays linearly and is excluded entirely once it's aged past 2x its
+horizon (floored at 14 days so a short-horizon item isn't discarded almost
+immediately) -- by then the market either already reacted (priced in) or
+the predicted move never happened (thesis didn't pan out), so it stops
+propping up the dossier's confidence either way. This runs both when new
+evidence merges AND once a day with no new evidence, so a dormant dossier
+keeps fading instead of freezing at its last score. A `SIGNALED`-but-
+unopened dossier that decays below the signal threshold is expired back to
+`ACTIVE` the same way an entry-timing expiry would. See `dossier.py`'s
+`evidence_weight`/`evidence_is_stale`/`recompute_decay`.
 
 ## Setup
 
@@ -210,8 +261,8 @@ pure logic, none require a live EDGAR/Finnhub/Anthropic/IB connection.
   `universe_screen.py`'s docstring) -- it never adds new candidate tickers
   automatically, since that's an editorial judgment call, not a threshold
   check.
-- EDGAR full-text extraction only actively looks for relationships in
-  10-K filings (where customer/supplier disclosures concentrate); 8-Ks and
+- EDGAR full-text extraction looks for relationships in 10-K and 10-Q
+  filings (where customer/supplier disclosures concentrate); 8-Ks and
   Form 4s feed the dossier engine as direct evidence but aren't run
   through relationship extraction.
 - No portfolio construction yet (the long-conviction / short-sector-ETF

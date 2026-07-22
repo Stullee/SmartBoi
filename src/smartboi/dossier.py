@@ -22,7 +22,7 @@ DIRECTIONS = ("LONG", "SHORT", "NONE")
 @dataclass
 class EvidenceRecord:
     evidence_id: str
-    source_type: str  # "news" | "8-K" | "10-K" | "4"
+    source_type: str  # "news" | "8-K" | "10-K" | "10-Q" | "4"
     source_name: str  # publisher/domain, or "SEC EDGAR"
     url: str
     headline: str
@@ -50,6 +50,15 @@ class Dossier:
     independent_source_count: int = 0
     status: str = "ACTIVE"  # ACTIVE | SIGNALED
     updated_at: str = ""
+    # Snapshot taken the moment this dossier last flipped to SIGNALED --
+    # used at entry time to check whether the price has already moved
+    # ("are we too late") and to expire a signal that never got a chance to
+    # enter (see engine.py's _try_open_from_signal / _expire_signal).
+    # Blank/None whenever status == ACTIVE.
+    signaled_at: str = ""
+    signaled_price: float | None = None
+    signaled_direction: str = ""
+    drift_alert_sent: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -93,22 +102,114 @@ def has_evidence(dossier: Dossier, evidence_id: str) -> bool:
     return any(e.evidence_id == evidence_id for e in dossier.evidence)
 
 
-def merge_evidence(dossier: Dossier, record: EvidenceRecord) -> None:
+# Evidence stops contributing once its age exceeds this many multiples of
+# its OWN predicted horizon_days -- by then either the market already
+# reacted (thesis proved out, so the item is priced in and no longer a
+# reason to enter fresh) or the predicted horizon passed with nothing
+# happening (thesis didn't pan out). Floored so a short-horizon item (e.g.
+# 1 day) isn't discarded almost immediately.
+_STALE_HORIZON_MULTIPLE = 2
+_MIN_STALE_DAYS = 14
+# Weight an evidence item keeps right at its stale cutoff, before being
+# excluded entirely -- never fully zero a moment before exclusion, since
+# aged corroboration is still weak signal that a persistent theme existed.
+_DECAY_FLOOR = 0.15
+
+
+def _age_days(record: EvidenceRecord, now: datetime) -> float:
+    try:
+        published = datetime.fromisoformat(record.published_at)
+    except ValueError:
+        return 0.0  # unparseable published_at -- treat as fresh rather than discard the item
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    return max(0.0, (now - published).total_seconds() / 86400)
+
+
+def _stale_cutoff_days(record: EvidenceRecord) -> float:
+    return max(record.horizon_days * _STALE_HORIZON_MULTIPLE, _MIN_STALE_DAYS)
+
+
+def evidence_is_stale(record: EvidenceRecord, now: datetime) -> bool:
+    """True once an item has aged well past its own predicted horizon
+    without the dossier's thesis ever being confirmed or invalidated by a
+    price move -- see the module-level constants above. Stale evidence is
+    excluded from the aggregate entirely, not merely down-weighted."""
+    return _age_days(record, now) > _stale_cutoff_days(record)
+
+
+def evidence_weight(record: EvidenceRecord, now: datetime) -> float:
+    """1.0 while an item is still within its own predicted horizon (it
+    hasn't had a chance to prove out yet); decays linearly to
+    `_DECAY_FLOOR` by the point it's considered stale (see
+    evidence_is_stale) -- this is what keeps an old article from propping
+    up a dossier's confidence forever."""
+    age = _age_days(record, now)
+    horizon = max(record.horizon_days, 1)
+    if age <= horizon:
+        return 1.0
+    cutoff = _stale_cutoff_days(record)
+    if age >= cutoff:
+        return _DECAY_FLOOR
+    fraction = (age - horizon) / (cutoff - horizon)
+    return 1.0 - fraction * (1.0 - _DECAY_FLOOR)
+
+
+def _aggregate(dossier: Dossier, now: datetime) -> None:
+    """Recomputes confidence/magnitude/horizon_days/independent_source_count
+    from dossier.evidence as of `now`, applying time-decay -- called both
+    right after a new evidence item is merged AND periodically with no new
+    evidence (engine.py's daily decay pass), so a dormant dossier's
+    confidence keeps fading even when nothing new happens to land on it.
+
+    `independent_source_count` only counts evidence agreeing with the
+    dossier's RESOLVED direction that ISN'T stale (dedup.py guarantees
+    distinct source names are genuinely different domains, never
+    syndicated republishes). Confidence is the mean of each agreeing item's
+    OWN confidence scaled by its own decay weight -- scaling before
+    averaging, not weighting the average itself, matters: a weighted mean
+    is scale-invariant when there's a single item (the weight cancels), so
+    a lone aging item would never fade if the weight were only applied as
+    an averaging factor. Boosted for corroboration from distinct sources
+    and capped at 1.0. Magnitude takes the max of each agreeing item's
+    magnitude scaled the same way, and horizon_days their plain mean."""
+    agreeing = [
+        e for e in dossier.evidence
+        if e.direction == dossier.direction and not evidence_is_stale(e, now)
+    ]
+    if dossier.direction == "NONE" or not agreeing:
+        dossier.independent_source_count = 0
+        dossier.confidence = 0.0
+        dossier.magnitude = 0.0
+        return
+
+    weighted = [(e, evidence_weight(e, now)) for e in agreeing]
+    dossier.independent_source_count = len({e.source_name for e in agreeing})
+    base_confidence = sum(e.confidence * w for e, w in weighted) / len(weighted)
+    corroboration_bonus = 0.1 * max(0, dossier.independent_source_count - 1)
+    dossier.confidence = min(1.0, base_confidence + corroboration_bonus)
+    dossier.magnitude = max(e.magnitude * w for e, w in weighted)
+    dossier.horizon_days = round(sum(e.horizon_days for e in agreeing) / len(agreeing))
+    dossier.thesis_summary = agreeing[-1].reasoning
+
+
+def recompute_decay(dossier: Dossier, now: datetime | None = None) -> None:
+    """Re-scores a dossier's aggregate from its EXISTING evidence with no
+    new item added -- the periodic half of time-decay (see _aggregate);
+    merge_evidence is the other half, run whenever fresh evidence lands."""
+    now = now or datetime.now(timezone.utc)
+    _aggregate(dossier, now)
+    dossier.updated_at = now.isoformat()
+
+
+def merge_evidence(dossier: Dossier, record: EvidenceRecord, now: datetime | None = None) -> None:
     """Folds one accepted (post-skeptic) evidence record into the dossier's
-    aggregate state.
+    aggregate state (see _aggregate for the actual aggregation/decay math).
 
     Direction only changes when the new record's confidence beats the
     existing aggregate -- a single weak item can't flip a thesis built on
-    stronger evidence. `independent_source_count` is recomputed here from
-    the evidence agreeing with the dossier's RESOLVED direction (never the
-    new record's, which may disagree and must not corrupt the count the
-    signal gate reads; dedup.py guarantees distinct source names are
-    genuinely different domains/stories, never syndicated republishes).
-    Aggregate confidence is the mean confidence of agreeing evidence,
-    boosted for corroboration from distinct sources and capped at 1.0.
-    Magnitude takes the max of agreeing evidence (the biggest single
-    implied impact, not diluted by weaker corroborating items) and
-    horizon_days their mean."""
+    stronger evidence."""
+    now = now or datetime.now(timezone.utc)
     dossier.evidence.append(record)
 
     if record.direction != "NONE" and (
@@ -116,16 +217,8 @@ def merge_evidence(dossier: Dossier, record: EvidenceRecord) -> None:
     ):
         dossier.direction = record.direction
 
-    agreeing = [e for e in dossier.evidence if e.direction == dossier.direction]
-    if dossier.direction != "NONE" and agreeing:
-        dossier.independent_source_count = len({e.source_name for e in agreeing})
-        base_confidence = sum(e.confidence for e in agreeing) / len(agreeing)
-        corroboration_bonus = 0.1 * max(0, dossier.independent_source_count - 1)
-        dossier.confidence = min(1.0, base_confidence + corroboration_bonus)
-        dossier.magnitude = max(e.magnitude for e in agreeing)
-        dossier.horizon_days = round(sum(e.horizon_days for e in agreeing) / len(agreeing))
-        dossier.thesis_summary = record.reasoning
-    dossier.updated_at = datetime.now(timezone.utc).isoformat()
+    _aggregate(dossier, now)
+    dossier.updated_at = now.isoformat()
 
 
 _UPDATE_TOOL = {

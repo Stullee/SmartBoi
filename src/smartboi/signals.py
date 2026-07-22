@@ -56,6 +56,33 @@ def evaluate(dossier: Dossier, confidence_threshold: float, min_independent_sour
     )
 
 
+def favorable_drift_pct(direction: str, signaled_price: float, current_price: float) -> float:
+    """Percent the price has already moved in the signal's favorable
+    direction since it fired -- how much of the anticipated correction may
+    already have been captured by the market between signal and entry.
+    Positive means price moved the way the thesis expects (up for LONG,
+    down for SHORT); used by engine.py to decide whether an entry would be
+    chasing a move that's already largely over ("are we too late")."""
+    if signaled_price <= 0:
+        return 0.0
+    pct = (current_price - signaled_price) / signaled_price * 100
+    return pct if direction == "LONG" else -pct
+
+
+def signal_expired(signaled_at: str, deadline_days: int, now: datetime | None = None) -> bool:
+    """True once a signal has been waiting this long for an entry that
+    never got confirmed (no reachable price feed, or price drift blocked
+    it every poll) -- used to reset a dossier back to ACTIVE instead of
+    leaving it stuck SIGNALED forever chasing a stale opportunity."""
+    if not signaled_at:
+        return False
+    now = now or datetime.now(timezone.utc)
+    signaled = datetime.fromisoformat(signaled_at)
+    if signaled.tzinfo is None:
+        signaled = signaled.replace(tzinfo=timezone.utc)
+    return (now - signaled).days >= deadline_days
+
+
 def log_signal(log_path: Path, signal: SignalEvent) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a") as f:

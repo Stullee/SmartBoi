@@ -38,6 +38,8 @@ def gather_dossiers(store: DossierStore) -> list[dict]:
                 "thesis_summary": d.thesis_summary,
                 "evidence_count": len(d.evidence),
                 "updated_at": d.updated_at,
+                "signaled_at": d.signaled_at,
+                "signaled_price": d.signaled_price,
             }
         )
     rows.sort(key=lambda r: (r["confidence"] * r["magnitude"]), reverse=True)

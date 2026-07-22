@@ -33,18 +33,20 @@ from smartboi.alerts import AlertSender
 from smartboi.config import Settings
 from smartboi.dedup import DedupIndex, fingerprint, source_domain
 from smartboi.dossier import (
+    Dossier,
     DossierStore,
     DossierUpdater,
     EvidenceRecord,
     has_evidence,
     merge_evidence,
+    recompute_decay,
 )
 from smartboi.edgar import EdgarClient, FilingEvent
 from smartboi.graph import RelationshipExtractor, RelationshipGraph, Relationship
 from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal
 from smartboi.prices import ReadOnlyPriceFeed
-from smartboi.signals import evaluate, log_signal
+from smartboi.signals import evaluate, favorable_drift_pct, log_signal, signal_expired
 from smartboi.skeptic import Skeptic
 from smartboi.state import JsonState
 from smartboi.universe import SEED_RELATIONSHIPS, spec_by_symbol
@@ -60,6 +62,14 @@ DATA_DIR = Path("data")
 # the Gateway restarting daily, or simply not being up yet, shouldn't cost
 # most of a day of price marks.
 IB_RETRY_GAP_SEC = 900
+# Evidence time-decay is a slow-moving correction, not a live signal --
+# recomputing it once a day is plenty (see _run_decay_pass).
+DECAY_PASS_INTERVAL_SEC = 86400
+# Filing forms run through relationship extraction, in addition to feeding
+# the dossier engine as direct evidence -- 8-Ks and Form 4s are event-driven
+# and rarely restate customer/supplier relationships, so extraction time is
+# spent on the two disclosure-heavy forms.
+RELATIONSHIP_EXTRACTION_FORMS = ("10-K", "10-Q")
 
 
 class Engine:
@@ -94,6 +104,7 @@ class Engine:
         self._last_edgar_poll: float | None = None
         self._last_news_poll: float | None = None
         self._last_price_poll: float | None = None
+        self._last_decay_pass: float | None = None
         self._backfill_ran = False  # once per process; per-symbol state persists in backfill_state
         self._dashboard_task: asyncio.Task | None = None
         self._closing = False
@@ -250,6 +261,9 @@ class Engine:
             and self._universe_screen_due()
         ):
             await self._run_universe_screen()
+        if self._due(self._last_decay_pass, DECAY_PASS_INTERVAL_SEC, now):
+            self._last_decay_pass = now
+            self._run_decay_pass()
 
     def _universe_screen_due(self) -> bool:
         """Scheduled off the PERSISTED last-screen timestamp (wall clock),
@@ -288,7 +302,7 @@ class Engine:
         if not text:
             return  # fetch failed/empty -- unregistered, so the next poll retries it
 
-        if filing.form == "10-K" and self.extractor is not None:
+        if filing.form in RELATIONSHIP_EXTRACTION_FORMS and self.extractor is not None:
             await self._extract_relationships(symbol, filing, text)
 
         evidence_text = f"SEC {filing.form} filed {filing.filing_date} for {symbol}:\n{text[:4000]}"
@@ -569,46 +583,128 @@ class Engine:
                 f"sources={signal.independent_source_count}. {signal.thesis_summary}",
                 asdict(signal),
             )
-            if dossier.status == "ACTIVE":
+            if dossier.status == "ACTIVE" or dossier.direction != dossier.signaled_direction:
+                # A fresh signal (or a thesis that flipped direction while
+                # still SIGNALED-but-unopened) gets a fresh price baseline --
+                # see _snapshot_signal_price and _try_open_from_signal below.
                 dossier.status = "SIGNALED"
+                await self._snapshot_signal_price(dossier)
                 self.dossiers.save(dossier)
         return True
 
     # --- Price marking / hypothetical execution ---
+
+    async def _snapshot_signal_price(self, dossier: Dossier) -> None:
+        """Records the price the moment a dossier becomes SIGNALED, so
+        entry time can later tell whether the market has already moved
+        ("are we too late") -- see favorable_drift_pct in signals.py and
+        _try_open_from_signal. Left as None if no price feed is configured/
+        reachable; the drift check then simply has nothing to compare
+        against and is skipped (same graceful-degradation pattern as
+        everywhere else IB is optional)."""
+        dossier.signaled_at = datetime.now(timezone.utc).isoformat()
+        dossier.signaled_direction = dossier.direction
+        dossier.drift_alert_sent = False
+        dossier.signaled_price = None
+        if self.price_feed is None:
+            return
+        try:
+            if await self.price_feed.ensure_connected():
+                dossier.signaled_price = await self.price_feed.last_price(dossier.symbol)
+        except Exception:  # noqa: BLE001 - a missing baseline just disables the drift check for this signal
+            log.exception("%s: could not snapshot signal-time price.", dossier.symbol)
+
+    def _reset_to_active(self, dossier: Dossier) -> None:
+        dossier.status = "ACTIVE"
+        dossier.signaled_at = ""
+        dossier.signaled_price = None
+        dossier.signaled_direction = ""
+        dossier.drift_alert_sent = False
+
+    def _expire_signal(self, dossier: Dossier, reason: str) -> None:
+        log.info("[SIGNAL] %s: expiring unopened signal (%s) -- resetting to ACTIVE so fresh "
+                 "evidence can re-trigger it with a clean baseline.", dossier.symbol, reason)
+        self._reset_to_active(dossier)
+        self.dossiers.save(dossier)
+
+    async def _try_open_from_signal(self, symbol: str, dossier: Dossier) -> None:
+        """Whether/how a SIGNALED-but-not-yet-open dossier becomes a paper
+        trade this poll -- the "are we too late" gate. Two guards, both a
+        no-op without enable_ib_price_feed (no baseline price to compare
+        against, see _snapshot_signal_price):
+
+        1. Favorable drift: if the price already moved
+           max_favorable_drift_pct in the signal's favorable direction
+           since it fired, the correction likely already happened between
+           signal and entry -- skip rather than chase a move that's largely
+           over. Alerted once per signal (drift_alert_sent), not every poll.
+        2. Entry deadline: a signal stuck unopened (drift-blocked every
+           poll, or IB unreachable) for signal_entry_deadline_days is
+           expired back to ACTIVE rather than left waiting forever on an
+           increasingly stale opportunity."""
+        try:
+            price = await self.price_feed.last_price(symbol)
+        except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
+            log.exception("%s: could not fetch entry price.", symbol)
+            return
+        if price is None:
+            return
+
+        if dossier.signaled_price is not None:
+            drift = favorable_drift_pct(dossier.direction, dossier.signaled_price, price)
+            if drift >= self.settings.max_favorable_drift_pct:
+                if not dossier.drift_alert_sent:
+                    dossier.drift_alert_sent = True
+                    self.dossiers.save(dossier)
+                    log.info(
+                        "[SIGNAL] %s: price already moved %.1f%% favorably since the signal fired "
+                        "at $%.2f (now $%.2f) -- likely already priced in, skipping entry.",
+                        symbol, drift, dossier.signaled_price, price,
+                    )
+                    await self.alerts.send(
+                        "signal_stale",
+                        f"{symbol}: likely already priced in",
+                        f"Price moved {drift:.1f}% in the favorable direction since the signal fired "
+                        f"at ${dossier.signaled_price:.2f} (now ${price:.2f}) -- skipping entry to avoid "
+                        "chasing a move that may already be over.",
+                        {"symbol": symbol, "drift_pct": drift, "signaled_price": dossier.signaled_price, "current_price": price},
+                    )
+                if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
+                    self._expire_signal(dossier, f"price drifted {drift:.1f}% before an entry could be confirmed")
+                return
+
+        if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
+            self._expire_signal(dossier, "no confirmed entry within the deadline")
+            return
+
+        citations = [
+            {
+                "source_name": e.source_name, "url": e.url,
+                "headline": e.headline, "published_at": e.published_at,
+            }
+            for e in dossier.evidence[-5:]
+        ]
+        horizon = min(dossier.horizon_days or self.settings.max_horizon_days, self.settings.max_horizon_days)
+        trade = self.journal.open(
+            symbol, dossier.direction, price,
+            self.settings.stop_loss_pct, self.settings.take_profit_pct,
+            horizon, dossier.thesis_summary, dossier.confidence,
+            dossier.independent_source_count, citations,
+        )
+        await self.alerts.send(
+            "paper_trade_opened",
+            f"Paper trade opened: {trade.direction} {trade.symbol}",
+            f"entry={trade.entry_price:.2f} stop={trade.stop_price:.2f} "
+            f"target={trade.target_price:.2f} horizon={trade.horizon_days}d. {trade.thesis_summary}",
+            asdict(trade),
+        )
 
     async def _mark_and_execute(self) -> None:
         for symbol in self.dossiers.all_symbols():
             dossier = self.dossiers.load(symbol)
             if dossier.status != "SIGNALED" or self.journal.has_open(symbol):
                 continue
-            try:
-                price = await self.price_feed.last_price(symbol)
-            except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
-                log.exception("%s: could not fetch entry price.", symbol)
-                continue
-            if price is None:
-                continue
-            citations = [
-                {
-                    "source_name": e.source_name, "url": e.url,
-                    "headline": e.headline, "published_at": e.published_at,
-                }
-                for e in dossier.evidence[-5:]
-            ]
-            horizon = min(dossier.horizon_days or self.settings.max_horizon_days, self.settings.max_horizon_days)
-            trade = self.journal.open(
-                symbol, dossier.direction, price,
-                self.settings.stop_loss_pct, self.settings.take_profit_pct,
-                horizon, dossier.thesis_summary, dossier.confidence,
-                dossier.independent_source_count, citations,
-            )
-            await self.alerts.send(
-                "paper_trade_opened",
-                f"Paper trade opened: {trade.direction} {trade.symbol}",
-                f"entry={trade.entry_price:.2f} stop={trade.stop_price:.2f} "
-                f"target={trade.target_price:.2f} horizon={trade.horizon_days}d. {trade.thesis_summary}",
-                asdict(trade),
-            )
+            await self._try_open_from_signal(symbol, dossier)
 
         open_symbols = list(self.journal.open_trades.keys())
         if not open_symbols:
@@ -631,8 +727,40 @@ class Engine:
                     asdict(trade),
                 )
                 dossier = self.dossiers.load(symbol)
-                dossier.status = "ACTIVE"
+                self._reset_to_active(dossier)
                 self.dossiers.save(dossier)
+
+    # --- Evidence time-decay ---
+
+    def _run_decay_pass(self) -> None:
+        """Once a day, re-scores every dossier's aggregate confidence/
+        magnitude/independent_source_count against its EXISTING evidence
+        with no new evidence required -- otherwise a dormant dossier (no
+        fresh news landing on it) would keep yesterday's confidence
+        forever. See dossier.py's evidence_weight/evidence_is_stale for the
+        actual decay curve. A SIGNALED-but-not-yet-entered dossier that
+        decays below the signal threshold is expired back to ACTIVE (the
+        thesis is going cold without ever getting a confirmed entry); once
+        a paper trade has actually opened, decay no longer touches that
+        dossier -- the open trade has its own stop/target/horizon."""
+        now = datetime.now(timezone.utc)
+        for symbol in self.dossiers.all_symbols():
+            dossier = self.dossiers.load(symbol)
+            if not dossier.evidence:
+                continue
+            before = (dossier.direction, round(dossier.confidence, 3), round(dossier.magnitude, 3),
+                      dossier.independent_source_count)
+            recompute_decay(dossier, now)
+            after = (dossier.direction, round(dossier.confidence, 3), round(dossier.magnitude, 3),
+                     dossier.independent_source_count)
+            if before == after:
+                continue
+            if dossier.status == "SIGNALED" and not self.journal.has_open(symbol):
+                signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources)
+                if signal is None:
+                    self._expire_signal(dossier, "evidence decayed below the signal threshold before an entry was confirmed")
+                    continue
+            self.dossiers.save(dossier)
 
     # --- Universe auto-screen ---
 

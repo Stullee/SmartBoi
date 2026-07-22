@@ -1,6 +1,6 @@
 ---
 name: SmartBoi (Evidence Synthesis, Paper-Only)
-version: "0.3.0"
+version: "0.4.0"
 slug: smartboi
 description: >-
   LLM-driven cross-company evidence synthesis for equity research: ingests
@@ -27,7 +27,7 @@ options:
   enable_edgar_ingestion: true
   enable_relationship_backfill: true
   edgar_user_agent: ""
-  edgar_forms: "8-K,10-K,4"
+  edgar_forms: "8-K,10-K,10-Q,4"
   edgar_poll_interval_sec: 3600
   edgar_lookback_days: 14
   enable_news_ingestion: true
@@ -41,6 +41,8 @@ options:
   signal_confidence_threshold: 0.65
   min_independent_sources: 2
   max_horizon_days: 56
+  max_favorable_drift_pct: 5.0
+  signal_entry_deadline_days: 5
   stop_loss_pct: 8.0
   take_profit_pct: 16.0
   enable_ib_price_feed: false
@@ -76,6 +78,8 @@ schema:
   signal_confidence_threshold: float(0,1)
   min_independent_sources: int(1,10)
   max_horizon_days: int(1,180)
+  max_favorable_drift_pct: float(0,100)
+  signal_entry_deadline_days: int(1,60)
   stop_loss_pct: float(0.1,50)
   take_profit_pct: float(0.1,100)
   enable_ib_price_feed: bool

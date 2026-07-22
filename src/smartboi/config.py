@@ -32,8 +32,8 @@ class Settings(BaseSettings):
     symbols: str = ""
     anchor_symbols: str = ""
 
-    # --- SEC EDGAR ingestion (8-K material events, 10-K customer/supplier
-    # disclosures, Form 4 insider transactions) ---
+    # --- SEC EDGAR ingestion (8-K material events, 10-K/10-Q customer/
+    # supplier disclosures, Form 4 insider transactions) ---
     enable_edgar_ingestion: bool = True
     # One-time relationship backfill: on first run (and once per newly
     # added symbol), extract relationships from each tradeable company's
@@ -48,7 +48,11 @@ class Settings(BaseSettings):
     # not a secret, just informational, but required for EDGAR ingestion to
     # actually work. Left empty, EDGAR ingestion logs a warning and skips.
     edgar_user_agent: str = ""
-    edgar_forms: str = "8-K,10-K,4"
+    # 10-Q added alongside 10-K: quarterly filings also disclose customer/
+    # supplier changes and are run through the same relationship
+    # extraction (see engine.py), keeping the graph fresher between annual
+    # 10-Ks instead of only updating once a year.
+    edgar_forms: str = "8-K,10-K,10-Q,4"
     edgar_poll_interval_sec: int = 3600
     # Rolling lookback window checked on every poll (not just first-run
     # backfill) -- dedup.py's fingerprint index prevents reprocessing a
@@ -75,6 +79,22 @@ class Settings(BaseSettings):
     signal_confidence_threshold: float = 0.65
     min_independent_sources: int = 2
     max_horizon_days: int = 56  # ~8 weeks, the top of README's 2-8 week holding window
+
+    # --- Entry timing: "have we missed the correction already" guards.
+    # Applied when a SIGNALED dossier is about to become a paper trade
+    # (engine.py's _try_open_from_signal) -- neither has any effect without
+    # enable_ib_price_feed, since there's no price to check against yet. ---
+    # Skip opening if the price has already moved this many percent in the
+    # signal's favorable direction since it fired -- the correction likely
+    # already happened between signal and entry (e.g. price_poll_interval_sec
+    # gaps, or IB being briefly unreachable) and entering now would be
+    # chasing a move that's largely over, not capturing it.
+    max_favorable_drift_pct: float = 5.0
+    # If a signal sits unopened this many days (drift-blocked every poll, or
+    # no reachable price feed) it's expired back to ACTIVE instead of being
+    # stuck forever waiting to chase an increasingly stale opportunity --
+    # fresh evidence can re-signal it later with a clean baseline.
+    signal_entry_deadline_days: int = 5
 
     # --- Paper trade journal (percentage-based stop/target -- this system
     # has no intraday bar/ATR data at a weeks-long holding horizon) ---

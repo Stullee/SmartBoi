@@ -42,8 +42,8 @@ Recommended order:
 |---|---|
 | `symbols` | Comma-separated TRADEABLE tickers (your small/mid-caps). Setting this (or `anchor_symbols`) replaces the built-in starter watchlist entirely; both empty uses the starter watchlist (see `src/smartboi/universe.py`) |
 | `anchor_symbols` | Comma-separated ANCHOR tickers -- big, heavily-covered giants (e.g. `AAPL,MSFT,TSM`) whose news should propagate to your tradeable names. Never trade targets themselves. Relationships between anchors and tradeables are discovered automatically from the tradeable companies' 10-K filings |
-| `enable_edgar_ingestion` / `edgar_user_agent` | SEC EDGAR filing ingestion (8-K/10-K/Form 4). Requires a descriptive User-Agent |
-| `enable_relationship_backfill` | One-time extraction from each tradeable company's most recent 10-K (regardless of age) so the relationship graph populates on first run instead of over a year of annual filings. Each symbol is only ever backfilled once |
+| `enable_edgar_ingestion` / `edgar_user_agent` | SEC EDGAR filing ingestion (8-K/10-K/10-Q/Form 4). Requires a descriptive User-Agent |
+| `enable_relationship_backfill` | One-time extraction from each tradeable company's most recent 10-K (regardless of age) so the relationship graph populates on first run instead of over a year of annual filings. Each symbol is only ever backfilled once. Ongoing 10-Qs (quarterly) keep the graph refreshed between annual 10-Ks |
 | `edgar_forms` | Comma-separated SEC form types to ingest |
 | `edgar_poll_interval_sec` / `edgar_lookback_days` | How often to poll, and the rolling lookback window each poll checks |
 | `enable_news_ingestion` / `finnhub_api_key` | Finnhub company-news ingestion (free tier) |
@@ -53,6 +53,8 @@ Recommended order:
 | `signal_confidence_threshold` | Minimum `confidence * magnitude` for a dossier to fire a signal |
 | `min_independent_sources` | Minimum distinct-domain corroborating sources required (dedup collapses syndicated republishes to one) |
 | `max_horizon_days` | Cap on how long a hypothetical position is held before a timeout close |
+| `max_favorable_drift_pct` | "Are we too late" guard (requires `enable_ib_price_feed`): skip opening a signaled trade if the price already moved this many percent in the favorable direction since the signal fired -- the correction likely already happened between signal and entry |
+| `signal_entry_deadline_days` | A signal stuck unopened this many days (drift-blocked every poll, or IB unreachable) is expired back to ACTIVE instead of waiting forever on an increasingly stale opportunity |
 | `stop_loss_pct` / `take_profit_pct` | Percentage-based stop/target for hypothetical positions (no intraday bar data exists at this holding horizon) |
 | `enable_ib_price_feed` | Turns on price marking / hypothetical trade execution. **Never places real orders** -- read-only, see `src/smartboi/prices.py` |
 | `ib_host` / `ib_port` / `ib_client_id` | Address of a running IB Gateway/TWS instance for read-only price data |

@@ -90,11 +90,12 @@ function renderDossiers(rows) {
   var body = rows.map(function(d) {
     return "<tr><td><b>" + d.symbol + "</b></td><td>" + badge(d.direction) + "</td><td>" +
       fmt(d.confidence) + "</td><td>" + fmt(d.magnitude) + "</td><td>" + d.horizon_days + "d</td><td>" +
-      d.independent_source_count + "</td><td>" + d.evidence_count + "</td><td>" + esc(d.status) + "</td><td style='max-width:32rem'>" +
-      esc(d.thesis_summary) + "</td></tr>";
+      d.independent_source_count + "</td><td>" + d.evidence_count + "</td><td>" + esc(d.status) + "</td><td>" +
+      (d.signaled_price != null ? "$" + fmt(d.signaled_price) + " @ " + (d.signaled_at || "").slice(0, 10) : "-") +
+      "</td><td style='max-width:32rem'>" + esc(d.thesis_summary) + "</td></tr>";
   }).join("");
   return "<table><tr><th>Symbol</th><th>Dir</th><th>Confidence</th><th>Magnitude</th><th>Horizon</th>" +
-    "<th>Sources</th><th>Evidence</th><th>Status</th><th>Thesis</th></tr>" + body + "</table>";
+    "<th>Sources</th><th>Evidence</th><th>Status</th><th>Signaled @</th><th>Thesis</th></tr>" + body + "</table>";
 }
 
 function renderPaperTrades(rows, openTrades) {
