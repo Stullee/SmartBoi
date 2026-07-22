@@ -679,7 +679,7 @@ class Engine:
         if not proposed.get("is_new_information"):
             return True
 
-        verdict = await self.skeptic.review(evidence_text, proposed)
+        verdict = await self.skeptic.review(evidence_text, proposed, relationship_note)
         if verdict is None:
             return False  # transient LLM failure or budget exhausted -- retry this evidence later
         if verdict.get("refuted"):

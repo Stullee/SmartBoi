@@ -48,9 +48,17 @@ that specific inefficiency, not to race anyone on speed:
    10-K/10-Q customer/supplier disclosures, Form 4 insider transactions,
    parsed into readable transaction summaries) as a first-class evidence
    source, not an afterthought. See `edgar.py`.
-5. **Adversarial to itself** -- every proposed dossier update is reviewed
-   by a second, skeptical LLM pass trying to refute it before it counts.
-   See `skeptic.py`.
+5. **Adversarial to itself, calibrated by directness** -- every proposed
+   dossier update is reviewed by a second, skeptical LLM pass trying to
+   refute it before it counts, but the bar differs deliberately for direct
+   vs. propagated evidence. Direct evidence (mechanical Form 4 activity,
+   vague governance news) is held to a high bar. Propagated evidence is
+   judged on whether the ORIGIN fact is concrete and the disclosed
+   relationship is direct enough to support the proposed magnitude --
+   never refuted merely for being unconfirmed/indirect, since that's the
+   normal state of every piece of propagated evidence by definition and
+   demanding otherwise would mean point 2 above could never produce a
+   signal. See `skeptic.py`.
 6. **Prune-only universe auto-screen** -- a monthly market-cap/analyst-
    coverage recheck flags tickers that no longer fit (acquired, delisted,
    graduated to broad coverage) instead of trusting a hardcoded list to
