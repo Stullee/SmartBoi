@@ -52,7 +52,12 @@ class Skeptic:
         self._client = AsyncAnthropic(api_key=api_key)
         self._model = model
 
-    async def review(self, evidence_text: str, proposed: dict) -> dict:
+    async def review(self, evidence_text: str, proposed: dict) -> dict | None:
+        """Returns the verdict dict, or None on a transient API failure --
+        the caller (engine.py) then leaves the evidence unregistered so a
+        later poll retries it, rather than permanently discarding evidence
+        because of a network blip. Evidence still never merges without an
+        actual verdict."""
         prompt = (
             f"Proposed update: direction={proposed.get('direction')}, "
             f"magnitude={proposed.get('magnitude')}, confidence={proposed.get('confidence')}, "
@@ -68,9 +73,9 @@ class Skeptic:
                 tool_choice={"type": "tool", "name": "skeptic_verdict"},
                 messages=[{"role": "user", "content": prompt}],
             )
-        except Exception as exc:  # noqa: BLE001 - fail safe: an API failure counts as a refutation
-            log.warning("Skeptic review failed (%s) -- treating as refuted.", exc)
-            return {"refuted": True, "reasoning": f"skeptic call failed: {exc}", "adjusted_confidence": 0.0}
+        except Exception as exc:  # noqa: BLE001 - fail safe: nothing merges without a real verdict
+            log.warning("Skeptic review failed (%s) -- will retry this evidence on a later poll.", exc)
+            return None
         for block in response.content:
             if block.type == "tool_use":
                 return block.input

@@ -24,7 +24,7 @@ def _evidence(direction="LONG", confidence=0.7, magnitude=0.6, horizon_days=20, 
 def test_first_evidence_sets_dossier_state():
     dossier = Dossier(symbol="UCTT")
     record = _evidence()
-    merge_evidence(dossier, record, independent_source_count=1)
+    merge_evidence(dossier, record)
 
     assert dossier.direction == "LONG"
     assert dossier.confidence == 0.7
@@ -36,10 +36,10 @@ def test_first_evidence_sets_dossier_state():
 
 def test_corroborating_evidence_boosts_confidence():
     dossier = Dossier(symbol="UCTT")
-    merge_evidence(dossier, _evidence(confidence=0.6, source_name="reuters.com", evidence_id="e1"), independent_source_count=1)
+    merge_evidence(dossier, _evidence(confidence=0.6, source_name="reuters.com", evidence_id="e1"))
     base_confidence = dossier.confidence
 
-    merge_evidence(dossier, _evidence(confidence=0.6, source_name="bloomberg.com", evidence_id="e2"), independent_source_count=2)
+    merge_evidence(dossier, _evidence(confidence=0.6, source_name="bloomberg.com", evidence_id="e2"))
 
     assert dossier.independent_source_count == 2
     assert dossier.confidence > base_confidence
@@ -48,16 +48,16 @@ def test_corroborating_evidence_boosts_confidence():
 
 def test_weak_disagreeing_evidence_does_not_flip_direction():
     dossier = Dossier(symbol="UCTT")
-    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.8, evidence_id="e1"), independent_source_count=1)
-    merge_evidence(dossier, _evidence(direction="SHORT", confidence=0.3, evidence_id="e2"), independent_source_count=1)
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.8, evidence_id="e1"))
+    merge_evidence(dossier, _evidence(direction="SHORT", confidence=0.3, evidence_id="e2"))
 
     assert dossier.direction == "LONG"
 
 
 def test_stronger_disagreeing_evidence_flips_direction():
     dossier = Dossier(symbol="UCTT")
-    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.4, evidence_id="e1"), independent_source_count=1)
-    merge_evidence(dossier, _evidence(direction="SHORT", confidence=0.9, evidence_id="e2"), independent_source_count=1)
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.4, evidence_id="e1"))
+    merge_evidence(dossier, _evidence(direction="SHORT", confidence=0.9, evidence_id="e2"))
 
     assert dossier.direction == "SHORT"
 
@@ -68,7 +68,6 @@ def test_confidence_never_exceeds_one():
         merge_evidence(
             dossier,
             _evidence(confidence=0.95, source_name=f"source{i}.com", evidence_id=f"e{i}"),
-            independent_source_count=i + 1,
         )
     assert dossier.confidence <= 1.0
 
@@ -76,7 +75,7 @@ def test_confidence_never_exceeds_one():
 def test_dossier_store_round_trip(tmp_path):
     store = DossierStore(tmp_path / "dossiers")
     dossier = Dossier(symbol="UCTT")
-    merge_evidence(dossier, _evidence(), independent_source_count=1)
+    merge_evidence(dossier, _evidence())
     store.save(dossier)
 
     reloaded = store.load("UCTT")
@@ -96,3 +95,24 @@ def test_dossier_store_missing_symbol_returns_blank():
         assert dossier.symbol == "NOPE"
         assert dossier.direction == "NONE"
         assert dossier.evidence == []
+
+
+def test_disagreeing_evidence_does_not_corrupt_source_count():
+    # The count the signal gate reads must reflect sources agreeing with the
+    # dossier's RESOLVED direction, not whatever direction the newest record had.
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.8, source_name="reuters.com", evidence_id="e1"))
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.8, source_name="bloomberg.com", evidence_id="e2"))
+    merge_evidence(dossier, _evidence(direction="SHORT", confidence=0.3, source_name="ft.com", evidence_id="e3"))
+
+    assert dossier.direction == "LONG"
+    assert dossier.independent_source_count == 2  # the two LONG sources, not the SHORT one
+
+
+def test_has_evidence_is_idempotence_guard():
+    from smartboi.dossier import has_evidence
+
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(evidence_id="news:https://example.com/a:2026-07-21"))
+    assert has_evidence(dossier, "news:https://example.com/a:2026-07-21")
+    assert not has_evidence(dossier, "news:https://example.com/b:2026-07-21")

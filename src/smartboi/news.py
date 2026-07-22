@@ -5,7 +5,10 @@ for the universe auto-screen's market-cap/analyst-coverage checks
 and both needs are covered by its free tier."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -16,6 +19,22 @@ log = logging.getLogger(__name__)
 _NEWS_URL = "https://finnhub.io/api/v1/company-news"
 _PROFILE_URL = "https://finnhub.io/api/v1/stock/profile2"
 _RECOMMENDATION_URL = "https://finnhub.io/api/v1/stock/recommendation"
+
+# Finnhub's free tier allows 60 requests/minute -- a ~40-symbol universe
+# polled as a burst blows through that partway in and 429s the rest of the
+# list every single poll, systematically starving whichever symbols sort
+# last. Spacing requests just under the budget keeps a full pass legal.
+_REQUEST_GAP_SEC = 1.1
+_MAX_ATTEMPTS = 3
+
+# Finnhub puts the API key in the query string, so any logged exception
+# containing the request URL (httpx includes it) would leak the key into
+# the add-on log -- scrub it before it reaches a log line.
+_TOKEN_RE = re.compile(r"token=[^&\s'\"]+")
+
+
+def redact_token(text: object) -> str:
+    return _TOKEN_RE.sub("token=REDACTED", str(text))
 
 
 @dataclass(frozen=True)
@@ -38,18 +57,36 @@ class FinnhubClient:
     def __init__(self, api_key: str):
         self._api_key = api_key
         self._client = httpx.AsyncClient(timeout=15.0)
+        self._last_request = 0.0
+
+    async def _throttled_get(self, url: str, params: dict) -> httpx.Response:
+        response: httpx.Response | None = None
+        for attempt in range(_MAX_ATTEMPTS):
+            now = time.monotonic()
+            wait = _REQUEST_GAP_SEC - (now - self._last_request)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request = time.monotonic()
+            response = await self._client.get(url, params={**params, "token": self._api_key})
+            if response.status_code != 429:
+                response.raise_for_status()
+                return response
+            retry_after = float(response.headers.get("Retry-After") or 0)
+            delay = max(retry_after, 20.0 * (attempt + 1))
+            log.warning("Finnhub rate limit hit -- backing off %.0fs.", delay)
+            await asyncio.sleep(delay)
+        response.raise_for_status()  # still 429 after retries -> raise to the caller
+        return response
 
     async def recent_news(self, symbol: str, from_date: str, to_date: str) -> list[NewsArticle]:
         """`from_date`/`to_date` are YYYY-MM-DD. Finnhub's free tier covers
         US-listed common stock only -- fine for this universe."""
         try:
-            response = await self._client.get(
-                _NEWS_URL,
-                params={"symbol": symbol, "from": from_date, "to": to_date, "token": self._api_key},
+            response = await self._throttled_get(
+                _NEWS_URL, {"symbol": symbol, "from": from_date, "to": to_date}
             )
-            response.raise_for_status()
         except httpx.HTTPError as exc:
-            log.warning("%s: Finnhub news fetch failed: %s", symbol, exc)
+            log.warning("%s: Finnhub news fetch failed: %s", symbol, redact_token(exc))
             return []
         articles = []
         for row in response.json():
@@ -70,10 +107,9 @@ class FinnhubClient:
 
     async def market_cap_musd(self, symbol: str) -> float | None:
         try:
-            response = await self._client.get(_PROFILE_URL, params={"symbol": symbol, "token": self._api_key})
-            response.raise_for_status()
+            response = await self._throttled_get(_PROFILE_URL, {"symbol": symbol})
         except httpx.HTTPError as exc:
-            log.warning("%s: Finnhub profile fetch failed: %s", symbol, exc)
+            log.warning("%s: Finnhub profile fetch failed: %s", symbol, redact_token(exc))
             return None
         return response.json().get("marketCapitalization")  # already millions USD per Finnhub's docs
 
@@ -81,10 +117,9 @@ class FinnhubClient:
         """Most recent month's total analyst recommendation count across
         all rating buckets -- a proxy for "how thinly covered is this"."""
         try:
-            response = await self._client.get(_RECOMMENDATION_URL, params={"symbol": symbol, "token": self._api_key})
-            response.raise_for_status()
+            response = await self._throttled_get(_RECOMMENDATION_URL, {"symbol": symbol})
         except httpx.HTTPError as exc:
-            log.warning("%s: Finnhub recommendation-trend fetch failed: %s", symbol, exc)
+            log.warning("%s: Finnhub recommendation-trend fetch failed: %s", symbol, redact_token(exc))
             return None
         rows = response.json()
         if not rows:

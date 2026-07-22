@@ -58,7 +58,7 @@ Recommended order:
 | `enable_universe_autoscreen` | Monthly market-cap/analyst-coverage recheck that prunes tickers that no longer fit (acquired, delisted, graduated to broad coverage) |
 | `universe_min_market_cap_musd` / `universe_max_market_cap_musd` / `universe_max_analyst_count` | Bounds for the auto-screen |
 | `log_level` | `debug`, `info`, `warning`, or `error` |
-| `alert_webhook_url` | Optional webhook for events needing attention. Empty disables |
+| `alert_webhook_url` | Optional: a JSON payload is POSTed here on every signal and paper trade open/close. Point it at a Home Assistant webhook trigger (`http://homeassistant.local:8123/api/webhook/<your-id>`) and attach an automation that sends a mobile notification. Empty disables |
 | `enable_dashboard` | Read-only dashboard (see below). Enabled by default |
 
 ## Dashboard

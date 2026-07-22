@@ -89,6 +89,9 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
     log_dir: str = "logs"
+    # Optional: a JSON payload is POSTed here on every signal and paper
+    # trade open/close (see alerts.py) -- point it at a Home Assistant
+    # webhook trigger or any HTTP endpoint. Empty disables alerts.
     alert_webhook_url: str = ""
 
     enable_dashboard: bool = True

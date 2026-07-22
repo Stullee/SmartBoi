@@ -4,7 +4,14 @@ signal is accumulated evidence crossing a bar, not any single article (see
 README point 3). Signals are always logged, whether or not a price feed is
 configured to actually open a hypothetical position (see paper_journal.py
 and prices.py) -- so the detection layer is fully exercisable, and its
-output fully visible, before IB is wired in."""
+output fully visible, before IB is wired in.
+
+Deliberately status-blind: a dossier already SIGNALED (awaiting a price
+feed, or with a hypothetical position already open) re-logs an updated
+signal each time newly accepted evidence keeps it above threshold. The
+SIGNALED status only gates opening a paper trade (engine.py), never
+logging -- otherwise a no-price-feed deployment would log exactly one
+signal per symbol, ever, since only a closing trade resets the status."""
 from __future__ import annotations
 
 import json
@@ -31,7 +38,7 @@ class SignalEvent:
 
 
 def evaluate(dossier: Dossier, confidence_threshold: float, min_independent_sources: int) -> SignalEvent | None:
-    if dossier.status != "ACTIVE" or dossier.direction == "NONE":
+    if dossier.direction == "NONE":
         return None
     if dossier.independent_source_count < min_independent_sources:
         return None

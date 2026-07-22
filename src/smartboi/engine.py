@@ -4,14 +4,21 @@ graph -> dossier updates -> adversarial skeptic pass -> signal evaluation
 implements point-by-point.
 
 Every optional integration degrades gracefully instead of failing to
-start -- see config.py's docstring. A completely unconfigured run still
-does something useful: nothing (EDGAR/news both need at least a User-Agent
-or an API key to fetch anything). Add EDGAR_USER_AGENT and/or
+start -- see config.py's docstring. Add EDGAR_USER_AGENT and/or
 FINNHUB_API_KEY to start collecting evidence; add ANTHROPIC_API_KEY to
 start scoring it into dossiers; add IB (ENABLE_IB_PRICE_FEED=true) to start
 actually opening/marking hypothetical positions. Signals are detected and
 logged (signals.jsonl) the moment ANTHROPIC_API_KEY is present, regardless
-of whether IB is configured yet."""
+of whether IB is configured yet.
+
+Evidence is only marked as seen (dedup-registered) once it has been
+handled DEFINITIVELY -- scored into dossiers, judged not-new, or refuted
+by the skeptic. Evidence that can't be scored yet (no ANTHROPIC_API_KEY
+configured) or hits a transient LLM/API failure stays unregistered and is
+retried on later polls, so a missing key or a network blip never
+permanently burns evidence; per-dossier merging is idempotent
+(dossier.has_evidence) so retries of a partially-processed item never
+double-count."""
 from __future__ import annotations
 
 import asyncio
@@ -22,13 +29,14 @@ from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from smartboi.alerts import AlertSender
 from smartboi.config import Settings
 from smartboi.dedup import DedupIndex, fingerprint, source_domain
 from smartboi.dossier import (
-    Dossier,
     DossierStore,
     DossierUpdater,
     EvidenceRecord,
+    has_evidence,
     merge_evidence,
 )
 from smartboi.edgar import EdgarClient, FilingEvent
@@ -47,11 +55,11 @@ log = logging.getLogger(__name__)
 
 TICK_INTERVAL_SEC = 30
 DATA_DIR = Path("data")
-
-
-def _count_independent_sources(evidence_and_new: list[EvidenceRecord], direction: str) -> int:
-    agreeing = [e for e in evidence_and_new if e.direction == direction]
-    return len({e.source_name for e in agreeing})
+# When the IB Gateway is unreachable, retry the connection this often
+# instead of waiting out a full price_poll_interval_sec (6h by default) --
+# the Gateway restarting daily, or simply not being up yet, shouldn't cost
+# most of a day of price marks.
+IB_RETRY_GAP_SEC = 900
 
 
 class Engine:
@@ -64,6 +72,7 @@ class Engine:
         self.dossiers = DossierStore(DATA_DIR / "dossiers")
         self.journal = PaperTradeJournal(log_dir / "paper_trades.jsonl")
         self.universe_screen_state = JsonState(DATA_DIR / "universe_screen_state.json")
+        self.alerts = AlertSender(settings.alert_webhook_url)
 
         self.spec_by_symbol = spec_by_symbol(DEFAULT_UNIVERSE)
 
@@ -75,10 +84,13 @@ class Engine:
         self.price_feed: ReadOnlyPriceFeed | None = None
 
         self._warned: set[str] = set()
-        self._last_edgar_poll = 0.0
-        self._last_news_poll = 0.0
-        self._last_price_poll = 0.0
-        self._last_screen = 0.0
+        # None = never polled this process -> due immediately on the first
+        # tick. (These are time.monotonic() marks; comparing against an
+        # initial 0.0 would compare against machine BOOT time and delay the
+        # first pass by up to a full interval after a reboot.)
+        self._last_edgar_poll: float | None = None
+        self._last_news_poll: float | None = None
+        self._last_price_poll: float | None = None
         self._dashboard_task: asyncio.Task | None = None
         self._closing = False
 
@@ -125,20 +137,19 @@ class Engine:
         else:
             self._warn_once(
                 "anthropic",
-                "ANTHROPIC_API_KEY not set -- evidence will be collected but dossiers will not be "
-                "scored (no relationship extraction, dossier updates, or signals).",
+                "ANTHROPIC_API_KEY not set -- evidence will be collected but not scored yet; "
+                "unscored items are retried automatically once a key is configured.",
             )
 
         if self.settings.enable_ib_price_feed:
             self.price_feed = ReadOnlyPriceFeed(
                 self.settings.ib_host, self.settings.ib_port, self.settings.ib_client_id
             )
-            try:
-                await self.price_feed.connect()
-                log.info("Read-only IB price feed: ENABLED")
-            except Exception:  # noqa: BLE001 - a missing/unreachable IB Gateway must not stop the rest of the pipeline
-                log.exception("Could not connect the IB price feed -- will retry on the next price poll.")
-                self.price_feed = None
+            log.info(
+                "Read-only IB price feed: ENABLED -- connects on the first price poll and "
+                "reconnects automatically (retries every %d min while the Gateway is unreachable).",
+                IB_RETRY_GAP_SEC // 60,
+            )
         else:
             self._warn_once(
                 "ib",
@@ -146,6 +157,12 @@ class Engine:
                 "but no hypothetical position can be opened or marked to market until "
                 "ENABLE_IB_PRICE_FEED=true. This never places real orders (see prices.py).",
             )
+
+        if self.alerts.enabled:
+            log.info("Webhook alerts: ENABLED (signals and paper trade opens/closes)")
+        else:
+            log.info("Webhook alerts: disabled -- set ALERT_WEBHOOK_URL (e.g. a Home Assistant "
+                     "webhook trigger) to get notified of signals and paper trades.")
 
         if self.settings.enable_dashboard:
             self._dashboard_task = asyncio.create_task(self._run_dashboard_safely())
@@ -189,25 +206,53 @@ class Engine:
                 await self.skeptic.aclose()
             if self.price_feed is not None:
                 self.price_feed.disconnect()
+            await self.alerts.aclose()
+
+    @staticmethod
+    def _due(last: float | None, interval_sec: float, now: float) -> bool:
+        return last is None or now - last >= interval_sec
 
     async def _tick(self) -> None:
         now = time.monotonic()
-        if self.edgar_client is not None and now - self._last_edgar_poll >= self.settings.edgar_poll_interval_sec:
+        if self.edgar_client is not None and self._due(self._last_edgar_poll, self.settings.edgar_poll_interval_sec, now):
             self._last_edgar_poll = now
             await self._poll_edgar()
-        if self.finnhub is not None and now - self._last_news_poll >= self.settings.news_poll_interval_sec:
+        if self.finnhub is not None and self._due(self._last_news_poll, self.settings.news_poll_interval_sec, now):
             self._last_news_poll = now
             await self._poll_news()
-        if self.price_feed is not None and now - self._last_price_poll >= self.settings.price_poll_interval_sec:
-            self._last_price_poll = now
-            await self._mark_and_execute()
+        if self.price_feed is not None and self._due(self._last_price_poll, self.settings.price_poll_interval_sec, now):
+            if await self.price_feed.ensure_connected():
+                self._last_price_poll = now
+                await self._mark_and_execute()
+            else:
+                self._warn_once(
+                    "ib-unreachable",
+                    f"IB Gateway unreachable -- the price feed keeps retrying every {IB_RETRY_GAP_SEC // 60} min "
+                    "in the background. Set ENABLE_IB_PRICE_FEED=false if you don't want it yet.",
+                )
+                # Leave the poll pending but back off the connection attempt.
+                self._last_price_poll = now - self.settings.price_poll_interval_sec + IB_RETRY_GAP_SEC
         if (
             self.finnhub is not None
             and self.settings.enable_universe_autoscreen
-            and now - self._last_screen >= self.settings.universe_screen_interval_days * 86400
+            and self._universe_screen_due()
         ):
-            self._last_screen = now
             await self._run_universe_screen()
+
+    def _universe_screen_due(self) -> bool:
+        """Scheduled off the PERSISTED last-screen timestamp (wall clock),
+        so the monthly cadence survives restarts -- a process-local timer
+        would reset on every restart and, at a 30-day interval, in practice
+        never fire."""
+        last = self.universe_screen_state.get("last_screened_at")
+        if not last:
+            return True
+        try:
+            last_dt = datetime.fromisoformat(last)
+        except ValueError:
+            return True
+        interval = timedelta(days=self.settings.universe_screen_interval_days)
+        return datetime.now(timezone.utc) - last_dt >= interval
 
     # --- EDGAR ingestion ---
 
@@ -226,11 +271,10 @@ class Engine:
         fp = f"filing:{symbol}:{filing.accession_number}"
         if self.dedup.is_duplicate(fp):
             return
-        self.dedup.register(fp, "sec.gov")
 
-        text = await self.edgar_client.fetch_text(filing)
+        text = await self.edgar_client.fetch_evidence_text(filing)
         if not text:
-            return
+            return  # fetch failed/empty -- unregistered, so the next poll retries it
 
         if filing.form == "10-K" and self.extractor is not None:
             known = self.settings.symbol_list
@@ -258,7 +302,7 @@ class Engine:
                     )
 
         evidence_text = f"SEC {filing.form} filed {filing.filing_date} for {symbol}:\n{text[:4000]}"
-        await self._process_evidence(
+        scored = await self._process_evidence(
             origin_symbol=symbol,
             evidence_text=evidence_text,
             source_type=filing.form,
@@ -267,6 +311,8 @@ class Engine:
             headline=f"{symbol} {filing.form} filed {filing.filing_date}",
             published_at=filing.filing_date,
         )
+        if scored:
+            self.dedup.register(fp, "sec.gov")
 
     # --- News ingestion ---
 
@@ -285,9 +331,8 @@ class Engine:
                 if self.dedup.is_duplicate(fp):
                     continue
                 domain = source_domain(article.url) or article.source
-                self.dedup.register(fp, domain)
                 evidence_text = f"News ({article.source}, {published}): {article.headline}\n{article.summary}"
-                await self._process_evidence(
+                scored = await self._process_evidence(
                     origin_symbol=symbol,
                     evidence_text=evidence_text,
                     source_type="news",
@@ -296,6 +341,8 @@ class Engine:
                     headline=article.headline,
                     published_at=published,
                 )
+                if scored:
+                    self.dedup.register(fp, domain)
 
     # --- Shared evidence -> dossier pipeline ---
 
@@ -308,9 +355,14 @@ class Engine:
         url: str,
         headline: str,
         published_at: str,
-    ) -> None:
+    ) -> bool:
+        """Returns True when the item was handled definitively (every
+        affected dossier merged/rejected/refuted it, or nothing needed
+        scoring); False when it should be retried on a later poll (no
+        dossier engine configured yet, or a transient LLM failure) -- the
+        caller then leaves its dedup fingerprint unregistered."""
         if self.updater is None or self.skeptic is None:
-            return  # evidence's dedup fingerprint is already registered; just not scored yet
+            return False  # collected but not scoreable yet -- retried once a key is configured
 
         universe = set(self.settings.symbol_list)
         targets: list[tuple[str, str]] = []  # (target_symbol, relationship_note)
@@ -325,11 +377,14 @@ class Engine:
                 continue
             targets.append((linked_symbol, rel.description))
 
+        all_definitive = True
         for target_symbol, relationship_note in targets:
-            await self._update_dossier(
+            definitive = await self._update_dossier(
                 target_symbol, evidence_text, origin_symbol, relationship_note,
                 source_type, source_name, url, headline, published_at,
             )
+            all_definitive = all_definitive and definitive
+        return all_definitive
 
     async def _update_dossier(
         self,
@@ -342,19 +397,30 @@ class Engine:
         url: str,
         headline: str,
         published_at: str,
-    ) -> None:
+    ) -> bool:
+        """Returns True when this dossier handled the evidence definitively
+        (merged, not-new, or refuted); False on a transient failure that
+        warrants a retry on a later poll."""
+        evidence_id = f"{source_type}:{url or headline}:{published_at}"
         dossier = self.dossiers.load(target_symbol)
+        if has_evidence(dossier, evidence_id):
+            return True  # already merged on an earlier, partially-failed pass
+
         proposed = await self.updater.propose_update(dossier, evidence_text, origin_symbol, relationship_note)
-        if proposed is None or not proposed.get("is_new_information"):
-            return
+        if proposed is None:
+            return False  # transient LLM failure -- retry this evidence later
+        if not proposed.get("is_new_information"):
+            return True
 
         verdict = await self.skeptic.review(evidence_text, proposed)
+        if verdict is None:
+            return False  # transient LLM failure -- retry this evidence later
         if verdict.get("refuted"):
             log.info("%s: evidence refuted by skeptic (%s)", target_symbol, verdict.get("reasoning", ""))
-            return
+            return True
 
         record = EvidenceRecord(
-            evidence_id=f"{source_type}:{url or headline}:{published_at}",
+            evidence_id=evidence_id,
             source_type=source_type,
             source_name=source_name,
             url=url,
@@ -370,16 +436,23 @@ class Engine:
             reasoning=proposed["reasoning"],
             skeptic_note=verdict.get("reasoning", ""),
         )
-        independent_sources = _count_independent_sources(dossier.evidence + [record], record.direction)
-        merge_evidence(dossier, record, independent_sources)
+        merge_evidence(dossier, record)
         self.dossiers.save(dossier)
 
         signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources)
         if signal is not None:
             log_signal(Path(self.settings.log_dir) / "signals.jsonl", signal)
+            await self.alerts.send(
+                "signal",
+                f"{signal.direction} signal: {signal.symbol}",
+                f"confidence={signal.confidence:.2f} magnitude={signal.magnitude:.2f} "
+                f"sources={signal.independent_source_count}. {signal.thesis_summary}",
+                asdict(signal),
+            )
             if dossier.status == "ACTIVE":
                 dossier.status = "SIGNALED"
                 self.dossiers.save(dossier)
+        return True
 
     # --- Price marking / hypothetical execution ---
 
@@ -403,11 +476,18 @@ class Engine:
                 for e in dossier.evidence[-5:]
             ]
             horizon = min(dossier.horizon_days or self.settings.max_horizon_days, self.settings.max_horizon_days)
-            self.journal.open(
+            trade = self.journal.open(
                 symbol, dossier.direction, price,
                 self.settings.stop_loss_pct, self.settings.take_profit_pct,
                 horizon, dossier.thesis_summary, dossier.confidence,
                 dossier.independent_source_count, citations,
+            )
+            await self.alerts.send(
+                "paper_trade_opened",
+                f"Paper trade opened: {trade.direction} {trade.symbol}",
+                f"entry={trade.entry_price:.2f} stop={trade.stop_price:.2f} "
+                f"target={trade.target_price:.2f} horizon={trade.horizon_days}d. {trade.thesis_summary}",
+                asdict(trade),
             )
 
         open_symbols = list(self.journal.open_trades.keys())
@@ -415,12 +495,21 @@ class Engine:
             return
         prices = await self.price_feed.last_prices(open_symbols)
         for symbol, price in prices.items():
-            was_open = self.journal.has_open(symbol)
+            trade = self.journal.open_trades.get(symbol)
+            if trade is None:
+                continue
             self.journal.update(symbol, price)
-            if was_open and not self.journal.has_open(symbol):
-                # The paper trade just closed (WIN/LOSS/TIMEOUT) -- reset the
-                # dossier so future evidence can trigger a fresh signal
-                # instead of being permanently stuck at SIGNALED.
+            if trade.status != "OPEN":
+                # The paper trade just closed (WIN/LOSS/TIMEOUT) -- notify,
+                # then reset the dossier so future evidence can trigger a
+                # fresh signal instead of being permanently stuck at SIGNALED.
+                await self.alerts.send(
+                    "paper_trade_closed",
+                    f"Paper trade closed: {trade.symbol} {trade.status}",
+                    f"{trade.direction} entry={trade.entry_price:.2f} exit={trade.exit_price:.2f} "
+                    f"R={trade.r_multiple:.2f}",
+                    asdict(trade),
+                )
                 dossier = self.dossiers.load(symbol)
                 dossier.status = "ACTIVE"
                 self.dossiers.save(dossier)

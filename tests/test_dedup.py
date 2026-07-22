@@ -48,4 +48,29 @@ def test_dedup_index_register_is_idempotent(tmp_path):
     fp = fingerprint("UCTT", "Some story", "2026-07-21")
     index.register(fp, "reuters.com")
     index.register(fp, "bloomberg.com")  # should not overwrite the first-seen domain
-    assert index._seen[fp] == "reuters.com"
+    assert index.domain_for(fp) == "reuters.com"
+
+
+def test_dedup_index_prunes_old_entries_on_load(tmp_path):
+    path = tmp_path / "dedup_index.json"
+    index = DedupIndex(path, max_age_days=90)
+    old_fp = fingerprint("UCTT", "Ancient story", "2026-01-01")
+    new_fp = fingerprint("UCTT", "Fresh story", "2026-07-21")
+    index.register(old_fp, "reuters.com", registered_at="2026-01-01T00:00:00+00:00")
+    index.register(new_fp, "reuters.com")
+
+    reloaded = DedupIndex(path, max_age_days=90)
+    assert not reloaded.is_duplicate(old_fp)
+    assert reloaded.is_duplicate(new_fp)
+
+
+def test_dedup_index_reads_legacy_flat_format(tmp_path):
+    import json
+
+    path = tmp_path / "dedup_index.json"
+    fp = fingerprint("UCTT", "Legacy story", "2026-07-20")
+    path.write_text(json.dumps({fp: "reuters.com"}))  # pre-timestamp format
+
+    index = DedupIndex(path)
+    assert index.is_duplicate(fp)
+    assert index.domain_for(fp) == "reuters.com"

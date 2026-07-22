@@ -84,6 +84,7 @@ src/smartboi/
   dossier.py                 per-company evidence dossier: model, store, LLM update proposal
   skeptic.py                  adversarial second pass that tries to refute proposed updates
   signals.py                    evidence-threshold crossing -> SignalEvent (always logged)
+  alerts.py                      optional webhook POST on signals / paper trade opens & closes
   paper_journal.py                hypothetical trade open/mark/close -- NO order-placement code
   prices.py                        read-only IB price feed -- NO order-placement code, optional
   universe_screen.py                monthly market-cap/analyst-coverage prune-only recheck
@@ -159,6 +160,17 @@ See [`DEPLOY.md`](DEPLOY.md) -- ships as a proper Home Assistant add-on
 (`ha-addons/smartboi`), installable alongside the existing TradingBot
 add-on on the same host, configured through the HA UI instead of a `.env`
 file.
+
+## Alerts
+
+Set `ALERT_WEBHOOK_URL` to get a JSON payload POSTed on every signal and
+every paper trade open/close -- so a headless deployment tells you when
+something happened instead of relying on you checking the dashboard. Point
+it at a Home Assistant webhook trigger
+(`http://homeassistant.local:8123/api/webhook/<your-id>`) with an
+automation that forwards to a mobile notification, or any other HTTP
+endpoint. The payload is `{event, title, message, data, sent_at}` where
+`event` is `signal`, `paper_trade_opened`, or `paper_trade_closed`.
 
 ## Running the tests
 

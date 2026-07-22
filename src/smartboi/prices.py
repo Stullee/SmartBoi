@@ -37,6 +37,20 @@ class ReadOnlyPriceFeed:
         await self.ib.connectAsync(self._host, self._port, clientId=self._client_id, timeout=15)
         log.info("Connected read-only price feed to IB at %s:%s (client_id=%s)", self._host, self._port, self._client_id)
 
+    async def ensure_connected(self) -> bool:
+        """(Re)connects if the session is down -- IB Gateway restarts itself
+        daily by design, and the Gateway may simply not be running yet when
+        the engine starts, so the engine calls this before every price poll
+        instead of trusting a connection made once at startup."""
+        if self.ib.isConnected():
+            return True
+        try:
+            await self.connect()
+            return True
+        except Exception as exc:  # noqa: BLE001 - an unreachable Gateway must never kill the poll loop
+            log.warning("IB price feed unreachable at %s:%s (%s) -- will retry.", self._host, self._port, exc)
+            return False
+
     async def last_price(self, symbol: str) -> float | None:
         contract = self._contracts.get(symbol)
         if contract is None:

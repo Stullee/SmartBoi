@@ -11,11 +11,13 @@ import json
 import logging
 import re
 import time
+import warnings
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +27,23 @@ _SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik10}.json"
 # polling a few dozen symbols every hour never gets remotely close, but this
 # still spaces requests out rather than bursting all of them at once.
 _REQUEST_GAP_SEC = 0.3
+# The ticker->CIK map gains new listings (IPOs, ticker changes) over time; a
+# cache that never expires would leave those unresolvable forever ("no CIK
+# found") on a long-lived deployment.
+_CIK_CACHE_MAX_AGE = timedelta(days=7)
+
+# Form 4 transaction codes worth spelling out for the dossier engine -- the
+# raw code is kept alongside so nothing is lost for unmapped ones.
+_FORM4_TRANSACTION_CODES = {
+    "P": "open-market purchase",
+    "S": "open-market sale",
+    "A": "grant/award",
+    "M": "option exercise",
+    "F": "tax-withholding disposition",
+    "G": "gift",
+    "D": "disposition to issuer",
+    "C": "conversion of derivative",
+}
 
 
 @dataclass(frozen=True)
@@ -45,9 +64,88 @@ class FilingEvent:
         )
 
     @property
+    def raw_document_url(self) -> str:
+        """Like document_url, but with any XSL-rendering prefix stripped --
+        Form 4 primaryDocument paths usually point at the human-readable
+        rendering ("xslF345X05/form4.xml"); the same filename without the
+        prefix is the raw XML the structured parser needs."""
+        accession_nodash = self.accession_number.replace("-", "")
+        raw_doc = re.sub(r"^xsl[^/]*/", "", self.primary_document)
+        return f"https://www.sec.gov/Archives/edgar/data/{int(self.cik10)}/{accession_nodash}/{raw_doc}"
+
+    @property
     def index_url(self) -> str:
         accession_nodash = self.accession_number.replace("-", "")
         return f"https://www.sec.gov/Archives/edgar/data/{int(self.cik10)}/{accession_nodash}/"
+
+
+def _form4_value(node, tag: str) -> str:
+    """Text of `<tag><value>x</value></tag>` (or bare `<tag>x</tag>`) under
+    `node` -- html.parser lowercases tags, so `tag` must be lowercase."""
+    found = node.find(tag)
+    if found is None:
+        return ""
+    value = found.find("value")
+    return (value or found).get_text(strip=True)
+
+
+def _fmt_shares(raw: str) -> str:
+    try:
+        return f"{float(raw):,.0f}"
+    except ValueError:
+        return raw
+
+
+def summarize_form4(xml_text: str) -> str:
+    """Compact, human/LLM-readable summary of a Form 4's non-derivative
+    transactions ("insider X (CFO) open-market purchase of 10,000 shares at
+    $12.34..."). Returns "" when the text isn't parseable as Form 4 XML --
+    the caller then falls back to plain text extraction rather than feeding
+    raw XML to the dossier engine as 'evidence'."""
+    with warnings.catch_warnings():
+        # html.parser on XML is deliberate (lenient, and avoids an lxml
+        # dependency) -- it just lowercases tags, which _form4_value expects.
+        warnings.simplefilter("ignore", XMLParsedAsHTMLWarning)
+        soup = BeautifulSoup(xml_text, "html.parser")
+    owner = _form4_value(soup, "rptownername")
+    if not owner:
+        return ""
+
+    roles = []
+    relationship = soup.find("reportingownerrelationship")
+    if relationship is not None:
+        if _form4_value(relationship, "isdirector") in ("1", "true"):
+            roles.append("director")
+        officer_title = _form4_value(relationship, "officertitle")
+        if officer_title:
+            roles.append(officer_title)
+        elif _form4_value(relationship, "isofficer") in ("1", "true"):
+            roles.append("officer")
+        if _form4_value(relationship, "istenpercentowner") in ("1", "true"):
+            roles.append("10% owner")
+    role = ", ".join(roles) or "insider"
+
+    lines = []
+    for txn in soup.find_all("nonderivativetransaction"):
+        code = _form4_value(txn, "transactioncode")
+        desc = _FORM4_TRANSACTION_CODES.get(code, f"transaction code {code}")
+        shares = _fmt_shares(_form4_value(txn, "transactionshares"))
+        price = _form4_value(txn, "transactionpricepershare")
+        date = _form4_value(txn, "transactiondate")
+        owned_after = _fmt_shares(_form4_value(txn, "sharesownedfollowingtransaction"))
+        line = f"{date}: {desc} of {shares} shares"
+        if price:
+            line += f" at ${price}"
+        if owned_after:
+            line += f" ({owned_after} shares owned after)"
+        lines.append(line)
+
+    if not lines:
+        return (
+            f"Form 4 insider filing by {owner} ({role}): no non-derivative "
+            "transactions reported (derivative/option activity only)."
+        )
+    return f"Form 4 insider transactions by {owner} ({role}): " + "; ".join(lines)
 
 
 class EdgarClient:
@@ -56,6 +154,7 @@ class EdgarClient:
         self._client = httpx.AsyncClient(headers=headers, timeout=20.0)
         self._cache_path = cache_path
         self._cik_by_ticker: dict[str, str] | None = None
+        self._map_loaded_at: datetime | None = None
         self._last_request = 0.0
 
     async def _throttled_get(self, url: str) -> httpx.Response:
@@ -69,20 +168,43 @@ class EdgarClient:
         return response
 
     async def _ticker_map(self) -> dict[str, str]:
-        if self._cik_by_ticker is not None:
-            return self._cik_by_ticker
+        now = datetime.now(timezone.utc)
+        if self._cik_by_ticker is not None and self._map_loaded_at is not None:
+            if now - self._map_loaded_at < _CIK_CACHE_MAX_AGE:
+                return self._cik_by_ticker
+
+        cached_map: dict[str, str] | None = None
+        cache_fresh = False
         if self._cache_path.exists():
             try:
-                self._cik_by_ticker = json.loads(self._cache_path.read_text())
-                return self._cik_by_ticker
+                raw = json.loads(self._cache_path.read_text())
+                if isinstance(raw, dict) and "map" in raw:
+                    cached_map = raw["map"]
+                    fetched_at = raw.get("fetched_at", "")
+                    cache_fresh = fetched_at >= (now - _CIK_CACHE_MAX_AGE).isoformat()
+                else:
+                    cached_map = raw  # legacy flat format with no timestamp -> refresh
             except (json.JSONDecodeError, OSError):
                 pass
-        response = await self._throttled_get(_TICKERS_URL)
-        raw = response.json()
-        mapping = {row["ticker"].upper(): str(row["cik_str"]).zfill(10) for row in raw.values()}
-        self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self._cache_path.write_text(json.dumps(mapping))
+
+        if cached_map is not None and cache_fresh:
+            self._cik_by_ticker = cached_map
+            self._map_loaded_at = now
+            return cached_map
+
+        try:
+            response = await self._throttled_get(_TICKERS_URL)
+            raw = response.json()
+            mapping = {row["ticker"].upper(): str(row["cik_str"]).zfill(10) for row in raw.values()}
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._cache_path.write_text(json.dumps({"fetched_at": now.isoformat(), "map": mapping}))
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            if cached_map is None:
+                raise
+            log.warning("Could not refresh EDGAR's ticker map (%s) -- using the stale cached copy.", exc)
+            mapping = cached_map
         self._cik_by_ticker = mapping
+        self._map_loaded_at = now
         return mapping
 
     async def cik_for(self, symbol: str) -> str | None:
@@ -118,6 +240,23 @@ class EdgarClient:
                 continue
             events.append(FilingEvent(symbol, cik10, form, filing_date, accession, primary_doc))
         return events
+
+    async def fetch_evidence_text(self, filing: FilingEvent) -> str:
+        """Evidence-ready text for a filing. Form 4s get a structured
+        summary of the insider transactions (the raw filing is XML --
+        useless noise as LLM 'evidence'); everything else gets plain-text
+        extraction of the primary document (see fetch_text)."""
+        if filing.form == "4":
+            try:
+                response = await self._throttled_get(filing.raw_document_url)
+            except httpx.HTTPError as exc:
+                log.warning("%s: could not fetch Form 4 XML %s: %s", filing.symbol, filing.raw_document_url, exc)
+                return ""
+            summary = summarize_form4(response.text)
+            if summary:
+                return summary
+            log.warning("%s: Form 4 %s did not parse -- falling back to plain text.", filing.symbol, filing.accession_number)
+        return await self.fetch_text(filing)
 
     async def fetch_text(self, filing: FilingEvent, max_chars: int = 40_000) -> str:
         """Plain-text extraction of a filing's primary document, truncated --

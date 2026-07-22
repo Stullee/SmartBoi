@@ -85,22 +85,31 @@ class DossierStore:
         return sorted(p.stem for p in self.dir_path.glob("*.json"))
 
 
-def merge_evidence(dossier: Dossier, record: EvidenceRecord, independent_source_count: int) -> None:
+def has_evidence(dossier: Dossier, evidence_id: str) -> bool:
+    """Whether this evidence item was already merged -- makes reprocessing
+    idempotent when an ingestion pass is retried after a partial failure
+    (see engine.py, which only marks an item done once every affected
+    dossier has definitively handled it)."""
+    return any(e.evidence_id == evidence_id for e in dossier.evidence)
+
+
+def merge_evidence(dossier: Dossier, record: EvidenceRecord) -> None:
     """Folds one accepted (post-skeptic) evidence record into the dossier's
     aggregate state.
 
     Direction only changes when the new record's confidence beats the
     existing aggregate -- a single weak item can't flip a thesis built on
-    stronger evidence. Aggregate confidence is the mean confidence of
-    evidence currently agreeing with the dossier's direction, boosted for
-    corroboration from distinct sources (dedup.py guarantees
-    `independent_source_count` only counts genuinely different source
-    domains/stories, never syndicated republishes of the same one) and
-    capped at 1.0. Magnitude takes the max of agreeing evidence (the
-    biggest single implied impact, not diluted by weaker corroborating
-    items) and horizon_days their mean."""
+    stronger evidence. `independent_source_count` is recomputed here from
+    the evidence agreeing with the dossier's RESOLVED direction (never the
+    new record's, which may disagree and must not corrupt the count the
+    signal gate reads; dedup.py guarantees distinct source names are
+    genuinely different domains/stories, never syndicated republishes).
+    Aggregate confidence is the mean confidence of agreeing evidence,
+    boosted for corroboration from distinct sources and capped at 1.0.
+    Magnitude takes the max of agreeing evidence (the biggest single
+    implied impact, not diluted by weaker corroborating items) and
+    horizon_days their mean."""
     dossier.evidence.append(record)
-    dossier.independent_source_count = independent_source_count
 
     if record.direction != "NONE" and (
         dossier.direction == "NONE" or record.confidence >= dossier.confidence
@@ -109,8 +118,9 @@ def merge_evidence(dossier: Dossier, record: EvidenceRecord, independent_source_
 
     agreeing = [e for e in dossier.evidence if e.direction == dossier.direction]
     if dossier.direction != "NONE" and agreeing:
+        dossier.independent_source_count = len({e.source_name for e in agreeing})
         base_confidence = sum(e.confidence for e in agreeing) / len(agreeing)
-        corroboration_bonus = 0.1 * max(0, independent_source_count - 1)
+        corroboration_bonus = 0.1 * max(0, dossier.independent_source_count - 1)
         dossier.confidence = min(1.0, base_confidence + corroboration_bonus)
         dossier.magnitude = max(e.magnitude for e in agreeing)
         dossier.horizon_days = round(sum(e.horizon_days for e in agreeing) / len(agreeing))

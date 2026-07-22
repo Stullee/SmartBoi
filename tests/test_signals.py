@@ -37,7 +37,10 @@ def test_no_signal_when_direction_none():
     assert signal is None
 
 
-def test_no_signal_when_already_signaled():
+def test_signaled_dossier_still_relogs_signals():
+    # Without a price feed nothing ever resets SIGNALED back to ACTIVE, so
+    # evaluation must be status-blind or each symbol could only ever log one
+    # signal; the SIGNALED status only gates opening a paper trade (engine.py).
     dossier = _dossier(status="SIGNALED", confidence=0.9, magnitude=0.9, independent_source_count=3)
     signal = evaluate(dossier, confidence_threshold=0.5, min_independent_sources=2)
-    assert signal is None
+    assert signal is not None

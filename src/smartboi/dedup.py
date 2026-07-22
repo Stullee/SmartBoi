@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -45,25 +46,44 @@ def fingerprint(symbol: str, headline: str, published_date: str) -> str:
 class DedupIndex:
     """Persisted so dedup state survives restarts -- an evidence item seen
     yesterday must still be recognized as a duplicate today, not reprocessed
-    (and re-billed to the LLM) just because the process restarted."""
+    (and re-billed to the LLM) just because the process restarted.
+
+    Entries older than `max_age_days` are pruned on load so the index can't
+    grow without bound; the cutoff just has to comfortably exceed every
+    ingestion lookback window (14 days for EDGAR, 3 for news), since a
+    fingerprint only matters while its story can still reappear in a poll."""
 
     path: Path
-    _seen: dict[str, str] = field(default_factory=dict)  # fingerprint -> first-seen source_domain
+    max_age_days: int = 90
+    _seen: dict[str, list] = field(default_factory=dict)  # fingerprint -> [source_domain, registered_at_iso]
 
     def __post_init__(self) -> None:
-        if self.path.exists():
-            try:
-                self._seen = json.loads(self.path.read_text())
-            except (json.JSONDecodeError, OSError):
-                self._seen = {}
+        if not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(days=self.max_age_days)).isoformat()
+        for fp, value in raw.items():
+            # Legacy format stored a bare domain string with no timestamp;
+            # adopt it as seen-now so it ages out normally from here.
+            domain, registered_at = (value, now.isoformat()) if isinstance(value, str) else value
+            if registered_at >= cutoff:
+                self._seen[fp] = [domain, registered_at]
 
     def is_duplicate(self, fp: str) -> bool:
         return fp in self._seen
 
-    def register(self, fp: str, domain: str) -> None:
+    def domain_for(self, fp: str) -> str | None:
+        entry = self._seen.get(fp)
+        return entry[0] if entry else None
+
+    def register(self, fp: str, domain: str, registered_at: str | None = None) -> None:
         if fp in self._seen:
             return
-        self._seen[fp] = domain
+        self._seen[fp] = [domain, registered_at or datetime.now(timezone.utc).isoformat()]
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._seen))
