@@ -51,6 +51,27 @@ def engine(tmp_path, monkeypatch):
     return e
 
 
+# --- Invariant: SEED_RELATIONSHIPS only ever seeds edges between symbols
+# actually in the LIVE (possibly custom SYMBOLS/ANCHOR_SYMBOLS) universe --
+# a custom deployment must never get default-universe edges for companies
+# it never configured. ---
+
+async def test_seed_graph_skips_relationships_outside_a_custom_universe(engine):
+    # The fixture's universe (FORM, UCTT, INTC) doesn't fully contain any
+    # SEED_RELATIONSHIPS pair (UCTT's seeded counterparties are AMAT/LRCX,
+    # neither configured here) -- nothing should be seeded.
+    engine._seed_graph()
+    assert engine.graph.relationships == []
+
+
+async def test_seed_graph_seeds_relationships_fully_inside_the_universe(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(_env_file=None, symbols="UCTT", anchor_symbols="AMAT", enable_dashboard=False)
+    e = Engine(settings)
+    e._seed_graph()
+    assert any(r.from_symbol == "UCTT" and r.to_symbol == "AMAT" for r in e.graph.relationships)
+
+
 # --- Invariant: relationship extraction falls back to Finnhub's fuzzy
 # search when EDGAR's strict SEC-title match can't resolve a ticker ---
 

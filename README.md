@@ -132,7 +132,12 @@ exactly what should propagate to the smaller names via the relationship
 graph. See `src/smartboi/universe.py` for the full list and
 `SEED_RELATIONSHIPS` for the manually-seeded, well-documented edges
 (the rest are left for the extraction pipeline to find in actual filings
-rather than asserted as fact).
+rather than asserted as fact). `SEED_RELATIONSHIPS` only ever seeds an
+edge when BOTH companies are actually in the live universe -- a custom
+`SYMBOLS`/`ANCHOR_SYMBOLS` deployment that doesn't include these
+particular tickers gets none of this starter data; every edge in a
+custom universe comes from that universe's own filings instead (see
+`engine.py`'s `_seed_graph`).
 
 ### Bring your own universe
 

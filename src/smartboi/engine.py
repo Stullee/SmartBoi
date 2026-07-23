@@ -200,8 +200,19 @@ class Engine:
         log.warning(message)
 
     def _seed_graph(self) -> None:
+        """Seeds the well-documented DEFAULT_UNIVERSE relationships
+        (SEED_RELATIONSHIPS) -- but only the ones where BOTH companies are
+        actually in the live universe. A custom SYMBOLS/ANCHOR_SYMBOLS
+        deployment that doesn't include e.g. UCTT/AMAT must not have their
+        relationship silently seeded into its graph just because it's
+        hardcoded here; every edge in a custom universe should come from
+        that universe's own filings, same as any symbol accepted later via
+        the dashboard."""
+        known = set(self.symbol_list)
         now = datetime.now(timezone.utc).isoformat()
         for from_sym, to_sym, rel_type, description, confidence in SEED_RELATIONSHIPS:
+            if from_sym not in known or to_sym not in known:
+                continue
             self.graph.add(
                 Relationship(from_sym, to_sym, rel_type, description, "manual seed", confidence, now)
             )
