@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from smartboi.dossier import (
     Dossier,
     DossierStore,
@@ -175,7 +177,11 @@ def test_stale_evidence_excluded_from_aggregate():
     assert dossier.confidence == 0.0
     assert dossier.magnitude == 0.0
     assert dossier.independent_source_count == 0
-    assert dossier.direction == "LONG"  # direction itself doesn't revert on decay
+    # Mass-based resolution (see _side_mass): once the only evidence on a
+    # side goes stale, that side's mass drops to zero: with nothing on
+    # either side, direction resolves to NONE rather than staying "sticky"
+    # at LONG with 0 confidence, which would be a contradictory label.
+    assert dossier.direction == "NONE"
 
 
 def test_recompute_decay_fades_confidence_without_new_evidence():
@@ -198,3 +204,64 @@ def test_recompute_decay_is_a_noop_within_horizon():
 
     assert dossier.confidence == fresh_confidence
     assert dossier.magnitude == fresh_magnitude
+
+
+# --- Contestedness: opposing evidence discounts confidence (dossier.py's
+# _side_mass / mass-based direction resolution) ---
+
+def test_uncontested_evidence_is_unaffected():
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.8, source_name="a.com", evidence_id="e1"), now=NOW)
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.8, source_name="b.com", evidence_id="e2"), now=NOW)
+    # No opposing evidence at all -- contest factor is 1, confidence behaves
+    # exactly as the pre-contestedness formula (mean + corroboration bonus).
+    assert dossier.direction == "LONG"
+    assert dossier.confidence == pytest.approx(min(1.0, 0.8 + 0.1))
+
+
+def test_contested_evidence_partially_discounts_confidence():
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.8, source_name="a.com", evidence_id="e1"), now=NOW)
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.8, source_name="b.com", evidence_id="e2"), now=NOW)
+    uncontested_confidence = dossier.confidence
+
+    merge_evidence(dossier, _evidence(direction="SHORT", confidence=0.3, evidence_id="e3"), now=NOW)
+
+    assert dossier.direction == "LONG"  # opposing mass (0.3) well below agreeing mass (1.6)
+    assert 0.0 < dossier.confidence < uncontested_confidence
+
+
+def test_evenly_contested_evidence_zeroes_confidence():
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.7, evidence_id="e1"), now=NOW)
+    merge_evidence(dossier, _evidence(direction="SHORT", confidence=0.7, evidence_id="e2"), now=NOW)
+    # Exact tie in mass -- direction stays at whatever it already was
+    # (LONG, set by the first merge), but a 50/50 split is not a thesis:
+    # confidence is fully discounted to zero.
+    assert dossier.direction == "LONG"
+    assert dossier.confidence == 0.0
+
+
+def test_direction_flips_only_when_opposing_mass_exceeds_accumulated():
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.8, evidence_id="e1"), now=NOW)
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.8, evidence_id="e2"), now=NOW)
+    # Accumulated LONG mass = 1.6; a single SHORT item at 0.9 can't outvote
+    # an accumulated majority the way a single-item comparison could.
+    merge_evidence(dossier, _evidence(direction="SHORT", confidence=0.9, evidence_id="e3"), now=NOW)
+    assert dossier.direction == "LONG"
+
+
+def test_stale_opposition_does_not_discount_confidence():
+    dossier = Dossier(symbol="UCTT")
+    old_short = _evidence(
+        direction="SHORT", confidence=0.9, horizon_days=5, evidence_id="e_old_short",
+        published_at=(NOW - timedelta(days=100)).isoformat(),
+    )
+    merge_evidence(dossier, old_short, now=NOW)
+    merge_evidence(dossier, _evidence(direction="LONG", confidence=0.8, evidence_id="e_fresh_long"), now=NOW)
+    # old_short's horizon (5d) gives a 14-day stale cutoff (the floor); at
+    # 100 days old it's already excluded from mass entirely, so it must not
+    # discount the fresh LONG evidence's confidence at all.
+    assert dossier.direction == "LONG"
+    assert dossier.confidence == 0.8

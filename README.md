@@ -268,7 +268,66 @@ existed. The graph's own extracted relationship confidence (how directly a
 disclosed customer/supplier link connects two companies) is also now
 passed directly to both the dossier updater and the skeptic, instead of
 being left for them to re-infer purely from the relationship description's
-wording on every single evidence item.
+wording on every single evidence item. Filing text sent to the LLM is
+capped at 150,000 characters (`fetch_text`'s `max_chars` default) but no
+longer by a flat prefix truncation -- `edgar.py`'s `_truncate_head_tail`
+keeps roughly the
+first two-thirds and the last third of the document with a
+`[...document middle omitted...]` marker in between, since financial
+statement notes (where customer/supplier/segment disclosures concentrate)
+tend to sit near the end of a long filing and a prefix-only cut was
+silently starving the graph of exactly the evidence it needs.
+
+## Contested evidence
+
+A dossier's direction and confidence are no longer decided by comparing
+individual evidence items -- `dossier.py`'s `_aggregate` sums decay-weighted
+mass separately for each side (`mass_agree` for whichever direction has
+more accumulated weight, `mass_opposing` for the other) and derives both
+fields from the totals:
+
+- **Direction** is whichever side carries more mass. A single strong item
+  no longer flips the thesis on its own if the accumulated opposing side
+  is heavier; conversely the direction does flip once new evidence tips
+  the balance, not just when it individually outweighs the single most
+  recent opposing item.
+- **Confidence** starts from the agreeing side's own strength (base
+  confidence plus a small corroboration bonus for multiple independent
+  agreeing sources, capped at 1.0), then gets discounted by how contested
+  the dossier is: `confidence *= max(0, 1 - mass_opposing / mass_agree)`.
+  Evenly split evidence (`mass_opposing == mass_agree`) zeroes confidence
+  out entirely -- a dossier that's just as bullish as it is bearish isn't
+  a real thesis yet. Stale opposing evidence (decayed to zero weight, see
+  Evidence time-decay above) stops discounting once it's aged out, exactly
+  like it stops corroborating.
+
+Both totals are surfaced on the dashboard's dossier table ("Mass (agree vs
+oppose)" column) so a low-confidence dossier's cause -- contested vs. just
+thin -- is visible at a glance instead of having to guess from the raw
+evidence log.
+
+## Forward-validation data capture
+
+Confidence/magnitude scores are worthless as a strategy signal until
+they're checked against what the market actually did afterward, and that
+check needs a time series that starts now -- a missed day can't be
+backfilled later. Two append-only logs capture that raw material at zero
+extra LLM cost, piggybacked on work the engine already does daily:
+
+- **`logs/dossier_snapshots.jsonl`** -- every dossier's direction,
+  confidence, magnitude, `confidence * magnitude` score, source count, and
+  status, once per day, unconditionally (even dossiers with no evidence
+  and no changes get a data point, so the resulting series has no gaps to
+  explain away). Written by `engine.py`'s `_run_daily_snapshot`, piggybacked
+  on the existing daily decay pass. See `status.py`'s `snapshot_dossier`.
+- **`logs/price_marks.jsonl`** -- a daily closing-ish price for every
+  tradeable (non-anchor) universe symbol, piggybacked on the existing 6h IB
+  price poll. Written by `engine.py`'s `_run_daily_price_marks`.
+
+Joining the two by symbol/date is what a later offline analysis (per-
+ecosystem benchmarks, a counterfactual ledger for signals the confidence
+threshold skipped) will run against -- not built yet, deliberately
+sequenced after the engine has real test coverage (see Running the tests).
 
 ## Setup
 
@@ -350,9 +409,21 @@ pip install -r requirements.txt
 pytest
 ```
 
-Tests cover dedup fingerprinting, the relationship graph, dossier evidence
-merging, signal threshold evaluation, and the paper trade journal -- all
-pure logic, none require a live EDGAR/Finnhub/Anthropic/IB connection.
+Most tests cover dedup fingerprinting, the relationship graph, dossier
+evidence merging, signal threshold evaluation, and the paper trade journal
+-- all pure logic, none require a live EDGAR/Finnhub/Anthropic/IB
+connection.
+
+`tests/test_engine.py` covers the engine loop itself, wired to scripted
+fakes (`tests/fakes.py` -- plain classes with queued canned responses, no
+mocking framework) instead of real API clients: the retry/registration
+semantics around a deferred LLM call, the propagation cooldown's
+definitive-only recording, and the full signal -> snapshot -> open -> close
+-> reset lifecycle. Runs isolated in a `tmp_path` so it never touches this
+repo's real `data/`/`logs/` directories or makes a network/LLM call.
+
+CI (`.github/workflows/ci.yml`) runs the full suite on every push to `main`
+and every pull request.
 
 ## Known limitations / possible next steps
 

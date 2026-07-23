@@ -90,6 +90,21 @@ class FilingEvent:
         return f"https://www.sec.gov/Archives/edgar/data/{int(self.cik10)}/{accession_nodash}/"
 
 
+def _truncate_head_tail(text: str, max_chars: int) -> str:
+    """Head + tail truncation instead of a flat prefix: most of the budget
+    from the front, a meaningful slice from the back, joined with a marker
+    showing where the middle was dropped. Used for filing text where the
+    highest-value content (financial statement notes) often sits near the
+    end of a long document -- see EdgarClient.fetch_text. A no-op (returns
+    text unchanged) when it already fits."""
+    if len(text) <= max_chars:
+        return text
+    marker = " [...document middle omitted...] "
+    head_chars = (max_chars - len(marker)) * 2 // 3
+    tail_chars = max_chars - len(marker) - head_chars
+    return text[:head_chars] + marker + text[-tail_chars:]
+
+
 def _form4_value(node, tag: str) -> str:
     """Text of `<tag><value>x</value></tag>` (or bare `<tag>x</tag>`) under
     `node` -- html.parser lowercases tags, so `tag` must be lowercase."""
@@ -357,18 +372,21 @@ class EdgarClient:
         context/cost regardless of the source document's actual length.
 
         150k chars (~35-40k tokens) rather than a tighter cap: a modern
-        10-K's extracted text commonly runs 300k-800k chars, and the
-        quantitative customer-concentration disclosures relationship
-        extraction actually wants ("Customer X accounted for 22% of
-        revenue") usually sit in the notes to financial statements near the
-        END of the document, not the front matter -- a much tighter
-        front-truncation was plausibly extracting mostly boilerplate and
-        missing the highest-value content. This only costs more on the
-        relatively rare extraction path (10-K/10-Q, annual/quarterly, plus
-        the one-time backfill): the per-evidence dossier-update path
-        (engine.py) re-truncates to 4000 chars regardless of what this
-        returns, so raising this does NOT increase the high-frequency
-        per-article cost the daily LLM call budget is guarding against."""
+        10-K's extracted text commonly runs 300k-800k chars. Even so, taken
+        from the FRONT alone this still cuts off well before the notes to
+        financial statements where the quantitative customer-concentration
+        disclosures relationship extraction actually wants ("Customer X
+        accounted for 22% of revenue") usually sit, for anything much past
+        150k chars -- so this takes HEAD + TAIL instead of a flat prefix:
+        most of the budget from the front (Item 1 business description,
+        MD&A) and a meaningful slice from the back (financial statement
+        notes), joined with a marker showing where the middle was dropped.
+        This only costs more on the relatively rare extraction path
+        (10-K/10-Q, annual/quarterly, plus the one-time backfill): the
+        per-evidence dossier-update path (engine.py) re-truncates to 4000
+        chars regardless of what this returns, so raising this does NOT
+        increase the high-frequency per-article cost the daily LLM call
+        budget is guarding against."""
         try:
             response = await self._throttled_get(filing.document_url)
         except httpx.HTTPError as exc:
@@ -381,7 +399,7 @@ class EdgarClient:
         else:
             text = response.text
         text = re.sub(r"\s+", " ", text).strip()
-        return text[:max_chars]
+        return _truncate_head_tail(text, max_chars)
 
     async def aclose(self) -> None:
         await self._client.aclose()

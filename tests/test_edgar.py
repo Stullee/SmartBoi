@@ -132,3 +132,31 @@ async def test_find_ticker_by_name_no_match_returns_none(tmp_path):
         assert ticker is None
     finally:
         await client.aclose()
+
+
+# --- Head+tail truncation ---
+
+from smartboi.edgar import _truncate_head_tail
+
+
+def test_truncate_head_tail_noop_when_already_fits():
+    assert _truncate_head_tail("short text", 1000) == "short text"
+
+
+def test_truncate_head_tail_keeps_front_and_back():
+    text = "HEAD" + ("x" * 1000) + "TAIL"
+    result = _truncate_head_tail(text, 100)
+    assert result.startswith("HEAD")
+    assert result.endswith("TAIL")
+    assert "[...document middle omitted...]" in result
+    assert len(result) <= 100
+
+
+def test_truncate_head_tail_respects_budget_ratio():
+    text = "A" * 10000
+    result = _truncate_head_tail(text, 150)
+    marker = " [...document middle omitted...] "
+    head, _, tail = result.partition(marker)
+    # 2:1 head:tail split of the budget.
+    assert len(head) > len(tail)
+    assert len(result) <= 150

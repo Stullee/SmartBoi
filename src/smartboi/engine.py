@@ -50,6 +50,7 @@ from smartboi.ratelimit import SlidingWindowLimiter
 from smartboi.signals import evaluate, favorable_drift_pct, log_signal, signal_expired
 from smartboi.skeptic import Skeptic
 from smartboi.state import JsonState
+from smartboi.status import snapshot_dossier
 from smartboi.universe import SEED_RELATIONSHIPS, CompanySpec, spec_by_symbol
 from smartboi.universe_screen import screen_universe
 from smartboi.usage import UsageTracker
@@ -67,6 +68,12 @@ IB_RETRY_GAP_SEC = 900
 # Evidence time-decay is a slow-moving correction, not a live signal --
 # recomputing it once a day is plenty (see _run_decay_pass).
 DECAY_PASS_INTERVAL_SEC = 86400
+# Daily dossier-score snapshot and daily price marks (see _run_daily_snapshot
+# / _run_daily_price_marks): the raw material for validating whether
+# confidence*magnitude predicts forward returns. Forward data can't be
+# backfilled, so this starts accruing from day one regardless of when the
+# analysis side of that question gets built.
+DAILY_SNAPSHOT_INTERVAL_SEC = 86400
 # Filing forms run through relationship extraction, in addition to feeding
 # the dossier engine as direct evidence -- 8-Ks and Form 4s are event-driven
 # and rarely restate customer/supplier relationships, so extraction time is
@@ -140,6 +147,8 @@ class Engine:
         self._last_news_poll: float | None = None
         self._last_price_poll: float | None = None
         self._last_decay_pass: float | None = None
+        self._last_daily_snapshot: float | None = None
+        self._last_price_marks: float | None = None
         self._dashboard_task: asyncio.Task | None = None
         self._closing = False
 
@@ -339,6 +348,11 @@ class Engine:
             if await self.price_feed.ensure_connected():
                 self._last_price_poll = now
                 await self._mark_and_execute()
+                # Piggybacked on this same (already-connected) price poll
+                # rather than a separate cadence -- see _run_daily_price_marks.
+                if self._due(self._last_price_marks, DAILY_SNAPSHOT_INTERVAL_SEC, now):
+                    self._last_price_marks = now
+                    await self._run_daily_price_marks()
             else:
                 self._warn_once(
                     "ib-unreachable",
@@ -356,6 +370,9 @@ class Engine:
         if self._due(self._last_decay_pass, DECAY_PASS_INTERVAL_SEC, now):
             self._last_decay_pass = now
             self._run_decay_pass()
+        if self._due(self._last_daily_snapshot, DAILY_SNAPSHOT_INTERVAL_SEC, now):
+            self._last_daily_snapshot = now
+            self._run_daily_snapshot()
 
     def _universe_screen_due(self) -> bool:
         """Scheduled off the PERSISTED last-screen timestamp (wall clock),
@@ -946,6 +963,49 @@ class Engine:
                     self._expire_signal(dossier, "evidence decayed below the signal threshold before an entry was confirmed")
                     continue
             self.dossiers.save(dossier)
+
+    # --- Forward-validation capture (Phase A): daily dossier score
+    # snapshots and daily price marks, the raw material for eventually
+    # asking "does confidence*magnitude predict forward returns" across
+    # every dossier, every day -- not just the handful that become paper
+    # trades. Deliberately capture-only: no analysis happens here, and
+    # nothing here is gated on ANTHROPIC_API_KEY/IB being configured at
+    # all except price marks needing a live price to mark. Forward data
+    # can't be backfilled, so this starts accruing from day one. ---
+
+    def _run_daily_snapshot(self) -> None:
+        """Appends every dossier's current score to
+        logs/dossier_snapshots.jsonl, once a day, unconditionally (even a
+        dossier with zero evidence gets a real score=0 row) -- see
+        status.py's snapshot_dossier. No LLM/API cost: pure reads of
+        already-persisted dossier state."""
+        snapshotted_at = datetime.now(timezone.utc).isoformat()
+        path = Path(self.settings.log_dir) / "dossier_snapshots.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            for symbol in self.dossiers.all_symbols():
+                dossier = self.dossiers.load(symbol)
+                f.write(json.dumps(snapshot_dossier(dossier, snapshotted_at)) + "\n")
+
+    async def _run_daily_price_marks(self) -> None:
+        """Appends every TRADEABLE symbol's last price to
+        logs/price_marks.jsonl, once a day -- not just symbols with an open
+        paper trade (_mark_and_execute already marks those every price
+        poll for P&L purposes; this is a separate, broader capture for
+        later joining against dossier_snapshots.jsonl by symbol/date).
+        Only runs when the price feed is enabled and reachable -- piggybacks
+        on an already-connected poll rather than opening a new connection
+        cadence."""
+        symbols = [c.symbol for c in self.universe if not c.signal_source_only]
+        if not symbols:
+            return
+        prices = await self.price_feed.last_prices(symbols)
+        marked_at = datetime.now(timezone.utc).isoformat()
+        path = Path(self.settings.log_dir) / "price_marks.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            for symbol, price in prices.items():
+                f.write(json.dumps({"marked_at": marked_at, "symbol": symbol, "price": price}) + "\n")
 
     # --- Universe auto-screen ---
 

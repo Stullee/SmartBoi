@@ -62,6 +62,13 @@ class Dossier:
     signaled_price: float | None = None
     signaled_direction: str = ""
     drift_alert_sent: bool = False
+    # Decay-weighted evidence mass for/against the resolved direction, as
+    # of the last _aggregate call (see dossier.py's _side_mass) -- exposed
+    # so the dashboard can show WHY a confidence is low: a small agreeing
+    # mass with a large opposing mass is a genuinely contested thesis, not
+    # a data problem. mass_opposing == 0 means confidence is undiscounted.
+    mass_agree: float = 0.0
+    mass_opposing: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -158,44 +165,99 @@ def evidence_weight(record: EvidenceRecord, now: datetime) -> float:
     return 1.0 - fraction * (1.0 - _DECAY_FLOOR)
 
 
-def _aggregate(dossier: Dossier, now: datetime) -> None:
-    """Recomputes confidence/magnitude/horizon_days/independent_source_count
-    from dossier.evidence as of `now`, applying time-decay -- called both
-    right after a new evidence item is merged AND periodically with no new
-    evidence (engine.py's daily decay pass), so a dormant dossier's
-    confidence keeps fading even when nothing new happens to land on it.
+def _side_mass(dossier: Dossier, direction: str, now: datetime) -> float:
+    """Decay-weighted evidence mass for one side (LONG or SHORT): the sum
+    of confidence*weight over all non-stale evidence on that side, across
+    the dossier's ENTIRE history -- not just evidence agreeing with
+    whatever the dossier's direction currently happens to be. This is the
+    basis for both direction resolution and the contestedness discount in
+    _aggregate; NONE-direction evidence never contributes to either side."""
+    return sum(
+        e.confidence * evidence_weight(e, now)
+        for e in dossier.evidence
+        if e.direction == direction and not evidence_is_stale(e, now)
+    )
 
-    `independent_source_count` only counts evidence agreeing with the
-    dossier's RESOLVED direction that ISN'T stale. Distinct source_name
-    values are genuinely independent evidence, never the same fact
-    double-counted: for news, dedup.py guarantees distinct names are
-    different publisher domains, not syndicated republishes of one wire
-    story; for EDGAR, engine.py differentiates by filing form ("SEC EDGAR
-    (8-K)" vs "(Form 4)" vs "(10-Q)") since a material event, an insider
-    transaction, and a quarterly filing are independent disclosures, not
-    restatements of each other. Confidence is the mean of each agreeing item's
-    OWN confidence scaled by its own decay weight -- scaling before
-    averaging, not weighting the average itself, matters: a weighted mean
-    is scale-invariant when there's a single item (the weight cancels), so
-    a lone aging item would never fade if the weight were only applied as
-    an averaging factor. Boosted for corroboration from distinct sources
-    and capped at 1.0. Magnitude takes the max of each agreeing item's
+
+def _aggregate(dossier: Dossier, now: datetime) -> None:
+    """Recomputes direction/confidence/magnitude/horizon_days/
+    independent_source_count from dossier.evidence as of `now`, applying
+    time-decay -- called both right after a new evidence item is merged
+    AND periodically with no new evidence (engine.py's daily decay pass),
+    so a dormant dossier's confidence keeps fading even when nothing new
+    happens to land on it.
+
+    Direction and confidence are both resolved from ACCUMULATED evidence
+    mass (see _side_mass), not decided by comparing one new record against
+    the current aggregate: W_long/W_short are the decay-weighted sum of
+    confidence over all non-stale LONG/SHORT evidence respectively.
+    Direction is whichever side has the larger mass -- so a single strong
+    contrary item can no longer instantly flip direction and erase an
+    accumulated majority side the way a single-item comparison would; a
+    new side only wins once its own accumulated mass actually exceeds the
+    old side's. On an exact tie with nonzero mass on both sides, direction
+    is left unchanged (avoids churn from a razor-thin new balance); a tie
+    at zero mass (no evidence, or all of it decayed to stale) resolves to
+    NONE.
+
+    Once direction is resolved, confidence is the usual decay-weighted,
+    corroboration-boosted confidence of the winning side, further
+    multiplied by max(0, 1 - W_opposing / W_agreeing): a contested dossier
+    is discounted proportionally to how much opposing mass exists, a 50/50
+    split zeroes confidence entirely (the honest read of a genuinely
+    contested thesis), and no opposition at all leaves it unchanged
+    (factor = 1). `independent_source_count` only counts winning-side
+    evidence that isn't stale. Distinct source_name values are genuinely
+    independent evidence, never the same fact double-counted: for news,
+    dedup.py guarantees distinct names are different publisher domains,
+    not syndicated republishes of one wire story; for EDGAR, engine.py
+    differentiates by filing form ("SEC EDGAR (8-K)" vs "(Form 4)" vs
+    "(10-Q)") since a material event, an insider transaction, and a
+    quarterly filing are independent disclosures, not restatements of each
+    other. Confidence is the mean of each agreeing item's OWN confidence
+    scaled by its own decay weight -- scaling before averaging, not
+    weighting the average itself, matters: a weighted mean is scale-
+    invariant when there's a single item (the weight cancels), so a lone
+    aging item would never fade if the weight were only applied as an
+    averaging factor. Magnitude takes the max of each agreeing item's
     magnitude scaled the same way, and horizon_days their plain mean."""
+    w_long = _side_mass(dossier, "LONG", now)
+    w_short = _side_mass(dossier, "SHORT", now)
+
+    if w_long > w_short:
+        dossier.direction = "LONG"
+    elif w_short > w_long:
+        dossier.direction = "SHORT"
+    elif w_long == 0.0:
+        dossier.direction = "NONE"
+    # else: a genuine tie with nonzero mass on both sides -- keep whatever
+    # direction the dossier already had (falls through, no assignment).
+
+    if dossier.direction not in ("LONG", "SHORT"):
+        dossier.independent_source_count = 0
+        dossier.confidence = 0.0
+        dossier.magnitude = 0.0
+        dossier.mass_agree = 0.0
+        dossier.mass_opposing = 0.0
+        return
+
     agreeing = [
         e for e in dossier.evidence
         if e.direction == dossier.direction and not evidence_is_stale(e, now)
     ]
-    if dossier.direction == "NONE" or not agreeing:
-        dossier.independent_source_count = 0
-        dossier.confidence = 0.0
-        dossier.magnitude = 0.0
-        return
-
     weighted = [(e, evidence_weight(e, now)) for e in agreeing]
     dossier.independent_source_count = len({e.source_name for e in agreeing})
     base_confidence = sum(e.confidence * w for e, w in weighted) / len(weighted)
     corroboration_bonus = 0.1 * max(0, dossier.independent_source_count - 1)
-    dossier.confidence = min(1.0, base_confidence + corroboration_bonus)
+    raw_confidence = min(1.0, base_confidence + corroboration_bonus)
+
+    w_agree = w_long if dossier.direction == "LONG" else w_short
+    w_opposing = w_short if dossier.direction == "LONG" else w_long
+    contest_factor = max(0.0, 1.0 - w_opposing / w_agree)  # w_agree > 0 is guaranteed here
+    dossier.confidence = raw_confidence * contest_factor
+    dossier.mass_agree = w_agree
+    dossier.mass_opposing = w_opposing
+
     dossier.magnitude = max(e.magnitude * w for e, w in weighted)
     dossier.horizon_days = round(sum(e.horizon_days for e in agreeing) / len(agreeing))
     # The last few agreeing items' reasoning, not just the single latest --
@@ -219,19 +281,12 @@ def recompute_decay(dossier: Dossier, now: datetime | None = None) -> None:
 
 def merge_evidence(dossier: Dossier, record: EvidenceRecord, now: datetime | None = None) -> None:
     """Folds one accepted (post-skeptic) evidence record into the dossier's
-    aggregate state (see _aggregate for the actual aggregation/decay math).
-
-    Direction only changes when the new record's confidence beats the
-    existing aggregate -- a single weak item can't flip a thesis built on
-    stronger evidence."""
+    aggregate state. Direction and confidence are both fully resolved
+    inside _aggregate from the dossier's ACCUMULATED evidence mass, not
+    decided here by comparing this one new record against the current
+    aggregate -- see _aggregate's docstring for why that matters."""
     now = now or datetime.now(timezone.utc)
     dossier.evidence.append(record)
-
-    if record.direction != "NONE" and (
-        dossier.direction == "NONE" or record.confidence >= dossier.confidence
-    ):
-        dossier.direction = record.direction
-
     _aggregate(dossier, now)
     dossier.updated_at = now.isoformat()
 

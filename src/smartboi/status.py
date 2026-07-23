@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from smartboi.dossier import DossierStore
+from smartboi.dossier import Dossier, DossierStore
 from smartboi.graph import RelationshipGraph
 
 
@@ -40,6 +40,8 @@ def gather_dossiers(store: DossierStore) -> list[dict]:
                 "updated_at": d.updated_at,
                 "signaled_at": d.signaled_at,
                 "signaled_price": d.signaled_price,
+                "mass_agree": round(d.mass_agree, 3),
+                "mass_opposing": round(d.mass_opposing, 3),
             }
         )
     rows.sort(key=lambda r: (r["confidence"] * r["magnitude"]), reverse=True)
@@ -106,6 +108,27 @@ def gather_universe_candidates(candidates: dict, accepted: dict) -> list[dict]:
         rows.append(row)
     rows.sort(key=lambda c: c.get("seen_count", 0), reverse=True)
     return rows
+
+
+def snapshot_dossier(d: Dossier, snapshotted_at: str) -> dict:
+    """One row for the daily dossier-snapshot log (logs/dossier_snapshots.jsonl,
+    see engine.py's _run_daily_snapshot) -- the raw material for eventually
+    validating whether confidence*magnitude predicts forward returns,
+    joined by symbol/date against logs/price_marks.jsonl. Captures every
+    dossier once a day regardless of whether anything actually changed
+    that day, so the resulting time series has no gaps to explain away --
+    forward data can't be backfilled once a day is missed, so this is
+    deliberately unconditional rather than only logging on a change."""
+    return {
+        "snapshotted_at": snapshotted_at,
+        "symbol": d.symbol,
+        "direction": d.direction,
+        "confidence": round(d.confidence, 4),
+        "magnitude": round(d.magnitude, 4),
+        "score": round(d.confidence * d.magnitude, 4),
+        "independent_source_count": d.independent_source_count,
+        "status": d.status,
+    }
 
 
 def gather_usage(snapshot) -> dict:

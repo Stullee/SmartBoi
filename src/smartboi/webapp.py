@@ -96,14 +96,17 @@ function renderCapabilities(c) {
 function renderDossiers(rows) {
   if (!rows.length) return '<div class="empty">No dossiers yet.</div>';
   var body = rows.map(function(d) {
+    var contested = d.mass_opposing > 0
+      ? '<span class="warn" title="Opposing evidence mass -- discounts confidence">' + fmt(d.mass_agree, 2) + ' vs ' + fmt(d.mass_opposing, 2) + '</span>'
+      : (d.mass_agree > 0 ? fmt(d.mass_agree, 2) : "-");
     return "<tr><td><b>" + d.symbol + "</b></td><td>" + badge(d.direction) + "</td><td>" +
       fmt(d.confidence) + "</td><td>" + fmt(d.magnitude) + "</td><td>" + d.horizon_days + "d</td><td>" +
-      d.independent_source_count + "</td><td>" + d.evidence_count + "</td><td>" + esc(d.status) + "</td><td>" +
+      d.independent_source_count + "</td><td>" + contested + "</td><td>" + d.evidence_count + "</td><td>" + esc(d.status) + "</td><td>" +
       (d.signaled_price != null ? "$" + fmt(d.signaled_price) + " @ " + (d.signaled_at || "").slice(0, 10) : "-") +
       "</td><td style='max-width:32rem'>" + esc(d.thesis_summary) + "</td></tr>";
   }).join("");
   return "<table><tr><th>Symbol</th><th>Dir</th><th>Confidence</th><th>Magnitude</th><th>Horizon</th>" +
-    "<th>Sources</th><th>Evidence</th><th>Status</th><th>Signaled @</th><th>Thesis</th></tr>" + body + "</table>";
+    "<th>Sources</th><th>Mass (agree vs oppose)</th><th>Evidence</th><th>Status</th><th>Signaled @</th><th>Thesis</th></tr>" + body + "</table>";
 }
 
 function renderPaperTrades(rows, openTrades) {
