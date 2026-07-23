@@ -98,8 +98,11 @@ class Settings(BaseSettings):
 
     # --- Evidence / signal thresholds ---
     # A dossier signals once confidence * magnitude clears this bar AND has
-    # at least min_independent_sources distinct-domain corroborating items
-    # (dedup.py already collapses syndicated republishes to one source).
+    # at least min_independent_sources independent corroborating items --
+    # distinct publisher domains for news (dedup.py already collapses
+    # syndicated republishes of one wire story to a single source), distinct
+    # filing types for EDGAR (an 8-K, a Form 4, and a 10-Q each count
+    # separately -- independent disclosures, not restatements of each other).
     signal_confidence_threshold: float = 0.65
     min_independent_sources: int = 2
     max_horizon_days: int = 56  # ~8 weeks, the top of README's 2-8 week holding window

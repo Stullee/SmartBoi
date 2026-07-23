@@ -393,7 +393,16 @@ class Engine:
             origin_symbol=symbol,
             evidence_text=evidence_text,
             source_type=filing.form,
-            source_name="SEC EDGAR",
+            # Differentiated by FORM TYPE, not left as a flat "SEC EDGAR" --
+            # independent_source_count (dossier.py) counts distinct
+            # source_name values, so a company's 8-K, Form 4, and 10-Q are
+            # genuinely independent disclosures (a material event, an
+            # insider transaction, a quarterly filing are not the same fact
+            # restated) and deserve to count as separate corroborating
+            # sources. Left at form-type granularity rather than per-filing:
+            # two 8-Ks close together are more likely the same unfolding
+            # story than two truly independent confirmations.
+            source_name=f"SEC EDGAR ({filing.form})",
             url=filing.document_url,
             headline=f"{symbol} {filing.form} filed {filing.filing_date}",
             published_at=filing.filing_date,

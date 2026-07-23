@@ -25,7 +25,7 @@ DIRECTIONS = ("LONG", "SHORT", "NONE")
 class EvidenceRecord:
     evidence_id: str
     source_type: str  # "news" | "8-K" | "10-K" | "10-Q" | "4"
-    source_name: str  # publisher/domain, or "SEC EDGAR"
+    source_name: str  # publisher/domain, or "SEC EDGAR (<form>)" e.g. "SEC EDGAR (8-K)"
     url: str
     headline: str
     published_at: str
@@ -165,9 +165,14 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     confidence keeps fading even when nothing new happens to land on it.
 
     `independent_source_count` only counts evidence agreeing with the
-    dossier's RESOLVED direction that ISN'T stale (dedup.py guarantees
-    distinct source names are genuinely different domains, never
-    syndicated republishes). Confidence is the mean of each agreeing item's
+    dossier's RESOLVED direction that ISN'T stale. Distinct source_name
+    values are genuinely independent evidence, never the same fact
+    double-counted: for news, dedup.py guarantees distinct names are
+    different publisher domains, not syndicated republishes of one wire
+    story; for EDGAR, engine.py differentiates by filing form ("SEC EDGAR
+    (8-K)" vs "(Form 4)" vs "(10-Q)") since a material event, an insider
+    transaction, and a quarterly filing are independent disclosures, not
+    restatements of each other. Confidence is the mean of each agreeing item's
     OWN confidence scaled by its own decay weight -- scaling before
     averaging, not weighting the average itself, matters: a weighted mean
     is scale-invariant when there's a single item (the weight cancels), so
