@@ -14,11 +14,14 @@ from datetime import datetime, timezone
 
 import httpx
 
+from smartboi.edgar import normalize_company_name
+
 log = logging.getLogger(__name__)
 
 _NEWS_URL = "https://finnhub.io/api/v1/company-news"
 _PROFILE_URL = "https://finnhub.io/api/v1/stock/profile2"
 _RECOMMENDATION_URL = "https://finnhub.io/api/v1/stock/recommendation"
+_SEARCH_URL = "https://finnhub.io/api/v1/search"
 
 # Finnhub's free tier allows 60 requests/minute -- a ~40-symbol universe
 # polled as a burst blows through that partway in and 429s the rest of the
@@ -45,6 +48,29 @@ class NewsArticle:
     source: str
     url: str
     published_at: str  # ISO datetime, UTC
+
+
+def _best_search_match(results: list[dict], normalized_query: str) -> str | None:
+    """First /search result whose own name plausibly matches the query --
+    Finnhub's relevance ranking on an unconstrained free-text query can't
+    be trusted blindly, so this is a real filter, not a formality. Skips
+    anything without a plain US ticker (a "." in the symbol means a
+    foreign-exchange listing, e.g. "005930.KS") or that isn't a common
+    stock (ETFs, indices, OTC junk that shows up in the same search)."""
+    for row in results:
+        symbol = row.get("symbol") or ""
+        if not symbol or "." in symbol or row.get("type") != "Common Stock":
+            continue
+        normalized_result = normalize_company_name(row.get("description") or "")
+        if not normalized_result:
+            continue
+        if (
+            normalized_result == normalized_query
+            or normalized_result.startswith(normalized_query + " ")
+            or normalized_query.startswith(normalized_result + " ")
+        ):
+            return symbol.upper()
+    return None
 
 
 def _epoch_to_iso(epoch: int | None) -> str:
@@ -104,6 +130,25 @@ class FinnhubClient:
                 )
             )
         return articles
+
+    async def search_ticker_by_name(self, company_name: str) -> str | None:
+        """Fuzzy company-name -> US ticker fallback for when EdgarClient.
+        find_ticker_by_name's exact/prefix match against SEC's own
+        registered filer TITLE misses -- e.g. brand-name-vs-legal-name
+        mismatches ("Google" vs "Alphabet Inc") or common abbreviations
+        ("IBM" vs "International Business Machines Corp") that a strict
+        SEC-title match can't catch. Finnhub's /search is the same fuzzy,
+        brand-aware lookup its own autocomplete uses -- free tier, no extra
+        integration or cost beyond one more throttled request."""
+        normalized_query = normalize_company_name(company_name)
+        if not normalized_query:
+            return None
+        try:
+            response = await self._throttled_get(_SEARCH_URL, {"q": company_name})
+        except httpx.HTTPError as exc:
+            log.warning("Ticker search failed for %r: %s", company_name, redact_token(exc))
+            return None
+        return _best_search_match(response.json().get("result", []), normalized_query)
 
     async def market_cap_musd(self, symbol: str) -> float | None:
         try:

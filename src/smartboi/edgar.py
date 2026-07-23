@@ -33,7 +33,7 @@ _REQUEST_GAP_SEC = 0.3
 _CIK_CACHE_MAX_AGE = timedelta(days=7)
 
 # Legal-entity suffixes stripped when matching a filing's free-text company
-# name against SEC's registered title (see _normalize_company_name) --
+# name against SEC's registered title (see normalize_company_name) --
 # filing text rarely spells out a counterparty's full registered name
 # ("ASML" vs "ASML Holding N.V."), so matching on the stripped core name is
 # what makes the lookup useful at all.
@@ -122,7 +122,7 @@ def _fmt_shares(raw: str) -> str:
         return raw
 
 
-def _normalize_company_name(name: str) -> str:
+def normalize_company_name(name: str) -> str:
     """Lowercased, punctuation-stripped, legal-suffix-stripped core of a
     company name -- "ASML Holding N.V." and "ASML" both normalize toward
     "asml" (a leading/trailing suffix strip in each direction), which is
@@ -249,7 +249,7 @@ class EdgarClient:
             ticker_map = {row["ticker"].upper(): str(row["cik_str"]).zfill(10) for row in raw.values()}
             name_map = {}
             for row in raw.values():
-                normalized = _normalize_company_name(row.get("title", ""))
+                normalized = normalize_company_name(row.get("title", ""))
                 if normalized:
                     name_map.setdefault(normalized, row["ticker"].upper())
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -282,7 +282,7 @@ class EdgarClient:
         and generic entity descriptions never resolve, which is correct --
         there is no ticker to find."""
         _, name_map = await self._ticker_map()
-        normalized = _normalize_company_name(company_name)
+        normalized = normalize_company_name(company_name)
         if not normalized:
             return None
         if normalized in name_map:

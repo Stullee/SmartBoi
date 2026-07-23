@@ -36,6 +36,7 @@ class FakeEdgarClient:
 class FakeFinnhub:
     def __init__(self):
         self.articles_by_symbol: dict[str, list] = {}
+        self.ticker_by_name: dict[str, str] = {}
 
     async def recent_news(self, symbol, from_date, to_date):
         return self.articles_by_symbol.get(symbol, [])
@@ -45,6 +46,9 @@ class FakeFinnhub:
 
     async def analyst_count(self, symbol):
         return None
+
+    async def search_ticker_by_name(self, company_name):
+        return self.ticker_by_name.get(company_name)
 
     async def aclose(self):
         pass

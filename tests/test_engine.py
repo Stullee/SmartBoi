@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from smartboi.config import Settings
+from smartboi.edgar import FilingEvent
 from smartboi.engine import Engine
 from smartboi.graph import Relationship
 
@@ -48,6 +49,29 @@ def engine(tmp_path, monkeypatch):
     e.skeptic = FakeSkeptic()
     e.price_feed = FakePriceFeed()
     return e
+
+
+# --- Invariant: relationship extraction falls back to Finnhub's fuzzy
+# search when EDGAR's strict SEC-title match can't resolve a ticker ---
+
+async def test_relationship_extraction_falls_back_to_finnhub_search(engine):
+    filing = FilingEvent(
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000001", primary_document="form.htm",
+    )
+    engine.extractor.default = [{
+        "counterparty_name": "Some Uncommon Co", "counterparty_ticker": None,
+        "rel_type": "customer", "description": "our largest customer, Some Uncommon Co",
+        "confidence": 0.9, "quote": "our largest customer, Some Uncommon Co",
+    }]
+    # FakeEdgarClient.find_ticker_by_name always returns None -- the fallback
+    # is the only path that can resolve this one.
+    engine.finnhub.ticker_by_name["Some Uncommon Co"] = "ZZZZ"
+
+    await engine._extract_relationships("FORM", filing, "filing text")
+
+    candidates = list(engine.candidates.data.values())
+    assert any(c.get("ticker") == "ZZZZ" for c in candidates)
 
 
 # --- Invariant: evidence is registered only on definitive handling ---

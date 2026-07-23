@@ -153,13 +153,20 @@ When a filing discloses a relationship to a company OUTSIDE the universe,
 it's recorded as a **universe candidate** (`data/universe_candidates.json`,
 shown on the dashboard, webhook-alerted on first discovery) -- a proposal
 for you to review, never auto-added. If the model didn't recognize the
-counterparty's ticker, `EdgarClient.find_ticker_by_name` tries to resolve
-one from SEC's own filer list before giving up (matching on a normalized
-name, so "ASML" matches the registered "ASML Holding N.V.") -- this is
-what makes most real public companies show up with a ticker instead of
-"no ticker found." Government bodies, regulators, and generic customer-
-class descriptions ("public utilities") are filtered out entirely rather
-than shown as an unactionable dead end (see engine.py's
+counterparty's ticker, resolution falls back through two tiers before
+giving up: `EdgarClient.find_ticker_by_name` matches a normalized name
+against SEC's own registered filer list ("ASML" matches the registered
+"ASML Holding N.V."), and when that strict match misses --
+brand-name-vs-legal-name mismatches ("Google" vs "Alphabet Inc"),
+abbreviations ("IBM" vs "International Business Machines Corp"), anything
+not phrased close to the SEC filer's exact title -- `FinnhubClient.
+search_ticker_by_name` tries Finnhub's own fuzzy/brand-aware `/search`
+endpoint (free tier, no extra integration). Both are best-effort and
+US-listed-SEC-filer-or-Finnhub-covered only: private companies and
+foreign issuers that don't file with the SEC or trade in the US genuinely
+have no ticker to find. Government bodies, regulators, and generic
+customer-class descriptions ("public utilities") are filtered out
+entirely rather than shown as an unactionable dead end (see engine.py's
 `_NON_COMPANY_KEYWORDS` -- only ever applied after ticker resolution has
 already failed, so a real resolved candidate is never hidden by it).
 
@@ -170,7 +177,11 @@ cycle, not a value fixed at startup. Persisted in
 `data/accepted_candidates.json`, so it survives a restart without ever
 touching `SYMBOLS`/`ANCHOR_SYMBOLS` by hand (those still work too, if you
 prefer static config). A candidate that never resolved to a ticker has no
-button -- there's nothing to add without one.
+button -- there's nothing to add without one. The candidate list sorts
+addable candidates (resolved ticker, not yet accepted) first, so the ones
+actually worth a decision aren't buried under a long tail of
+unresolved-ticker or already-added entries -- see `status.py`'s
+`gather_universe_candidates`.
 
 ## Entry timing: are we too late?
 

@@ -455,7 +455,14 @@ class Engine:
                 # A regulator (government body, agency) can never be a
                 # ticker -- skip resolution and don't clutter candidates
                 # with something that will never be actionable.
-                resolved = await self.edgar_client.find_ticker_by_name(rel.get("counterparty_name") or "")
+                name = rel.get("counterparty_name") or ""
+                resolved = await self.edgar_client.find_ticker_by_name(name)
+                if not resolved:
+                    # SEC's own filer title is often a legal name a filing
+                    # never uses ("Alphabet Inc" vs "Google") -- Finnhub's
+                    # fuzzy, brand-aware search catches most of what the
+                    # strict SEC-title match misses.
+                    resolved = await self.finnhub.search_ticker_by_name(name)
                 if resolved:
                     ticker = resolved
             if not ticker or ticker not in known:
@@ -493,8 +500,9 @@ class Engine:
         first time each one is discovered. Deliberately never auto-added:
         whether a name belongs is an editorial judgment (same reasoning as
         the prune-only auto-screen). `resolved_ticker` is set when the
-        model didn't supply one but EdgarClient.find_ticker_by_name found a
-        match -- candidates are keyed by ticker when one exists (so the
+        model didn't supply one but EdgarClient.find_ticker_by_name or
+        FinnhubClient.search_ticker_by_name found a match -- candidates are
+        keyed by ticker when one exists (so the
         dashboard's Accept button has something to act on), by name
         otherwise. Regulators and names matching an obvious non-company
         pattern (government bodies, generic customer-class descriptions,

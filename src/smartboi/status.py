@@ -95,18 +95,26 @@ def gather_recent_signals(log_path: Path, limit: int = 25) -> list[dict]:
     return _read_jsonl(log_path)[-limit:]
 
 
+def _is_addable(c: dict) -> bool:
+    return bool(c.get("ticker")) and not c.get("accepted_as")
+
+
 def gather_universe_candidates(candidates: dict, accepted: dict) -> list[dict]:
     """Companies outside the universe that filings disclosed relationships
-    to (see engine._record_universe_candidate) -- most-corroborated first,
-    for human review. Annotated with `accepted_as` when the dashboard's
-    Accept button (or SYMBOLS/ANCHOR_SYMBOLS) has already added this
-    ticker, so the UI can show its state instead of an Accept button."""
+    to (see engine._record_universe_candidate), for human review.
+    Annotated with `accepted_as` when the dashboard's Accept button (or
+    SYMBOLS/ANCHOR_SYMBOLS) has already added this ticker, so the UI can
+    show its state instead of an Accept button. Sorted addable candidates
+    first (a resolved ticker, not yet accepted -- there's actually
+    something to click), then everything else -- both groups
+    most-corroborated first -- so the entries that need a decision aren't
+    buried under a long tail of unresolved/already-added ones."""
     rows = []
     for key, c in candidates.items():
         row = dict(c)
         row["accepted_as"] = accepted.get(row.get("ticker") or key)
         rows.append(row)
-    rows.sort(key=lambda c: c.get("seen_count", 0), reverse=True)
+    rows.sort(key=lambda c: (0 if _is_addable(c) else 1, -c.get("seen_count", 0)))
     return rows
 
 

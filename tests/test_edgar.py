@@ -76,18 +76,18 @@ def test_raw_document_url_strips_xsl_rendering_prefix():
 
 import json
 
-from smartboi.edgar import EdgarClient, _normalize_company_name
+from smartboi.edgar import EdgarClient, normalize_company_name
 
 
 def test_normalize_company_name_strips_legal_suffixes():
-    assert _normalize_company_name("ASML Holding N.V.") == "asml"
-    assert _normalize_company_name("The Boeing Company") == "boeing"
-    assert _normalize_company_name("Applied Materials, Inc.") == "applied materials"
+    assert normalize_company_name("ASML Holding N.V.") == "asml"
+    assert normalize_company_name("The Boeing Company") == "boeing"
+    assert normalize_company_name("Applied Materials, Inc.") == "applied materials"
 
 
 def test_normalize_company_name_handles_plain_names():
-    assert _normalize_company_name("ASML") == "asml"
-    assert _normalize_company_name("") == ""
+    assert normalize_company_name("ASML") == "asml"
+    assert normalize_company_name("") == ""
 
 
 async def _seed_cache(tmp_path, tickers_and_titles):
@@ -95,7 +95,7 @@ async def _seed_cache(tmp_path, tickers_and_titles):
     ticker_map = {t.upper(): "0000000001" for t, _ in tickers_and_titles}
     name_map = {}
     for ticker, title in tickers_and_titles:
-        name_map[_normalize_company_name(title)] = ticker.upper()
+        name_map[normalize_company_name(title)] = ticker.upper()
     cache_path.write_text(json.dumps({
         "fetched_at": "2026-07-22T00:00:00+00:00",
         "map": ticker_map,
