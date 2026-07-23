@@ -114,6 +114,15 @@ class Engine:
             settings.max_propagated_evidence_per_link,
             settings.propagated_evidence_cooldown_hours * 3600,
         )
+        # Caches a dossier-update proposal (evidence_id -> proposed dict)
+        # between the propose_update call and the skeptic call, so that if
+        # the skeptic call is deferred by an exhausted daily LLM call budget
+        # (see usage.py), the retry on a later poll doesn't re-pay for
+        # propose_update -- it already has the answer, it just needs the
+        # skeptic's verdict. In-memory only: on a restart the worst case is
+        # falling back to today's behavior (re-propose from scratch), never
+        # a new failure mode, so this doesn't need to survive a restart.
+        self._pending_proposals: dict[str, dict] = {}
 
         self.edgar_client: EdgarClient | None = None
         self.finnhub: FinnhubClient | None = None
@@ -619,11 +628,15 @@ class Engine:
             return False  # collected but not scoreable yet -- retried once a key is configured
 
         universe = set(self.symbol_list)
-        targets: list[tuple[str, str]] = []  # (target_symbol, relationship_note)
+        # (target_symbol, relationship_note, relationship_confidence) --
+        # confidence is the graph edge's own extracted confidence (None for
+        # direct/non-propagated evidence, which has no edge at all).
+        targets: list[tuple[str, str, float | None]] = []
+        propagation_keys: dict[str, str] = {}  # target_symbol -> limiter key, propagated targets only
 
         origin_spec = self.spec_by_symbol.get(origin_symbol)
         if origin_spec is None or not origin_spec.signal_source_only:
-            targets.append((origin_symbol, ""))
+            targets.append((origin_symbol, "", None))
 
         now = time.monotonic()
         throttled = 0
@@ -638,10 +651,17 @@ class Engine:
             # SAME target even when the causal link keeps getting refused for
             # the same reason. Direct evidence (target == origin, handled
             # above) is never throttled -- only fan-out to OTHER dossiers.
-            if not self._propagation_limiter.allow(f"{origin_symbol}->{linked_symbol}", now):
+            # Pre-filter with would_allow (read-only) rather than allow(): the
+            # slot is only actually consumed (record, below) once this
+            # target's processing DEFINITIVELY completes, so a deferred/
+            # retried attempt (budget exhaustion, transient failure) doesn't
+            # burn a second slot for what's the same underlying evidence.
+            key = f"{origin_symbol}->{linked_symbol}"
+            if not self._propagation_limiter.would_allow(key, now):
                 throttled += 1
                 continue
-            targets.append((linked_symbol, rel.description))
+            propagation_keys[linked_symbol] = key
+            targets.append((linked_symbol, rel.description, rel.confidence))
         if throttled:
             self._warn_once(
                 f"throttled:{origin_symbol}",
@@ -653,11 +673,13 @@ class Engine:
             )
 
         all_definitive = True
-        for target_symbol, relationship_note in targets:
+        for target_symbol, relationship_note, relationship_confidence in targets:
             definitive = await self._update_dossier(
-                target_symbol, evidence_text, origin_symbol, relationship_note,
+                target_symbol, evidence_text, origin_symbol, relationship_note, relationship_confidence,
                 source_type, source_name, url, headline, published_at,
             )
+            if definitive and target_symbol in propagation_keys:
+                self._propagation_limiter.record(propagation_keys[target_symbol], now)
             all_definitive = all_definitive and definitive
         return all_definitive
 
@@ -667,6 +689,7 @@ class Engine:
         evidence_text: str,
         origin_symbol: str,
         relationship_note: str,
+        relationship_confidence: float | None,
         source_type: str,
         source_name: str,
         url: str,
@@ -682,15 +705,27 @@ class Engine:
         if has_evidence(dossier, evidence_id):
             return True  # already merged on an earlier, partially-failed pass
 
-        proposed = await self.updater.propose_update(dossier, evidence_text, origin_symbol, relationship_note)
+        # Cache the proposal across a budget-deferred skeptic call: without
+        # this, deferring at the skeptic step (verdict is None, below) would
+        # otherwise mean the RETRY re-pays for propose_update from scratch
+        # even though nothing about the proposal changed -- it's the exact
+        # same evidence, just waiting for the skeptic's turn.
+        proposal_key = f"{target_symbol}:{evidence_id}"
+        proposed = self._pending_proposals.get(proposal_key)
         if proposed is None:
-            return False  # transient LLM failure or budget exhausted -- retry this evidence later
-        if not proposed.get("is_new_information"):
-            return True
+            proposed = await self.updater.propose_update(
+                dossier, evidence_text, origin_symbol, relationship_note, relationship_confidence
+            )
+            if proposed is None:
+                return False  # transient LLM failure or budget exhausted -- retry this evidence later
+            if not proposed.get("is_new_information"):
+                return True
+            self._pending_proposals[proposal_key] = proposed
 
-        verdict = await self.skeptic.review(evidence_text, proposed, relationship_note)
+        verdict = await self.skeptic.review(evidence_text, proposed, relationship_note, relationship_confidence)
         if verdict is None:
             return False  # transient LLM failure or budget exhausted -- retry this evidence later
+        self._pending_proposals.pop(proposal_key, None)
         if verdict.get("refuted"):
             log.info("%s: evidence refuted by skeptic (%s)", target_symbol, verdict.get("reasoning", ""))
             return True
@@ -705,6 +740,7 @@ class Engine:
             origin_symbol=origin_symbol,
             is_propagated=(target_symbol != origin_symbol),
             relationship_note=relationship_note,
+            relationship_confidence=relationship_confidence,
             direction=proposed["direction"],
             magnitude=float(verdict.get("adjusted_magnitude", proposed["magnitude"])),
             confidence=float(verdict.get("adjusted_confidence", proposed["confidence"])),

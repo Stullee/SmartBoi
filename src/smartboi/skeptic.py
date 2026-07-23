@@ -103,7 +103,9 @@ _SYSTEM_PROMPT = (
     "size; (2) is the proposed magnitude/confidence proportionate to how DIRECTLY the "
     "disclosed relationship connects the two companies (a named customer representing a "
     "stated revenue concentration deserves more weight than a vague thematic/sector-exposure "
-    "framing) -- when the origin fact IS real but the size is too large for how weak or "
+    "framing) -- when given the relationship's own extracted confidence number, weigh your "
+    "proportionality judgment against it directly rather than only re-inferring directness from "
+    "the note's wording each time; when the origin fact IS real but the size is too large for how weak or "
     "generic the disclosed relationship actually is, do NOT refute this case: instead accept "
     "it (refuted=false) with adjusted_magnitude scaled down to something proportionate to the "
     "relationship's actual strength. A real fact filtered through a loose relationship is "
@@ -128,7 +130,10 @@ class Skeptic:
         self._model = model
         self._usage = usage
 
-    async def review(self, evidence_text: str, proposed: dict, relationship_note: str = "") -> dict | None:
+    async def review(
+        self, evidence_text: str, proposed: dict, relationship_note: str = "",
+        relationship_confidence: float | None = None,
+    ) -> dict | None:
         """Returns the verdict dict, or None on a transient API failure OR
         an exhausted daily LLM call budget (usage.py) -- the caller
         (engine.py) then leaves the evidence unregistered so a later poll
@@ -140,12 +145,20 @@ class Skeptic:
         (see graph.py), passed through UNFILTERED rather than relying on
         the dossier updater's paraphrase of it -- lets the skeptic judge
         how directly the relationship actually connects the two companies
-        (see _SYSTEM_PROMPT point 2) from the original extracted text."""
+        (see _SYSTEM_PROMPT point 2) from the original extracted text.
+        `relationship_confidence` is that same edge's own numeric confidence
+        (extraction time), given directly rather than left for the skeptic
+        to re-infer proportionality purely from the wording of the note
+        every time."""
         if not self._usage.budget_remaining():
             log.info("Daily LLM call budget reached -- deferring skeptic review.")
             return None
+        confidence_suffix = (
+            f" [relationship confidence: {relationship_confidence:.2f}]" if relationship_confidence is not None else ""
+        )
         relationship_line = (
-            f"Disclosed relationship (verified from a filing, not asserted by the proposer): {relationship_note}\n"
+            f"Disclosed relationship (verified from a filing, not asserted by the proposer): "
+            f"{relationship_note}{confidence_suffix}\n"
             if relationship_note
             else "This evidence is about the company directly (not propagated).\n"
         )

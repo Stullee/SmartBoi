@@ -351,12 +351,24 @@ class EdgarClient:
             log.warning("%s: Form 4 %s did not parse -- falling back to plain text.", filing.symbol, filing.accession_number)
         return await self.fetch_text(filing)
 
-    async def fetch_text(self, filing: FilingEvent, max_chars: int = 40_000) -> str:
+    async def fetch_text(self, filing: FilingEvent, max_chars: int = 150_000) -> str:
         """Plain-text extraction of a filing's primary document, truncated --
-        LLM extraction only needs the substantive body (customer/supplier
-        mentions, item descriptions), not exhibits/boilerplate, and a hard
-        cap keeps one filing from dominating an extraction call's context/
-        cost regardless of the source document's actual length."""
+        a hard cap keeps one filing from dominating an extraction call's
+        context/cost regardless of the source document's actual length.
+
+        150k chars (~35-40k tokens) rather than a tighter cap: a modern
+        10-K's extracted text commonly runs 300k-800k chars, and the
+        quantitative customer-concentration disclosures relationship
+        extraction actually wants ("Customer X accounted for 22% of
+        revenue") usually sit in the notes to financial statements near the
+        END of the document, not the front matter -- a much tighter
+        front-truncation was plausibly extracting mostly boilerplate and
+        missing the highest-value content. This only costs more on the
+        relatively rare extraction path (10-K/10-Q, annual/quarterly, plus
+        the one-time backfill): the per-evidence dossier-update path
+        (engine.py) re-truncates to 4000 chars regardless of what this
+        returns, so raising this does NOT increase the high-frequency
+        per-article cost the daily LLM call budget is guarding against."""
         try:
             response = await self._throttled_get(filing.document_url)
         except httpx.HTTPError as exc:

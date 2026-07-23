@@ -244,6 +244,32 @@ Also worth tuning down if spend matters more than freshness:
 `NEWS_POLL_INTERVAL_SEC` (default 3600 -- this strategy holds positions for
 weeks, so 15-minute freshness was pure waste) and `EDGAR_POLL_INTERVAL_SEC`.
 
+The propagation cooldown no longer double-charges on a retry: it now only
+consumes a slot once a target's evidence is DEFINITIVELY handled (merged,
+refused, or judged not-new), not on every attempt -- a budget-deferred or
+transient-failure retry re-checks the same slot instead of burning a second
+one for what's the same underlying evidence. Similarly, a dossier-update
+proposal that pays for `propose_update` but then has its skeptic call
+deferred by the budget is now cached in memory and reused on retry instead
+of being re-proposed (and re-paid for) from scratch.
+
+## Corroboration
+
+`MIN_INDEPENDENT_SOURCES` counts genuinely independent evidence, not just
+distinct API calls: for news, `dedup.py` collapses syndicated republishes
+of one wire story to a single publisher domain; for SEC filings, each
+filing TYPE counts separately (`"SEC EDGAR (8-K)"`, `"SEC EDGAR (Form 4)"`,
+`"SEC EDGAR (10-Q)"`, ...) rather than every filing collapsing onto one
+flat `"SEC EDGAR"` source -- a material event, an insider transaction, and
+a quarterly filing are independent disclosures, not restatements of each
+other, and previously a filing-heavy dossier could never satisfy the
+corroboration bar from EDGAR evidence alone no matter how much of it
+existed. The graph's own extracted relationship confidence (how directly a
+disclosed customer/supplier link connects two companies) is also now
+passed directly to both the dossier updater and the skeptic, instead of
+being left for them to re-infer purely from the relationship description's
+wording on every single evidence item.
+
 ## Setup
 
 ```bash

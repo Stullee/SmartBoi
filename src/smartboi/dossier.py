@@ -38,6 +38,7 @@ class EvidenceRecord:
     horizon_days: int
     reasoning: str
     skeptic_note: str
+    relationship_confidence: float | None = None  # the graph edge's own extracted confidence; None when not propagated
 
 
 @dataclass
@@ -197,7 +198,14 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     dossier.confidence = min(1.0, base_confidence + corroboration_bonus)
     dossier.magnitude = max(e.magnitude * w for e, w in weighted)
     dossier.horizon_days = round(sum(e.horizon_days for e in agreeing) / len(agreeing))
-    dossier.thesis_summary = agreeing[-1].reasoning
+    # The last few agreeing items' reasoning, not just the single latest --
+    # a one-sentence blurb from only the newest item is a thin "current
+    # thesis" to feed back into the updater's prompt (see
+    # DossierUpdater.propose_update) when several items have actually
+    # accumulated; this gives it more of the accumulated picture at
+    # basically no extra cost (no new LLM call, just joining text already
+    # on hand).
+    dossier.thesis_summary = " | ".join(e.reasoning for e in agreeing[-3:])
 
 
 def recompute_decay(dossier: Dossier, now: datetime | None = None) -> None:
@@ -280,7 +288,8 @@ class DossierUpdater:
         self._usage = usage
 
     async def propose_update(
-        self, dossier: Dossier, evidence_text: str, origin_symbol: str, relationship_note: str
+        self, dossier: Dossier, evidence_text: str, origin_symbol: str, relationship_note: str,
+        relationship_confidence: float | None = None,
     ) -> dict | None:
         if not self._usage.budget_remaining():
             log.info("%s: daily LLM call budget reached -- deferring dossier update.", dossier.symbol)
@@ -291,9 +300,15 @@ class DossierUpdater:
             if dossier.evidence
             else "No existing thesis -- this is the first evidence item for this company."
         )
+        relationship_confidence_note = (
+            f" (the relationship itself is disclosed with confidence {relationship_confidence:.2f}, "
+            "extracted from a filing -- weigh how directly it connects the two companies)"
+            if relationship_confidence is not None
+            else ""
+        )
         propagation = (
             f"This evidence is about a LINKED company ({origin_symbol}), not {dossier.symbol} "
-            f"directly. Relationship: {relationship_note}"
+            f"directly. Relationship: {relationship_note}{relationship_confidence_note}"
             if relationship_note
             else f"This evidence is about {dossier.symbol} directly."
         )

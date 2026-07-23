@@ -15,15 +15,36 @@ class SlidingWindowLimiter:
         self.window_sec = window_sec
         self._events: dict[str, list[float]] = defaultdict(list)
 
-    def allow(self, key: str, now: float) -> bool:
-        """True (and records the event) if fewer than max_events have
-        occurred for `key` within the trailing window_sec as of `now`;
-        False (no-op, nothing recorded) once the cap is already reached."""
+    def _prune(self, key: str, now: float) -> list[float]:
         history = self._events[key]
         cutoff = now - self.window_sec
         while history and history[0] < cutoff:
             history.pop(0)
-        if len(history) >= self.max_events:
+        return history
+
+    def would_allow(self, key: str, now: float) -> bool:
+        """Read-only check: would an event for `key` be allowed right now,
+        without recording anything. Use this to pre-filter BEFORE doing
+        expensive work, then call `record` only once that work has
+        definitively completed -- otherwise a retried attempt (the earlier
+        one deferred by a transient failure or budget exhaustion) burns a
+        second slot for what is, from the caller's perspective, the same
+        underlying event, not a new one."""
+        return len(self._prune(key, now)) < self.max_events
+
+    def record(self, key: str, now: float) -> None:
+        """Commits one event for `key` at `now`, unconditionally -- pair
+        with a prior `would_allow` check; does not itself enforce the cap."""
+        self._events[key].append(now)
+
+    def allow(self, key: str, now: float) -> bool:
+        """Convenience check-and-record in one call: True (and records the
+        event) if fewer than max_events have occurred for `key` within the
+        trailing window_sec as of `now`; False (no-op) once the cap is
+        already reached. Use `would_allow`/`record` separately instead when
+        the caller needs to defer recording until an attempt actually
+        succeeds (see engine.py's propagation cooldown)."""
+        if not self.would_allow(key, now):
             return False
-        history.append(now)
+        self.record(key, now)
         return True
