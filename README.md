@@ -183,10 +183,32 @@ cycle, not a value fixed at startup. Persisted in
 touching `SYMBOLS`/`ANCHOR_SYMBOLS` by hand (those still work too, if you
 prefer static config). A candidate that never resolved to a ticker has no
 button -- there's nothing to add without one. The candidate list sorts
-addable candidates (resolved ticker, not yet accepted) first, so the ones
-actually worth a decision aren't buried under a long tail of
-unresolved-ticker or already-added entries -- see `status.py`'s
-`gather_universe_candidates`.
+addable candidates (resolved ticker, not yet accepted) first, and collapses
+still-unresolved ones behind a "N candidate(s) with no resolved ticker"
+disclosure instead of listing them inline, so the ones actually worth a
+decision aren't buried under a long tail of unresolved-ticker or
+already-added entries -- see `status.py`'s `gather_universe_candidates`.
+
+Ticker resolution for a name-keyed candidate isn't a one-shot attempt: once
+a day, `engine.py`'s `_run_candidate_ticker_recheck` retries every
+still-unresolved candidate through both tiers again -- catches ones
+discovered before the Finnhub fallback existed, or where SEC's ticker map
+has since caught up with a new listing (a fresh IPO, a name that changed).
+A candidate that resolves on recheck is moved from its name key to its
+ticker key, merging into an existing ticker-keyed entry (seen count,
+related-to list, etc. all combined) if a separate filing had already
+discovered the same company with a ticker in the meantime -- nothing is
+ever silently duplicated or lost. The same daily pass also suggests
+"tradeable" vs "anchor" for every resolved-but-not-yet-accepted candidate,
+from its market cap/analyst count against the exact same small/mid-cap
+thin-coverage bounds the universe auto-screen applies to existing members
+(`UNIVERSE_MIN_MARKET_CAP_MUSD`/`UNIVERSE_MAX_MARKET_CAP_MUSD`/
+`UNIVERSE_MAX_ANALYST_COUNT`) -- a big, heavily-covered name gets
+recommended as an anchor (news source, matching what it deliberately looks
+like), a small/mid-cap thinly-covered one as tradeable. Shown as a bolded
+Accept button on the dashboard, with the reason on hover -- a hint, not a
+guarantee; you always get the final call. See
+`universe_screen.recommend_candidate_type`.
 
 ## Entry timing: are we too late?
 

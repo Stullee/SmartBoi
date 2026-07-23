@@ -10,6 +10,7 @@ class FakeEdgarClient:
         self.filings_by_symbol: dict[str, list] = {}
         self.text_by_accession: dict[str, str] = {}
         self.latest_filings: dict[tuple[str, str], object] = {}
+        self.ticker_by_name: dict[str, str] = {}
 
     async def cik_for(self, symbol):
         return "0000000001"
@@ -27,7 +28,7 @@ class FakeEdgarClient:
         return self.text_by_accession.get(filing.accession_number, "")
 
     async def find_ticker_by_name(self, name):
-        return None
+        return self.ticker_by_name.get(name)
 
     async def aclose(self):
         pass
@@ -37,15 +38,17 @@ class FakeFinnhub:
     def __init__(self):
         self.articles_by_symbol: dict[str, list] = {}
         self.ticker_by_name: dict[str, str] = {}
+        self.market_cap_by_symbol: dict[str, float] = {}
+        self.analyst_count_by_symbol: dict[str, int] = {}
 
     async def recent_news(self, symbol, from_date, to_date):
         return self.articles_by_symbol.get(symbol, [])
 
     async def market_cap_musd(self, symbol):
-        return None
+        return self.market_cap_by_symbol.get(symbol)
 
     async def analyst_count(self, symbol):
-        return None
+        return self.analyst_count_by_symbol.get(symbol)
 
     async def search_ticker_by_name(self, company_name):
         return self.ticker_by_name.get(company_name)

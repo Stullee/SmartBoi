@@ -52,7 +52,7 @@ from smartboi.skeptic import Skeptic
 from smartboi.state import JsonState
 from smartboi.status import snapshot_dossier
 from smartboi.universe import SEED_RELATIONSHIPS, CompanySpec, spec_by_symbol
-from smartboi.universe_screen import screen_universe
+from smartboi.universe_screen import recommend_candidate_type, screen_universe
 from smartboi.usage import UsageTracker
 from smartboi.webapp import run_dashboard
 
@@ -74,6 +74,12 @@ DECAY_PASS_INTERVAL_SEC = 86400
 # backfilled, so this starts accruing from day one regardless of when the
 # analysis side of that question gets built.
 DAILY_SNAPSHOT_INTERVAL_SEC = 86400
+# How often already-discovered, still-ticker-less universe candidates get
+# another resolution attempt (see _run_candidate_ticker_recheck) -- daily is
+# plenty for something that only changes when SEC's ticker map gains a new
+# listing or a name happens to now match Finnhub's fuzzy search; there's no
+# reason to burn API calls checking more often than that.
+CANDIDATE_RECHECK_INTERVAL_SEC = 86400
 # Filing forms run through relationship extraction, in addition to feeding
 # the dossier engine as direct evidence -- 8-Ks and Form 4s are event-driven
 # and rarely restate customer/supplier relationships, so extraction time is
@@ -149,6 +155,7 @@ class Engine:
         self._last_decay_pass: float | None = None
         self._last_daily_snapshot: float | None = None
         self._last_price_marks: float | None = None
+        self._last_candidate_recheck: float | None = None
         self._dashboard_task: asyncio.Task | None = None
         self._closing = False
 
@@ -384,6 +391,12 @@ class Engine:
         if self._due(self._last_daily_snapshot, DAILY_SNAPSHOT_INTERVAL_SEC, now):
             self._last_daily_snapshot = now
             self._run_daily_snapshot()
+        if (
+            self.edgar_client is not None
+            and self._due(self._last_candidate_recheck, CANDIDATE_RECHECK_INTERVAL_SEC, now)
+        ):
+            self._last_candidate_recheck = now
+            await self._run_candidate_ticker_recheck()
 
     def _universe_screen_due(self) -> bool:
         """Scheduled off the PERSISTED last-screen timestamp (wall clock),
@@ -530,6 +543,18 @@ class Engine:
         now = datetime.now(timezone.utc).isoformat()
         entry = self.candidates.get(key)
         is_new = entry is None
+        if is_new and ticker:
+            # A previous pass (before a ticker resolved) may have already
+            # stored this same company under its name key -- merge into
+            # that history instead of starting a fresh seen_count/sources
+            # trail and leaving the old entry as an orphaned duplicate.
+            orphan_key = name.upper()
+            orphan = self.candidates.get(orphan_key) if orphan_key != key else None
+            if orphan is not None:
+                entry = orphan
+                entry["ticker"] = ticker
+                is_new = False
+                self.candidates.delete(orphan_key)
         if is_new:
             entry = {
                 "name": name, "ticker": ticker,
@@ -562,6 +587,69 @@ class Engine:
                    if ticker else "No ticker could be resolved -- likely private or not SEC-listed."),
                 entry,
             )
+
+    async def _run_candidate_ticker_recheck(self) -> None:
+        """Daily housekeeping pass over already-discovered universe
+        candidates (see CANDIDATE_RECHECK_INTERVAL_SEC), two parts:
+
+        1. Retries ticker resolution (EdgarClient.find_ticker_by_name, then
+           FinnhubClient.search_ticker_by_name) for every candidate that
+           still has no ticker -- catches ones discovered before the
+           Finnhub fallback existed, or where SEC's ticker map has since
+           caught up with a new listing. A newly-resolved candidate is
+           re-keyed from its name key to its ticker (merging into an
+           existing ticker-keyed entry if a separate discovery path
+           already created one), so it becomes addable on the dashboard
+           instead of stuck ticker-less forever.
+        2. For every ticker-having, not-yet-accepted candidate without a
+           recommendation yet, suggests "tradeable" vs "anchor" from its
+           market cap/analyst count -- see
+           universe_screen.recommend_candidate_type. A hint for which
+           Accept button to click, not a guarantee.
+
+        Both steps are free of LLM cost -- a cached EDGAR name-map lookup
+        plus a couple of throttled Finnhub calls per still-unresolved or
+        unrecommended candidate."""
+        for key, entry in list(self.candidates.data.items()):
+            ticker = entry.get("ticker") or ""
+            changed = False
+            if not ticker:
+                name = entry.get("name") or ""
+                if not name:
+                    continue
+                resolved = await self.edgar_client.find_ticker_by_name(name)
+                if not resolved and self.finnhub is not None:
+                    resolved = await self.finnhub.search_ticker_by_name(name)
+                if not resolved:
+                    continue
+                ticker = resolved
+                entry["ticker"] = ticker
+                existing = self.candidates.get(ticker)
+                if existing is not None:
+                    existing["seen_count"] = existing.get("seen_count", 0) + entry.get("seen_count", 0)
+                    existing["related_to"] = sorted(set(existing.get("related_to", [])) | set(entry.get("related_to", [])))
+                    existing["rel_types"] = sorted(set(existing.get("rel_types", [])) | set(entry.get("rel_types", [])))
+                    existing["last_seen_at"] = max(existing.get("last_seen_at", ""), entry.get("last_seen_at", ""))
+                    entry = existing
+                self.candidates.delete(key)
+                log.info("[CANDIDATE] %s: resolved ticker %s on recheck.", entry.get("name"), ticker)
+                changed = True
+
+            if self.finnhub is not None and not entry.get("recommended_as") and ticker not in self.accepted_candidates.data:
+                market_cap = await self.finnhub.market_cap_musd(ticker)
+                analysts = await self.finnhub.analyst_count(ticker)
+                recommendation, reason = recommend_candidate_type(
+                    market_cap, analysts,
+                    self.settings.universe_min_market_cap_musd,
+                    self.settings.universe_max_market_cap_musd,
+                    self.settings.universe_max_analyst_count,
+                )
+                entry["recommended_as"] = recommendation
+                entry["recommendation_reason"] = reason
+                changed = True
+
+            if changed:
+                self.candidates.set(ticker, entry)
 
     # --- One-time relationship backfill ---
 

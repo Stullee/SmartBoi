@@ -23,6 +23,14 @@ class JsonState:
 
     def set(self, key: str, value) -> None:
         self.data[key] = value
+        self._save()
+
+    def delete(self, key: str) -> None:
+        if key in self.data:
+            del self.data[key]
+            self._save()
+
+    def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data))

@@ -95,6 +95,131 @@ async def test_relationship_extraction_falls_back_to_finnhub_search(engine):
     assert any(c.get("ticker") == "ZZZZ" for c in candidates)
 
 
+async def test_second_discovery_with_a_resolved_ticker_merges_the_orphan(engine):
+    # First mention: no ticker resolves -- stored under the name key.
+    filing = FilingEvent(
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000001", primary_document="form.htm",
+    )
+    engine.extractor.default = [{
+        "counterparty_name": "Some Uncommon Co", "counterparty_ticker": None,
+        "rel_type": "customer", "description": "our largest customer, Some Uncommon Co",
+        "confidence": 0.9, "quote": "our largest customer, Some Uncommon Co",
+    }]
+    await engine._extract_relationships("FORM", filing, "filing text")
+    assert engine.candidates.get("SOME UNCOMMON CO") is not None
+
+    # Second mention (a different filing/symbol): this time a ticker
+    # resolves -- must merge into the ticker key, not orphan the first.
+    engine.extractor.default = [{
+        "counterparty_name": "Some Uncommon Co", "counterparty_ticker": "ZZZZ",
+        "rel_type": "supplier", "description": "our supplier, Some Uncommon Co",
+        "confidence": 0.8, "quote": "our supplier, Some Uncommon Co",
+    }]
+    await engine._extract_relationships("UCTT", filing, "filing text")
+
+    assert "SOME UNCOMMON CO" not in engine.candidates.data
+    merged = engine.candidates.get("ZZZZ")
+    assert merged is not None
+    assert merged["seen_count"] == 2
+    assert set(merged["related_to"]) == {"FORM", "UCTT"}
+
+
+# --- Invariant: the daily candidate recheck resolves tickers for
+# previously-unresolved candidates (re-keying name -> ticker, merging with
+# any existing ticker-keyed entry) and recommends tradeable/anchor ---
+
+def _seed_candidate(engine, key, **overrides):
+    entry = {
+        "name": "Some Uncommon Co", "ticker": "", "related_to": ["FORM"],
+        "rel_types": ["customer"], "description": "d", "sources": [],
+        "seen_count": 3, "first_seen_at": "2026-07-01T00:00:00+00:00",
+    }
+    entry.update(overrides)
+    engine.candidates.set(key, entry)
+    return entry
+
+
+async def test_candidate_recheck_resolves_via_edgar_and_rekeys(engine):
+    _seed_candidate(engine, "SOME UNCOMMON CO")
+    engine.edgar_client.ticker_by_name["Some Uncommon Co"] = "ZZZZ"
+
+    await engine._run_candidate_ticker_recheck()
+
+    assert "SOME UNCOMMON CO" not in engine.candidates.data
+    resolved = engine.candidates.get("ZZZZ")
+    assert resolved is not None
+    assert resolved["ticker"] == "ZZZZ"
+    assert resolved["seen_count"] == 3
+
+
+async def test_candidate_recheck_falls_back_to_finnhub(engine):
+    _seed_candidate(engine, "SOME UNCOMMON CO")
+    engine.finnhub.ticker_by_name["Some Uncommon Co"] = "ZZZZ"
+
+    await engine._run_candidate_ticker_recheck()
+
+    assert engine.candidates.get("ZZZZ")["ticker"] == "ZZZZ"
+
+
+async def test_candidate_recheck_merges_into_existing_ticker_keyed_entry(engine):
+    _seed_candidate(engine, "SOME UNCOMMON CO", seen_count=3, related_to=["FORM"])
+    engine.candidates.set("ZZZZ", {
+        "name": "Some Uncommon Co", "ticker": "ZZZZ", "related_to": ["UCTT"],
+        "rel_types": ["supplier"], "description": "d2", "sources": [],
+        "seen_count": 5, "first_seen_at": "2026-06-01T00:00:00+00:00",
+        "last_seen_at": "2026-06-01T00:00:00+00:00",
+    })
+    engine.edgar_client.ticker_by_name["Some Uncommon Co"] = "ZZZZ"
+
+    await engine._run_candidate_ticker_recheck()
+
+    assert "SOME UNCOMMON CO" not in engine.candidates.data
+    merged = engine.candidates.get("ZZZZ")
+    assert merged["seen_count"] == 8  # 3 + 5, no data lost from either discovery path
+    assert set(merged["related_to"]) == {"FORM", "UCTT"}
+
+
+async def test_candidate_recheck_leaves_unresolvable_candidates_alone(engine):
+    _seed_candidate(engine, "SOME UNCOMMON CO")
+
+    await engine._run_candidate_ticker_recheck()
+
+    assert engine.candidates.get("SOME UNCOMMON CO") is not None
+    assert engine.candidates.get("SOME UNCOMMON CO")["ticker"] == ""
+
+
+async def test_candidate_recheck_recommends_tradeable_for_small_cap(engine):
+    _seed_candidate(engine, "ZZZZ", ticker="ZZZZ", name="Small Cap Co")
+    engine.finnhub.market_cap_by_symbol["ZZZZ"] = 500.0
+    engine.finnhub.analyst_count_by_symbol["ZZZZ"] = 2
+
+    await engine._run_candidate_ticker_recheck()
+
+    entry = engine.candidates.get("ZZZZ")
+    assert entry["recommended_as"] == "tradeable"
+    assert entry["recommendation_reason"]
+
+
+async def test_candidate_recheck_recommends_anchor_for_large_cap(engine):
+    _seed_candidate(engine, "ZZZZ", ticker="ZZZZ", name="Giant Co")
+    engine.finnhub.market_cap_by_symbol["ZZZZ"] = 500_000.0
+
+    await engine._run_candidate_ticker_recheck()
+
+    assert engine.candidates.get("ZZZZ")["recommended_as"] == "anchor"
+
+
+async def test_candidate_recheck_skips_recommendation_for_accepted_candidates(engine):
+    _seed_candidate(engine, "ZZZZ", ticker="ZZZZ", name="Already Added Co")
+    engine.accepted_candidates.set("ZZZZ", "tradeable")
+    engine.finnhub.market_cap_by_symbol["ZZZZ"] = 500.0
+
+    await engine._run_candidate_ticker_recheck()
+
+    assert "recommended_as" not in engine.candidates.get("ZZZZ")
+
+
 # --- Invariant: evidence is registered only on definitive handling ---
 
 async def test_deferred_updater_is_not_definitive(engine):

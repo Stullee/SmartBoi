@@ -154,22 +154,39 @@ function renderSignals(rows) {
 function candidateAction(c) {
   if (!c.ticker) return '<span style="opacity:0.5">no ticker</span>';
   if (c.accepted_as) return '<span class="badge on">added: ' + esc(c.accepted_as) + '</span>';
-  return '<button class="accept-btn" data-symbol="' + esc(c.ticker) + '" data-as="tradeable">+ Tradeable</button> ' +
-    '<button class="accept-btn" data-symbol="' + esc(c.ticker) + '" data-as="anchor">+ Anchor</button>';
+  var reasonAttr = c.recommendation_reason ? ' title="' + esc(c.recommendation_reason) + '"' : '';
+  var tradeableBtn = '<button class="accept-btn" data-symbol="' + esc(c.ticker) + '" data-as="tradeable"' +
+    (c.recommended_as === "tradeable" ? ' style="font-weight:700"' + reasonAttr : '') + '>+ Tradeable</button>';
+  var anchorBtn = '<button class="accept-btn" data-symbol="' + esc(c.ticker) + '" data-as="anchor"' +
+    (c.recommended_as === "anchor" ? ' style="font-weight:700"' + reasonAttr : '') + '>+ Anchor</button>';
+  return tradeableBtn + ' ' + anchorBtn;
 }
 
-function renderCandidates(rows) {
-  if (!rows.length) return '<div class="empty">None discovered yet -- candidates appear as filings disclose relationships to companies outside the universe.</div>';
+function candidateTable(rows) {
   return "<table><tr><th>Name</th><th>Ticker</th><th>Related to</th><th>Type</th><th>Mentions</th><th>Description</th><th>Action</th></tr>" +
     rows.map(function(c) {
       return "<tr><td>" + esc(c.name) + "</td><td>" + esc(c.ticker || "?") + "</td><td>" +
         esc((c.related_to || []).join(", ")) + "</td><td>" + esc((c.rel_types || []).join(", ")) + "</td><td>" +
         (c.seen_count || 0) + "</td><td style='max-width:28rem'>" + esc(c.description) + "</td><td>" +
         candidateAction(c) + "</td></tr>";
-    }).join("") + "</table>" +
+    }).join("") + "</table>";
+}
+
+function renderCandidates(rows) {
+  if (!rows.length) return '<div class="empty">None discovered yet -- candidates appear as filings disclose relationships to companies outside the universe.</div>';
+  var actionable = rows.filter(function(c) { return c.ticker; });
+  var noTicker = rows.filter(function(c) { return !c.ticker; });
+  var html = actionable.length ? candidateTable(actionable) : '<div class="empty">No addable candidates yet -- see the list below.</div>';
+  if (noTicker.length) {
+    html += '<details style="margin-top:0.6rem"><summary style="cursor:pointer;opacity:0.7">' +
+      noTicker.length + ' candidate(s) with no resolved ticker (private companies, regulators, or names ' +
+      'not yet matched -- rechecked automatically once a day)</summary>' + candidateTable(noTicker) + '</details>';
+  }
+  return html +
     '<div class="empty">"+ Tradeable" adds it as a trade target; "+ Anchor" adds it purely as a news source (never traded). ' +
-    'Takes effect on the next poll, no restart needed. Candidates with no ticker resolved (private companies, ' +
-    'regulators, generic customer classes) can only be added manually via <b>symbols</b>/<b>anchor_symbols</b> if you have a ticker for them.</div>';
+    'Takes effect on the next poll, no restart needed. A bold button is the suggested choice from market cap/analyst ' +
+    'coverage -- hover it for why. Candidates with no ticker resolved can only be added manually via ' +
+    '<b>symbols</b>/<b>anchor_symbols</b> if you have a ticker for them.</div>';
 }
 
 function renderGraph(g) {

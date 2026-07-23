@@ -77,3 +77,34 @@ async def screen_universe(
             len(dropped), ", ".join(f"{r.symbol} ({r.reason})" for r in dropped),
         )
     return results
+
+
+def recommend_candidate_type(
+    market_cap_musd: float | None,
+    analyst_count: int | None,
+    min_market_cap_musd: float,
+    max_market_cap_musd: float,
+    max_analyst_count: int,
+) -> tuple[str, str]:
+    """Suggests "tradeable" or "anchor" for a resolved universe candidate --
+    a "which Accept button" hint on the dashboard, not a guarantee. Reuses
+    the exact same small/mid-cap thin-coverage bounds screen_universe
+    applies to existing members: a big, heavily-covered name is exactly
+    the profile this system treats as a news SOURCE (an anchor, never a
+    trade target); a small/mid-cap, thinly-covered name is exactly what it
+    looks for as a trade target. Returns ("unknown", reason) rather than
+    guessing when there isn't enough data to judge."""
+    if market_cap_musd is None:
+        return "unknown", "no market cap data available"
+    if market_cap_musd > max_market_cap_musd:
+        return "anchor", f"market cap ${market_cap_musd:.0f}M exceeds the tradeable ceiling of ${max_market_cap_musd:.0f}M"
+    if analyst_count is not None and analyst_count > max_analyst_count:
+        return "anchor", f"{analyst_count} analysts already cover it -- past the thin-coverage bound of {max_analyst_count}"
+    if market_cap_musd < min_market_cap_musd:
+        return (
+            "tradeable",
+            f"market cap ${market_cap_musd:.0f}M is below the usual floor of ${min_market_cap_musd:.0f}M -- "
+            "still tradeable, just smaller than the typical pick",
+        )
+    analyst_note = f"{analyst_count} analysts" if analyst_count is not None else "unknown analyst coverage"
+    return "tradeable", f"market cap ${market_cap_musd:.0f}M and {analyst_note} fit the small/mid-cap thin-coverage profile"
