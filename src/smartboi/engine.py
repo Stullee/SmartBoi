@@ -697,7 +697,7 @@ class Engine:
             is_propagated=(target_symbol != origin_symbol),
             relationship_note=relationship_note,
             direction=proposed["direction"],
-            magnitude=float(proposed["magnitude"]),
+            magnitude=float(verdict.get("adjusted_magnitude", proposed["magnitude"])),
             confidence=float(verdict.get("adjusted_confidence", proposed["confidence"])),
             horizon_days=int(proposed["horizon_days"]),
             reasoning=proposed["reasoning"],
@@ -705,6 +705,13 @@ class Engine:
         )
         merge_evidence(dossier, record)
         self.dossiers.save(dossier)
+        log.info(
+            "[EVIDENCE] %s: accepted %s magnitude=%.2f confidence=%.2f (dossier now: direction=%s "
+            "confidence=%.2f magnitude=%.2f sources=%d, status=%s)",
+            target_symbol, record.direction, record.magnitude, record.confidence,
+            dossier.direction, dossier.confidence, dossier.magnitude,
+            dossier.independent_source_count, dossier.status,
+        )
 
         signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources)
         if signal is not None:

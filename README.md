@@ -58,7 +58,12 @@ that specific inefficiency, not to race anyone on speed:
    never refuted merely for being unconfirmed/indirect, since that's the
    normal state of every piece of propagated evidence by definition and
    demanding otherwise would mean point 2 above could never produce a
-   signal. See `skeptic.py`.
+   signal. When the only problem is that the proposed size is too large
+   for how loosely the relationship is disclosed, the skeptic scales
+   `adjusted_magnitude` down and accepts it rather than refusing outright
+   -- a real fact through a weak relationship is still worth something,
+   just less than proposed, and refusing it outright would throw away
+   exactly the small, accumulating corroboration point 3 depends on.
 6. **Prune-only universe auto-screen** -- a monthly market-cap/analyst-
    coverage recheck flags tickers that no longer fit (acquired, delisted,
    graduated to broad coverage) instead of trusting a hardcoded list to

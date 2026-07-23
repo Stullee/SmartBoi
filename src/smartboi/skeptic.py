@@ -13,7 +13,15 @@ by definition, since the entire point of this strategy (README point 2) is
 trading the lag before the market connects a linked company's news to a
 second-order name. Demanding that confirmation up front before evidence
 counts would mean the propagation mechanism could structurally never
-produce a signal, regardless of how good the underlying pipeline is."""
+produce a signal, regardless of how good the underlying pipeline is.
+
+Also carries `adjusted_magnitude` alongside `adjusted_confidence` -- a
+second real-world run showed the recalibrated skeptic reasoning correctly
+(origin fact real, but proposed size too large for how loosely the
+relationship is disclosed) and then still refusing outright, because a
+too-large MAGNITUDE had no accept-but-shrink option, only accept-as-is or
+refuse. That forced good-but-oversized propagated evidence to be thrown
+away rather than scaled down and counted for what it's actually worth."""
 from __future__ import annotations
 
 import logging
@@ -36,13 +44,16 @@ _TOOL = {
                     "True if the evidence is generic/non-specific filler, promotional or "
                     "speculative language, old/already-priced-in news being treated as new, "
                     "a mechanical/non-discretionary event with no real signal (e.g. tax-"
-                    "withholding RSU vesting, a routine pre-planned 10b5-1 sale), OR -- for "
-                    "propagated evidence -- a magnitude/confidence disproportionate to how "
-                    "DIRECTLY the disclosed relationship actually connects the two companies. "
-                    "Being propagated (about a linked company rather than this one) or lacking "
-                    "confirmation that the second-order effect has already occurred is NOT by "
-                    "itself a reason to refute -- that is the normal, expected state of "
-                    "evidence this strategy is built to act on before the market catches up."
+                    "withholding RSU vesting, a routine pre-planned 10b5-1 sale), or reasoning "
+                    "that isn't actually specific to this company. Being propagated (about a "
+                    "linked company rather than this one) or lacking confirmation that the "
+                    "second-order effect has already occurred is NOT by itself a reason to "
+                    "refute -- that is the normal, expected state of evidence this strategy is "
+                    "built to act on before the market catches up. If the ONLY problem is that "
+                    "the proposed magnitude/confidence is too large for how loosely the "
+                    "disclosed relationship connects the two companies (the origin fact and "
+                    "reasoning are otherwise fine), do NOT refute -- set refuted=false and "
+                    "scale adjusted_magnitude/adjusted_confidence down instead."
                 ),
             },
             "reasoning": {"type": "string", "description": "One or two sentences."},
@@ -50,8 +61,20 @@ _TOOL = {
                 "type": "number", "minimum": 0, "maximum": 1,
                 "description": "Your own confidence in the proposed direction, which may be lower than the original proposal's.",
             },
+            "adjusted_magnitude": {
+                "type": "number", "minimum": 0, "maximum": 1,
+                "description": (
+                    "Your own view of the magnitude, which may be lower than the original proposal's. "
+                    "Use this -- accepting with a SMALLER magnitude, not refuted=true -- when the origin "
+                    "fact is real and the direction is right, but the proposed size is too large for how "
+                    "loosely/genericly the disclosed relationship actually connects the two companies. "
+                    "Refusing real-but-modest evidence outright throws away exactly the kind of small, "
+                    "accumulating corroboration this strategy is built to combine over time; scaling it "
+                    "down lets it count for what it's actually worth instead."
+                ),
+            },
         },
-        "required": ["refuted", "reasoning", "adjusted_confidence"],
+        "required": ["refuted", "reasoning", "adjusted_confidence", "adjusted_magnitude"],
     },
 }
 
@@ -76,17 +99,26 @@ _SYSTEM_PROMPT = (
     "Instead judge propagated evidence on: (1) is the ORIGIN news itself a concrete, specific "
     "fact (an actual order, contract, capacity change, guidance revision, disclosed financial "
     "figure) rather than generic sector sentiment, momentum-chasing, or analyst commentary "
-    "with no hard data -- refute the latter; (2) is the proposed magnitude/confidence "
-    "proportionate to how DIRECTLY the disclosed relationship connects the two companies (a "
-    "named customer representing a stated revenue concentration deserves more weight than a "
-    "vague thematic/sector-exposure framing) -- refute a magnitude/confidence too large for "
-    "how weak or generic the actual disclosed relationship is, even when the origin fact "
-    "itself is real; (3) is the reasoning actually specific to the target company, or could "
-    "it be pasted onto any company in the sector unchanged -- refute the latter.\n\n"
+    "with no hard data -- refute this case, it has nothing real underneath it regardless of "
+    "size; (2) is the proposed magnitude/confidence proportionate to how DIRECTLY the "
+    "disclosed relationship connects the two companies (a named customer representing a "
+    "stated revenue concentration deserves more weight than a vague thematic/sector-exposure "
+    "framing) -- when the origin fact IS real but the size is too large for how weak or "
+    "generic the disclosed relationship actually is, do NOT refute this case: instead accept "
+    "it (refuted=false) with adjusted_magnitude scaled down to something proportionate to the "
+    "relationship's actual strength. A real fact filtered through a loose relationship is "
+    "still worth something, just less than proposed -- it's exactly the kind of small, "
+    "accumulating corroboration this strategy combines over time (see README point 3), and "
+    "refusing it outright throws that away; (3) is the reasoning actually specific to the "
+    "target company, or could it be pasted onto any company in the sector unchanged -- refute "
+    "the latter, no amount of magnitude-scaling fixes reasoning that isn't really about this "
+    "company.\n\n"
     "Default to refuted=true only when genuinely unsure after weighing the above -- a missed "
     "real signal costs nothing, a false positive costs a bad trade, but refuting every "
     "propagated item on principle means this strategy's core thesis never gets tested either "
-    "way."
+    "way. When you're refuting SOLELY because of size/proportionality (point 2) rather than "
+    "because the origin fact or reasoning itself is weak (points 1 and 3), prefer scaling "
+    "adjusted_magnitude down over refusing outright."
 )
 
 
@@ -140,7 +172,7 @@ class Skeptic:
         for block in response.content:
             if block.type == "tool_use":
                 return block.input
-        return {"refuted": True, "reasoning": "model returned no verdict", "adjusted_confidence": 0.0}
+        return {"refuted": True, "reasoning": "model returned no verdict", "adjusted_confidence": 0.0, "adjusted_magnitude": 0.0}
 
     async def aclose(self) -> None:
         await self._client.close()

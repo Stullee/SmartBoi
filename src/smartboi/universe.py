@@ -80,7 +80,13 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
     CompanySpec("IESC", "IES Holdings", "grid_datacenter", notes="Electrical infrastructure services"),
     CompanySpec("LMB", "Limbach Holdings", "grid_datacenter", notes="Mechanical/electrical building systems"),
     CompanySpec("MTRX", "Matrix Service", "grid_datacenter", notes="Energy infrastructure engineering"),
-    CompanySpec("THR", "Thermon Group", "grid_datacenter", notes="Process heating"),
+    # THR (Thermon Group) removed: delisted from the NYSE effective June 1,
+    # 2026 (trading suspended, Form 25 filed) -- SEC's live ticker map
+    # correctly dropped the mapping, which is why it always failed CIK
+    # lookup. The registrant (CIK 1489096) still exists/files, there's just
+    # no tradeable ticker anymore. Exactly what universe_screen.py's
+    # prune-only auto-screen exists to catch; pruned by hand here since it
+    # never auto-removes.
     CompanySpec("PLPC", "Preformed Line Products", "grid_datacenter", notes="Grid hardware"),
     CompanySpec("POWL", "Powell Industries", "grid_datacenter",
                 notes="Electrical switchgear; partly graduated to broader coverage already"),
