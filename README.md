@@ -383,10 +383,13 @@ polling EDGAR/news/prices on their own configured intervals.
 
 A dashboard (`ENABLE_DASHBOARD=true` by default) runs alongside the engine.
 Open `http://localhost:8100/` (or `DASHBOARD_PORT`): which integrations are
-enabled, the relationship graph, every company's dossier, open/closed
-hypothetical trades with win rate and average R, recent signals, today's
-LLM call/token usage against the daily budget, and discovered universe
-candidates. Auto-refreshes every 10 seconds. Never places orders.
+enabled, the relationship graph (grouped by filer -- each company's own
+disclosed customers/suppliers/competitors/regulators together, strongest
+confidence first, rather than one flat table sorted by extraction order),
+every company's dossier, open/closed hypothetical trades with win rate and
+average R, recent signals, today's LLM call/token usage against the daily
+budget, and discovered universe candidates. Auto-refreshes every 10
+seconds. Never places orders.
 
 Almost entirely read-only, except one endpoint: `POST /api/candidates/accept`
 adds a discovered candidate into the live universe (the dashboard's "+

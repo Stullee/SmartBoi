@@ -173,12 +173,16 @@ function renderCandidates(rows) {
 }
 
 function renderGraph(g) {
-  if (!g.edges.length) return '<div class="empty">No relationships extracted yet.</div>';
-  return "<table><tr><th>From</th><th>Type</th><th>To</th><th>Confidence</th><th>Description</th></tr>" +
-    g.edges.map(function(e) {
-      return "<tr><td>" + e.from + "</td><td>" + esc(e.type) + "</td><td>" + e.to + "</td><td>" + fmt(e.confidence) +
-        "</td><td style='max-width:32rem'>" + esc(e.description) + "</td></tr>";
-    }).join("") + "</table>";
+  if (!g.edge_count) return '<div class="empty">No relationships extracted yet.</div>';
+  return g.by_symbol.map(function(group) {
+    var rows = group.relationships.map(function(r) {
+      return "<tr><td>" + esc(r.type) + "</td><td><b>" + r.counterparty + "</b></td><td>" + fmt(r.confidence) +
+        "</td><td style='max-width:32rem'>" + esc(r.description) + "</td></tr>";
+    }).join("");
+    return "<div style='margin-top:0.6rem'><b>" + group.symbol + "</b> <span style='opacity:0.6'>(" +
+      group.relationships.length + ")</span></div>" +
+      "<table><tr><th>Type</th><th>Counterparty</th><th>Confidence</th><th>Description</th></tr>" + rows + "</table>";
+  }).join("");
 }
 
 function render(data) {

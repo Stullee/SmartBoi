@@ -1,5 +1,6 @@
 from smartboi.dossier import Dossier
-from smartboi.status import gather_universe_candidates, snapshot_dossier
+from smartboi.graph import Relationship, RelationshipGraph
+from smartboi.status import gather_graph_stats, gather_universe_candidates, snapshot_dossier
 
 
 def test_snapshot_dossier_includes_computed_score():
@@ -46,3 +47,25 @@ def test_gather_universe_candidates_demotes_already_accepted():
     }
     rows = gather_universe_candidates(candidates, accepted={"AAA": "AAA"})
     assert [r["ticker"] for r in rows] == ["BBB", "AAA"]
+
+
+def test_gather_graph_stats_groups_by_filer_symbol(tmp_path):
+    graph = RelationshipGraph(tmp_path / "graph.json")
+    graph.add(Relationship("FORM", "AMAT", "customer", "desc 1", "manual", 0.6, "2026-07-01"))
+    graph.add(Relationship("FORM", "INTC", "supplier", "desc 2", "manual", 0.9, "2026-07-02"))
+    graph.add(Relationship("UCTT", "AMAT", "customer", "desc 3", "manual", 0.7, "2026-07-03"))
+
+    stats = gather_graph_stats(graph)
+    assert stats["edge_count"] == 3
+    assert [g["symbol"] for g in stats["by_symbol"]] == ["FORM", "UCTT"]  # sorted, one group per filer
+
+    form_group = stats["by_symbol"][0]
+    assert len(form_group["relationships"]) == 2
+    # Strongest confidence first within a group.
+    assert [r["counterparty"] for r in form_group["relationships"]] == ["INTC", "AMAT"]
+
+
+def test_gather_graph_stats_empty_graph(tmp_path):
+    graph = RelationshipGraph(tmp_path / "graph.json")
+    stats = gather_graph_stats(graph)
+    assert stats == {"edge_count": 0, "by_symbol": []}

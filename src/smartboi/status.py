@@ -49,18 +49,29 @@ def gather_dossiers(store: DossierStore) -> list[dict]:
 
 
 def gather_graph_stats(graph: RelationshipGraph) -> dict:
+    """Relationships grouped by the filer (`from_symbol` -- "the company the
+    evidence is about", see graph.py's Relationship) instead of one flat
+    row per edge -- a company with several disclosed counterparties reads
+    as one group ("FORM: customer of X, supplier to Y, ...") rather than
+    being scattered across a table sorted by insertion order. Each group's
+    own relationships are strongest-confidence first."""
+    by_symbol: dict[str, list[dict]] = {}
+    for r in graph.relationships:
+        by_symbol.setdefault(r.from_symbol, []).append(
+            {
+                "counterparty": r.to_symbol,
+                "type": r.rel_type,
+                "confidence": r.confidence,
+                "description": r.description,
+            }
+        )
+    groups = [
+        {"symbol": symbol, "relationships": sorted(rels, key=lambda x: x["confidence"], reverse=True)}
+        for symbol, rels in sorted(by_symbol.items())
+    ]
     return {
         "edge_count": len(graph.relationships),
-        "edges": [
-            {
-                "from": r.from_symbol,
-                "to": r.to_symbol,
-                "type": r.rel_type,
-                "description": r.description,
-                "confidence": r.confidence,
-            }
-            for r in graph.relationships
-        ],
+        "by_symbol": groups,
     }
 
 
