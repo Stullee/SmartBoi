@@ -49,7 +49,7 @@ from smartboi.dossier import (
 from smartboi.edgar import EdgarClient, FilingEvent
 from smartboi.graph import REL_TYPES, RelationshipExtractor, RelationshipGraph, Relationship
 from smartboi.news import FinnhubClient
-from smartboi.paper_journal import PaperTradeJournal
+from smartboi.paper_journal import PaperTradeJournal, cost_bps_per_side_for_cap
 from smartboi.prices import ReadOnlyPriceFeed
 from smartboi.ratelimit import SlidingWindowLimiter
 from smartboi.signals import evaluate, favorable_drift_pct, log_signal, signal_expired
@@ -1549,12 +1549,24 @@ class Engine:
             for e in dossier.evidence[-5:]
         ]
         horizon = min(dossier.horizon_days or self.settings.max_horizon_days, self.settings.max_horizon_days)
+        # Market cap decides the transaction-cost bucket (and the borrow
+        # flag for shorts): a flat per-side figure understates friction
+        # exactly where this strategy hunts. Best-effort -- with no lookup
+        # source the journal assumes the middle bucket, never the cheapest.
+        market_cap: float | None = None
+        if self.finnhub is not None:
+            try:
+                market_cap = await self.finnhub.market_cap_musd(symbol)
+            except Exception:  # noqa: BLE001 - a failed lookup must not block the entry; the cost model has a fallback
+                log.warning("%s: market-cap lookup for cost bucketing failed.", symbol)
+        cost_per_side = cost_bps_per_side_for_cap(market_cap, self.settings.transaction_cost_bps_per_side)
         trade = self.journal.open(
             symbol, dossier.direction, price,
             self.settings.stop_loss_pct, self.settings.take_profit_pct,
             horizon, dossier.thesis_summary, dossier.confidence,
             dossier.independent_source_count, citations,
-            cost_bps_round_trip=self.settings.transaction_cost_bps_per_side * 2,
+            cost_bps_round_trip=cost_per_side * 2,
+            market_cap_musd=market_cap,
         )
         await self.alerts.send(
             "paper_trade_opened",

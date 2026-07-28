@@ -231,3 +231,52 @@ def test_restart_drops_open_trade_already_present_in_closed_log(tmp_path):
 
     reloaded = PaperTradeJournal(journal.log_path)
     assert not reloaded.has_open("UCTT")  # self-healed, no second close possible
+
+
+# --- Market-cap transaction-cost buckets + borrow flag ---
+
+from smartboi.paper_journal import assumes_borrow, cost_bps_per_side_for_cap
+
+
+def test_cost_buckets_follow_market_cap():
+    assert cost_bps_per_side_for_cap(5000.0, floor_bps_per_side=25.0) == 50.0
+    assert cost_bps_per_side_for_cap(1000.0, floor_bps_per_side=25.0) == 50.0
+    assert cost_bps_per_side_for_cap(600.0, floor_bps_per_side=25.0) == 150.0
+    assert cost_bps_per_side_for_cap(120.0, floor_bps_per_side=25.0) == 300.0
+
+
+def test_unknown_cap_gets_middle_bucket_not_cheapest():
+    assert cost_bps_per_side_for_cap(None, floor_bps_per_side=25.0) == 150.0
+    assert cost_bps_per_side_for_cap(0.0, floor_bps_per_side=25.0) == 150.0
+
+
+def test_configured_floor_is_a_floor_not_a_ceiling():
+    # A user who raised the flat setting above a bucket keeps their number.
+    assert cost_bps_per_side_for_cap(5000.0, floor_bps_per_side=80.0) == 80.0
+    # But the flat setting can never buy sub-bucket costs on a small cap.
+    assert cost_bps_per_side_for_cap(120.0, floor_bps_per_side=25.0) == 300.0
+
+
+def test_assumes_borrow_only_for_small_or_unknown_shorts():
+    assert assumes_borrow("SHORT", 120.0)
+    assert assumes_borrow("SHORT", None)
+    assert not assumes_borrow("SHORT", 800.0)
+    assert not assumes_borrow("LONG", 120.0)
+    assert not assumes_borrow("LONG", None)
+
+
+def test_open_records_cap_and_borrow_flag(tmp_path):
+    journal = PaperTradeJournal(tmp_path / "paper_trades.jsonl")
+    trade = journal.open(
+        "UCTT", "SHORT", 100.0, stop_loss_pct=8.0, take_profit_pct=16.0,
+        horizon_days=20, thesis_summary="t", confidence=0.8,
+        independent_source_count=2, citations=[],
+        cost_bps_round_trip=600.0, market_cap_musd=120.0,
+    )
+    assert trade.market_cap_musd == 120.0
+    assert trade.assumes_borrow is True
+
+    # And survives the open-state snapshot round trip.
+    reloaded = PaperTradeJournal(tmp_path / "paper_trades.jsonl")
+    assert reloaded.open_trades["UCTT"].assumes_borrow is True
+    assert reloaded.open_trades["UCTT"].market_cap_musd == 120.0

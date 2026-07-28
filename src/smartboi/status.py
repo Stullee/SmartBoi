@@ -24,6 +24,12 @@ class PaperTradeStats:
     # implicit -- the gap between these two is the whole question of whether
     # a thin-edge strategy survives contact with real spreads.
     avg_r_gross: float = 0.0
+    # Closed SHORTs whose borrow was never verifiable (small/unknown-cap
+    # names are routinely hard-to-borrow -- see paper_journal.assumes_borrow)
+    # and the avg R of everything else. borrow-assumed trades commingled
+    # into one headline number would overstate what was actually executable.
+    borrow_assumed: int = 0
+    avg_r_clean: float = 0.0
 
 
 def gather_dossiers(store: DossierStore) -> list[dict]:
@@ -105,6 +111,9 @@ def gather_paper_trade_stats(log_path: Path) -> tuple[PaperTradeStats, list[dict
         stats.avg_r_gross = round(sum(gross) / len(gross), 3) if gross else 0.0
         stats.win_rate = stats.wins / stats.closed
         stats.avg_r = sum(r.get("r_multiple") or 0.0 for r in rows) / stats.closed
+        stats.borrow_assumed = sum(1 for r in rows if r.get("assumes_borrow"))
+        clean = [r.get("r_multiple") or 0.0 for r in rows if not r.get("assumes_borrow")]
+        stats.avg_r_clean = round(sum(clean) / len(clean), 3) if clean else 0.0
     return stats, rows[-20:]
 
 

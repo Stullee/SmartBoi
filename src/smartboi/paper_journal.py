@@ -19,6 +19,49 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# Per-side transaction-cost floors by market-cap bucket, in basis points of
+# notional. A flat per-side figure calibrated for liquid names badly
+# understates friction exactly where this strategy hunts: realistic
+# round trips run 1-4% on sub-$300M names (wide spreads, real impact),
+# i.e. a large fraction of the 16%-target/8%-stop distances. Values follow
+# the 2026-07 audit's recommendation: 50bp/side above $1B, 150bp/side
+# $300M-$1B, 300bp/side below $300M. The configured
+# TRANSACTION_COST_BPS_PER_SIDE acts as a floor under all buckets, never a
+# ceiling over them.
+_CAP_BUCKET_BPS_PER_SIDE = ((1000.0, 50.0), (300.0, 150.0), (0.0, 300.0))
+# With no market cap available (Finnhub down/unconfigured, unknown ticker)
+# assume the MIDDLE bucket rather than the cheapest -- unknown liquidity is
+# not a reason to assume the best case in the record this journal exists
+# to keep honest.
+_UNKNOWN_CAP_BPS_PER_SIDE = 150.0
+# Shorts below this market cap are flagged assumes_borrow: small-caps are
+# routinely hard-to-borrow, and a paper SHORT that a real account could
+# not have located shares for is not a fill -- the flag keeps those
+# separable in every statistic instead of silently commingled.
+_BORROW_RISK_CAP_MUSD = 500.0
+
+
+def cost_bps_per_side_for_cap(market_cap_musd: float | None, floor_bps_per_side: float) -> float:
+    """Per-side transaction-cost assumption for a trade in a name of the
+    given market cap (in $M), never below the configured floor. None/zero
+    cap (lookup failed) gets the middle bucket, not the cheapest."""
+    if market_cap_musd is None or market_cap_musd <= 0:
+        return max(floor_bps_per_side, _UNKNOWN_CAP_BPS_PER_SIDE)
+    for cap_floor, bps in _CAP_BUCKET_BPS_PER_SIDE:
+        if market_cap_musd >= cap_floor:
+            return max(floor_bps_per_side, bps)
+    return max(floor_bps_per_side, _UNKNOWN_CAP_BPS_PER_SIDE)
+
+
+def assumes_borrow(direction: str, market_cap_musd: float | None) -> bool:
+    """Whether a hypothetical SHORT rests on an unverified borrow: below
+    the borrow-risk cap (or with no cap known at all), shares may simply
+    not have been locatable, so the trade's P&L is conditional on an
+    assumption a real account might not have been able to satisfy."""
+    if direction != "SHORT":
+        return False
+    return market_cap_musd is None or market_cap_musd < _BORROW_RISK_CAP_MUSD
+
 
 @dataclass
 class PaperTrade:
@@ -43,6 +86,15 @@ class PaperTrade:
     # (both sides combined). Recorded per trade rather than assumed, so a
     # record stays interpretable if the assumption is ever changed.
     cost_bps_round_trip: float = 0.0
+    # Market cap ($M) at open, when a lookup source was available -- what
+    # the cost bucket above was derived from, recorded so the derivation
+    # stays auditable per trade. None when no source could price it.
+    market_cap_musd: float | None = None
+    # True for SHORTs in names small enough (or unknown enough) that a real
+    # account might not have located borrowable shares -- see
+    # assumes_borrow(). Kept per trade so win-rate/avg-R statistics can be
+    # split into "clean" vs "assumes a borrow existed".
+    assumes_borrow: bool = False
 
     def _net_pnl(self, exit_price: float) -> float:
         """P&L per share after the round-trip transaction cost.
@@ -149,6 +201,7 @@ class PaperTradeJournal:
         independent_source_count: int,
         citations: list[dict],
         cost_bps_round_trip: float = 0.0,
+        market_cap_musd: float | None = None,
     ) -> PaperTrade:
         if direction == "LONG":
             stop_price = entry_price * (1 - stop_loss_pct / 100)
@@ -169,6 +222,8 @@ class PaperTradeJournal:
             independent_source_count=independent_source_count,
             citations=citations,
             cost_bps_round_trip=cost_bps_round_trip,
+            market_cap_musd=market_cap_musd,
+            assumes_borrow=assumes_borrow(direction, market_cap_musd),
         )
         self.open_trades[symbol] = trade
         self._write_open_state()

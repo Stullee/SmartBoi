@@ -276,6 +276,11 @@ function render(data) {
     (data.paper_stats.closed ? Math.round(data.paper_stats.win_rate * 100) + "%" : "-") + '</div></div>';
   html += '<div class="card"><div class="label">Paper avg R</div><div class="value ' + cls(data.paper_stats.avg_r) + '">' +
     (data.paper_stats.closed ? fmt(data.paper_stats.avg_r) : "-") + '</div></div>';
+  if (data.paper_stats.borrow_assumed) {
+    html += '<div class="card"><div class="label">Avg R excl. ' + data.paper_stats.borrow_assumed +
+      ' borrow-assumed short(s)</div><div class="value ' + cls(data.paper_stats.avg_r_clean) + '">' +
+      fmt(data.paper_stats.avg_r_clean) + '</div></div>';
+  }
   html += '<div class="card"><div class="label">LLM calls today</div><div class="value">' +
     data.usage.calls + ' / ' + data.usage.daily_call_budget + '</div></div>';
   html += '<div class="card"><div class="label">LLM tokens today (in/out)</div><div class="value" style="font-size:1rem">' +
