@@ -213,6 +213,24 @@ class Engine:
         existing = self.spec_by_symbol.get(symbol)
         if existing is not None:
             return existing
+
+        # A large, heavily-covered company must never become a trade target,
+        # however it was requested. The engine already computed that judgement
+        # (recommend_candidate_type, from live market cap and analyst count);
+        # this stops a click -- or a caller passing the wrong type -- from
+        # overriding it. Confirmed live: a deployment accumulated ten
+        # mega/large caps as TRADEABLE this way, including a $323B pharma,
+        # which then accrued dossiers and LLM spend on a name whose news has
+        # no diffusion lag left to trade.
+        entry = self.candidates.get(symbol) or {}
+        recommended = entry.get("recommended_as")
+        if as_type == "tradeable" and recommended == "anchor":
+            raise ValueError(
+                f"{symbol} screens as an ANCHOR, not a trade target "
+                f"({entry.get('recommendation_reason', 'past the tradeable bounds')}). "
+                "Add it as an anchor instead -- its news will still propagate. "
+                "If you really want it tradeable, put it in SYMBOLS."
+            )
         spec = CompanySpec(symbol, symbol, "accepted", signal_source_only=(as_type == "anchor"),
                             notes=f"Accepted ({source}) from a discovered universe candidate")
         self.universe.append(spec)
@@ -422,6 +440,7 @@ class Engine:
             await self._run_universe_screen()
         if self._due(self._last_decay_pass, DECAY_PASS_INTERVAL_SEC, now):
             self._last_decay_pass = now
+            self._archive_orphaned_dossiers()
             self._run_decay_pass()
         if self._daily_pass_due("dossier_snapshot"):
             self._mark_daily_pass_done("dossier_snapshot")
@@ -1219,8 +1238,19 @@ class Engine:
             asdict(trade),
         )
 
+    def _is_tradeable(self, symbol: str) -> bool:
+        spec = self.spec_by_symbol.get(symbol)
+        return spec is not None and not spec.signal_source_only
+
     async def _mark_and_execute(self) -> None:
         for symbol in self.dossiers.all_symbols():
+            # Dossier FILES outlive universe membership: a symbol demoted to
+            # anchor (or dropped entirely) keeps its file, and a stale
+            # SIGNALED one would otherwise open a paper trade on something
+            # this system is no longer allowed to trade -- an anchor exists
+            # precisely because it must never be a trade target.
+            if not self._is_tradeable(symbol):
+                continue
             dossier = self.dossiers.load(symbol)
             if dossier.status != "SIGNALED" or self.journal.has_open(symbol):
                 continue
@@ -1324,6 +1354,63 @@ class Engine:
         with path.open("a") as f:
             for symbol, price in prices.items():
                 f.write(json.dumps({"marked_at": marked_at, "symbol": symbol, "price": price}) + "\n")
+
+    def reset_accepted_candidates(self) -> dict:
+        """Drops every runtime-accepted symbol, returning the universe to the
+        curated DEFAULT_UNIVERSE (or SYMBOLS/ANCHOR_SYMBOLS), and archives the
+        dossiers that orphans.
+
+        Exists because there was no way back: accepted symbols persisted with
+        no removal path, so a deployment that accumulated wrong additions
+        could only be fixed by hand-editing JSON on the Home Assistant host --
+        exactly the thing the dashboard exists to avoid. Archives rather than
+        deletes the dossiers, same as _archive_orphaned_dossiers.
+
+        Candidates themselves are left intact: they are discovered facts from
+        filings, and clearing them would just make the engine rediscover the
+        same names and re-pay for the ticker/market-data lookups."""
+        removed = sorted(self.accepted_candidates.data)
+        for symbol in removed:
+            self.accepted_candidates.delete(symbol)
+        self.universe = list(self.settings.universe)
+        self._apply_accepted_candidates()
+        self.spec_by_symbol = spec_by_symbol(self.universe)
+        self._archive_orphaned_dossiers()
+        log.warning("[UNIVERSE] Reset %d runtime-accepted symbol(s): %s. Universe is back to the curated list.",
+                    len(removed), ", ".join(removed) or "none")
+        return {"removed": removed, "universe_size": len(self.universe)}
+
+    def _archive_orphaned_dossiers(self) -> None:
+        """Moves dossiers for symbols that are no longer tradeable out of the
+        live directory into data/dossiers_archived/.
+
+        Nothing previously cleaned these up, so a demotion (or a universe
+        refresh) silently left the file behind: still loaded by every decay
+        pass, still snapshotted into the forward-validation log as though it
+        were a live thesis, and -- before the guard in _mark_and_execute --
+        still able to open a paper trade. Archived rather than deleted
+        because the accumulated evidence is real history, and because a
+        symbol promoted back to tradeable should not silently start from a
+        blank thesis."""
+        archive = DATA_DIR / "dossiers_archived"
+        moved = []
+        for symbol in self.dossiers.all_symbols():
+            if self._is_tradeable(symbol):
+                continue
+            archive.mkdir(parents=True, exist_ok=True)
+            source = self.dossiers.dir_path / f"{symbol}.json"
+            try:
+                source.replace(archive / f"{symbol}.json")
+            except OSError:
+                log.exception("%s: could not archive orphaned dossier.", symbol)
+                continue
+            moved.append(symbol)
+        if moved:
+            log.info(
+                "[DOSSIER] Archived %d dossier(s) for symbols no longer tradeable: %s "
+                "(moved to %s, not deleted).",
+                len(moved), ", ".join(moved), archive,
+            )
 
     # --- Universe auto-screen ---
 

@@ -119,10 +119,13 @@ _INDEX_HTML = """<!doctype html>
   <button id="btn-screen">Screen candidates</button>
   <button id="btn-analyze">Forward-return report</button>
   <button id="btn-diagnostics">Diagnostics bundle</button>
+  <button id="btn-reset" style="border-color:rgba(239,83,80,0.5)">Reset added symbols</button>
 </div>
-<div class="toolhint">All three are read-only: screening does market-cap/analyst lookups, the other two read
-  already-persisted state. None changes a dossier, the universe, or any trade. The diagnostics bundle is safe to
-  paste &mdash; credentials and personal data are omitted and log lines are scrubbed.</div>
+<div class="toolhint">The first three are read-only: screening does market-cap/analyst lookups, the other two
+  read already-persisted state. None changes a dossier, the universe, or any trade, and the diagnostics bundle is
+  safe to paste &mdash; credentials and personal data are omitted and log lines are scrubbed.
+  <b>Reset added symbols</b> is the one that changes things: it removes every symbol added at runtime, returning the
+  universe to the curated list, and archives (never deletes) the dossiers that orphans. It asks first.</div>
 <pre id="tool-output"></pre>
 
 <div id="app">Loading&hellip;</div>
@@ -371,6 +374,22 @@ document.getElementById("btn-analyze").addEventListener("click", function() {
 document.getElementById("btn-diagnostics").addEventListener("click", function() {
   runTool("tools/diagnostics", {}, this);
 });
+document.getElementById("btn-reset").addEventListener("click", function() {
+  if (!confirm("Remove every symbol added at runtime and return to the curated universe?\n\n" +
+               "Dossiers for the removed symbols are ARCHIVED, not deleted. Candidates, trades " +
+               "and captured logs are untouched.")) return;
+  var out = document.getElementById("tool-output");
+  out.style.display = "block";
+  out.textContent = "Resetting…";
+  fetch(API_BASE + "universe/reset-accepted", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  }).then(function(r) { return r.json(); }).then(function(res) {
+    out.textContent = res.error ? ("Error: " + res.error)
+      : ("Removed " + res.removed.length + " added symbol(s): " + (res.removed.join(", ") || "none") +
+         "\nUniverse is now " + res.universe_size + " symbols.");
+    refresh();
+  }).catch(function(err) { out.textContent = "Failed: " + err; });
+});
 
 function refresh() {
   var controller = new AbortController();
@@ -483,7 +502,13 @@ def create_app(engine) -> web.Application:
                 {"error": f"{symbol} is not a discovered candidate -- use SYMBOLS/ANCHOR_SYMBOLS to add it manually."},
                 status=404,
             )
-        spec = engine.accept_candidate(symbol, as_type)
+        try:
+            spec = engine.accept_candidate(symbol, as_type)
+        except ValueError as exc:
+            # accept_candidate refuses to make a large, heavily-covered name a
+            # trade target regardless of which button was clicked -- surface
+            # its reason rather than a generic failure.
+            return web.json_response({"error": str(exc)}, status=400)
         return web.json_response({"ok": True, "symbol": spec.symbol, "as": as_type})
 
     # Serializes tool runs. A screening pass shares the engine's own
@@ -556,6 +581,16 @@ def create_app(engine) -> web.Application:
 
         return await _run_tool(run)
 
+    async def handle_reset_accepted(request: web.Request) -> web.Response:
+        """Drops every runtime-accepted symbol, returning the universe to the
+        curated list, and archives the dossiers that orphans (see
+        engine.reset_accepted_candidates). The only DESTRUCTIVE endpoint here,
+        and deliberately narrow: it removes additions, never the curated
+        universe, never a candidate, never a trade or a captured log. The UI
+        confirms before calling it."""
+        result = await asyncio.to_thread(engine.reset_accepted_candidates)
+        return web.json_response({"ok": True, **result})
+
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_status)
@@ -563,6 +598,7 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/tools/screen", handle_tool_screen)
     app.router.add_post("/api/tools/forward-returns", handle_tool_forward_returns)
     app.router.add_post("/api/tools/diagnostics", handle_tool_diagnostics)
+    app.router.add_post("/api/universe/reset-accepted", handle_reset_accepted)
     return app
 
 

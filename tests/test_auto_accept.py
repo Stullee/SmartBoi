@@ -212,3 +212,73 @@ async def test_a_candidate_recorded_before_bounds_existed_is_refreshed(engine):
     await engine._run_candidate_ticker_recheck()
 
     assert engine.candidates.get("ZZZZ")["recommended_as"] == "tradeable"
+
+
+# --- A large, heavily-covered name must never become a trade target,
+# however it was requested. Confirmed live: a deployment accumulated ten
+# mega/large caps as TRADEABLE through the dashboard's own button, including
+# a $323B pharma, which then accrued dossiers and LLM spend.
+
+async def test_accepting_an_anchor_recommendation_as_tradeable_is_refused(engine):
+    entry = _candidate(name="Merck", ticker="MRK", recommended_as="anchor")
+    entry["recommendation_reason"] = "market cap $322954M exceeds the tradeable ceiling"
+    engine.candidates.set("MRK", entry)
+
+    with pytest.raises(ValueError, match="screens as an ANCHOR"):
+        engine.accept_candidate("MRK", "tradeable")
+    assert "MRK" not in engine.spec_by_symbol
+
+
+async def test_the_same_name_can_still_be_accepted_as_an_anchor(engine):
+    engine.candidates.set("MRK", _candidate(name="Merck", ticker="MRK", recommended_as="anchor"))
+    spec = engine.accept_candidate("MRK", "anchor")
+    assert spec.signal_source_only is True
+
+
+# --- Recovering from a polluted universe ---
+
+async def test_reset_removes_runtime_additions_and_archives_their_dossiers(engine, tmp_path):
+    from smartboi.dossier import Dossier
+
+    engine.candidates.set("ZZZZ", _candidate())
+    await engine._auto_accept_candidates()
+    assert "ZZZZ" in engine.spec_by_symbol
+    engine.dossiers.save(Dossier(symbol="ZZZZ"))
+
+    result = engine.reset_accepted_candidates()
+
+    assert result["removed"] == ["ZZZZ"]
+    assert "ZZZZ" not in engine.spec_by_symbol
+    assert engine.accepted_candidates.data == {}
+    # Archived, not deleted -- the accumulated evidence is real history.
+    assert not (engine.dossiers.dir_path / "ZZZZ.json").exists()
+    assert (tmp_path / "data" / "dossiers_archived" / "ZZZZ.json").exists()
+    # The curated universe survives untouched.
+    assert "DCO" in engine.spec_by_symbol
+
+
+async def test_reset_leaves_discovered_candidates_alone(engine):
+    """Candidates are facts discovered from filings -- clearing them would
+    just make the engine rediscover the same names and re-pay for the
+    ticker and market-data lookups."""
+    engine.candidates.set("ZZZZ", _candidate())
+    await engine._auto_accept_candidates()
+    engine.reset_accepted_candidates()
+    assert "ZZZZ" in engine.candidates.data
+
+
+async def test_paper_trades_never_open_on_a_non_tradeable_symbol(engine):
+    """A dossier FILE outlives universe membership: a symbol demoted to
+    anchor keeps its file, and a stale SIGNALED one must not open a trade on
+    something the system is no longer allowed to trade."""
+    from smartboi.dossier import Dossier
+    from tests.fakes import FakePriceFeed
+
+    engine.price_feed = FakePriceFeed(prices={"RTX": 100.0})
+    signaled = Dossier(symbol="RTX", direction="LONG", confidence=0.9, magnitude=0.9,
+                       status="SIGNALED", signaled_at="2026-07-28T00:00:00+00:00")
+    engine.dossiers.save(signaled)          # RTX is an ANCHOR in this fixture
+
+    await engine._mark_and_execute()
+
+    assert not engine.journal.has_open("RTX")
