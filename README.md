@@ -220,6 +220,27 @@ Accept button on the dashboard, with the reason on hover -- a hint, not a
 guarantee; you always get the final call. See
 `universe_screen.recommend_candidate_type`.
 
+**`scripts/screen_candidates.py`** is the same market-cap/analyst-count
+screening logic as a standalone review tool, for picking a batch of new
+tradeable tickers rather than reviewing candidates one at a time on the
+dashboard:
+
+```bash
+python scripts/screen_candidates.py                     # mines data/universe_candidates.json
+python scripts/screen_candidates.py AEIS CEVA POWI       # or screen specific ideas instead
+python scripts/screen_candidates.py --min-cap 50 --max-cap 2000 --max-analysts 4
+```
+
+By default it screens every resolved-ticker entry the engine has already
+discovered, against tighter bounds than the live auto-screen's defaults
+(`$100M-$3000M`, `<=6` analysts) -- deliberately tighter, since the point
+of a universe refresh is genuinely thin-coverage small-caps, not names
+that have already drifted toward the auto-screen's outer bound. Output is
+a ranked table (thinnest coverage first) with an ecosystem guess (the
+first already-classified company a candidate was discovered in relation
+to) -- a starting point for review, never applied automatically; picking
+the final list is still your call, same as accepting any other candidate.
+
 ## Entry timing: are we too late?
 
 A signal firing (evidence crossed the confidence/magnitude/corroboration
@@ -382,10 +403,32 @@ extra LLM cost, piggybacked on work the engine already does daily:
   tradeable (non-anchor) universe symbol, piggybacked on the existing 6h IB
   price poll. Written by `engine.py`'s `_run_daily_price_marks`.
 
-Joining the two by symbol/date is what a later offline analysis (per-
-ecosystem benchmarks, a counterfactual ledger for signals the confidence
-threshold skipped) will run against -- not built yet, deliberately
-sequenced after the engine has real test coverage (see Running the tests).
+**`scripts/analyze_forward_returns.py`** joins the two by symbol/date and
+answers the actual question: does `confidence * magnitude` predict what
+the market does next?
+
+```bash
+python scripts/analyze_forward_returns.py                       # default 5- and 20-day horizons
+python scripts/analyze_forward_returns.py --horizons 5,10,20
+```
+
+Pure offline analysis (no network, no engine dependency) of the two logs
+above. For each horizon it reports: mean forward return by score bucket
+(`<0.2`, `0.2-0.35`, `0.35-0.5`, `>=0.5`) and whether it's monotonic; the
+correlation between score and signed forward return; overall hit-rate (%
+of theses where the direction was right); a per-symbol breakdown, worst
+first; and a benchmark-relative variant -- each return minus its own
+ecosystem's mean return over the same window (ecosystem tags from
+`universe.py`), separating alpha (the pick itself) from sector beta (the
+whole ecosystem moved). Forward return is always signed in the THESIS
+direction (LONG: price up is a win; SHORT: price down is a win), so a
+positive number always means "right so far" regardless of direction. Only
+as good as how long the capture above has actually been running -- forward
+data can't be backfilled, so an early run on a fresh deployment will
+mostly say "not enough data yet," which is the correct answer, not a bug.
+See `forward_returns.py` for the join/aggregation math (network-free and
+unit tested on synthetic rows) and a counterfactual ledger for signals the
+confidence threshold skipped is still a possible future addition.
 
 ## Setup
 
