@@ -147,7 +147,11 @@ _SYSTEM_PROMPT = (
     "'our largest customer, X Corp, accounted for 22% of revenue'), never speculation. "
     "Match counterparty names to the provided ticker list only when you're confident; "
     "otherwise leave counterparty_ticker null. Skip vague or immaterial mentions -- only "
-    "relationships with clear business/financial significance."
+    "relationships with clear business/financial significance. Do NOT report a company's "
+    "LENDERS, underwriters or auditors as suppliers -- a credit agreement is a real "
+    "disclosure, but a bank's news has no path to the borrower's fundamentals, which is "
+    "the only thing this graph is used for. A financial institution should only appear when "
+    "it is a genuine CUSTOMER or competitor of the filing company."
 )
 
 

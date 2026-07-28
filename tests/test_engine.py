@@ -459,3 +459,64 @@ async def test_full_lifecycle_signal_open_close_reset(engine):
     assert dossier.status == "ACTIVE"
     assert dossier.signaled_at == ""
     assert dossier.signaled_price is None
+
+
+# --- A model that fills in "NULL" rather than leaving the ticker null.
+# Confirmed live: a BAE Systems relationship was recorded against the ticker
+# "NULL" and accepted into the universe as an anchor.
+
+async def test_placeholder_tickers_are_treated_as_no_ticker(engine):
+    filing = FilingEvent(
+        symbol="AMPX", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000001", primary_document="f.htm",
+    )
+    engine.extractor.default = [{
+        "counterparty_name": "BAE Systems", "counterparty_ticker": "NULL",
+        "rel_type": "customer", "description": "listed as a customer",
+        "confidence": 0.85, "quote": "q",
+    }]
+
+    await engine._extract_relationships("AMPX", filing, "text")
+
+    assert all(r.to_symbol != "NULL" for r in engine.graph.relationships)
+    assert "NULL" not in engine.candidates.data
+
+
+# --- A bank disclosed as a "supplier" is a lender: a real disclosure, but a
+# dead end for propagation. Confirmed live: BAC, WTFC and M&T entered the
+# universe off credit-facility disclosures.
+
+async def test_lender_supplier_relationships_are_dropped(engine):
+    filing = FilingEvent(
+        symbol="UFPT", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000002", primary_document="f.htm",
+    )
+    engine.extractor.default = [{
+        "counterparty_name": "Bank of America", "counterparty_ticker": "BAC",
+        "rel_type": "supplier",
+        "description": "Lender providing secured credit facilities under a revolving credit facility.",
+        "confidence": 0.95, "quote": "Third Amended and Restated Credit Agreement",
+    }]
+
+    await engine._extract_relationships("UFPT", filing, "text")
+
+    assert engine.graph.relationships == []
+    assert engine.candidates.data == {}
+
+
+async def test_a_bank_as_a_genuine_customer_is_kept(engine):
+    """Only the "our lender" direction is a dead end -- a company SELLING to
+    a bank is a real propagation path."""
+    filing = FilingEvent(
+        symbol="UFPT", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000003", primary_document="f.htm",
+    )
+    engine.extractor.default = [{
+        "counterparty_name": "Bank of America", "counterparty_ticker": "BAC",
+        "rel_type": "customer", "description": "BAC accounted for 15% of net sales.",
+        "confidence": 0.95, "quote": "q",
+    }]
+
+    await engine._extract_relationships("UFPT", filing, "text")
+
+    assert any(r.to_symbol == "BAC" for r in engine.graph.relationships) or "BAC" in engine.candidates.data

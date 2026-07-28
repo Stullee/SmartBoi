@@ -96,6 +96,27 @@ RELATIONSHIP_EXTRACTION_FORMS = ("10-K", "10-Q")
 # never investable, so they're just noise in a list meant to be acted on.
 # Deliberately only applied AFTER ticker resolution has already failed --
 # this can never hide a candidate that actually resolved to a ticker.
+# Values a model returns to mean "I don't know a ticker" while still filling
+# the field in. Confirmed live: a BAE Systems relationship was recorded
+# against the ticker "NULL" and accepted into the universe as an anchor,
+# because the literal string is truthy where JSON null would not have been.
+_PLACEHOLDER_TICKERS = frozenset({"NULL", "NONE", "N/A", "NA", "NIL", "TBD", "UNKNOWN", "-", "?"})
+
+# Phrases that mark a disclosed "supplier" as a LENDER rather than a supply-
+# chain counterparty. A credit agreement genuinely is a disclosed
+# relationship, and extraction is right to find it -- but a bank's news has
+# no propagation path to a borrower's fundamentals, which is the only thing
+# this graph is for. Confirmed live: Bank of America, Wintrust and M&T
+# entered the universe this way, off credit-facility disclosures in
+# UFPT/LMB/INTT filings. They pass the non-company keyword filter because
+# that only applies when ticker resolution FAILS, and a major bank resolves
+# perfectly well.
+_LENDER_PHRASES = (
+    "lender", "credit facility", "credit agreement", "revolving credit",
+    "revolving loan", "term loan", "delayed draw", "financing facilit",
+    "loan and security agreement", "underwriter",
+)
+
 _NON_COMPANY_KEYWORDS = (
     "government", "department", "agency", "administration", "bureau",
     "army", "navy", "air force", "military", "board", "authority",
@@ -562,6 +583,13 @@ class Engine:
             return
         now = datetime.now(timezone.utc).isoformat()
         for rel in relationships:
+            if self._is_lender_relationship(rel):
+                log.info(
+                    "%s: dropping lender relationship to %s (a credit provider is a disclosed "
+                    "counterparty, but its news has no path to this company's fundamentals).",
+                    symbol, rel.get("counterparty_name"),
+                )
+                continue
             if rel.get("rel_type") not in REL_TYPES:
                 # The extraction tool schema declares an enum for rel_type,
                 # but Anthropic tool use doesn't hard-enforce it -- a stray
@@ -575,6 +603,8 @@ class Engine:
                 )
                 continue
             ticker = (rel.get("counterparty_ticker") or "").upper()
+            if ticker in _PLACEHOLDER_TICKERS:
+                ticker = ""  # a filled-in "I don't know", not a real symbol
             if not ticker and rel.get("rel_type") != "regulator":
                 # A regulator (government body, agency) can never be a
                 # ticker -- skip resolution and don't clutter candidates
@@ -613,6 +643,17 @@ class Engine:
                 )
 
     @staticmethod
+    def _is_lender_relationship(rel: dict) -> bool:
+        """Whether a disclosed "supplier" is really a lender. Restricted to
+        the supplier direction on purpose: a bank can legitimately be a
+        CUSTOMER (a company selling services to it), which is a real
+        propagation path -- only "our lender" is the dead end."""
+        if rel.get("rel_type") != "supplier":
+            return False
+        text = f"{rel.get('description', '')} {rel.get('quote', '')}".lower()
+        return any(phrase in text for phrase in _LENDER_PHRASES)
+
+    @staticmethod
     def _is_unsearchable(name: str) -> bool:
         """Whether a free-text counterparty name is worth spending a Finnhub
         ticker search on. Never-investable descriptions (government bodies,
@@ -649,6 +690,8 @@ class Engine:
         if not name:
             return
         ticker = resolved_ticker or (rel.get("counterparty_ticker") or "").upper()
+        if ticker in _PLACEHOLDER_TICKERS:
+            ticker = ""
         if not ticker and self._looks_like_non_company(name):
             return
         key = ticker or name.upper()
