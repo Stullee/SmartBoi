@@ -20,6 +20,10 @@ class PaperTradeStats:
     timeouts: int = 0
     win_rate: float = 0.0
     avg_r: float = 0.0
+    # Reported alongside net so the cost drag is visible rather than
+    # implicit -- the gap between these two is the whole question of whether
+    # a thin-edge strategy survives contact with real spreads.
+    avg_r_gross: float = 0.0
 
 
 def gather_dossiers(store: DossierStore) -> list[dict]:
@@ -97,6 +101,8 @@ def gather_paper_trade_stats(log_path: Path) -> tuple[PaperTradeStats, list[dict
         stats.wins = sum(1 for r in rows if r.get("status") == "WIN")
         stats.losses = sum(1 for r in rows if r.get("status") == "LOSS")
         stats.timeouts = sum(1 for r in rows if r.get("status") == "TIMEOUT")
+        gross = [r.get("r_multiple_gross") for r in rows if r.get("r_multiple_gross") is not None]
+        stats.avg_r_gross = round(sum(gross) / len(gross), 3) if gross else 0.0
         stats.win_rate = stats.wins / stats.closed
         stats.avg_r = sum(r.get("r_multiple") or 0.0 for r in rows) / stats.closed
     return stats, rows[-20:]

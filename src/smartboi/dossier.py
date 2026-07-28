@@ -39,6 +39,20 @@ class EvidenceRecord:
     reasoning: str
     skeptic_note: str
     relationship_confidence: float | None = None  # the graph edge's own extracted confidence; None when not propagated
+    # The exact model snapshots that produced this record. Forward-only
+    # testing is this system's core validity claim (README point 7), and it
+    # has one fragile edge: an LLM whose training corpus covers the period
+    # being "predicted" can recall how the story ended, and this is
+    # demonstrated, large, and NOT fixable by prompting -- models asked to
+    # forecast from Sept-Nov 2019 earnings calls mention COVID-19 in over a
+    # quarter of cases even when explicitly told not to use future
+    # knowledge. So a track record is only meaningful RELATIVE TO A MODEL
+    # SNAPSHOT: swapping the backbone silently resets the out-of-sample
+    # clock, because the new model's cutoff may postdate part of the record.
+    # Stamped per record so a model change is visible in the data rather
+    # than being something you have to remember.
+    scored_by_model: str = ""   # the dossier model that proposed this update
+    reviewed_by_model: str = ""  # the skeptic model that adjudicated it
 
 
 @dataclass

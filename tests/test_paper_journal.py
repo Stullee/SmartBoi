@@ -76,3 +76,61 @@ def test_no_new_trade_while_one_is_open(tmp_path):
     assert journal.has_open("UCTT")
     # Caller (engine.py) is responsible for checking has_open() before
     # calling open() again -- this test documents that expectation.
+
+
+# --- Transaction costs. The closest published analogue to this strategy
+# went from ~700% gross to ~50% at 25bp round-trip, and a survey of 204
+# anomalies found ~93% post-publication decay AFTER costs (vs ~50% before),
+# with the average anomaly netting 4bp/month. A paper record quoted gross is
+# not evidence -- and this strategy's edge sits in exactly the small,
+# thin-coverage names where spreads are worst.
+
+def test_costs_are_charged_on_both_sides(tmp_path):
+    journal = PaperTradeJournal(tmp_path / "t.jsonl")
+    trade = journal.open("AAA", "LONG", 100.0, 10.0, 20.0, 21, "t", 0.8, 2, [],
+                         cost_bps_round_trip=50.0)
+    journal.update("AAA", 120.0)                      # take-profit
+
+    # Gross: +20 on 10 of risk = 2.0R. Cost: 50bp over (100+120)/2 notional
+    # per side => 0.25% * 220 = 0.55 -> 0.055R of drag.
+    assert trade.r_multiple_gross == 2.0
+    assert trade.r_multiple == pytest.approx(1.945, abs=1e-3)
+    assert trade.r_multiple < trade.r_multiple_gross
+
+
+def test_costs_apply_to_shorts_in_the_same_direction(tmp_path):
+    """Cost is a drag regardless of side -- never a subsidy on a short."""
+    journal = PaperTradeJournal(tmp_path / "t.jsonl")
+    trade = journal.open("AAA", "SHORT", 100.0, 10.0, 20.0, 21, "t", 0.8, 2, [],
+                         cost_bps_round_trip=50.0)
+    journal.update("AAA", 80.0)                       # take-profit for a short
+    assert trade.r_multiple < trade.r_multiple_gross
+
+
+def test_a_marginal_winner_can_be_a_net_loser(tmp_path):
+    """The whole point: costs decide marginal trades, which is where a
+    thin-edge strategy lives."""
+    journal = PaperTradeJournal(tmp_path / "t.jsonl")
+    # Wide stop => small R per unit move, so cost drag dominates a small win.
+    trade = journal.open("AAA", "LONG", 100.0, 50.0, 0.05, 21, "t", 0.8, 2, [],
+                         cost_bps_round_trip=200.0)
+    journal.update("AAA", 100.05)
+    assert trade.r_multiple_gross > 0
+    assert trade.r_multiple < 0
+
+
+def test_unrealized_is_also_quoted_net(tmp_path):
+    """An open book quoted gross systematically flatters itself."""
+    journal = PaperTradeJournal(tmp_path / "t.jsonl")
+    trade = journal.open("AAA", "LONG", 100.0, 10.0, 50.0, 21, "t", 0.8, 2, [],
+                         cost_bps_round_trip=100.0)
+    journal.update("AAA", 105.0)
+    assert trade.status == "OPEN"
+    assert trade.unrealized_r_multiple() < 0.5        # gross would be exactly 0.5
+
+
+def test_zero_cost_reproduces_the_old_gross_behaviour(tmp_path):
+    journal = PaperTradeJournal(tmp_path / "t.jsonl")
+    trade = journal.open("AAA", "LONG", 100.0, 10.0, 20.0, 21, "t", 0.8, 2, [])
+    journal.update("AAA", 120.0)
+    assert trade.r_multiple == trade.r_multiple_gross == 2.0

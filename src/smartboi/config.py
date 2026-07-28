@@ -105,7 +105,28 @@ class Settings(BaseSettings):
     # separately -- independent disclosures, not restatements of each other).
     signal_confidence_threshold: float = 0.65
     min_independent_sources: int = 2
-    max_horizon_days: int = 56  # ~8 weeks, the top of README's 2-8 week holding window
+    # 21 trading-ish days, not the 56 this started with. The lead-lag
+    # literature is specific about where the tradeable component lives: a
+    # daily-resolution event study of supplier returns after large customer
+    # price moves finds predictability concentrated in the FIRST WEEK, and
+    # the one paper that decomposes the effect (Burt & Hrdlicka, JFQA 2021)
+    # finds that at horizons past roughly a month the predictability is
+    # *entirely* momentum commonality between linked firms -- shared factor
+    # exposure and correlated returns -- with no information-diffusion
+    # component left. Holding for eight weeks was therefore spending six of
+    # them earning momentum beta while calling it evidence synthesis.
+    max_horizon_days: int = 21
+
+    # --- Transaction costs ---
+    # Applied to every hypothetical trade's realized P&L. Not optional
+    # realism: the closest published analogue to this strategy went from
+    # ~700% gross to ~50% at 25bp round-trip, and a survey of 204 anomalies
+    # found post-publication decay of ~50% before costs and ~93% AFTER
+    # them, with the average anomaly netting 4bp/month. This strategy's
+    # edge is concentrated in exactly the small, thinly-covered names where
+    # spreads are widest, so a paper record that ignores costs is not
+    # evidence of anything. Charged per side, so the round-trip is double.
+    transaction_cost_bps_per_side: float = 25.0
 
     # --- Entry timing: "have we missed the correction already" guards.
     # Applied when a SIGNALED dossier is about to become a paper trade

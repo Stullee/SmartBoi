@@ -36,21 +36,43 @@ class PaperTrade:
     status: str = "OPEN"  # OPEN | WIN | LOSS | TIMEOUT
     closed_at: str | None = None
     exit_price: float | None = None
-    r_multiple: float | None = None
+    r_multiple: float | None = None            # NET of transaction costs
+    r_multiple_gross: float | None = None      # before costs, for comparison
     last_price: float | None = None
+    # Round-trip cost charged against this trade, in basis points of notional
+    # (both sides combined). Recorded per trade rather than assumed, so a
+    # record stays interpretable if the assumption is ever changed.
+    cost_bps_round_trip: float = 0.0
+
+    def _net_pnl(self, exit_price: float) -> float:
+        """P&L per share after the round-trip transaction cost.
+
+        Costs are charged as a fraction of notional on BOTH sides, which is
+        the standard way to express spread-crossing plus impact. This
+        matters more here than in most systems: the strategy deliberately
+        targets small, thinly-covered names, and that is exactly the size
+        bucket where spreads are widest -- the published lead-lag anomaly
+        this implements is documented to be statistically insignificant for
+        the largest, most liquid names, so the cost drag cannot be escaped
+        by trading bigger."""
+        gross = (
+            exit_price - self.entry_price
+            if self.direction == "LONG"
+            else self.entry_price - exit_price
+        )
+        cost = (self.entry_price + exit_price) * (self.cost_bps_round_trip / 2.0) / 10_000.0
+        return gross - cost
 
     def unrealized_r_multiple(self) -> float | None:
+        """Net of the round-trip cost, because that is the number that
+        decides whether the thesis paid -- an unrealized figure quoted gross
+        systematically flatters an open book."""
         if self.last_price is None:
             return None
         risk = abs(self.entry_price - self.stop_price)
         if risk <= 0:
             return None
-        pnl = (
-            self.last_price - self.entry_price
-            if self.direction == "LONG"
-            else self.entry_price - self.last_price
-        )
-        return round(pnl / risk, 3)
+        return round(self._net_pnl(self.last_price) / risk, 3)
 
 
 class PaperTradeJournal:
@@ -97,6 +119,7 @@ class PaperTradeJournal:
         confidence: float,
         independent_source_count: int,
         citations: list[dict],
+        cost_bps_round_trip: float = 0.0,
     ) -> PaperTrade:
         if direction == "LONG":
             stop_price = entry_price * (1 - stop_loss_pct / 100)
@@ -116,6 +139,7 @@ class PaperTradeJournal:
             confidence=confidence,
             independent_source_count=independent_source_count,
             citations=citations,
+            cost_bps_round_trip=cost_bps_round_trip,
         )
         self.open_trades[symbol] = trade
         self._write_open_state()
@@ -153,7 +177,7 @@ class PaperTradeJournal:
 
     def _close(self, trade: PaperTrade, status: str, exit_price: float, now: datetime) -> None:
         risk = abs(trade.entry_price - trade.stop_price)
-        pnl = (
+        gross = (
             exit_price - trade.entry_price
             if trade.direction == "LONG"
             else trade.entry_price - exit_price
@@ -161,10 +185,12 @@ class PaperTradeJournal:
         trade.status = status
         trade.exit_price = exit_price
         trade.closed_at = now.isoformat()
-        trade.r_multiple = round(pnl / risk, 3) if risk > 0 else 0.0
+        trade.r_multiple_gross = round(gross / risk, 3) if risk > 0 else 0.0
+        trade.r_multiple = round(trade._net_pnl(exit_price) / risk, 3) if risk > 0 else 0.0
         log.info(
-            "[PAPER] Closed %s %s: %s @ %.2f (R=%.2f)",
-            trade.direction, trade.symbol, status, exit_price, trade.r_multiple,
+            "[PAPER] Closed %s %s: %s @ %.2f (R=%.2f net, %.2f gross, %.0fbp round-trip)",
+            trade.direction, trade.symbol, status, exit_price,
+            trade.r_multiple, trade.r_multiple_gross, trade.cost_bps_round_trip,
         )
         self._append_to_log(trade)
         del self.open_trades[trade.symbol]

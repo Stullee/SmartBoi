@@ -147,6 +147,9 @@ class Engine:
         # _auto_accept_candidates). Persisted so a restart cannot reset the
         # cap and let a long candidate list through in one afternoon.
         self.auto_accept_state = JsonState(DATA_DIR / "auto_accept_state.json")
+        # Which model snapshots produced the existing record -- see
+        # _check_model_provenance for why a change to these matters.
+        self.model_state = JsonState(DATA_DIR / "model_provenance.json")
         self.alerts = AlertSender(settings.alert_webhook_url)
         self.usage = UsageTracker(DATA_DIR / "llm_usage.json", settings.max_daily_llm_calls)
 
@@ -271,6 +274,38 @@ class Engine:
         self._warned.add(key)
         log.warning(message)
 
+    def _check_model_provenance(self) -> None:
+        """Warns loudly when a model snapshot changes while a track record
+        already exists.
+
+        Forward-only testing is this system's central validity claim, and a
+        model swap quietly invalidates the part of the record that predates
+        it: the new snapshot's training cutoff may postdate evidence it is
+        now being asked to "predict", and look-ahead contamination of that
+        kind is measurable, large, and not fixable by prompting. The correct
+        response to this warning is to treat what follows as a NEW track
+        record reported separately -- not to keep appending to the old one,
+        and never to re-score existing dossier_snapshots.jsonl rows with the
+        new model."""
+        current = {
+            "extraction_model": self.settings.extraction_model,
+            "dossier_model": self.settings.dossier_model,
+            "skeptic_model": self.settings.skeptic_model,
+        }
+        previous = self.model_state.get("models")
+        if previous and previous != current:
+            changed = [k for k in current if previous.get(k) != current.get(k)]
+            log.warning(
+                "[PROVENANCE] Model snapshot(s) changed since the last run: %s. "
+                "Everything scored before now was judged by a DIFFERENT model, so the "
+                "forward track record is no longer one continuous out-of-sample test. "
+                "Treat what follows as a new record, report it separately, and do not "
+                "re-score historical snapshots with the new model.",
+                ", ".join(f"{k}: {previous.get(k)} -> {current[k]}" for k in changed),
+            )
+            self.model_state.set("changed_at", datetime.now(timezone.utc).isoformat())
+        self.model_state.set("models", current)
+
     def _seed_graph(self) -> None:
         """Seeds the well-documented DEFAULT_UNIVERSE relationships
         (SEED_RELATIONSHIPS) -- but only the ones where BOTH companies are
@@ -290,6 +325,7 @@ class Engine:
             )
 
     async def start(self) -> None:
+        self._check_model_provenance()
         self._seed_graph()
 
         if self.settings.enable_edgar_ingestion and self.settings.edgar_user_agent.strip():
@@ -1161,6 +1197,8 @@ class Engine:
             is_propagated=(target_symbol != origin_symbol),
             relationship_note=relationship_note,
             relationship_confidence=relationship_confidence,
+            scored_by_model=self.settings.dossier_model,
+            reviewed_by_model=self.settings.skeptic_model,
             direction=proposed["direction"],
             magnitude=float(verdict.get("adjusted_magnitude", proposed["magnitude"])),
             confidence=float(verdict.get("adjusted_confidence", proposed["confidence"])),
@@ -1295,6 +1333,7 @@ class Engine:
             self.settings.stop_loss_pct, self.settings.take_profit_pct,
             horizon, dossier.thesis_summary, dossier.confidence,
             dossier.independent_source_count, citations,
+            cost_bps_round_trip=self.settings.transaction_cost_bps_per_side * 2,
         )
         await self.alerts.send(
             "paper_trade_opened",
