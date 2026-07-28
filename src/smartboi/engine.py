@@ -713,7 +713,25 @@ class Engine:
                 log.info("[CANDIDATE] %s: resolved ticker %s on recheck.", entry.get("name"), ticker)
                 changed = True
 
-            if self.finnhub is not None and not entry.get("recommended_as") and ticker not in self.accepted_candidates.data:
+            # Recomputed whenever the BOUNDS it was derived from have changed,
+            # not just when it's missing. A recommendation is only meaningful
+            # relative to the thresholds that produced it, and those do move:
+            # the 2026-07 recalibration went from 100/6 to 75/10, which flips
+            # e.g. an $800M/8-analyst company from "anchor" to "tradeable".
+            # Keying only on absence would leave every already-seen candidate
+            # frozen at the old calibration forever -- and since
+            # _auto_accept_candidates acts on this value, silently keep
+            # auto-adding them under superseded thresholds.
+            bounds = [
+                self.settings.universe_min_market_cap_musd,
+                self.settings.universe_max_market_cap_musd,
+                float(self.settings.universe_max_analyst_count),
+            ]
+            if (
+                self.finnhub is not None
+                and ticker not in self.accepted_candidates.data
+                and entry.get("recommendation_bounds") != bounds
+            ):
                 market_cap = await self.finnhub.market_cap_musd(ticker)
                 analysts = await self.finnhub.analyst_count(ticker)
                 recommendation, reason = recommend_candidate_type(
@@ -722,8 +740,15 @@ class Engine:
                     self.settings.universe_max_market_cap_musd,
                     self.settings.universe_max_analyst_count,
                 )
+                previous = entry.get("recommended_as")
                 entry["recommended_as"] = recommendation
                 entry["recommendation_reason"] = reason
+                entry["recommendation_bounds"] = bounds
+                if previous and previous != recommendation:
+                    log.info(
+                        "[CANDIDATE] %s: recommendation changed %s -> %s under the current bounds (%s).",
+                        ticker, previous, recommendation, reason,
+                    )
                 changed = True
 
             if changed:

@@ -7,6 +7,8 @@ acting on it automatically safe -- above all that a TRADEABLE is never added on
 an unverified ticker, which is the confirmed-live Advantest->ATRO failure."""
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from smartboi.config import Settings
@@ -156,3 +158,57 @@ def test_legacy_string_entries_still_load(engine, tmp_path, monkeypatch):
     restarted = Engine(engine.settings)
     assert restarted.spec_by_symbol["OLDT"].signal_source_only is False
     assert restarted.spec_by_symbol["OLDA"].signal_source_only is True
+
+
+# --- A recommendation is only meaningful relative to the bounds that
+# produced it, and those move (the 2026-07 recalibration went 100/6 ->
+# 75/10). A stale one silently keeps auto-accept on superseded thresholds.
+
+async def test_recommendation_is_recomputed_when_the_bounds_change(engine):
+    engine.finnhub.market_cap_musd = lambda symbol: asyncio.sleep(0, result=800.0)
+    engine.finnhub.analyst_count = lambda symbol: asyncio.sleep(0, result=8)
+    # As recorded before the recalibration: 8 analysts was > the old bound of 6.
+    entry = _candidate(recommended_as="anchor")
+    entry["recommendation_bounds"] = [100.0, 5000.0, 6.0]
+    engine.candidates.set("ZZZZ", entry)
+
+    await engine._run_candidate_ticker_recheck()
+
+    # 8 analysts is inside the current bound of 10, so it's a trade target now.
+    assert engine.candidates.get("ZZZZ")["recommended_as"] == "tradeable"
+
+
+async def test_recommendation_is_not_recomputed_when_bounds_are_unchanged(engine):
+    """Re-fetching market data for every candidate on every daily recheck
+    would be pure waste -- two Finnhub calls each, against a 60/min budget
+    shared with the engine's own polling."""
+    calls = []
+
+    async def counting_market_cap(symbol):
+        calls.append(symbol)
+        return 800.0
+
+    engine.finnhub.market_cap_musd = counting_market_cap
+    engine.finnhub.analyst_count = lambda symbol: asyncio.sleep(0, result=8)
+    entry = _candidate(recommended_as="tradeable")
+    entry["recommendation_bounds"] = [
+        engine.settings.universe_min_market_cap_musd,
+        engine.settings.universe_max_market_cap_musd,
+        float(engine.settings.universe_max_analyst_count),
+    ]
+    engine.candidates.set("ZZZZ", entry)
+
+    await engine._run_candidate_ticker_recheck()
+    assert calls == []
+
+
+async def test_a_candidate_recorded_before_bounds_existed_is_refreshed(engine):
+    """Entries written before recommendation_bounds was stored at all have
+    no marker, so they must be treated as stale rather than trusted."""
+    engine.finnhub.market_cap_musd = lambda symbol: asyncio.sleep(0, result=800.0)
+    engine.finnhub.analyst_count = lambda symbol: asyncio.sleep(0, result=8)
+    engine.candidates.set("ZZZZ", _candidate(recommended_as="anchor"))  # no bounds key
+
+    await engine._run_candidate_ticker_recheck()
+
+    assert engine.candidates.get("ZZZZ")["recommended_as"] == "tradeable"
