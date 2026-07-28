@@ -716,19 +716,28 @@ class Engine:
                 fp = fingerprint(symbol, article.headline, published)
                 if self.dedup.is_duplicate(fp):
                     continue
-                domain = source_domain(article.url) or article.source
+                # The real publisher (Reuters, Bloomberg, ...) is what makes
+                # two articles genuinely independent sources -- Finnhub's
+                # free-tier article URLs all point at finnhub.io itself, so
+                # source_domain(article.url) was always non-empty and this
+                # used to prefer it, collapsing every single article onto
+                # one source identity ("finnhub.io") no matter how many
+                # distinct publishers actually covered a story. Only fall
+                # back to the URL's domain if Finnhub ever ships a genuinely
+                # empty source field.
+                publisher = (article.source or "").strip() or source_domain(article.url) or "unknown"
                 evidence_text = f"News ({article.source}, {published}): {article.headline}\n{article.summary}"
                 scored = await self._process_evidence(
                     origin_symbol=symbol,
                     evidence_text=evidence_text,
                     source_type="news",
-                    source_name=domain,
+                    source_name=publisher,
                     url=article.url,
                     headline=article.headline,
                     published_at=published,
                 )
                 if scored:
-                    self.dedup.register(fp, domain)
+                    self.dedup.register(fp, publisher)
 
     # --- Shared evidence -> dossier pipeline ---
 

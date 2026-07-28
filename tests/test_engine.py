@@ -14,6 +14,7 @@ from smartboi.config import Settings
 from smartboi.edgar import FilingEvent
 from smartboi.engine import Engine
 from smartboi.graph import Relationship
+from smartboi.news import NewsArticle
 
 from tests.fakes import (
     FakeEdgarClient,
@@ -49,6 +50,49 @@ def engine(tmp_path, monkeypatch):
     e.skeptic = FakeSkeptic()
     e.price_feed = FakePriceFeed()
     return e
+
+
+# --- Invariant: news source identity is the real publisher (P0 fix), not
+# Finnhub's own article-URL domain -- every free-tier article URL points at
+# finnhub.io itself, so using the URL domain collapsed every single article
+# onto one source identity and independent_source_count could never exceed
+# 1 no matter how many distinct publishers actually covered a story. ---
+
+async def test_distinct_publishers_count_as_independent_sources(engine):
+    engine.finnhub.articles_by_symbol["FORM"] = [
+        NewsArticle(symbol="FORM", headline="Headline A", summary="s", source="Reuters",
+                    url="https://finnhub.io/api/news/1", published_at="2026-07-23T00:00:00+00:00"),
+        NewsArticle(symbol="FORM", headline="Headline B", summary="s", source="Bloomberg",
+                    url="https://finnhub.io/api/news/2", published_at="2026-07-23T00:00:00+00:00"),
+    ]
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+
+    await engine._poll_news()
+
+    dossier = engine.dossiers.load("FORM")
+    assert dossier.independent_source_count == 2
+    assert {e.source_name for e in dossier.evidence} == {"Reuters", "Bloomberg"}
+
+
+async def test_same_headline_syndication_still_collapses_to_one_source(engine):
+    engine.finnhub.articles_by_symbol["FORM"] = [
+        NewsArticle(symbol="FORM", headline="Same Headline", summary="s", source="Reuters",
+                    url="https://finnhub.io/api/news/1", published_at="2026-07-23T00:00:00+00:00"),
+        # A different publisher syndicating the exact same story, same day --
+        # the dedup FINGERPRINT (symbol:normalized_headline:date) is what
+        # collapses this, deliberately independent of source identity.
+        NewsArticle(symbol="FORM", headline="Same Headline", summary="s", source="Yahoo",
+                    url="https://finnhub.io/api/news/2", published_at="2026-07-23T00:00:00+00:00"),
+    ]
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+
+    await engine._poll_news()
+
+    dossier = engine.dossiers.load("FORM")
+    assert dossier.independent_source_count == 1
+    assert len(dossier.evidence) == 1
 
 
 # --- Invariant: SEED_RELATIONSHIPS only ever seeds edges between symbols

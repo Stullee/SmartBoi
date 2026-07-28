@@ -294,8 +294,18 @@ of being re-proposed (and re-paid for) from scratch.
 ## Corroboration
 
 `MIN_INDEPENDENT_SOURCES` counts genuinely independent evidence, not just
-distinct API calls: for news, `dedup.py` collapses syndicated republishes
-of one wire story to a single publisher domain; for SEC filings, each
+distinct API calls: for news, `dedup.py`'s fingerprint (symbol + normalized
+headline + date) collapses syndicated republishes of one wire story into
+one data point regardless of which outlet's copy a feed happened to
+return, while source IDENTITY is the real publisher name (Reuters,
+Bloomberg, ...) -- `engine.py`'s `_poll_news` used to identify a source by
+its article URL's domain, but Finnhub's free tier serves every article
+through its own `finnhub.io` URLs, so every single article was silently
+labeled the same source and `independent_source_count` could never exceed
+1 no matter how many outlets actually covered a story (the actual publisher
+was already available in `NewsArticle.source`, just never used for
+identity). Fixed by preferring the publisher name outright. For SEC
+filings, each
 filing TYPE counts separately (`"SEC EDGAR (8-K)"`, `"SEC EDGAR (Form 4)"`,
 `"SEC EDGAR (10-Q)"`, ...) rather than every filing collapsing onto one
 flat `"SEC EDGAR"` source -- a material event, an insider transaction, and
