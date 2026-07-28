@@ -16,12 +16,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import asdict
 from pathlib import Path
 
 from aiohttp import web
 
+from smartboi.news import redact_token
+from smartboi.screen import (
+    DEFAULT_MAX_ANALYSTS as SCREEN_MAX_ANALYSTS,
+    DEFAULT_MAX_CAP_MUSD as SCREEN_MAX_CAP_MUSD,
+    DEFAULT_MIN_CAP_MUSD as SCREEN_MIN_CAP_MUSD,
+)
+from smartboi.tools import run_forward_returns, run_screen
 from smartboi.status import (
     gather_dossiers,
     gather_graph_stats,
@@ -34,6 +42,26 @@ from smartboi.status import (
 log = logging.getLogger(__name__)
 
 _STATUS_TIMEOUT_SEC = 8.0
+# A ticker as the screener will accept it: letters, digits, and the dot/dash
+# real symbols use (BRK.B, RDS-A). Anything else in the free-text box is
+# dropped rather than forwarded to Finnhub.
+_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,9}$")
+
+
+def _parse_tickers(raw: object) -> list[str]:
+    """The dashboard's free-text ticker box -> a clean symbol list. Accepts
+    whitespace, comma or semicolon separation (a free-text box should not
+    silently swallow a ticker over punctuation choice), uppercases,
+    de-duplicates while keeping the typed order, and drops anything that
+    isn't ticker-shaped -- this is operator input going into outbound API
+    calls, so it's validated against a pattern rather than passed through."""
+    if not isinstance(raw, str):
+        return []
+    out: list[str] = []
+    for token in re.split(r"[\s,;]+", raw.strip().upper()):
+        if token and _TICKER_RE.match(token) and token not in out:
+            out.append(token)
+    return out
 
 _INDEX_HTML = """<!doctype html>
 <html>
@@ -62,11 +90,36 @@ _INDEX_HTML = """<!doctype html>
   .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.78rem; }
   .badge.on { background: rgba(62,207,110,0.18); color: #3ecf6e; }
   .badge.off { background: rgba(128,128,128,0.18); opacity: 0.7; }
+  button { font: inherit; padding: 0.35rem 0.8rem; border-radius: 6px; cursor: pointer;
+           border: 1px solid rgba(128,128,128,0.4); background: rgba(128,128,128,0.14); color: inherit; }
+  button:hover:not(:disabled) { background: rgba(128,128,128,0.26); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  input[type=text] { font: inherit; padding: 0.35rem 0.6rem; border-radius: 6px; min-width: 22rem;
+                     border: 1px solid rgba(128,128,128,0.4); background: rgba(128,128,128,0.1); color: inherit; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+  .toolhint { opacity: 0.55; font-size: 0.8rem; margin: 0.4rem 0 0; }
+  #tool-output { background: rgba(128,128,128,0.12); border-radius: 8px; padding: 0.8rem 1rem;
+                 margin-top: 0.7rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.45;
+                 white-space: pre; display: none; }
 </style>
 </head>
 <body>
 <h1>SmartBoi Status</h1>
 <div class="subtitle">Paper-only cross-company evidence synthesis -- no order-placement code exists in this system.</div>
+
+<!-- Deliberately OUTSIDE #app: render() replaces that element's entire
+     innerHTML on every 10s auto-refresh, which would wipe a half-typed
+     ticker list and any report the operator is still reading. -->
+<h2 style="margin-top:0">Tools</h2>
+<div class="toolbar">
+  <input type="text" id="screen-tickers" placeholder="INTT ASYS CVU  (blank = screen discovered candidates)">
+  <button id="btn-screen">Screen candidates</button>
+  <button id="btn-analyze">Forward-return report</button>
+</div>
+<div class="toolhint">Both are read-only: screening does market-cap/analyst lookups, the report reads the captured
+  snapshot/price logs. Neither changes a dossier, the universe, or any trade.</div>
+<pre id="tool-output"></pre>
+
 <div id="app">Loading&hellip;</div>
 <div class="updated" id="updated"></div>
 <script>
@@ -259,6 +312,49 @@ document.addEventListener("click", function(ev) {
   });
 });
 
+// --- Tools (see /api/tools/* in webapp.py) ---------------------------------
+// A screening run is ~2.2s per ticker (two rate-limited Finnhub calls), so a
+// full run can legitimately take minutes -- far past REFRESH_TIMEOUT_MS,
+// hence its own much longer budget.
+var TOOL_TIMEOUT_MS = 300000;
+
+function runTool(path, body, button) {
+  var out = document.getElementById("tool-output");
+  var buttons = [document.getElementById("btn-screen"), document.getElementById("btn-analyze")];
+  buttons.forEach(function(b) { b.disabled = true; });
+  out.style.display = "block";
+  out.textContent = "Running… (this can take a few minutes for a long ticker list)";
+
+  var controller = new AbortController();
+  var timedOut = false;
+  var timer = setTimeout(function() { timedOut = true; controller.abort(); }, TOOL_TIMEOUT_MS);
+  fetch(API_BASE + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+    signal: controller.signal,
+  }).then(function(r) {
+    clearTimeout(timer);
+    return r.json();
+  }).then(function(result) {
+    out.textContent = result.error ? ("Error: " + result.error) : result.report;
+  }).catch(function(err) {
+    clearTimeout(timer);
+    out.textContent = timedOut
+      ? "No response after " + (TOOL_TIMEOUT_MS / 1000) + "s -- the run may still be going; try again shortly."
+      : "Failed: " + err;
+  }).finally(function() {
+    buttons.forEach(function(b) { b.disabled = false; });
+  });
+}
+
+document.getElementById("btn-screen").addEventListener("click", function() {
+  runTool("tools/screen", { tickers: document.getElementById("screen-tickers").value }, this);
+});
+document.getElementById("btn-analyze").addEventListener("click", function() {
+  runTool("tools/forward-returns", {}, this);
+});
+
 function refresh() {
   var controller = new AbortController();
   var timedOut = false;
@@ -373,10 +469,68 @@ def create_app(engine) -> web.Application:
         spec = engine.accept_candidate(symbol, as_type)
         return web.json_response({"ok": True, "symbol": spec.symbol, "as": as_type})
 
+    # Serializes tool runs. A screening pass shares the engine's own
+    # FinnhubClient (see tools.run_screen for why), and that client's
+    # request spacing is a single instance-wide timer -- two concurrent
+    # runs would interleave and blow through the free tier's 60/min.
+    tool_lock = asyncio.Lock()
+
+    async def _run_tool(handler) -> web.Response:
+        """Shared wrapper for /api/tools/*: one at a time, never 500s the
+        page, and never lets a tool failure touch the engine."""
+        if tool_lock.locked():
+            return web.json_response(
+                {"error": "Another tool run is already in progress -- wait for it to finish."}, status=409
+            )
+        async with tool_lock:
+            try:
+                return web.json_response({"report": await handler()})
+            except Exception as exc:  # noqa: BLE001 - a tool failure is a message, not a dead dashboard
+                log.exception("Dashboard tool run failed")
+                return web.json_response({"error": redact_token(exc)}, status=500)
+
+    async def handle_tool_screen(request: web.Request) -> web.Response:
+        """Runs the candidate screener (smartboi.tools.run_screen) and
+        returns its report as text. Read-only: it performs market-cap and
+        analyst-count lookups and formats a table. It cannot add a symbol
+        to the universe -- that stays a separate, deliberate click on a
+        discovered candidate (see handle_accept_candidate)."""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - a malformed body is a 400, not a 500
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        tickers = _parse_tickers(body.get("tickers"))
+
+        async def run() -> str:
+            return await run_screen(
+                engine.finnhub, engine.universe, tickers,
+                float(body.get("min_cap") or SCREEN_MIN_CAP_MUSD),
+                float(body.get("max_cap") or SCREEN_MAX_CAP_MUSD),
+                int(body.get("max_analysts") or SCREEN_MAX_ANALYSTS),
+            )
+
+        return await _run_tool(run)
+
+    async def handle_tool_forward_returns(request: web.Request) -> web.Response:
+        """Runs the forward-return analysis (smartboi.tools.run_forward_returns)
+        over the captured snapshot/price logs. Pure file reads -- no network,
+        no LLM, nothing mutated."""
+        async def run() -> str:
+            # Offloaded to a thread: this reads two append-only logs that
+            # grow every day, and parsing them synchronously on the event
+            # loop would stall the engine's polling for the duration.
+            return await asyncio.to_thread(
+                run_forward_returns, engine.settings.log_dir, engine.universe
+            )
+
+        return await _run_tool(run)
+
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_status)
     app.router.add_post("/api/candidates/accept", handle_accept_candidate)
+    app.router.add_post("/api/tools/screen", handle_tool_screen)
+    app.router.add_post("/api/tools/forward-returns", handle_tool_forward_returns)
     return app
 
 
