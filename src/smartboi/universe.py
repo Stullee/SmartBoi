@@ -66,6 +66,28 @@ Two structural notes behind the anchor expansion:
   the sector-exposure links (IESC -> MSFT/GOOGL at confidence 0.30-0.50)
   never provided.
 
+## Why nine ecosystems, and why deliberately uncorrelated ones
+
+The first four were one macro bet -- semis, grid/data-center and battery all
+ride the AI/electrification capex cycle, which is exactly why they sold off
+together in the first week of forward data, and why a book that was long all
+of them looked like it had no edge when it may simply have had no
+diversification.
+
+The five added since (medtech_supply, auto_supply, energy_services,
+industrial_machinery, transport_logistics) were chosen on two criteria:
+
+1. **The disclosure structure has to exist.** Every one is a place where a
+   small supplier is REQUIRED to disclose a concentrated large customer,
+   because losing that customer is a material risk. That is what makes the
+   relationship graph readable rather than inferred -- and it is why these
+   are supply chains rather than, say, consumer brands or financials.
+2. **The driver has to be different.** Vehicle production schedules, rig
+   counts and operator capex, industrial/agriculture cycles, and freight
+   rates are genuinely unrelated to AI capex and to each other. If the whole
+   book still moves together after this, that is information: it means the
+   signal is picking up market beta, not company-specific diffusion.
+
 ## Ecosystem sizing
 
 defense_tier2 and battery_storage were widened from two tradeables each to
@@ -388,6 +410,104 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
                 notes="Anchor: tier-1 seating/e-systems -- a tier-2's disclosed customer"),
     CompanySpec("MGA", "Magna International", "auto_supply", signal_source_only=True,
                 notes="Anchor: tier-1 contract manufacturer -- a tier-2's disclosed customer"),
+
+    # ================================================================
+    # Oilfield & energy services (added 2026-07)
+    # Small service companies disclose concentrated E&P customers, and
+    # activity is driven by rig counts and operator capex budgets -- a
+    # cycle with no relationship to AI/electrification capex.
+    # ================================================================
+    CompanySpec("NR", "Newpark Resources", "energy_services",
+                notes="unverified -- drilling fluids/site access; concentrated operator customers"),
+    CompanySpec("OIS", "Oil States International", "energy_services",
+                notes="unverified -- completion and production equipment"),
+    CompanySpec("PUMP", "ProPetro Holding", "energy_services",
+                notes="unverified -- pressure pumping; discloses very high customer concentration in the Permian"),
+    CompanySpec("NCSM", "NCS Multistage", "energy_services",
+                notes="unverified -- micro-cap completion technology; expected very thin coverage"),
+    CompanySpec("KLXE", "KLX Energy Services", "energy_services",
+                notes="unverified -- micro-cap completion/production services"),
+    CompanySpec("XOM", "Exxon Mobil", "energy_services", signal_source_only=True,
+                notes="Anchor: operator capex budgets drive service demand"),
+    CompanySpec("CVX", "Chevron", "energy_services", signal_source_only=True,
+                notes="Anchor: operator capex budgets"),
+    CompanySpec("COP", "ConocoPhillips", "energy_services", signal_source_only=True,
+                notes="Anchor: operator capex budgets"),
+    CompanySpec("OXY", "Occidental Petroleum", "energy_services", signal_source_only=True,
+                notes="Anchor: Permian operator capex -- the most-disclosed customer for pressure pumpers"),
+    CompanySpec("EOG", "EOG Resources", "energy_services", signal_source_only=True,
+                notes="Anchor: shale operator capex"),
+    CompanySpec("FANG", "Diamondback Energy", "energy_services", signal_source_only=True,
+                notes="Anchor: Permian operator capex"),
+    CompanySpec("SLB", "SLB (Schlumberger)", "energy_services", signal_source_only=True,
+                notes="Anchor: the tier-1 a smaller service company competes with or subcontracts to"),
+    CompanySpec("HAL", "Halliburton", "energy_services", signal_source_only=True,
+                notes="Anchor: tier-1 service bellwether"),
+    CompanySpec("BKR", "Baker Hughes", "energy_services", signal_source_only=True,
+                notes="Anchor: tier-1 service and equipment bellwether"),
+
+    # ================================================================
+    # Industrial machinery & components (added 2026-07)
+    # Small component makers disclose concentrated OEM customers; driven
+    # by industrial capex and construction/agriculture cycles.
+    # ================================================================
+    CompanySpec("HURC", "Hurco Companies", "industrial_machinery",
+                notes="unverified -- micro-cap CNC machine tools; expected very thin coverage"),
+    CompanySpec("TAYD", "Taylor Devices", "industrial_machinery",
+                notes="unverified -- micro-cap seismic/shock dampers for infrastructure and defense; very thin coverage"),
+    CompanySpec("GRC", "Gorman-Rupp", "industrial_machinery",
+                notes="unverified -- industrial pumps sold into municipal and OEM channels"),
+    CompanySpec("HDSN", "Hudson Technologies", "industrial_machinery",
+                notes="unverified -- refrigerant services; concentrated industrial/OEM customers"),
+    CompanySpec("EPAC", "Enerpac Tool Group", "industrial_machinery",
+                notes="unverified -- high-force tools for industrial maintenance"),
+    CompanySpec("CAT", "Caterpillar", "industrial_machinery", signal_source_only=True,
+                notes="Anchor: construction/mining equipment demand -- the OEM a component maker names"),
+    CompanySpec("DE", "Deere & Company", "industrial_machinery", signal_source_only=True,
+                notes="Anchor: agriculture equipment demand"),
+    CompanySpec("CMI", "Cummins", "industrial_machinery", signal_source_only=True,
+                notes="Anchor: engine/powertrain demand"),
+    CompanySpec("PCAR", "PACCAR", "industrial_machinery", signal_source_only=True,
+                notes="Anchor: commercial truck build rates"),
+    CompanySpec("HON", "Honeywell", "industrial_machinery", signal_source_only=True,
+                notes="Anchor: diversified industrial; a disclosed customer for many small suppliers"),
+    CompanySpec("EMR", "Emerson Electric", "industrial_machinery", signal_source_only=True,
+                notes="Anchor: process automation demand"),
+    CompanySpec("PH", "Parker Hannifin", "industrial_machinery", signal_source_only=True,
+                notes="Anchor: motion and control -- tier-1 customer of smaller component makers"),
+    CompanySpec("ITW", "Illinois Tool Works", "industrial_machinery", signal_source_only=True,
+                notes="Anchor: diversified industrial demand"),
+
+    # ================================================================
+    # Transport & logistics (added 2026-07)
+    # Small carriers and logistics providers disclose concentrated
+    # shipper customers; driven by freight rates and retail inventory
+    # cycles, uncorrelated with everything above.
+    # ================================================================
+    CompanySpec("ULH", "Universal Logistics Holdings", "transport_logistics",
+                notes="unverified -- dedicated/intermodal trucking; discloses very high customer concentration"),
+    CompanySpec("CVLG", "Covenant Logistics", "transport_logistics",
+                notes="unverified -- dedicated and expedited trucking with named shipper concentration"),
+    CompanySpec("RLGT", "Radiant Logistics", "transport_logistics",
+                notes="unverified -- micro-cap freight forwarding; expected thin coverage"),
+    CompanySpec("MRTN", "Marten Transport", "transport_logistics",
+                notes="unverified -- temperature-controlled trucking for food/retail shippers"),
+    CompanySpec("HTLD", "Heartland Express", "transport_logistics",
+                notes="unverified -- dry van truckload"),
+    CompanySpec("UPS", "United Parcel Service", "transport_logistics", signal_source_only=True,
+                notes="Anchor: parcel volumes and network capex"),
+    CompanySpec("FDX", "FedEx", "transport_logistics", signal_source_only=True,
+                notes="Anchor: parcel/freight volumes -- also purchases capacity from smaller carriers"),
+    CompanySpec("UNP", "Union Pacific", "transport_logistics", signal_source_only=True,
+                notes="Anchor: rail volumes drive intermodal demand"),
+    CompanySpec("CSX", "CSX Corp", "transport_logistics", signal_source_only=True,
+                notes="Anchor: rail volumes"),
+    CompanySpec("NSC", "Norfolk Southern", "transport_logistics", signal_source_only=True,
+                notes="Anchor: rail volumes"),
+    CompanySpec("WMT", "Walmart", "transport_logistics", signal_source_only=True,
+                notes="Anchor: the shipper a small carrier is most likely to name as a concentrated customer"),
+    CompanySpec("TGT", "Target", "transport_logistics", signal_source_only=True,
+                notes="Anchor: retail inventory cycles drive freight demand"),
 ]
 
 # Well-documented ecosystem relationships worth seeding directly rather than
