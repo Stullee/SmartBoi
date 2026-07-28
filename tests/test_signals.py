@@ -46,6 +46,31 @@ def test_signaled_dossier_still_relogs_signals():
     assert signal is not None
 
 
+def test_news_only_dossier_needs_the_higher_source_bar():
+    # Two news publishers can be one reworded wire story that slipped past
+    # dedup -- not enough for a news-only dossier when the stricter bar says 3.
+    dossier = _dossier(independent_source_count=2, has_filing_evidence=False)
+    assert evaluate(dossier, confidence_threshold=0.5, min_independent_sources=2,
+                    min_independent_sources_news_only=3) is None
+    dossier = _dossier(independent_source_count=3, has_filing_evidence=False)
+    assert evaluate(dossier, confidence_threshold=0.5, min_independent_sources=2,
+                    min_independent_sources_news_only=3) is not None
+
+
+def test_filing_corroborated_dossier_keeps_the_normal_bar():
+    # A filing is a primary disclosure -- immune to the reworded-wire-story
+    # failure mode -- so filing-corroborated dossiers keep the normal bar.
+    dossier = _dossier(independent_source_count=2, has_filing_evidence=True)
+    assert evaluate(dossier, confidence_threshold=0.5, min_independent_sources=2,
+                    min_independent_sources_news_only=3) is not None
+
+
+def test_news_only_bar_disabled_when_none():
+    dossier = _dossier(independent_source_count=2, has_filing_evidence=False)
+    assert evaluate(dossier, confidence_threshold=0.5, min_independent_sources=2,
+                    min_independent_sources_news_only=None) is not None
+
+
 # --- Entry timing: favorable_drift_pct / signal_expired ---
 
 from datetime import datetime, timedelta, timezone

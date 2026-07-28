@@ -183,6 +183,9 @@ class RelationshipExtractor:
             response = await self._client.messages.create(
                 model=self._model,
                 max_tokens=2000,
+                # Pinned to 0: extraction wants the same relationships out
+                # of the same filing text every run, not a fresh sample.
+                temperature=0,
                 system=_SYSTEM_PROMPT,
                 tools=[_EXTRACTION_TOOL],
                 tool_choice={"type": "tool", "name": "report_relationships"},

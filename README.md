@@ -397,6 +397,16 @@ statement notes (where customer/supplier/segment disclosures concentrate)
 tend to sit near the end of a long filing and a prefix-only cut was
 silently starving the graph of exactly the evidence it needs.
 
+Two further corroboration defenses (2026-07 follow-up): `dedup.py` also
+collapses **lightly reworded** republishes (token-overlap near-duplicate
+check, same symbol, same or previous UTC day) before they burn a scoring
+call or count as a second source, and a dossier whose agreeing evidence is
+**entirely news** needs `MIN_INDEPENDENT_SOURCES_NEWS_ONLY` (default 3)
+distinct publishers instead of the normal bar -- heavily reworded wire copy
+can still slip past any headline similarity check, but an SEC filing is a
+primary disclosure that cannot be a rewording of a news article, so any
+filing-corroborated dossier keeps the normal bar.
+
 ## Contested evidence
 
 A dossier's direction and confidence are no longer decided by comparing
@@ -452,6 +462,20 @@ duplicate batch on every restart (confirmed live: 6x on one day). Rows
 captured before this fix already have the duplicates baked in;
 `scripts/analyze_forward_returns.py` dedupes on (symbol, date) before
 analyzing, so old logs still produce a correct result.
+
+- **`logs/decisions.jsonl`** -- what the engine DID with each signal
+  episode: `trade_opened`, `drift_skip` (once per episode), or
+  `signal_expired`, each with the price at decision time when one was in
+  hand and the same episode key (`signaled_at`) that `signals.jsonl` rows
+  carry. Written by `engine.py` via `signals.log_decision`. Without this,
+  skips and expiries survived only as log lines and the entry-timing
+  guards were unfalsifiable.
+
+**`scripts/analyze_signal_events.py`** (also the dashboard's "Signal event
+study" button) joins signals + decisions + price marks and reports each
+outcome group's forward return from the fire date -- the entry-timing
+guards' scorecard: a drift-skipped episode whose move kept going is a
+trade the guard cost; one that mean-reverted is a chase it saved.
 
 **`scripts/analyze_forward_returns.py`** joins the two by symbol/date and
 answers the actual question: does `confidence * magnitude` predict what
@@ -644,3 +668,12 @@ and every pull request.
 - Percentage-based stop/target for paper trades, not ATR-based -- there's
   no intraday bar data at a weeks-long holding horizon the way TradingBot's
   intraday strategies have.
+
+Transaction costs are market-cap-bucketed per trade (50bp/side above $1B,
+150bp $300M-$1B, 300bp below, middle bucket when no cap source is
+reachable; `TRANSACTION_COST_BPS_PER_SIDE` acts as a floor under all
+buckets) -- a flat figure understated friction exactly where this strategy
+hunts. SHORTs in sub-$500M/unknown-cap names are flagged `assumes_borrow`
+(routinely hard-to-borrow; a fill a real account could not have located
+shares for is not a fill) and the dashboard reports avg R with and without
+them.

@@ -265,3 +265,93 @@ def test_stale_opposition_does_not_discount_confidence():
     # discount the fresh LONG evidence's confidence at all.
     assert dossier.direction == "LONG"
     assert dossier.confidence == 0.8
+
+
+# --- Regression: agreeing evidence must never LOWER confidence. The old
+# aggregation averaged agreeing items, so a dossier at 0.9 that gained a
+# weak 0.2-confidence CORROBORATING item fell to ~0.65 -- supporting
+# evidence moved the dossier AWAY from the signal threshold, inverting the
+# accumulated-evidence premise. ---
+
+def test_weak_agreeing_evidence_never_lowers_confidence():
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(confidence=0.9, source_name="reuters.com", evidence_id="e1"), now=NOW)
+    strong_alone = dossier.confidence
+
+    merge_evidence(dossier, _evidence(confidence=0.2, source_name="bloomberg.com", evidence_id="e2"), now=NOW)
+
+    assert dossier.confidence >= strong_alone
+
+
+def test_aged_agreeing_evidence_does_not_drag_down_a_fresh_item():
+    dossier = Dossier(symbol="UCTT")
+    aged = _evidence(
+        confidence=0.8, horizon_days=10, source_name="old.com", evidence_id="e_old",
+        published_at=(NOW - timedelta(days=19)).isoformat(),  # near the decay floor, not yet stale
+    )
+    merge_evidence(dossier, aged, now=NOW)
+    merge_evidence(dossier, _evidence(confidence=0.8, source_name="fresh.com", evidence_id="e_new"), now=NOW)
+
+    # Fresh 0.8 item + a second independent (aged) source: at least the
+    # fresh item's own strength plus the corroboration bonus.
+    assert dossier.confidence >= 0.8
+
+
+def test_lone_item_still_fades_with_age():
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(confidence=0.9, magnitude=0.9, horizon_days=20, evidence_id="e1"), now=NOW)
+    fresh = dossier.confidence
+
+    recompute_decay(dossier, NOW + timedelta(days=35))  # between horizon and stale cutoff
+
+    assert 0.0 < dossier.confidence < fresh
+
+
+# --- Regression: a record with an empty/unparseable published_at must age
+# from its MERGE time, not live at full weight forever (immortal evidence
+# that decay could never fade or expire). ---
+
+def test_unparseable_published_at_decays_from_merge_time():
+    dossier = Dossier(symbol="UCTT")
+    record = _evidence(confidence=0.9, magnitude=0.9, horizon_days=10, published_at="not-a-date", evidence_id="e1")
+    merge_evidence(dossier, record, now=NOW)
+    assert record.merged_at  # stamped at merge
+    assert dossier.confidence == 0.9  # fresh at merge time
+
+    recompute_decay(dossier, NOW + timedelta(days=60))  # far past the 20-day stale cutoff
+
+    assert dossier.confidence == 0.0
+    assert dossier.direction == "NONE"
+
+
+def test_empty_published_at_decays_from_merge_time():
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(confidence=0.9, horizon_days=10, published_at=" ", evidence_id="e1"), now=NOW)
+    recompute_decay(dossier, NOW + timedelta(days=60))
+    assert dossier.confidence == 0.0
+
+
+def test_aggregate_tracks_filing_evidence_flag():
+    # News-only agreeing evidence -> False; any filing source -> True; a
+    # filing on the LOSING side must not count (it doesn't corroborate the
+    # thesis being signaled).
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(evidence_id="n1", source_name="reuters.com"), now=NOW)
+    assert dossier.has_filing_evidence is False
+
+    filing = _evidence(evidence_id="f1", source_name="SEC EDGAR (8-K)")
+    filing.source_type = "8-K"
+    merge_evidence(dossier, filing, now=NOW)
+    assert dossier.has_filing_evidence is True
+
+
+def test_losing_side_filing_does_not_set_the_flag():
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(evidence_id="n1", confidence=0.9, source_name="reuters.com"), now=NOW)
+    merge_evidence(dossier, _evidence(evidence_id="n2", confidence=0.9, source_name="bloomberg.com"), now=NOW)
+    contrary_filing = _evidence(evidence_id="f1", direction="SHORT", confidence=0.2,
+                                source_name="SEC EDGAR (Form 4)")
+    contrary_filing.source_type = "4"
+    merge_evidence(dossier, contrary_filing, now=NOW)
+    assert dossier.direction == "LONG"
+    assert dossier.has_filing_evidence is False

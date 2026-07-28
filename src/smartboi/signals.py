@@ -37,10 +37,24 @@ class SignalEvent:
     generated_at: str
 
 
-def evaluate(dossier: Dossier, confidence_threshold: float, min_independent_sources: int) -> SignalEvent | None:
+def evaluate(
+    dossier: Dossier,
+    confidence_threshold: float,
+    min_independent_sources: int,
+    min_independent_sources_news_only: int | None = None,
+) -> SignalEvent | None:
     if dossier.direction == "NONE":
         return None
-    if dossier.independent_source_count < min_independent_sources:
+    required_sources = min_independent_sources
+    if min_independent_sources_news_only is not None and not dossier.has_filing_evidence:
+        # News-only corroboration is softer than it looks: two outlets
+        # rewording one wire story can slip past dedup's near-dup check as
+        # two "independent" sources, and that alone used to satisfy the
+        # gate that fires trades. A filing (8-K, Form 4, 10-Q...) is a
+        # primary disclosure that can't be a rewording of a news article,
+        # so a dossier corroborated purely by news must clear a higher bar.
+        required_sources = max(required_sources, min_independent_sources_news_only)
+    if dossier.independent_source_count < required_sources:
         return None
     if dossier.confidence * dossier.magnitude < confidence_threshold:
         return None
@@ -83,10 +97,47 @@ def signal_expired(signaled_at: str, deadline_days: int, now: datetime | None = 
     return (now - signaled).days >= deadline_days
 
 
-def log_signal(log_path: Path, signal: SignalEvent) -> None:
+def log_decision(
+    log_path: Path,
+    event: str,
+    symbol: str,
+    direction: str,
+    episode: str,
+    price: float | None = None,
+    reason: str = "",
+) -> None:
+    """Appends one row to the decisions ledger (logs/decisions.jsonl): what
+    the engine DID with a signal episode -- "trade_opened", "drift_skip",
+    or "signal_expired" -- with the price at decision time when one was in
+    hand. Signals firing is only half the record: without this, a
+    drift-skip or expiry survives only as a log line, and there is no way
+    to ever learn whether the entry-timing guards helped (skipped moves
+    that were indeed over) or hurt (skipped moves that kept going). The
+    `episode` key is the dossier's signaled_at, the same key signals.jsonl
+    rows carry, so the two logs join cleanly (see event_study.py)."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a") as f:
-        f.write(json.dumps(asdict(signal)) + "\n")
+        f.write(json.dumps({
+            "event": event,
+            "symbol": symbol,
+            "direction": direction,
+            "episode": episode,
+            "price": price,
+            "reason": reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }) + "\n")
+
+
+def log_signal(log_path: Path, signal: SignalEvent, episode: str = "") -> None:
+    """`episode` is the dossier's signaled_at timestamp: evaluation is
+    status-blind (see module docstring), so one signal EPISODE re-logs a
+    row on every newly accepted evidence item that keeps it above
+    threshold -- without an episode key, downstream event-level analysis
+    ("how did signals perform?") would count each re-log as a separate
+    signal instead of collapsing them to one event."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as f:
+        f.write(json.dumps({**asdict(signal), "episode": episode}) + "\n")
     log.info(
         "[SIGNAL] %s %s confidence=%.2f magnitude=%.2f sources=%d: %s",
         signal.direction, signal.symbol, signal.confidence, signal.magnitude,

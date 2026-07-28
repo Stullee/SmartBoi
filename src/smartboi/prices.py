@@ -14,10 +14,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import NamedTuple
 
 from ib_async import IB, Stock
 
 log = logging.getLogger(__name__)
+
+
+class PriceBar(NamedTuple):
+    """The most recent daily bar's close plus its intraday extremes --
+    high/low exist so paper-trade stop/target checks can see a level that
+    traded intraday but recovered by the close (see paper_journal.update);
+    a close-only mark silently erased exactly those stop-outs."""
+
+    close: float
+    high: float
+    low: float
 
 # Spaces out price lookups within one polling pass so a ~40-symbol universe
 # doesn't burst 40 historical-data requests at once against IB's pacing
@@ -51,7 +63,7 @@ class ReadOnlyPriceFeed:
             log.warning("IB price feed unreachable at %s:%s (%s) -- will retry.", self._host, self._port, exc)
             return False
 
-    async def last_price(self, symbol: str) -> float | None:
+    async def last_bar(self, symbol: str) -> PriceBar | None:
         contract = self._contracts.get(symbol)
         if contract is None:
             candidate = Stock(symbol, "SMART", "USD")
@@ -68,24 +80,32 @@ class ReadOnlyPriceFeed:
         )
         if not bars:
             return None
-        return float(bars[-1].close)
+        bar = bars[-1]
+        return PriceBar(close=float(bar.close), high=float(bar.high), low=float(bar.low))
 
-    async def last_prices(self, symbols: list[str]) -> dict[str, float]:
+    async def last_price(self, symbol: str) -> float | None:
+        bar = await self.last_bar(symbol)
+        return bar.close if bar is not None else None
+
+    async def last_bars(self, symbols: list[str]) -> dict[str, PriceBar]:
         """Sequential with a small gap between requests -- see module
         docstring on pacing. A failure for one symbol must not stop the
         rest of the universe from being priced."""
-        prices: dict[str, float] = {}
+        bars: dict[str, PriceBar] = {}
         for i, symbol in enumerate(symbols):
             if i > 0:
                 await asyncio.sleep(_REQUEST_GAP_SEC)
             try:
-                price = await self.last_price(symbol)
+                bar = await self.last_bar(symbol)
             except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
                 log.exception("%s: price lookup failed.", symbol)
                 continue
-            if price is not None:
-                prices[symbol] = price
-        return prices
+            if bar is not None:
+                bars[symbol] = bar
+        return bars
+
+    async def last_prices(self, symbols: list[str]) -> dict[str, float]:
+        return {symbol: bar.close for symbol, bar in (await self.last_bars(symbols)).items()}
 
     def disconnect(self) -> None:
         if self.ib.isConnected():

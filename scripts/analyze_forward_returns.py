@@ -83,12 +83,14 @@ def main() -> None:
     ecosystem_by_symbol = {symbol: spec.ecosystem for symbol, spec in specs.items()}
 
     horizons = [int(h.strip()) for h in args.horizons.split(",") if h.strip()]
+    directional = [s for s in snapshots if s.get("direction") in ("LONG", "SHORT")]
     for horizon_days in horizons:
         joined = [
-            r for r in (compute_forward_return(s, price_marks, horizon_days) for s in snapshots)
+            r for r in (compute_forward_return(s, price_marks, horizon_days) for s in directional)
             if r is not None
         ]
-        print(format_report(horizon_days, joined, price_marks, ecosystem_by_symbol))
+        print(format_report(horizon_days, joined, price_marks, ecosystem_by_symbol,
+                            attempted=len(directional)))
         print()
 
 

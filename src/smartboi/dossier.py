@@ -53,6 +53,15 @@ class EvidenceRecord:
     # than being something you have to remember.
     scored_by_model: str = ""   # the dossier model that proposed this update
     reviewed_by_model: str = ""  # the skeptic model that adjudicated it
+    # When this record was merged into the dossier -- the decay fallback
+    # anchor for records whose published_at is empty/unparseable (see
+    # _age_days), so a bad upstream date can't make evidence immortal.
+    merged_at: str = ""
+    # The updater's PRE-skeptic numbers (confidence/magnitude above are
+    # post-skeptic) -- kept so the skeptic pass's actual effect on outcomes
+    # is measurable instead of overwritten and lost.
+    proposed_confidence: float | None = None
+    proposed_magnitude: float | None = None
 
 
 @dataclass
@@ -83,6 +92,13 @@ class Dossier:
     # a data problem. mass_opposing == 0 means confidence is undiscounted.
     mass_agree: float = 0.0
     mass_opposing: float = 0.0
+    # Whether any non-stale agreeing evidence comes from an SEC filing
+    # (source_type != "news"). News-only corroboration is softer than it
+    # looks -- two outlets rewording one wire story can slip past dedup as
+    # two "independent" sources -- so signals.evaluate holds news-only
+    # dossiers to a higher independent-source bar. A filing is a primary
+    # disclosure and can't be a syndicated rewording of a news article.
+    has_filing_evidence: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -141,13 +157,20 @@ _DECAY_FLOOR = 0.15
 
 
 def _age_days(record: EvidenceRecord, now: datetime) -> float:
-    try:
-        published = datetime.fromisoformat(record.published_at)
-    except ValueError:
-        return 0.0  # unparseable published_at -- treat as fresh rather than discard the item
-    if published.tzinfo is None:
-        published = published.replace(tzinfo=timezone.utc)
-    return max(0.0, (now - published).total_seconds() / 86400)
+    # published_at first, then merged_at: a record with an empty or
+    # unparseable published date must still AGE (from when it was merged)
+    # -- treating it as perpetually fresh made such an item immortal, so it
+    # propped up the dossier's confidence forever and the decay pass could
+    # never fade or expire it.
+    for raw in (record.published_at, record.merged_at):
+        try:
+            anchor = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            continue
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - anchor).total_seconds() / 86400)
+    return 0.0  # no parseable date at all (legacy record) -- treat as fresh
 
 
 def _stale_cutoff_days(record: EvidenceRecord) -> float:
@@ -214,13 +237,26 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     at zero mass (no evidence, or all of it decayed to stale) resolves to
     NONE.
 
-    Once direction is resolved, confidence is the usual decay-weighted,
-    corroboration-boosted confidence of the winning side, further
-    multiplied by max(0, 1 - W_opposing / W_agreeing): a contested dossier
-    is discounted proportionally to how much opposing mass exists, a 50/50
-    split zeroes confidence entirely (the honest read of a genuinely
-    contested thesis), and no opposition at all leaves it unchanged
-    (factor = 1). `independent_source_count` only counts winning-side
+    Once direction is resolved, confidence starts from the STRONGEST
+    agreeing item's decay-scaled confidence (max of confidence_i *
+    weight_i), plus a corroboration bonus per additional independent
+    agreeing source, capped at 1.0, then multiplied by
+    max(0, 1 - W_opposing / W_agreeing): a contested dossier is discounted
+    proportionally to how much opposing mass exists, a 50/50 split zeroes
+    confidence entirely (the honest read of a genuinely contested thesis),
+    and no opposition at all leaves it unchanged (factor = 1).
+
+    Max-plus-bonus rather than an average, deliberately: an average
+    (weighted or not) makes a weaker AGREEING item drag the aggregate DOWN
+    -- a dossier at 0.9 that gained a 0.2-confidence corroborating item
+    fell to ~0.65 under the old mean, i.e. supporting evidence moved the
+    dossier AWAY from the signal threshold, inverting the system's core
+    premise that accumulated corroboration is what crosses the bar. With
+    max-plus-bonus, agreeing evidence can only corroborate (bonus) or be
+    neutral, never penalize; decay still works because the strongest
+    item's own weight fades with age (a lone 0.9 item at the decay floor
+    contributes 0.9 * 0.15), and fresher items take over the max as older
+    ones fade. `independent_source_count` only counts winning-side
     evidence that isn't stale. Distinct source_name values are genuinely
     independent evidence, never the same fact double-counted: for news,
     dedup.py guarantees distinct names are different publisher domains,
@@ -228,13 +264,8 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     differentiates by filing form ("SEC EDGAR (8-K)" vs "(Form 4)" vs
     "(10-Q)") since a material event, an insider transaction, and a
     quarterly filing are independent disclosures, not restatements of each
-    other. Confidence is the mean of each agreeing item's OWN confidence
-    scaled by its own decay weight -- scaling before averaging, not
-    weighting the average itself, matters: a weighted mean is scale-
-    invariant when there's a single item (the weight cancels), so a lone
-    aging item would never fade if the weight were only applied as an
-    averaging factor. Magnitude takes the max of each agreeing item's
-    magnitude scaled the same way, and horizon_days their plain mean."""
+    other. Magnitude takes the max of each agreeing item's magnitude
+    scaled by its decay weight, and horizon_days their plain mean."""
     w_long = _side_mass(dossier, "LONG", now)
     w_short = _side_mass(dossier, "SHORT", now)
 
@@ -253,6 +284,7 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
         dossier.magnitude = 0.0
         dossier.mass_agree = 0.0
         dossier.mass_opposing = 0.0
+        dossier.has_filing_evidence = False
         return
 
     agreeing = [
@@ -261,7 +293,8 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     ]
     weighted = [(e, evidence_weight(e, now)) for e in agreeing]
     dossier.independent_source_count = len({e.source_name for e in agreeing})
-    base_confidence = sum(e.confidence * w for e, w in weighted) / len(weighted)
+    dossier.has_filing_evidence = any(e.source_type != "news" for e in agreeing)
+    base_confidence = max(e.confidence * w for e, w in weighted)
     corroboration_bonus = 0.1 * max(0, dossier.independent_source_count - 1)
     raw_confidence = min(1.0, base_confidence + corroboration_bonus)
 
@@ -300,6 +333,8 @@ def merge_evidence(dossier: Dossier, record: EvidenceRecord, now: datetime | Non
     decided here by comparing this one new record against the current
     aggregate -- see _aggregate's docstring for why that matters."""
     now = now or datetime.now(timezone.utc)
+    if not record.merged_at:
+        record.merged_at = now.isoformat()
     dossier.evidence.append(record)
     _aggregate(dossier, now)
     dossier.updated_at = now.isoformat()
@@ -391,6 +426,11 @@ class DossierUpdater:
             response = await self._client.messages.create(
                 model=self._model,
                 max_tokens=500,
+                # Pinned to 0: this call's confidence/magnitude directly
+                # gate trades at a hard threshold, and the API default of
+                # 1.0 made every score a single high-temperature sample --
+                # some threshold crossings were sampling noise, not evidence.
+                temperature=0,
                 system=_SYSTEM_PROMPT,
                 tools=[_UPDATE_TOOL],
                 tool_choice={"type": "tool", "name": "update_thesis"},
