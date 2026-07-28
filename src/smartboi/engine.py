@@ -122,6 +122,10 @@ class Engine:
         self.backfill_state = JsonState(DATA_DIR / "relationship_backfill.json")
         self.candidates = JsonState(DATA_DIR / "universe_candidates.json")
         self.accepted_candidates = JsonState(DATA_DIR / "accepted_candidates.json")
+        # {date, count} -- the UTC-daily auto-accept budget (see
+        # _auto_accept_candidates). Persisted so a restart cannot reset the
+        # cap and let a long candidate list through in one afternoon.
+        self.auto_accept_state = JsonState(DATA_DIR / "auto_accept_state.json")
         self.alerts = AlertSender(settings.alert_webhook_url)
         self.usage = UsageTracker(DATA_DIR / "llm_usage.json", settings.max_daily_llm_calls)
 
@@ -172,18 +176,30 @@ class Engine:
         accept_candidate) without requiring a restart."""
         return [c.symbol for c in self.universe]
 
+    @staticmethod
+    def _accepted_entry(value) -> tuple[str, str]:
+        """(as_type, source) from an accepted_candidates.json entry. Entries
+        were originally a bare "tradeable"/"anchor" string and are now a
+        {"as", "source"} dict recording whether a human or the engine
+        accepted it (see accept_candidate) -- both shapes are read so an
+        existing file keeps working untouched across the upgrade."""
+        if isinstance(value, dict):
+            return value.get("as", "tradeable"), value.get("source", "manual")
+        return value, "manual"
+
     def _apply_accepted_candidates(self) -> None:
         known = {c.symbol for c in self.universe}
-        for symbol, as_type in self.accepted_candidates.data.items():
+        for symbol, value in self.accepted_candidates.data.items():
             if symbol in known:
                 continue
+            as_type, source = self._accepted_entry(value)
             self.universe.append(
                 CompanySpec(symbol, symbol, "accepted", signal_source_only=(as_type == "anchor"),
-                            notes="Accepted from a discovered universe candidate")
+                            notes=f"Accepted ({source}) from a discovered universe candidate")
             )
             known.add(symbol)
 
-    def accept_candidate(self, symbol: str, as_type: str) -> CompanySpec:
+    def accept_candidate(self, symbol: str, as_type: str, source: str = "manual") -> CompanySpec:
         """Adds a discovered universe candidate (see
         _record_universe_candidate) into the LIVE universe, no restart
         required: EDGAR/news polling picks it up on their next due tick
@@ -198,11 +214,16 @@ class Engine:
         if existing is not None:
             return existing
         spec = CompanySpec(symbol, symbol, "accepted", signal_source_only=(as_type == "anchor"),
-                            notes="Accepted from a discovered universe candidate")
+                            notes=f"Accepted ({source}) from a discovered universe candidate")
         self.universe.append(spec)
         self.spec_by_symbol[symbol] = spec
-        self.accepted_candidates.set(symbol, as_type)
-        log.info("[CANDIDATE] %s accepted into the universe as %s -- polled starting next cycle.", symbol, as_type)
+        # Stored as a dict (not a bare type string) once a source is
+        # recorded, so an auto-accepted symbol is distinguishable from one a
+        # human chose -- _apply_accepted_candidates reads both shapes, so
+        # existing files written before this keep working untouched.
+        self.accepted_candidates.set(symbol, {"as": as_type, "source": source})
+        log.info("[CANDIDATE] %s accepted (%s) into the universe as %s -- polled starting next cycle.",
+                 symbol, source, as_type)
         return spec
 
     def _warn_once(self, key: str, message: str) -> None:
@@ -411,6 +432,9 @@ class Engine:
         ):
             self._last_candidate_recheck = now
             await self._run_candidate_ticker_recheck()
+            # Straight after the recheck, which is what populates the
+            # recommendation this acts on.
+            await self._auto_accept_candidates()
         if self._due(self._last_heartbeat, HEARTBEAT_INTERVAL_SEC, now):
             self._last_heartbeat = now
             self._log_heartbeat()
@@ -704,6 +728,105 @@ class Engine:
 
             if changed:
                 self.candidates.set(ticker, entry)
+
+    async def _auto_accept_candidates(self) -> None:
+        """Acts on the tradeable-vs-anchor recommendation the engine already
+        computed for each discovered candidate (see
+        _run_candidate_ticker_recheck), instead of leaving every one of them
+        waiting on a dashboard click that would apply exactly that same
+        recommendation.
+
+        A candidate is not an arbitrary ticker that happened to clear a
+        threshold -- it exists because a TRADEABLE company's own SEC filing
+        disclosed a business relationship with it, so its relevance is
+        established by construction and its ecosystem is inferable from the
+        company that disclosed it. That's what makes this automatable at all,
+        and it's the specific reason universe_screen.py's prune-only stance
+        (which is about names with no relationship evidence) doesn't apply.
+
+        Anchors and tradeables are held to deliberately different bars:
+
+        - ANCHOR: liberal. An anchor can never become a trade
+          (signal_source_only), so the worst case is some wasted LLM spend --
+          while the upside is large, since it converts a dead-end candidate
+          into a live propagation source, which is the mechanism this whole
+          strategy runs on.
+        - TRADEABLE: guarded. It can produce signals and paper trades, so it
+          additionally requires (a) the resolved ticker's registered SEC name
+          to actually match the disclosed counterparty name -- the guard
+          against the confirmed-live Advantest->ATRO class of misresolution,
+          see EdgarClient.name_matches_ticker -- and (b) repeat disclosure
+          across filings, so a single throwaway mention can't start a
+          position.
+
+        Bounded and reversible: at most auto_accept_max_per_day per UTC day
+        (one filing naming a long list of counterparties can't flood the
+        universe), every acceptance logged and webhook-alerted, and each one
+        recorded in accepted_candidates.json marked "auto" so it can be
+        audited and undone by deleting the entry. Widening what's watched
+        can't by itself create a trade -- a dossier still has to form and
+        cross the signal threshold on its own."""
+        if not self.settings.enable_auto_accept_candidates:
+            return
+        today = datetime.now(timezone.utc).date().isoformat()
+        if self.auto_accept_state.get("date") != today:
+            self.auto_accept_state.set("date", today)
+            self.auto_accept_state.set("count", 0)
+        accepted_today = self.auto_accept_state.get("count", 0)
+
+        for key, entry in list(self.candidates.data.items()):
+            if accepted_today >= self.settings.auto_accept_max_per_day:
+                self._warn_once(
+                    f"auto-accept-cap:{today}",
+                    f"Auto-accept daily cap reached ({self.settings.auto_accept_max_per_day}) -- further "
+                    "candidates stay pending for the dashboard, and are reconsidered tomorrow.",
+                )
+                return
+            ticker = (entry.get("ticker") or "").upper()
+            if not ticker or ticker in self.spec_by_symbol or ticker in self.accepted_candidates.data:
+                continue
+            recommendation = entry.get("recommended_as")
+            if recommendation not in ("anchor", "tradeable"):
+                continue  # "unknown" (no market data) is never auto-accepted
+
+            if recommendation == "anchor":
+                if not self.settings.auto_accept_anchors:
+                    continue
+            else:
+                if not self.settings.auto_accept_tradeables:
+                    continue
+                if entry.get("seen_count", 0) < self.settings.auto_accept_min_seen_count:
+                    continue
+                if self.edgar_client is None:
+                    continue
+                if not await self.edgar_client.name_matches_ticker(entry.get("name") or "", ticker):
+                    # Recorded so this is visible on the dashboard as the
+                    # reason it stayed pending, rather than looking stuck.
+                    if not entry.get("auto_accept_blocked"):
+                        entry["auto_accept_blocked"] = (
+                            f"ticker {ticker} does not match the disclosed name "
+                            f"{entry.get('name')!r} in SEC's filer list -- needs a human check"
+                        )
+                        self.candidates.set(key, entry)
+                        log.warning("[CANDIDATE] %s: not auto-accepted -- %s", ticker, entry["auto_accept_blocked"])
+                    continue
+
+            spec = self.accept_candidate(ticker, recommendation, source="auto")
+            accepted_today += 1
+            self.auto_accept_state.set("count", accepted_today)
+            log.info(
+                "[CANDIDATE] %s auto-accepted as %s (%s). Disclosed by: %s.",
+                spec.symbol, recommendation, entry.get("recommendation_reason", ""),
+                ", ".join(entry.get("related_to", [])) or "unknown",
+            )
+            await self.alerts.send(
+                "candidate_auto_accepted",
+                f"Auto-added {spec.symbol} as {recommendation}",
+                f"{entry.get('name')} was disclosed as a {'/'.join(entry.get('rel_types', [])) or 'counterparty'} of "
+                f"{', '.join(entry.get('related_to', [])) or 'a tradeable company'}. "
+                f"{entry.get('recommendation_reason', '')}. Remove it from accepted_candidates.json to undo.",
+                {"symbol": spec.symbol, "as": recommendation, "reason": entry.get("recommendation_reason", "")},
+            )
 
     # --- One-time relationship backfill ---
 

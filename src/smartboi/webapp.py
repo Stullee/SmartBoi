@@ -112,7 +112,10 @@ _INDEX_HTML = """<!doctype html>
      ticker list and any report the operator is still reading. -->
 <h2 style="margin-top:0">Tools</h2>
 <div class="toolbar">
-  <input type="text" id="screen-tickers" placeholder="INTT ASYS CVU  (blank = screen discovered candidates)">
+  <input type="text" id="screen-tickers" placeholder="INTT ASYS SIF  (blank = screen discovered candidates)">
+  <label>cap $M <input type="text" id="screen-min-cap" value="75" style="min-width:4rem"></label>
+  <label>to <input type="text" id="screen-max-cap" value="3000" style="min-width:5rem"></label>
+  <label>max analysts <input type="text" id="screen-max-analysts" value="10" style="min-width:3rem"></label>
   <button id="btn-screen">Screen candidates</button>
   <button id="btn-analyze">Forward-return report</button>
 </div>
@@ -206,7 +209,8 @@ function renderSignals(rows) {
 
 function candidateAction(c) {
   if (!c.ticker) return '<span style="opacity:0.5">no ticker</span>';
-  if (c.accepted_as) return '<span class="badge on">added: ' + esc(c.accepted_as) + '</span>';
+  if (c.accepted_as) return '<span class="badge on">added: ' + esc(c.accepted_as) +
+    (c.accepted_source === "auto" ? " (auto)" : "") + '</span>';
   var reasonAttr = c.recommendation_reason ? ' title="' + esc(c.recommendation_reason) + '"' : '';
   var tradeableBtn = '<button class="accept-btn" data-symbol="' + esc(c.ticker) + '" data-as="tradeable"' +
     (c.recommended_as === "tradeable" ? ' style="font-weight:700"' + reasonAttr : '') + '>+ Tradeable</button>';
@@ -349,7 +353,14 @@ function runTool(path, body, button) {
 }
 
 document.getElementById("btn-screen").addEventListener("click", function() {
-  runTool("tools/screen", { tickers: document.getElementById("screen-tickers").value }, this);
+  // Bounds are editable so a screen can be re-run at a different bar without
+  // a terminal -- the whole point of this panel.
+  runTool("tools/screen", {
+    tickers: document.getElementById("screen-tickers").value,
+    min_cap: parseFloat(document.getElementById("screen-min-cap").value),
+    max_cap: parseFloat(document.getElementById("screen-max-cap").value),
+    max_analysts: parseInt(document.getElementById("screen-max-analysts").value, 10),
+  }, this);
 });
 document.getElementById("btn-analyze").addEventListener("click", function() {
   runTool("tools/forward-returns", {}, this);

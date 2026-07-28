@@ -292,6 +292,37 @@ class EdgarClient:
                 return ticker
         return None
 
+    async def name_matches_ticker(self, company_name: str, ticker: str) -> bool:
+        """Whether `ticker`'s registered SEC filer name is actually the same
+        company as the free-text `company_name` a filing named.
+
+        This is the guard against acting on a WRONG ticker. Confirmed live:
+        a PDF Solutions filing describing a partnership with *Advantest* (a
+        Japanese test-equipment maker, not a US filer) ended up recorded
+        against ATRO -- Astronics, an unrelated aerospace company. A
+        counterparty ticker can be wrong whether the model supplied it
+        directly or find_ticker_by_name resolved it, so verification is done
+        against SEC's own registered title rather than by trusting either
+        source. Matching is on the normalized core name (see
+        normalize_company_name), with a prefix allowance in both directions
+        so "ASML" still matches the registered "ASML Holding N.V.".
+
+        Returns False when the ticker isn't in SEC's map at all -- unknown
+        is not a match, and a caller gating an automatic action on this
+        should treat it as "don't"."""
+        _, name_map = await self._ticker_map()
+        normalized = normalize_company_name(company_name)
+        if not normalized:
+            return False
+        ticker = ticker.upper()
+        registered = [title for title, mapped in name_map.items() if mapped == ticker]
+        for title in registered:
+            if title == normalized:
+                return True
+            if title.startswith(normalized + " ") or normalized.startswith(title + " "):
+                return True
+        return False
+
     async def recent_filings(self, symbol: str, forms: set[str], since_date: str) -> list[FilingEvent]:
         """Filings for `symbol` on/after `since_date` (YYYY-MM-DD), restricted
         to `forms`. Only looks at the submissions endpoint's `recent` block

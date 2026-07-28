@@ -160,3 +160,51 @@ def test_truncate_head_tail_respects_budget_ratio():
     # 2:1 head:tail split of the budget.
     assert len(head) > len(tail)
     assert len(result) <= 150
+
+
+# --- Verifying a resolved ticker actually IS the disclosed company ---
+# The guard behind auto-accepting a candidate as tradeable: confirmed live,
+# a filing describing a partnership with *Advantest* ended up recorded
+# against ATRO (Astronics), an unrelated aerospace company.
+
+class _StubbedNameMap(EdgarClient):
+    def __init__(self, name_map):
+        self._name_map = name_map
+
+    async def _ticker_map(self):
+        return {}, self._name_map
+
+
+async def test_name_matches_ticker_accepts_the_registered_name():
+    client = _StubbedNameMap({"astronics": "ATRO"})
+    assert await client.name_matches_ticker("Astronics Corporation", "ATRO") is True
+
+
+async def test_name_matches_ticker_allows_a_prefix_in_either_direction():
+    """Filing text rarely spells out a registered name, so a short form has
+    to match a longer registered title and vice versa."""
+    # Registered title longer than the disclosed name.
+    client = _StubbedNameMap({"asml holding": "ASML"})
+    assert await client.name_matches_ticker("ASML", "ASML") is True
+    # Disclosed name longer than the registered title (legal suffixes like
+    # "Holding"/"N.V." are stripped by normalization, so this ends up exact).
+    client = _StubbedNameMap({"asml": "ASML"})
+    assert await client.name_matches_ticker("ASML Holding N.V.", "ASML") is True
+
+
+async def test_name_matches_ticker_rejects_a_different_company():
+    """Advantest is not Astronics -- this is the case that must return False."""
+    client = _StubbedNameMap({"astronics": "ATRO"})
+    assert await client.name_matches_ticker("Advantest", "ATRO") is False
+
+
+async def test_name_matches_ticker_rejects_an_unknown_ticker():
+    """Unknown is not a match: a caller gating an automatic action on this
+    must treat "not in SEC's map" as "don't"."""
+    client = _StubbedNameMap({"astronics": "ATRO"})
+    assert await client.name_matches_ticker("Some Company", "NOPE") is False
+
+
+async def test_name_matches_ticker_rejects_an_empty_name():
+    client = _StubbedNameMap({"astronics": "ATRO"})
+    assert await client.name_matches_ticker("", "ATRO") is False

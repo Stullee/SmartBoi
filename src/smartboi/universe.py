@@ -56,12 +56,33 @@ Two structural notes behind the anchor expansion:
   small component maker disclosing a concentrated big-medtech customer) with
   no exposure to that cycle.
 
-`notes` marks each tradeable name's provenance: "screen-verified" means live
-market-cap/analyst data confirmed it fits; "unverified" means it was added
-from the ecosystem thesis and still needs scripts/screen_candidates.py to
-confirm cap/coverage (and that it still trades at all -- a delisted ticker
-just fails CIK lookup with a warning, as THR did, and the monthly auto-screen
-flags it).
+## Why the tradeable bound is <=10 analysts, not <=6
+
+The original <=6-analyst bound was picked a priori, and a live screen of 15
+fresh candidates showed it is very nearly unreachable: 14 failed, and the
+failures cluster tightly just above it (7, 8, 8, 9, 9, 9, 9, 9, 10) rather
+than being spread out. The only names that clear <=6 are micro-caps below the
+$100M floor (CVU $63M, FLUX $13M, ULBI $90M). In other words the window
+between "big enough to clear the cap floor" and "obscure enough to have <=6
+analysts" is close to empty in US small caps.
+
+So the bound moved to <=10, with a $75M floor -- which also makes this file
+self-consistent, since PLAB (9), AOSL (10), DCO (9) and LMB (9) were already
+retained under an effective bound of ~10 while the screener still enforced 6.
+
+This is a different judgement from the SIGNAL threshold, which deliberately
+was NOT loosened: that one governs when to TRADE, and forward data showed
+sub-threshold signals losing money. This one governs what to WATCH, where the
+evidence says the original number was simply unattainable and nothing
+suggests a 9-analyst $400M company lacks the diffusion lag this strategy
+trades. Note the surviving names are still dramatically thinner than what
+they replaced -- 7-10 analysts at $100M-$3B, versus 9-19 analysts at $1-13B.
+
+`notes` records each tradeable name's live screen result. Names that failed
+are not kept as anchors the way the graduated names were: CEVA (15 analysts),
+TATT (13) and KIDS (15) are well-covered but too small for their news to
+propagate usefully, and CVU ($63M) and FLUX ($13M) are too small to be either
+a credible news source or a liquid target.
 """
 from __future__ import annotations
 
@@ -88,11 +109,9 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
     CompanySpec("AOSL", "Alpha and Omega Semiconductor", "semi_equipment",
                 notes="screen-verified 2026-07: $1.0B, 10 analysts. Power semiconductors"),
     CompanySpec("INTT", "inTEST Corp", "semi_equipment",
-                notes="unverified -- micro-cap semi/industrial test; expected very thin coverage"),
+                notes="screen-verified 2026-07: 9 analysts, within the $100M-$3B band. Semi/industrial test"),
     CompanySpec("ASYS", "Amtech Systems", "semi_equipment",
-                notes="unverified -- micro-cap semi equipment (diffusion/polishing); expected very thin coverage"),
-    CompanySpec("CEVA", "CEVA Inc", "semi_equipment",
-                notes="unverified -- DSP/IP licensing; royalties track chip unit volumes"),
+                notes="screen-verified 2026-07: 7 analysts, within the $100M-$3B band. Semi equipment (diffusion/polishing)"),
     # --- Anchors: the capex bellwethers ---
     CompanySpec("AMAT", "Applied Materials", "semi_equipment", signal_source_only=True,
                 notes="Anchor: semiconductor equipment capex bellwether"),
@@ -145,12 +164,8 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
     CompanySpec("DCO", "Ducommun", "defense_tier2",
                 notes="screen-verified 2026-07: $2.6B, 9 analysts. Best-functioning name in the graph "
                       "(disclosed RTX/LMT/NOC concentration at 0.95 confidence)"),
-    CompanySpec("CVU", "CPI Aerostructures", "defense_tier2",
-                notes="unverified -- micro-cap structural assemblies for defense primes; expected very thin coverage"),
     CompanySpec("SIF", "SIFCO Industries", "defense_tier2",
-                notes="unverified -- micro-cap forgings for aerospace/defense; expected very thin coverage"),
-    CompanySpec("TATT", "TAT Technologies", "defense_tier2",
-                notes="unverified -- small-cap aerospace thermal/APU components; expected thin coverage"),
+                notes="screen-verified 2026-07: $164M, NO analyst coverage on record -- the thinnest name here. Forgings for aerospace/defense"),
     # --- Anchors: primes whose awards flow down ---
     CompanySpec("RTX", "RTX (Raytheon)", "defense_tier2", signal_source_only=True,
                 notes="Anchor: prime contractor award announcements"),
@@ -201,11 +216,11 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
     CompanySpec("LMB", "Limbach Holdings", "grid_datacenter",
                 notes="screen-verified 2026-07: $887M, 9 analysts. Mechanical/electrical building systems"),
     CompanySpec("BWEN", "Broadwind", "grid_datacenter",
-                notes="unverified -- micro-cap fabricator (towers, industrial weldments); expected very thin coverage"),
+                notes="screen-verified 2026-07: 9 analysts, within the $100M-$3B band. Fabricator (towers, industrial weldments)"),
     CompanySpec("ESOA", "Energy Services of America", "grid_datacenter",
-                notes="unverified -- micro-cap utility/pipeline contractor; expected very thin coverage"),
+                notes="screen-verified 2026-07: 8 analysts, within the $100M-$3B band. Utility/pipeline contractor"),
     CompanySpec("WLDN", "Willdan Group", "grid_datacenter",
-                notes="unverified -- small-cap energy efficiency/grid services to utilities"),
+                notes="screen-verified 2026-07: 9 analysts, within the $100M-$3B band. Energy efficiency/grid services to utilities"),
     # --- Anchors: hyperscaler capex + grid equipment ---
     CompanySpec("MSFT", "Microsoft", "grid_datacenter", signal_source_only=True,
                 notes="Anchor: hyperscaler data-center capex announcements"),
@@ -241,10 +256,8 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
     # --- Tradeable ---
     CompanySpec("NVX", "Novonix", "battery_storage",
                 notes="screen-verified 2026-07: $149M, 5 analysts -- PASSES the thin-coverage bounds. Battery materials"),
-    CompanySpec("FLUX", "Flux Power Holdings", "battery_storage",
-                notes="unverified -- micro-cap industrial lithium packs (forklift/airport GSE); expected very thin coverage"),
     CompanySpec("ULBI", "Ultralife Corp", "battery_storage",
-                notes="unverified -- micro-cap batteries/comms with defense crossover; expected very thin coverage"),
+                notes="screen-verified 2026-07: $90M -- just under the $100M floor, kept deliberately (see docstring). Batteries/comms, defense crossover"),
     # --- Anchors ---
     CompanySpec("TSLA", "Tesla", "battery_storage", signal_source_only=True,
                 notes="Anchor: EV/battery demand signal source"),
@@ -279,13 +292,11 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
     # ================================================================
     # --- Tradeable (all unverified -- screen before relying on these) ---
     CompanySpec("UFPT", "UFP Technologies", "medtech_supply",
-                notes="unverified -- components/packaging for medical devices; discloses concentrated medtech customers"),
+                notes="screen-verified 2026-07: 10 analysts, within the $100M-$3B band. Components/packaging for medical devices"),
     CompanySpec("IRMD", "IRadimed", "medtech_supply",
-                notes="unverified -- micro-cap MRI-compatible devices; expected very thin coverage"),
+                notes="screen-verified 2026-07: 8 analysts, within the $100M-$3B band. MRI-compatible devices"),
     CompanySpec("MLAB", "Mesa Laboratories", "medtech_supply",
-                notes="unverified -- small-cap sterilization/QC instruments sold into medtech and pharma"),
-    CompanySpec("KIDS", "OrthoPediatrics", "medtech_supply",
-                notes="unverified -- small-cap pediatric orthopedic implants"),
+                notes="screen-verified 2026-07: 9 analysts, within the $100M-$3B band. Sterilization/QC instruments for medtech and pharma"),
     # --- Anchors: the big medtechs whose news should propagate down ---
     CompanySpec("MDT", "Medtronic", "medtech_supply", signal_source_only=True,
                 notes="Anchor: largest device maker -- procurement/product news propagates to suppliers"),

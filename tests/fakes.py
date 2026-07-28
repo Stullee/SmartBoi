@@ -11,6 +11,14 @@ class FakeEdgarClient:
         self.text_by_accession: dict[str, str] = {}
         self.latest_filings: dict[tuple[str, str], object] = {}
         self.ticker_by_name: dict[str, str] = {}
+        # Whether a resolved ticker's registered SEC name verifies against the
+        # disclosed counterparty name. Defaults to True so tests opt IN to the
+        # misresolution case (the confirmed-live Advantest->ATRO class)
+        # rather than every test having to set it up.
+        self.name_matches: bool = True
+
+    async def name_matches_ticker(self, name, ticker):
+        return self.name_matches
 
     async def cik_for(self, symbol):
         return "0000000001"

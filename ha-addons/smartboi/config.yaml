@@ -55,9 +55,14 @@ options:
   price_poll_interval_sec: 21600
   enable_universe_autoscreen: true
   universe_screen_interval_days: 30
-  universe_min_market_cap_musd: 100.0
+  universe_min_market_cap_musd: 75.0
   universe_max_market_cap_musd: 5000.0
-  universe_max_analyst_count: 6
+  universe_max_analyst_count: 10
+  enable_auto_accept_candidates: true
+  auto_accept_anchors: true
+  auto_accept_tradeables: true
+  auto_accept_min_seen_count: 2
+  auto_accept_max_per_day: 5
   log_level: "info"
   alert_webhook_url: ""
   enable_dashboard: true
@@ -98,6 +103,11 @@ schema:
   universe_min_market_cap_musd: float(0,1000000)
   universe_max_market_cap_musd: float(0,1000000)
   universe_max_analyst_count: int(0,100)
+  enable_auto_accept_candidates: bool
+  auto_accept_anchors: bool
+  auto_accept_tradeables: bool
+  auto_accept_min_seen_count: int(1,50)
+  auto_accept_max_per_day: int(0,100)
   log_level: list(debug|info|warning|error)
   alert_webhook_url: str
   enable_dashboard: bool

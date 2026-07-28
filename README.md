@@ -29,7 +29,9 @@ that specific inefficiency, not to race anyone on speed:
 
 1. **A universe where synthesis wins** -- small/mid-cap companies with thin
    analyst coverage, grouped into ecosystems (semiconductor equipment,
-   defense tier-2 suppliers, grid/data-center buildout, battery/storage),
+   defense tier-2 suppliers, grid/data-center buildout, battery/storage,
+   and medical-device supply -- the last one deliberately uncorrelated with
+   the AI/electrification capex cycle driving the other four),
    where a big, heavily-covered player's news plausibly moves a thinly-
    covered second-order name with a lag. See `src/smartboi/universe.py`.
 2. **Second-order effects, not headlines** -- a relationship graph
@@ -112,6 +114,9 @@ src/smartboi/
   paper_journal.py                hypothetical trade open/mark/close -- NO order-placement code
   prices.py                        read-only IB price feed -- NO order-placement code, optional
   universe_screen.py                monthly market-cap/analyst-coverage prune-only recheck
+  screen.py                          candidate screening CLI (python -m smartboi.screen)
+  forward_returns.py                  "does score predict forward returns" math (offline, pure)
+  tools.py                             operator tools the dashboard runs (screen / forward returns)
   status.py                          dashboard data gathering (pure reads of persisted state)
   webapp.py                           read-only dashboard, runs alongside the engine
   engine.py                            orchestrates ingestion -> graph -> dossier -> signals -> paper trades
@@ -185,8 +190,43 @@ entirely rather than shown as an unactionable dead end (see engine.py's
 `_NON_COMPANY_KEYWORDS` -- only ever applied after ticker resolution has
 already failed, so a real resolved candidate is never hidden by it).
 
-Accept a candidate with one click on the dashboard -- "+ Tradeable" or "+
-Anchor" -- and it's live immediately, no restart: EDGAR/news polling and
+**Candidates are auto-accepted by default** (`ENABLE_AUTO_ACCEPT_CANDIDATES`).
+The engine already resolves a candidate's ticker, fetches its market cap and
+analyst count, and computes a tradeable-vs-anchor recommendation from the
+same bounds it screens existing members against -- so accepting by hand
+applied exactly that recommendation, and the click was a veto rather than a
+judgement. A candidate is not an arbitrary ticker that cleared a threshold:
+it exists *because a tradeable company's own SEC filing disclosed a
+relationship with it*, which is what makes it automatable at all (and why
+`universe_screen.py`'s prune-only stance, which is about names with no
+relationship evidence, doesn't apply here).
+
+Anchors and tradeables are held to deliberately different bars:
+
+- **Anchor -- liberal.** It can never become a trade (`signal_source_only`),
+  so the worst case is some wasted LLM spend, while the upside is large: it
+  turns a dead-end candidate into a live propagation source, which is the
+  mechanism this whole strategy runs on.
+- **Tradeable -- guarded.** It can produce signals and paper trades, so it
+  additionally requires the resolved ticker's registered SEC name to actually
+  match the disclosed counterparty name (`EdgarClient.name_matches_ticker`),
+  plus repeat disclosure across filings (`AUTO_ACCEPT_MIN_SEEN_COUNT`). The
+  name check exists because of a confirmed-live misresolution: a filing
+  describing a partnership with *Advantest* was recorded against **ATRO**
+  (Astronics), an unrelated aerospace company. An anchor mistake is cheap;
+  auto-adding the wrong company as a trade target is not.
+
+Bounded and reversible: at most `AUTO_ACCEPT_MAX_PER_DAY` per UTC day (so one
+filing naming a long list of counterparties can't flood the universe), every
+acceptance logged and webhook-alerted, and each recorded in
+`data/accepted_candidates.json` marked `auto` -- shown as "added: tradeable
+(auto)" on the dashboard, and undone by deleting the entry. Widening what's
+watched can't by itself create a trade: a dossier still has to form and cross
+the signal threshold on its own. Set `AUTO_ACCEPT_TRADEABLES=false` to keep
+the guarded half manual while still auto-adding anchors.
+
+You can also accept a candidate with one click on the dashboard -- "+
+Tradeable" or "+ Anchor" -- and it's live immediately, no restart: EDGAR/news polling and
 the relationship backfill both read the current universe on their next
 cycle, not a value fixed at startup. Persisted in
 `data/accepted_candidates.json`, so it survives a restart without ever
@@ -489,6 +529,17 @@ polling EDGAR/news/prices on their own configured intervals.
 ## Dashboard
 
 A dashboard (`ENABLE_DASHBOARD=true` by default) runs alongside the engine.
+A **Tools** panel at the top runs the two analyses that previously needed a
+terminal on the Home Assistant host: **Screen candidates** (market-cap /
+analyst-coverage screen of specific tickers, or of every discovered
+candidate, with editable bounds) and **Forward-return report** (does
+`confidence x magnitude` predict forward returns -- bucket table,
+correlation, hit rate, sector-relative alpha, per-symbol breakdown). Both are
+read-only: one does market-data lookups, the other reads the captured
+snapshot/price logs. Neither changes a dossier, the universe, or any trade,
+and one runs at a time so a screen can't outrun Finnhub's rate limit
+alongside the engine's own polling.
+
 Open `http://localhost:8100/` (or `DASHBOARD_PORT`): which integrations are
 enabled, the relationship graph (grouped by filer -- each company's own
 disclosed customers/suppliers/competitors/regulators together, strongest

@@ -145,9 +145,46 @@ class Settings(BaseSettings):
     # never auto-adds new tickers. ---
     enable_universe_autoscreen: bool = True
     universe_screen_interval_days: int = 30
-    universe_min_market_cap_musd: float = 100.0
+    # Bounds moved from 100/6 to 75/10 in the 2026-07 refresh: a live screen
+    # of 15 candidates failed 14 of them, clustered just above the old
+    # analyst bound (7,8,8,9,9,9,9,9,10), while everything that DID clear <=6
+    # sat below the $100M floor. The old numbers described a window that is
+    # close to empty in US small caps -- see universe.py's docstring for the
+    # full reasoning, and note this is a "what to watch" bound, deliberately
+    # unlike the signal threshold ("when to trade"), which was not loosened.
+    universe_min_market_cap_musd: float = 75.0
     universe_max_market_cap_musd: float = 5000.0
-    universe_max_analyst_count: int = 6
+    universe_max_analyst_count: int = 10
+
+    # --- Auto-accepting discovered universe candidates ---
+    # A candidate is a company a TRADEABLE company's own SEC filing disclosed
+    # a relationship with (see engine.py's _record_universe_candidate), and
+    # the engine already resolves its ticker, fetches market cap/analyst
+    # count, and computes a tradeable-vs-anchor recommendation from the
+    # bounds above. Accepting it by hand applied exactly that recommendation,
+    # so the click added a veto, not a judgement -- these settings let the
+    # engine act on its own recommendation instead. Every auto-accept is
+    # logged, webhook-alerted, and recorded in accepted_candidates.json with
+    # an "auto" marker, so it stays auditable and is undone by deleting the
+    # entry. Nothing here can place an order; this only widens what is
+    # watched (see webapp.py's accept endpoint for the same reasoning).
+    enable_auto_accept_candidates: bool = True
+    # Anchors and tradeables are deliberately NOT held to the same bar. An
+    # anchor can never become a trade (signal_source_only), so the worst case
+    # is some wasted LLM spend, and the upside is large: it turns a dead-end
+    # candidate into a live propagation source, which is the mechanism the
+    # whole strategy runs on. A tradeable can produce signals and paper
+    # trades, so it additionally requires a verified name match and repeat
+    # disclosure (see engine.py's _auto_accept_candidates).
+    auto_accept_anchors: bool = True
+    auto_accept_tradeables: bool = True
+    # How many times a candidate must have been disclosed across filings
+    # before it can be auto-accepted as TRADEABLE -- one throwaway mention in
+    # a single filing isn't enough to start taking positions on a name.
+    auto_accept_min_seen_count: int = 2
+    # Ceiling on auto-accepts per day, so one filing that names a long list
+    # of counterparties can't flood the universe in a single pass.
+    auto_accept_max_per_day: int = 5
 
     log_level: str = "INFO"
     log_dir: str = "logs"

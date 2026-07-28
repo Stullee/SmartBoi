@@ -123,7 +123,18 @@ def gather_universe_candidates(candidates: dict, accepted: dict) -> list[dict]:
     rows = []
     for key, c in candidates.items():
         row = dict(c)
-        row["accepted_as"] = accepted.get(row.get("ticker") or key)
+        entry = accepted.get(row.get("ticker") or key)
+        # Entries were originally a bare "tradeable"/"anchor" string and are
+        # now a {"as", "source"} dict recording whether a human or the engine
+        # accepted it (see engine.accept_candidate). Both shapes are
+        # flattened here so the UI renders a string either way rather than
+        # "[object Object]" for anything written since the upgrade.
+        if isinstance(entry, dict):
+            row["accepted_as"] = entry.get("as")
+            row["accepted_source"] = entry.get("source", "manual")
+        else:
+            row["accepted_as"] = entry
+            row["accepted_source"] = "manual" if entry else None
         rows.append(row)
     rows.sort(key=lambda c: (0 if _is_addable(c) else 1, -c.get("seen_count", 0)))
     return rows

@@ -44,14 +44,19 @@ from smartboi.universe_screen import format_screening_report, guess_ecosystem, s
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MIN_CAP_MUSD = 100.0
+DEFAULT_MIN_CAP_MUSD = 75.0
 # Tighter than the engine's live 5000M ceiling: that bound governs PRUNING an
 # existing universe (where a borderline name is worth keeping until it
 # clearly no longer fits), while this one governs ADDING, where there's no
 # reason to start a new position anywhere near the ceiling it would soon
 # graduate past.
 DEFAULT_MAX_CAP_MUSD = 3000.0
-DEFAULT_MAX_ANALYSTS = 6
+# 10, not the 6 this started with: a live screen of 15 candidates failed 14 of
+# them, clustered just above 6 (7,8,8,9,9,9,9,9,10), while everything that did
+# clear 6 sat below the old $100M floor -- i.e. the old pair described a window
+# that is close to empty in US small caps. It also makes this agree with
+# universe.py, which already retained names at 9-10 analysts.
+DEFAULT_MAX_ANALYSTS = 10
 
 # Written by the Home Assistant supervisor from the add-on's configuration
 # form (see ha-addons/smartboi/_addon_options.py, which loads it into the
