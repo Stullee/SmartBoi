@@ -1135,6 +1135,19 @@ class Engine:
                 fp = fingerprint(symbol, article.headline, published)
                 if self.dedup.is_duplicate(fp):
                     continue
+                near_fp = self.dedup.find_near_duplicate(symbol, article.headline, published)
+                if near_fp is not None:
+                    # A lightly reworded republish of a story already scored
+                    # (same symbol, same/previous day, high headline-token
+                    # overlap): register THIS variant's fingerprint against
+                    # the original's source identity so future polls
+                    # exact-match it cheaply, and skip it entirely -- it
+                    # must neither burn a scoring call nor count as a second
+                    # independent source for the same underlying story.
+                    log.debug("%s: skipping near-duplicate headline %r (matches %r)",
+                              symbol, article.headline, near_fp)
+                    self.dedup.register(fp, self.dedup.domain_for(near_fp) or "unknown")
+                    continue
                 # The real publisher (Reuters, Bloomberg, ...) is what makes
                 # two articles genuinely independent sources -- Finnhub's
                 # free-tier article URLs all point at finnhub.io itself, so
@@ -1393,7 +1406,8 @@ class Engine:
             dossier.independent_source_count, dossier.status,
         )
 
-        signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources)
+        signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources,
+                          self.settings.min_independent_sources_news_only)
         if signal is not None:
             if dossier.status == "ACTIVE" or dossier.direction != dossier.signaled_direction:
                 # A fresh signal (or a thesis that flipped direction while
@@ -1486,7 +1500,8 @@ class Engine:
         the opposite direction from the thesis that actually signaled."""
         if (
             evaluate(dossier, self.settings.signal_confidence_threshold,
-                     self.settings.min_independent_sources) is None
+                     self.settings.min_independent_sources,
+                     self.settings.min_independent_sources_news_only) is None
             or dossier.direction != dossier.signaled_direction
         ):
             self._expire_signal(dossier, "thesis no longer qualifies at entry time")
@@ -1621,7 +1636,8 @@ class Engine:
             if before == after:
                 continue
             if dossier.status == "SIGNALED" and not self.journal.has_open(symbol):
-                signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources)
+                signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources,
+                                  self.settings.min_independent_sources_news_only)
                 if signal is None:
                     self._expire_signal(dossier, "evidence decayed below the signal threshold before an entry was confirmed")
                     continue

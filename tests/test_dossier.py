@@ -329,3 +329,29 @@ def test_empty_published_at_decays_from_merge_time():
     merge_evidence(dossier, _evidence(confidence=0.9, horizon_days=10, published_at=" ", evidence_id="e1"), now=NOW)
     recompute_decay(dossier, NOW + timedelta(days=60))
     assert dossier.confidence == 0.0
+
+
+def test_aggregate_tracks_filing_evidence_flag():
+    # News-only agreeing evidence -> False; any filing source -> True; a
+    # filing on the LOSING side must not count (it doesn't corroborate the
+    # thesis being signaled).
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(evidence_id="n1", source_name="reuters.com"), now=NOW)
+    assert dossier.has_filing_evidence is False
+
+    filing = _evidence(evidence_id="f1", source_name="SEC EDGAR (8-K)")
+    filing.source_type = "8-K"
+    merge_evidence(dossier, filing, now=NOW)
+    assert dossier.has_filing_evidence is True
+
+
+def test_losing_side_filing_does_not_set_the_flag():
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(evidence_id="n1", confidence=0.9, source_name="reuters.com"), now=NOW)
+    merge_evidence(dossier, _evidence(evidence_id="n2", confidence=0.9, source_name="bloomberg.com"), now=NOW)
+    contrary_filing = _evidence(evidence_id="f1", direction="SHORT", confidence=0.2,
+                                source_name="SEC EDGAR (Form 4)")
+    contrary_filing.source_type = "4"
+    merge_evidence(dossier, contrary_filing, now=NOW)
+    assert dossier.direction == "LONG"
+    assert dossier.has_filing_evidence is False

@@ -74,3 +74,63 @@ def test_dedup_index_reads_legacy_flat_format(tmp_path):
     index = DedupIndex(path)
     assert index.is_duplicate(fp)
     assert index.domain_for(fp) == "reuters.com"
+
+
+# --- Near-duplicate (reworded syndication) detection ---
+
+from smartboi.dedup import headline_tokens, near_duplicate
+
+
+def test_headline_tokens_strip_stopwords_and_suffixes():
+    assert headline_tokens("Acme Corp wins the Navy contract") == {"acme", "wins", "navy", "contract"}
+
+
+def test_near_duplicate_catches_light_rewording():
+    assert near_duplicate(
+        "Acme Corp wins $50M Navy contract",
+        "Acme wins $50M Navy contract",
+    )
+
+
+def test_near_duplicate_keeps_opposite_stories_distinct():
+    # 3 of 5 identity tokens shared (0.6) -- must stay below the threshold,
+    # these are opposite outcomes, not one reworded story.
+    assert not near_duplicate(
+        "Acme wins big Navy contract",
+        "Acme loses big Navy contract",
+    )
+
+
+def test_near_duplicate_empty_headlines_never_match():
+    assert not near_duplicate("", "Acme wins Navy contract")
+    assert not near_duplicate("the a an", "the a an")
+
+
+def test_find_near_duplicate_same_day(tmp_path):
+    index = DedupIndex(tmp_path / "dedup_index.json")
+    fp = fingerprint("UCTT", "Acme Corp wins $50M Navy contract", "2026-07-21")
+    index.register(fp, "reuters.com")
+    match = index.find_near_duplicate("UCTT", "Acme wins $50M Navy contract", "2026-07-21")
+    assert match == fp
+
+
+def test_find_near_duplicate_previous_day(tmp_path):
+    # Wire copy republished after UTC midnight used to get a fresh
+    # fingerprint purely from the date rollover.
+    index = DedupIndex(tmp_path / "dedup_index.json")
+    fp = fingerprint("UCTT", "Acme Corp wins $50M Navy contract", "2026-07-21")
+    index.register(fp, "reuters.com")
+    match = index.find_near_duplicate("UCTT", "Acme wins $50M Navy contract", "2026-07-22")
+    assert match == fp
+
+
+def test_find_near_duplicate_respects_symbol_and_distance(tmp_path):
+    index = DedupIndex(tmp_path / "dedup_index.json")
+    fp = fingerprint("UCTT", "Acme Corp wins $50M Navy contract", "2026-07-21")
+    index.register(fp, "reuters.com")
+    # Different symbol: no match.
+    assert index.find_near_duplicate("ICHR", "Acme wins $50M Navy contract", "2026-07-21") is None
+    # Two days later: outside the same/previous-day window.
+    assert index.find_near_duplicate("UCTT", "Acme wins $50M Navy contract", "2026-07-23") is None
+    # A genuinely different story: no match.
+    assert index.find_near_duplicate("UCTT", "Acme CFO resigns unexpectedly", "2026-07-21") is None

@@ -105,6 +105,14 @@ class Settings(BaseSettings):
     # separately -- independent disclosures, not restatements of each other).
     signal_confidence_threshold: float = 0.65
     min_independent_sources: int = 2
+    # Higher bar for dossiers whose agreeing evidence is ENTIRELY news:
+    # dedup collapses exact and lightly-reworded republishes, but heavily
+    # reworded wire copy can still land as two "independent" publishers --
+    # enough to satisfy min_independent_sources=2 and fire a trade on what
+    # is one underlying story. Filings are primary disclosures and immune
+    # to that failure mode, so any filing-corroborated dossier keeps the
+    # normal bar; news-only ones need this many distinct publishers.
+    min_independent_sources_news_only: int = 3
     # 21 trading-ish days, not the 56 this started with. The lead-lag
     # literature is specific about where the tradeable component lives: a
     # daily-resolution event study of supplier returns after large customer

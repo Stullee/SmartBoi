@@ -42,6 +42,54 @@ def fingerprint(symbol: str, headline: str, published_date: str) -> str:
     return f"{symbol}:{normalize_headline(headline)}:{published_date[:10]}"
 
 
+# Words that carry no story identity: corporate suffixes and glue words.
+# Stripped before the token-overlap comparison so "Acme Corp wins Navy
+# contract" and "Acme wins the Navy contract" compare as the same token
+# set. Deliberately short -- overstripping (e.g. removing verbs) would
+# collapse genuinely different stories ("wins contract" vs "loses
+# contract" must stay distinct).
+_HEADLINE_STOPWORDS = frozenset(
+    "a an the in on of for to and with its as at by from inc corp corporation "
+    "incorporated ltd plc co company holdings group".split()
+)
+
+
+def headline_tokens(headline: str) -> frozenset[str]:
+    """The identity-bearing token set of a headline (normalized, stopwords
+    and corporate suffixes removed) -- the unit near_duplicate compares."""
+    return frozenset(
+        t for t in normalize_headline(headline).split() if t not in _HEADLINE_STOPWORDS
+    )
+
+
+# Minimum Jaccard overlap between two headlines' token sets to call them
+# the same underlying story. Calibrated conservative: at 0.7, "Acme Corp
+# wins $50M Navy contract" matches "Acme wins $50M Navy contract" (a
+# syndicated rewording) while "Acme wins Navy contract" vs "Acme loses
+# Navy contract" (opposite stories, 3/5 shared tokens = 0.6) stays
+# distinct. This is a best-effort second line of defense -- heavily
+# reworded wire copy can still slip past it, which is why news-only
+# dossiers additionally face a higher independent-source bar (see
+# signals.evaluate's min_independent_sources_news_only).
+_NEAR_DUP_JACCARD = 0.7
+
+
+def near_duplicate(headline_a: str, headline_b: str, threshold: float = _NEAR_DUP_JACCARD) -> bool:
+    """Whether two headlines look like rewordings of the same story --
+    token-set Jaccard overlap at or above `threshold`. Exact duplicates are
+    already collapsed by fingerprint(); this catches the syndication case
+    the exact match misses: one wire story republished with lightly edited
+    headlines, which would otherwise count as two 'independent' sources
+    toward the corroboration gate that fires trades."""
+    a, b = headline_tokens(headline_a), headline_tokens(headline_b)
+    if not a or not b:
+        return False
+    union = len(a | b)
+    if union == 0:
+        return False
+    return len(a & b) / union >= threshold
+
+
 @dataclass
 class DedupIndex:
     """Persisted so dedup state survives restarts -- an evidence item seen
@@ -75,6 +123,38 @@ class DedupIndex:
 
     def is_duplicate(self, fp: str) -> bool:
         return fp in self._seen
+
+    def find_near_duplicate(self, symbol: str, headline: str, published_date: str) -> str | None:
+        """The fingerprint of an already-registered story this headline is
+        a likely rewording of (same symbol, same or previous calendar day,
+        token overlap >= the near-dup threshold) -- or None. Checked after
+        the exact fingerprint miss: syndicated wire copy is routinely
+        republished with a lightly edited headline (and sometimes after
+        UTC midnight), which produced a distinct fingerprint, a second
+        LLM-scored evidence item, and a second 'independent' source for
+        what is one underlying story. Fingerprint keys are parseable
+        because normalize_headline strips punctuation -- the embedded
+        headline can never itself contain a colon."""
+        candidate_tokens = headline_tokens(headline)
+        if not candidate_tokens:
+            return None
+        dates = {published_date[:10]}
+        try:
+            d = datetime.fromisoformat(published_date[:10]).date()
+            dates.add((d - timedelta(days=1)).isoformat())
+        except ValueError:
+            pass
+        prefix = f"{symbol}:"
+        for fp in self._seen:
+            if not fp.startswith(prefix):
+                continue
+            rest, _, seen_date = fp.rpartition(":")
+            if seen_date not in dates:
+                continue
+            seen_headline = rest[len(prefix):]
+            if near_duplicate(headline, seen_headline):
+                return fp
+        return None
 
     def domain_for(self, fp: str) -> str | None:
         entry = self._seen.get(fp)

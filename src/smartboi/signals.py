@@ -37,10 +37,24 @@ class SignalEvent:
     generated_at: str
 
 
-def evaluate(dossier: Dossier, confidence_threshold: float, min_independent_sources: int) -> SignalEvent | None:
+def evaluate(
+    dossier: Dossier,
+    confidence_threshold: float,
+    min_independent_sources: int,
+    min_independent_sources_news_only: int | None = None,
+) -> SignalEvent | None:
     if dossier.direction == "NONE":
         return None
-    if dossier.independent_source_count < min_independent_sources:
+    required_sources = min_independent_sources
+    if min_independent_sources_news_only is not None and not dossier.has_filing_evidence:
+        # News-only corroboration is softer than it looks: two outlets
+        # rewording one wire story can slip past dedup's near-dup check as
+        # two "independent" sources, and that alone used to satisfy the
+        # gate that fires trades. A filing (8-K, Form 4, 10-Q...) is a
+        # primary disclosure that can't be a rewording of a news article,
+        # so a dossier corroborated purely by news must clear a higher bar.
+        required_sources = max(required_sources, min_independent_sources_news_only)
+    if dossier.independent_source_count < required_sources:
         return None
     if dossier.confidence * dossier.magnitude < confidence_threshold:
         return None

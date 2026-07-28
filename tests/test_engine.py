@@ -38,6 +38,11 @@ def engine(tmp_path, monkeypatch):
     settings = Settings(
         _env_file=None, symbols="FORM,UCTT", anchor_symbols="INTC",
         signal_confidence_threshold=0.5, min_independent_sources=2,
+        # The news-only corroboration bar is exercised by its own dedicated
+        # test below; pinned to the normal bar here so the lifecycle tests
+        # (which build news-only dossiers for convenience) stay focused on
+        # the signal -> trade machinery.
+        min_independent_sources_news_only=2,
         enable_relationship_backfill=False, enable_universe_autoscreen=False,
         enable_dashboard=False, max_propagated_evidence_per_link=1,
         propagated_evidence_cooldown_hours=6,
@@ -652,6 +657,50 @@ async def test_no_trade_opens_when_thesis_no_longer_qualifies_at_entry(engine):
 
     assert not engine.journal.has_open("FORM")
     assert engine.dossiers.load("FORM").status == "ACTIVE"  # expired, clean slate
+
+
+# --- News-only corroboration bar: two publishers can be one reworded wire
+# story that slipped past dedup, so a dossier corroborated ONLY by news
+# needs min_independent_sources_news_only; any filing evidence on the
+# agreeing side restores the normal bar (a filing can't be a rewording of
+# a news article). ---
+
+async def test_news_only_dossier_held_to_higher_source_bar(engine):
+    engine.settings.min_independent_sources_news_only = 3
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+
+    # Two news publishers: enough for the normal bar, not the news-only one.
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+    assert engine.dossiers.load("FORM").status == "ACTIVE"
+
+    # A third, genuinely distinct publisher clears the news-only bar.
+    await engine._process_evidence(
+        origin_symbol="FORM", evidence_text="evidence 2", source_type="news",
+        source_name="wsj.com", url="https://x/2", headline="h2", published_at="2026-07-23",
+    )
+    assert engine.dossiers.load("FORM").status == "SIGNALED"
+
+
+async def test_filing_evidence_restores_the_normal_bar(engine):
+    engine.settings.min_independent_sources_news_only = 3
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+
+    await engine._process_evidence(
+        origin_symbol="UCTT", evidence_text="news evidence", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="n1", published_at="2026-07-23",
+    )
+    await engine._process_evidence(
+        origin_symbol="UCTT", evidence_text="8-K material event", source_type="8-K",
+        source_name="SEC EDGAR (8-K)", url="https://sec.gov/1", headline="8-K", published_at="2026-07-23",
+    )
+    # Two sources, one of them a filing: normal bar (2) applies -> signals.
+    assert engine.dossiers.load("UCTT").status == "SIGNALED"
 
 
 # --- Regression: retry of a partially-deferred item must not re-pay LLM

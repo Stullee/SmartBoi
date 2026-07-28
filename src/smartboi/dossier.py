@@ -92,6 +92,13 @@ class Dossier:
     # a data problem. mass_opposing == 0 means confidence is undiscounted.
     mass_agree: float = 0.0
     mass_opposing: float = 0.0
+    # Whether any non-stale agreeing evidence comes from an SEC filing
+    # (source_type != "news"). News-only corroboration is softer than it
+    # looks -- two outlets rewording one wire story can slip past dedup as
+    # two "independent" sources -- so signals.evaluate holds news-only
+    # dossiers to a higher independent-source bar. A filing is a primary
+    # disclosure and can't be a syndicated rewording of a news article.
+    has_filing_evidence: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -277,6 +284,7 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
         dossier.magnitude = 0.0
         dossier.mass_agree = 0.0
         dossier.mass_opposing = 0.0
+        dossier.has_filing_evidence = False
         return
 
     agreeing = [
@@ -285,6 +293,7 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     ]
     weighted = [(e, evidence_weight(e, now)) for e in agreeing]
     dossier.independent_source_count = len({e.source_name for e in agreeing})
+    dossier.has_filing_evidence = any(e.source_type != "news" for e in agreeing)
     base_confidence = max(e.confidence * w for e, w in weighted)
     corroboration_bonus = 0.1 * max(0, dossier.independent_source_count - 1)
     raw_confidence = min(1.0, base_confidence + corroboration_bonus)
