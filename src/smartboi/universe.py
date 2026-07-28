@@ -49,12 +49,32 @@ Two structural notes behind the anchor expansion:
   extractor turn a tradeable company's mention of ASML/GEV/ETN into a real
   graph EDGE instead of a dead-end universe candidate. Trade targets have to
   be chosen by screening (scripts/screen_candidates.py), not discovered.
-- **A fifth, deliberately uncorrelated ecosystem (medtech_supply).** The
-  original four are largely one macro bet -- semis, grid/data-center and
+- **Two deliberately uncorrelated ecosystems (medtech_supply, auto_supply).**
+  The original four are largely one macro bet -- semis, grid/data-center and
   battery are all the AI/electrification capex cycle, which is why they all
-  sold off together. Medical-device suppliers have the identical structure (a
-  small component maker disclosing a concentrated big-medtech customer) with
-  no exposure to that cycle.
+  sold off together in the first week of forward data. Medical-device
+  suppliers and automotive tier-2s have the identical disclosure structure (a
+  small component maker naming a concentrated large customer) with no exposure
+  to that cycle.
+
+  auto_supply is the strongest structural fit in the whole universe, because
+  its customer concentration is not inferred from a thematic framing -- it is
+  a stated percentage. A driveline or seating supplier discloses "GM
+  accounted for N% of net sales" because losing a single OEM platform is an
+  existential risk it is REQUIRED to disclose. That is exactly the hard,
+  quantified edge the relationship graph exists to read, and precisely what
+  the sector-exposure links (IESC -> MSFT/GOOGL at confidence 0.30-0.50)
+  never provided.
+
+## Ecosystem sizing
+
+defense_tier2 and battery_storage were widened from two tradeables each to
+six in 2026-07. Two names is not an ecosystem -- one delisting or acquisition
+empties it, and with a deliberately high signal bar, a handful of names
+across the whole universe makes the realistic signal rate near zero. Breadth
+here buys more CHANCES at a real catalyst; it is explicitly not a substitute
+for lowering the bar, which the first fortnight of forward data argued
+against.
 
 ## Why the tradeable bound is <=10 analysts, not <=6
 
@@ -166,6 +186,14 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
                       "(disclosed RTX/LMT/NOC concentration at 0.95 confidence)"),
     CompanySpec("SIF", "SIFCO Industries", "defense_tier2",
                 notes="screen-verified 2026-07: $164M, NO analyst coverage on record -- the thinnest name here. Forgings for aerospace/defense"),
+    CompanySpec("CDRE", "Cadre Holdings", "defense_tier2",
+                notes="unverified -- body armor/safety equipment sold into federal and law-enforcement programs"),
+    CompanySpec("VVX", "V2X Inc", "defense_tier2",
+                notes="unverified -- defense logistics/services; revenue concentrated in named government programs"),
+    CompanySpec("RDW", "Redwire Corp", "defense_tier2",
+                notes="unverified -- space infrastructure components; discloses prime-contractor and NASA concentration"),
+    CompanySpec("BKTI", "BK Technologies", "defense_tier2",
+                notes="unverified -- micro-cap land-mobile radio for public safety/federal agencies; expected very thin coverage"),
     # --- Anchors: primes whose awards flow down ---
     CompanySpec("RTX", "RTX (Raytheon)", "defense_tier2", signal_source_only=True,
                 notes="Anchor: prime contractor award announcements"),
@@ -258,15 +286,19 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
                 notes="screen-verified 2026-07: $149M, 5 analysts -- PASSES the thin-coverage bounds. Battery materials"),
     CompanySpec("ULBI", "Ultralife Corp", "battery_storage",
                 notes="screen-verified 2026-07: $90M -- just under the $100M floor, kept deliberately (see docstring). Batteries/comms, defense crossover"),
+    CompanySpec("MVST", "Microvast Holdings", "battery_storage",
+                notes="unverified -- commercial-vehicle battery systems; discloses concentrated OEM customers"),
+    CompanySpec("SLDP", "Solid Power", "battery_storage",
+                notes="unverified -- solid-state cells; BMW/Ford development agreements are disclosed relationships"),
+    CompanySpec("KULR", "KULR Technology", "battery_storage",
+                notes="unverified -- battery thermal management/safety; NASA and defense customers disclosed"),
+    CompanySpec("SES", "SES AI Corp", "battery_storage",
+                notes="unverified -- Li-Metal cells; OEM joint development agreements are disclosed relationships"),
     # --- Anchors ---
     CompanySpec("TSLA", "Tesla", "battery_storage", signal_source_only=True,
                 notes="Anchor: EV/battery demand signal source"),
     CompanySpec("ALB", "Albemarle", "battery_storage", signal_source_only=True,
                 notes="Anchor: lithium giant -- key materials price/demand driver"),
-    CompanySpec("GM", "General Motors", "battery_storage", signal_source_only=True,
-                notes="Anchor: EV demand"),
-    CompanySpec("F", "Ford Motor", "battery_storage", signal_source_only=True,
-                notes="Anchor: EV demand"),
     CompanySpec("FSLR", "First Solar", "battery_storage", signal_source_only=True,
                 notes="Anchor: solar + storage demand"),
     CompanySpec("ENPH", "Enphase Energy", "battery_storage", signal_source_only=True,
@@ -310,6 +342,52 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
                 notes="Anchor: medical supplies/consumables demand"),
     CompanySpec("ZBH", "Zimmer Biomet", "medtech_supply", signal_source_only=True,
                 notes="Anchor: orthopedic implant demand"),
+
+    # ================================================================
+    # Automotive supply chain (added 2026-07)
+    # The strongest structural fit in the universe: customer concentration
+    # here is not inferred, it is a stated percentage. An axle or seat
+    # maker discloses "GM accounted for N% of net sales" because a single
+    # OEM losing a platform is an existential risk it is REQUIRED to
+    # disclose -- exactly the hard, quantified edge the relationship graph
+    # is built to read, and the thing sector-exposure framings never give.
+    # Also a genuine diversifier: driven by vehicle production schedules
+    # and OEM platform awards, not the AI/electrification capex cycle
+    # behind semis, grid and battery.
+    # ================================================================
+    # --- Tradeable (all unverified -- screen before relying on these) ---
+    CompanySpec("AXL", "American Axle & Manufacturing", "auto_supply",
+                notes="unverified -- driveline; historically discloses GM as a very large stated share of net sales"),
+    CompanySpec("STRT", "Strattec Security", "auto_supply",
+                notes="unverified -- locks/latches/keys; discloses GM, Ford and Stellantis concentration explicitly"),
+    CompanySpec("SRI", "Stoneridge", "auto_supply",
+                notes="unverified -- vehicle electronics and driver-information systems for OEM platforms"),
+    CompanySpec("GTX", "Garrett Motion", "auto_supply",
+                notes="unverified -- turbochargers; revenue tied to named OEM platform awards"),
+    CompanySpec("THRM", "Gentherm", "auto_supply",
+                notes="unverified -- thermal seat/comfort systems; discloses OEM customer concentration"),
+    CompanySpec("SUP", "Superior Industries International", "auto_supply",
+                notes="unverified -- aluminium wheels; concentrated OEM customer base"),
+    # --- Anchors: the OEMs whose production and platform news propagates
+    # down, plus the tier-1s a small supplier is most likely to name ---
+    CompanySpec("GM", "General Motors", "auto_supply", signal_source_only=True,
+                notes="Anchor: the single most-disclosed customer in this ecosystem -- production cuts and platform awards propagate straight down"),
+    CompanySpec("F", "Ford Motor", "auto_supply", signal_source_only=True,
+                notes="Anchor: OEM production schedules and platform awards"),
+    CompanySpec("STLA", "Stellantis", "auto_supply", signal_source_only=True,
+                notes="Anchor: OEM production schedules and platform awards"),
+    CompanySpec("TM", "Toyota Motor", "auto_supply", signal_source_only=True,
+                notes="Anchor: OEM production schedules; also a disclosed customer of ESOA"),
+    CompanySpec("HMC", "Honda Motor", "auto_supply", signal_source_only=True,
+                notes="Anchor: OEM production schedules"),
+    CompanySpec("APTV", "Aptiv", "auto_supply", signal_source_only=True,
+                notes="Anchor: tier-1 electrical architecture -- a tier-2's disclosed customer"),
+    CompanySpec("BWA", "BorgWarner", "auto_supply", signal_source_only=True,
+                notes="Anchor: tier-1 propulsion -- a tier-2's disclosed customer"),
+    CompanySpec("LEA", "Lear Corp", "auto_supply", signal_source_only=True,
+                notes="Anchor: tier-1 seating/e-systems -- a tier-2's disclosed customer"),
+    CompanySpec("MGA", "Magna International", "auto_supply", signal_source_only=True,
+                notes="Anchor: tier-1 contract manufacturer -- a tier-2's disclosed customer"),
 ]
 
 # Well-documented ecosystem relationships worth seeding directly rather than
