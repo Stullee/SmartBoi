@@ -173,6 +173,11 @@ class Skeptic:
             response = await self._client.messages.create(
                 model=self._model,
                 max_tokens=300,
+                # Pinned to 0 -- the verdict (and adjusted numbers) decide
+                # whether evidence counts toward a hard trade threshold;
+                # the API's default 1.0 made refute/accept partly sampling
+                # noise, and a retried item could flip outcome run-to-run.
+                temperature=0,
                 system=_SYSTEM_PROMPT,
                 tools=[_TOOL],
                 tool_choice={"type": "tool", "name": "skeptic_verdict"},

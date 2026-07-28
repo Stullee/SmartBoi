@@ -48,6 +48,7 @@ class FakeFinnhub:
         self.ticker_by_name: dict[str, str] = {}
         self.market_cap_by_symbol: dict[str, float] = {}
         self.analyst_count_by_symbol: dict[str, int] = {}
+        self.quotes_by_symbol: dict[str, float] = {}
 
     async def recent_news(self, symbol, from_date, to_date):
         return self.articles_by_symbol.get(symbol, [])
@@ -60,6 +61,9 @@ class FakeFinnhub:
 
     async def search_ticker_by_name(self, company_name):
         return self.ticker_by_name.get(company_name)
+
+    async def quote(self, symbol):
+        return self.quotes_by_symbol.get(symbol)
 
     async def aclose(self):
         pass
@@ -124,7 +128,11 @@ class FakeExtractor(_ScriptedCallable):
 
 
 class FakePriceFeed:
-    def __init__(self, prices: dict[str, float] | None = None, connected: bool = True):
+    """Prices may be plain floats (high=low=close, i.e. the old close-only
+    behavior) or PriceBar-style (close, high, low) tuples for tests that
+    exercise intraday stop/target evaluation."""
+
+    def __init__(self, prices: dict[str, float | tuple] | None = None, connected: bool = True):
         self.prices = dict(prices or {})
         self._connected = connected
 
@@ -134,11 +142,28 @@ class FakePriceFeed:
     async def connect(self):
         self._connected = True
 
+    def _bar(self, symbol):
+        from smartboi.prices import PriceBar
+
+        value = self.prices.get(symbol)
+        if value is None:
+            return None
+        if isinstance(value, tuple):
+            return PriceBar(*value)
+        return PriceBar(close=value, high=value, low=value)
+
+    async def last_bar(self, symbol):
+        return self._bar(symbol)
+
+    async def last_bars(self, symbols):
+        return {s: self._bar(s) for s in symbols if self._bar(s) is not None}
+
     async def last_price(self, symbol):
-        return self.prices.get(symbol)
+        bar = self._bar(symbol)
+        return bar.close if bar is not None else None
 
     async def last_prices(self, symbols):
-        return {s: self.prices[s] for s in symbols if s in self.prices}
+        return {s: bar.close for s, bar in (await self.last_bars(symbols)).items()}
 
     def disconnect(self):
         self._connected = False

@@ -22,6 +22,7 @@ _NEWS_URL = "https://finnhub.io/api/v1/company-news"
 _PROFILE_URL = "https://finnhub.io/api/v1/stock/profile2"
 _RECOMMENDATION_URL = "https://finnhub.io/api/v1/stock/recommendation"
 _SEARCH_URL = "https://finnhub.io/api/v1/search"
+_QUOTE_URL = "https://finnhub.io/api/v1/quote"
 
 # Finnhub's free tier allows 60 requests/minute -- a ~40-symbol universe
 # polled as a burst blows through that partway in and 429s the rest of the
@@ -188,6 +189,23 @@ class FinnhubClient:
             return None
         self._search_422s = 0
         return _best_search_match(response.json().get("result", []), normalized_query)
+
+    async def quote(self, symbol: str) -> float | None:
+        """Current/last price via Finnhub's free-tier /quote -- the
+        IB-independent price source for daily forward-validation marks and
+        signal-time drift baselines (see engine.py). Finnhub answers an
+        unknown symbol with 200 and c=0, so 0 maps to None rather than
+        being recorded as a real price."""
+        try:
+            response = await self._throttled_get(_QUOTE_URL, {"symbol": symbol})
+        except httpx.HTTPError as exc:
+            log.warning("%s: Finnhub quote fetch failed: %s", symbol, redact_token(exc))
+            return None
+        try:
+            price = float(response.json().get("c") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        return price if price > 0 else None
 
     async def market_cap_musd(self, symbol: str) -> float | None:
         try:

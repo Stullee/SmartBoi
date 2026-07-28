@@ -16,9 +16,12 @@ handled DEFINITIVELY -- scored into dossiers, judged not-new, or refuted
 by the skeptic. Evidence that can't be scored yet (no ANTHROPIC_API_KEY
 configured), hits a transient LLM/API failure, or is deferred by the daily
 LLM call budget (usage.py) stays unregistered and is retried on a later
-poll, so none of those ever permanently burn evidence; per-dossier merging
-is idempotent (dossier.has_evidence) so retries of a partially-processed
-item never double-count."""
+poll; per-dossier merging is idempotent (dossier.has_evidence plus the
+in-memory handled-outcome cache) so retries of a partially-processed item
+never double-count or double-pay. The retry vehicle is the item simply
+REAPPEARING in a later poll, so deferral is only lossless while the item
+stays inside its ingestion lookback window (news_lookback_days /
+edgar_lookback_days) -- an item still unscored when it ages out is dropped."""
 from __future__ import annotations
 
 import asyncio
@@ -32,7 +35,9 @@ from pathlib import Path
 from smartboi.alerts import AlertSender
 from smartboi.config import Settings
 from smartboi.dedup import DedupIndex, fingerprint, source_domain
+from smartboi.edgar import _truncate_head_tail
 from smartboi.dossier import (
+    DIRECTIONS,
     Dossier,
     DossierStore,
     DossierUpdater,
@@ -166,7 +171,20 @@ class Engine:
         # skeptic's verdict. In-memory only: on a restart the worst case is
         # falling back to today's behavior (re-propose from scratch), never
         # a new failure mode, so this doesn't need to survive a restart.
-        self._pending_proposals: dict[str, dict] = {}
+        # Values are (proposal, cached_at_monotonic) so entries whose
+        # evidence has aged out of every ingestion lookback window (and so
+        # can never be retried) are evicted instead of leaking forever.
+        self._pending_proposals: dict[str, tuple[dict, float]] = {}
+        # (target_symbol, evidence_id) pairs handled definitively WITHOUT a
+        # merge (skeptic-refuted, judged not-new, or a malformed proposal).
+        # has_evidence() makes the merged outcome idempotent across retries,
+        # but these outcomes previously left no marker at all -- so when a
+        # SIBLING target of the same evidence item was budget-deferred, the
+        # retry re-paid propose_update (and the skeptic) for targets that
+        # were already definitively done, and a second skeptic run could
+        # even accept what the first had refuted. In-memory only, same
+        # restart trade-off as _pending_proposals.
+        self._handled_outcomes: dict[str, float] = {}
 
         self.edgar_client: EdgarClient | None = None
         self.finnhub: FinnhubClient | None = None
@@ -186,6 +204,15 @@ class Engine:
         self._last_decay_pass: float | None = None
         self._last_candidate_recheck: float | None = None
         self._last_heartbeat: float | None = None
+        # Backfill retries after a deferred extraction are held off until
+        # this monotonic time -- without it, an exhausted daily LLM budget
+        # would re-fetch each pending symbol's full 10-K text from EDGAR
+        # every 30-second tick for the rest of the day, achieving nothing.
+        self._backfill_retry_after: float = 0.0
+        # Same shape for a failed daily price-mark pass (every source down):
+        # stays DUE (the day must not be lost) but retries on a backoff, not
+        # every 30-second tick.
+        self._price_marks_retry_after: float = 0.0
         self._dashboard_task: asyncio.Task | None = None
         self._closing = False
 
@@ -322,8 +349,11 @@ class Engine:
         else:
             self._warn_once(
                 "anthropic",
-                "ANTHROPIC_API_KEY not set -- evidence will be collected but not scored yet; "
-                "unscored items are retried automatically once a key is configured.",
+                "ANTHROPIC_API_KEY not set -- evidence will be collected but not scored yet. "
+                "Unscored items are retried automatically once a key is configured, but only "
+                "while they remain inside the ingestion lookback windows (news: "
+                f"{self.settings.news_lookback_days}d, EDGAR: {self.settings.edgar_lookback_days}d) "
+                "-- anything older by then is not scored.",
             )
 
         if self.settings.enable_ib_price_feed:
@@ -440,11 +470,6 @@ class Engine:
             if await self.price_feed.ensure_connected():
                 self._last_price_poll = now
                 await self._mark_and_execute()
-                # Piggybacked on this same (already-connected) price poll
-                # rather than a separate cadence -- see _run_daily_price_marks.
-                if self._daily_pass_due("price_marks"):
-                    self._mark_daily_pass_done("price_marks")
-                    await self._run_daily_price_marks()
             else:
                 self._warn_once(
                     "ib-unreachable",
@@ -463,9 +488,28 @@ class Engine:
             self._last_decay_pass = now
             self._archive_orphaned_dossiers()
             self._run_decay_pass()
+        # Both daily passes are marked done AFTER a successful run, not
+        # before: forward data can't be backfilled, so a pass that raised
+        # (disk error, feed dropping mid-fetch) must stay due and be
+        # retried on the next tick instead of silently losing the day's
+        # capture. Duplicate rows from a partial write are handled
+        # downstream (dedup_snapshots / last-mark-wins), a lost day is not.
         if self._daily_pass_due("dossier_snapshot"):
-            self._mark_daily_pass_done("dossier_snapshot")
             self._run_daily_snapshot()
+            self._mark_daily_pass_done("dossier_snapshot")
+        # Daily price marks are deliberately NOT gated on IB being enabled
+        # or reachable -- they are the raw material for the forward-return
+        # validation, and a missed day is permanently unbackfillable. IB is
+        # preferred when available; Finnhub's /quote fills in otherwise.
+        if (
+            (self.price_feed is not None or self.finnhub is not None)
+            and now >= self._price_marks_retry_after
+            and self._daily_pass_due("price_marks")
+        ):
+            if await self._run_daily_price_marks():
+                self._mark_daily_pass_done("price_marks")
+            else:
+                self._price_marks_retry_after = time.monotonic() + IB_RETRY_GAP_SEC
         if (
             self.edgar_client is not None
             and self._due(self._last_candidate_recheck, CANDIDATE_RECHECK_INTERVAL_SEC, now)
@@ -533,7 +577,10 @@ class Engine:
                 log.exception("%s: EDGAR poll failed", symbol)
                 continue
             for filing in filings:
-                await self._process_filing(symbol, filing)
+                try:
+                    await self._process_filing(symbol, filing)
+                except Exception:  # noqa: BLE001 - one bad filing must not abort the rest of the poll
+                    log.exception("%s: processing filing %s failed", symbol, filing.accession_number)
 
     async def _process_filing(self, symbol: str, filing: FilingEvent) -> None:
         fp = f"filing:{symbol}:{filing.accession_number}"
@@ -547,7 +594,14 @@ class Engine:
         if filing.form in RELATIONSHIP_EXTRACTION_FORMS and self.extractor is not None:
             await self._extract_relationships(symbol, filing, text)
 
-        evidence_text = f"SEC {filing.form} filed {filing.filing_date} for {symbol}:\n{text[:4000]}"
+        # Head + tail rather than a flat prefix: the first few thousand
+        # characters of a filing are mostly the SEC cover page and checkbox
+        # boilerplate, so a flat text[:4000] often fed the dossier engine
+        # near-zero actual content -- the disclosed items sit further in.
+        evidence_text = (
+            f"SEC {filing.form} filed {filing.filing_date} for {symbol}:\n"
+            f"{_truncate_head_tail(text, 4000)}"
+        )
         scored = await self._process_evidence(
             origin_symbol=symbol,
             evidence_text=evidence_text,
@@ -569,18 +623,20 @@ class Engine:
         if scored:
             self.dedup.register(fp, "sec.gov")
 
-    async def _extract_relationships(self, symbol: str, filing: FilingEvent, text: str) -> None:
+    async def _extract_relationships(self, symbol: str, filing: FilingEvent, text: str) -> bool:
         """LLM relationship extraction from one filing's text into the
         graph -- shared by regular 10-K/10-Q polling and the one-time
         backfill. graph.add dedupes on (from, to, rel_type), so
         re-extraction of a filing can only ever add edges, never duplicate
-        them. Returns without acting if the daily LLM call budget is
-        exhausted (extract() returns None) -- retried whenever this filing
-        is next polled, same as any other transient-failure path."""
+        them. Returns False (without acting) if the daily LLM call budget
+        is exhausted or the API call failed transiently (extract() returns
+        None) -- the caller must NOT treat the filing as extracted; it is
+        retried whenever this filing is next polled, same as any other
+        transient-failure path. Returns True once extraction actually ran."""
         known = self.symbol_list
         relationships = await self.extractor.extract(symbol, filing.form, text, known)
         if relationships is None:
-            return
+            return False
         now = datetime.now(timezone.utc).isoformat()
         for rel in relationships:
             if self._is_lender_relationship(rel):
@@ -611,11 +667,15 @@ class Engine:
                 # with something that will never be actionable.
                 name = rel.get("counterparty_name") or ""
                 resolved = await self.edgar_client.find_ticker_by_name(name)
-                if not resolved:
+                if not resolved and self.finnhub is not None and not self._is_unsearchable(name):
                     # SEC's own filer title is often a legal name a filing
                     # never uses ("Alphabet Inc" vs "Google") -- Finnhub's
                     # fuzzy, brand-aware search catches most of what the
-                    # strict SEC-title match misses.
+                    # strict SEC-title match misses. Guarded on the client
+                    # actually existing: news ingestion is an OPTIONAL
+                    # integration, and an unguarded call here crashed the
+                    # entire EDGAR poll on every Finnhub-less deployment
+                    # the moment a filing named an unresolvable company.
                     resolved = await self.finnhub.search_ticker_by_name(name)
                 if resolved:
                     ticker = resolved
@@ -625,22 +685,33 @@ class Engine:
                 continue
             if ticker == symbol:
                 continue
+            try:
+                confidence = min(1.0, max(0.0, float(rel["confidence"])))
+                description = str(rel["description"])
+            except (KeyError, TypeError, ValueError):
+                # Anthropic tool use doesn't hard-enforce the schema (see
+                # rel_type above) -- a missing/null field must skip this one
+                # relationship, not crash the whole poll after a paid call.
+                log.warning("%s: dropping malformed relationship to %s (bad description/confidence).",
+                            symbol, ticker)
+                continue
             added = self.graph.add(
                 Relationship(
                     from_symbol=symbol,
                     to_symbol=ticker,
                     rel_type=rel["rel_type"],
-                    description=rel["description"],
+                    description=description,
                     source=filing.document_url,
-                    confidence=float(rel["confidence"]),
+                    confidence=confidence,
                     extracted_at=now,
                 )
             )
             if added:
                 log.info(
                     "[GRAPH] %s -> %s (%s, confidence=%.2f): %s",
-                    symbol, ticker, rel["rel_type"], rel["confidence"], rel["description"],
+                    symbol, ticker, rel["rel_type"], confidence, description,
                 )
+        return True
 
     @staticmethod
     def _is_lender_relationship(rel: dict) -> bool:
@@ -812,9 +883,16 @@ class Engine:
                 self.settings.universe_max_market_cap_musd,
                 float(self.settings.universe_max_analyst_count),
             ]
+            # Accepted symbols are deliberately NOT excluded here: their
+            # recommendation is what _reconcile_accepted_types acts on, and
+            # freezing it at acceptance time meant post-acceptance drift (a
+            # company graduating past the tradeable ceiling, coverage
+            # thickening) could never be detected -- the reconcile pass's
+            # entire documented purpose. Refreshes only when the bounds it
+            # was derived from changed, so this stays two Finnhub calls per
+            # candidate per recalibration, not per day.
             if (
                 self.finnhub is not None
-                and ticker not in self.accepted_candidates.data
                 and entry.get("recommendation_bounds") != bounds
             ):
                 market_cap = await self.finnhub.market_cap_musd(ticker)
@@ -954,6 +1032,8 @@ class Engine:
         symbol is backfilled once ever (persisted), so a symbol accepted at
         runtime (accept_candidate) gets backfilled on the very next tick
         without needing a restart."""
+        if time.monotonic() < self._backfill_retry_after:
+            return
         pending = [
             spec.symbol
             for spec in self.universe
@@ -977,7 +1057,15 @@ class Engine:
                 text = await self.edgar_client.fetch_text(filing)
                 if not text:
                     continue  # fetch failed -- left pending, retried on the next tick
-                await self._extract_relationships(symbol, filing, text)
+                if not await self._extract_relationships(symbol, filing, text):
+                    # Extraction was deferred (budget exhausted or a
+                    # transient API failure) -- the symbol must NOT be
+                    # marked backfilled, or its 10-K would silently never
+                    # be extracted at all until next year's annual filing.
+                    # Back off before retrying so a spent daily budget
+                    # doesn't turn this into a 30-second fetch loop.
+                    self._backfill_retry_after = time.monotonic() + IB_RETRY_GAP_SEC
+                    continue
                 self.backfill_state.set(symbol, {"backfilled_at": datetime.now(timezone.utc).isoformat(),
                                                  "accession": filing.accession_number,
                                                  "filing_date": filing.filing_date})
@@ -999,7 +1087,15 @@ class Engine:
                 log.exception("%s: news poll failed", symbol)
                 continue
             for article in articles:
-                published = article.published_at or from_date
+                # An article with no timestamp gets an EMPTY published_at
+                # rather than a substituted date: substituting from_date
+                # (which slides forward every day) used to give the same
+                # undated story a brand-new fingerprint and evidence_id
+                # every day it stayed in Finnhub's response window, so it
+                # was re-billed and re-merged as fresh evidence daily.
+                # Decay for a dateless record falls back to its merge time
+                # (see dossier._age_days), so nothing becomes immortal.
+                published = article.published_at or ""
                 fp = fingerprint(symbol, article.headline, published)
                 if self.dedup.is_duplicate(fp):
                     continue
@@ -1013,16 +1109,22 @@ class Engine:
                 # back to the URL's domain if Finnhub ever ships a genuinely
                 # empty source field.
                 publisher = (article.source or "").strip() or source_domain(article.url) or "unknown"
-                evidence_text = f"News ({article.source}, {published}): {article.headline}\n{article.summary}"
-                scored = await self._process_evidence(
-                    origin_symbol=symbol,
-                    evidence_text=evidence_text,
-                    source_type="news",
-                    source_name=publisher,
-                    url=article.url,
-                    headline=article.headline,
-                    published_at=published,
+                evidence_text = (
+                    f"News ({article.source}, {published or 'undated'}): {article.headline}\n{article.summary}"
                 )
+                try:
+                    scored = await self._process_evidence(
+                        origin_symbol=symbol,
+                        evidence_text=evidence_text,
+                        source_type="news",
+                        source_name=publisher,
+                        url=article.url,
+                        headline=article.headline,
+                        published_at=published,
+                    )
+                except Exception:  # noqa: BLE001 - one bad article must not abort the rest of the poll
+                    log.exception("%s: processing article %r failed", symbol, article.headline)
+                    continue
                 if scored:
                     self.dedup.register(fp, publisher)
 
@@ -1094,14 +1196,75 @@ class Engine:
 
         all_definitive = True
         for target_symbol, relationship_note, relationship_confidence in targets:
-            definitive = await self._update_dossier(
+            outcome = await self._update_dossier(
                 target_symbol, evidence_text, origin_symbol, relationship_note, relationship_confidence,
                 source_type, source_name, url, headline, published_at,
             )
-            if definitive and target_symbol in propagation_keys:
+            # Only a target handled fresh THIS pass consumes a cooldown
+            # slot -- "already" means an earlier, partially-deferred pass
+            # already handled (and charged) this same evidence for this
+            # target, and re-recording it on every retry used to fill the
+            # window with phantom events that throttled genuinely new
+            # propagation for hours.
+            if outcome == "handled" and target_symbol in propagation_keys:
                 self._propagation_limiter.record(propagation_keys[target_symbol], now)
-            all_definitive = all_definitive and definitive
+            all_definitive = all_definitive and outcome != "deferred"
         return all_definitive
+
+    # How long a cached pending proposal or handled-outcome marker can be
+    # retried before its evidence has aged out of every ingestion lookback
+    # window (14-day EDGAR is the longest) and the entry is just a leak.
+    _EVIDENCE_CACHE_TTL_SEC = 15 * 86400
+
+    def _evict_stale_evidence_caches(self) -> None:
+        cutoff = time.monotonic() - self._EVIDENCE_CACHE_TTL_SEC
+        self._pending_proposals = {
+            k: v for k, v in self._pending_proposals.items() if v[1] >= cutoff
+        }
+        self._handled_outcomes = {
+            k: t for k, t in self._handled_outcomes.items() if t >= cutoff
+        }
+
+    def _mark_handled(self, proposal_key: str) -> str:
+        """Records a definitive non-merge outcome (not-new, refuted, or a
+        malformed proposal) so a retry of the same evidence item -- forced
+        by a SIBLING target's deferral -- doesn't re-pay propose_update and
+        the skeptic for a target that was already definitively done (and,
+        worse, give a nondeterministic second skeptic run the chance to
+        accept what the first refuted)."""
+        self._handled_outcomes[proposal_key] = time.monotonic()
+        self._evict_stale_evidence_caches()
+        return "handled"
+
+    @staticmethod
+    def _validated_proposal(target_symbol: str, proposed: dict) -> dict | None:
+        """Clamped, type-checked copy of a propose_update tool response, or
+        None when a required field is missing/invalid -- Anthropic tool use
+        does not hard-enforce the declared schema, and indexing a missing
+        field used to abort the entire poll cycle after the call was paid."""
+        try:
+            direction = proposed["direction"]
+            if direction not in DIRECTIONS:
+                raise ValueError(f"direction {direction!r}")
+            return {
+                "is_new_information": bool(proposed.get("is_new_information")),
+                "direction": direction,
+                "magnitude": min(1.0, max(0.0, float(proposed["magnitude"]))),
+                "confidence": min(1.0, max(0.0, float(proposed["confidence"]))),
+                "horizon_days": max(1, int(proposed["horizon_days"])),
+                "reasoning": str(proposed.get("reasoning") or ""),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("%s: malformed dossier-update proposal (%s) -- skipping this evidence.",
+                        target_symbol, exc)
+            return None
+
+    @staticmethod
+    def _adjusted(verdict: dict, key: str, fallback: float) -> float:
+        try:
+            return min(1.0, max(0.0, float(verdict.get(key, fallback))))
+        except (TypeError, ValueError):
+            return fallback
 
     async def _update_dossier(
         self,
@@ -1115,40 +1278,49 @@ class Engine:
         url: str,
         headline: str,
         published_at: str,
-    ) -> bool:
-        """Returns True when this dossier handled the evidence definitively
-        (merged, not-new, or refuted); False on a transient failure or an
-        exhausted daily LLM call budget, either of which warrants a retry
-        on a later poll."""
+    ) -> str:
+        """Outcome of folding one evidence item into one dossier:
+        "handled"  -- definitively handled fresh this pass (merged, judged
+                      not-new, refuted, or dropped as malformed);
+        "already"  -- was definitively handled on an earlier, partially-
+                      deferred pass of the same item (idempotent retry);
+        "deferred" -- transient failure or exhausted daily LLM budget;
+                      warrants a retry on a later poll."""
         evidence_id = f"{source_type}:{url or headline}:{published_at}"
         dossier = self.dossiers.load(target_symbol)
         if has_evidence(dossier, evidence_id):
-            return True  # already merged on an earlier, partially-failed pass
+            return "already"  # merged on an earlier, partially-failed pass
+        proposal_key = f"{target_symbol}:{evidence_id}"
+        if proposal_key in self._handled_outcomes:
+            return "already"  # judged not-new/refuted on an earlier pass
 
         # Cache the proposal across a budget-deferred skeptic call: without
         # this, deferring at the skeptic step (verdict is None, below) would
         # otherwise mean the RETRY re-pays for propose_update from scratch
         # even though nothing about the proposal changed -- it's the exact
         # same evidence, just waiting for the skeptic's turn.
-        proposal_key = f"{target_symbol}:{evidence_id}"
-        proposed = self._pending_proposals.get(proposal_key)
+        cached = self._pending_proposals.get(proposal_key)
+        proposed = cached[0] if cached is not None else None
         if proposed is None:
-            proposed = await self.updater.propose_update(
+            raw = await self.updater.propose_update(
                 dossier, evidence_text, origin_symbol, relationship_note, relationship_confidence
             )
+            if raw is None:
+                return "deferred"  # transient LLM failure or budget exhausted -- retry later
+            proposed = self._validated_proposal(target_symbol, raw)
             if proposed is None:
-                return False  # transient LLM failure or budget exhausted -- retry this evidence later
-            if not proposed.get("is_new_information"):
-                return True
-            self._pending_proposals[proposal_key] = proposed
+                return self._mark_handled(proposal_key)  # malformed -- dropping is definitive
+            if not proposed["is_new_information"]:
+                return self._mark_handled(proposal_key)
+            self._pending_proposals[proposal_key] = (proposed, time.monotonic())
 
         verdict = await self.skeptic.review(evidence_text, proposed, relationship_note, relationship_confidence)
         if verdict is None:
-            return False  # transient LLM failure or budget exhausted -- retry this evidence later
+            return "deferred"  # transient LLM failure or budget exhausted -- retry later
         self._pending_proposals.pop(proposal_key, None)
         if verdict.get("refuted"):
             log.info("%s: evidence refuted by skeptic (%s)", target_symbol, verdict.get("reasoning", ""))
-            return True
+            return self._mark_handled(proposal_key)
 
         record = EvidenceRecord(
             evidence_id=evidence_id,
@@ -1162,11 +1334,16 @@ class Engine:
             relationship_note=relationship_note,
             relationship_confidence=relationship_confidence,
             direction=proposed["direction"],
-            magnitude=float(verdict.get("adjusted_magnitude", proposed["magnitude"])),
-            confidence=float(verdict.get("adjusted_confidence", proposed["confidence"])),
-            horizon_days=int(proposed["horizon_days"]),
+            magnitude=self._adjusted(verdict, "adjusted_magnitude", proposed["magnitude"]),
+            confidence=self._adjusted(verdict, "adjusted_confidence", proposed["confidence"]),
+            horizon_days=proposed["horizon_days"],
             reasoning=proposed["reasoning"],
-            skeptic_note=verdict.get("reasoning", ""),
+            skeptic_note=str(verdict.get("reasoning") or ""),
+            # The pre-skeptic numbers are kept so the skeptic pass's actual
+            # effect (does it earn its 2x cost per item?) is measurable
+            # later instead of being overwritten and lost.
+            proposed_confidence=proposed["confidence"],
+            proposed_magnitude=proposed["magnitude"],
         )
         merge_evidence(dossier, record)
         self.dossiers.save(dossier)
@@ -1180,7 +1357,17 @@ class Engine:
 
         signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources)
         if signal is not None:
-            log_signal(Path(self.settings.log_dir) / "signals.jsonl", signal)
+            if dossier.status == "ACTIVE" or dossier.direction != dossier.signaled_direction:
+                # A fresh signal (or a thesis that flipped direction while
+                # still SIGNALED-but-unopened) gets a fresh price baseline --
+                # see _snapshot_signal_price and _try_open_from_signal below.
+                # Status/baseline are set BEFORE logging so every logged
+                # signal row carries its episode key (signaled_at) and
+                # re-logs of one episode can be collapsed downstream.
+                dossier.status = "SIGNALED"
+                await self._snapshot_signal_price(dossier)
+                self.dossiers.save(dossier)
+            log_signal(Path(self.settings.log_dir) / "signals.jsonl", signal, episode=dossier.signaled_at)
             await self.alerts.send(
                 "signal",
                 f"{signal.direction} signal: {signal.symbol}",
@@ -1188,14 +1375,15 @@ class Engine:
                 f"sources={signal.independent_source_count}. {signal.thesis_summary}",
                 asdict(signal),
             )
-            if dossier.status == "ACTIVE" or dossier.direction != dossier.signaled_direction:
-                # A fresh signal (or a thesis that flipped direction while
-                # still SIGNALED-but-unopened) gets a fresh price baseline --
-                # see _snapshot_signal_price and _try_open_from_signal below.
-                dossier.status = "SIGNALED"
-                await self._snapshot_signal_price(dossier)
-                self.dossiers.save(dossier)
-        return True
+        elif dossier.status == "SIGNALED" and not self.journal.has_open(target_symbol):
+            # Newly merged evidence dropped the thesis below the signal bar
+            # (or flipped it) while it sat SIGNALED-but-unopened. Left
+            # as-is, the next price poll would still open a paper trade on
+            # a thesis that no longer qualifies -- possibly in the OPPOSITE
+            # direction from the one that signaled, against a baseline
+            # snapped for the old thesis.
+            self._expire_signal(dossier, "evidence dropped below the signal threshold before an entry was confirmed")
+        return "handled"
 
     # --- Price marking / hypothetical execution ---
 
@@ -1211,11 +1399,14 @@ class Engine:
         dossier.signaled_direction = dossier.direction
         dossier.drift_alert_sent = False
         dossier.signaled_price = None
-        if self.price_feed is None:
-            return
         try:
-            if await self.price_feed.ensure_connected():
+            if self.price_feed is not None and await self.price_feed.ensure_connected():
                 dossier.signaled_price = await self.price_feed.last_price(dossier.symbol)
+            if dossier.signaled_price is None and self.finnhub is not None:
+                # Finnhub's /quote keeps the drift baseline usable when IB
+                # is down or not configured -- a missing baseline silently
+                # disables the "are we too late" check for this signal.
+                dossier.signaled_price = await self.finnhub.quote(dossier.symbol)
         except Exception:  # noqa: BLE001 - a missing baseline just disables the drift check for this signal
             log.exception("%s: could not snapshot signal-time price.", dossier.symbol)
 
@@ -1246,7 +1437,22 @@ class Engine:
         2. Entry deadline: a signal stuck unopened (drift-blocked every
            poll, or IB unreachable) for signal_entry_deadline_days is
            expired back to ACTIVE rather than left waiting forever on an
-           increasingly stale opportunity."""
+           increasingly stale opportunity.
+
+        Before either guard, the thesis is RE-CHECKED against the signal
+        bar at entry time: hours can pass between the signal firing and
+        this poll, and evidence merged in between may have dropped the
+        dossier below threshold or flipped its direction while the status
+        stayed SIGNALED. Opening from the stale status alone would take a
+        position the current evidence no longer justifies -- possibly in
+        the opposite direction from the thesis that actually signaled."""
+        if (
+            evaluate(dossier, self.settings.signal_confidence_threshold,
+                     self.settings.min_independent_sources) is None
+            or dossier.direction != dossier.signaled_direction
+        ):
+            self._expire_signal(dossier, "thesis no longer qualifies at entry time")
+            return
         try:
             price = await self.price_feed.last_price(symbol)
         except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
@@ -1325,12 +1531,16 @@ class Engine:
         open_symbols = list(self.journal.open_trades.keys())
         if not open_symbols:
             return
-        prices = await self.price_feed.last_prices(open_symbols)
-        for symbol, price in prices.items():
+        bars = await self.price_feed.last_bars(open_symbols)
+        for symbol, bar in bars.items():
             trade = self.journal.open_trades.get(symbol)
             if trade is None:
                 continue
-            self.journal.update(symbol, price)
+            # The day's high/low, not just the close: a stock that breached
+            # the stop intraday and recovered by the close is a real stop-out
+            # for any live position -- evaluating on close alone erased
+            # exactly those losses and flattered the paper record.
+            self.journal.update(symbol, bar.close, high=bar.high, low=bar.low)
             if trade.status != "OPEN":
                 # The paper trade just closed (WIN/LOSS/TIMEOUT) -- notify,
                 # then reset the dossier so future evidence can trigger a
@@ -1401,25 +1611,48 @@ class Engine:
                 dossier = self.dossiers.load(symbol)
                 f.write(json.dumps(snapshot_dossier(dossier, snapshotted_at)) + "\n")
 
-    async def _run_daily_price_marks(self) -> None:
-        """Appends every TRADEABLE symbol's last price to
-        logs/price_marks.jsonl, once a day -- not just symbols with an open
-        paper trade (_mark_and_execute already marks those every price
-        poll for P&L purposes; this is a separate, broader capture for
-        later joining against dossier_snapshots.jsonl by symbol/date).
-        Only runs when the price feed is enabled and reachable -- piggybacks
-        on an already-connected poll rather than opening a new connection
-        cadence."""
-        symbols = [c.symbol for c in self.universe if not c.signal_source_only]
+    async def _run_daily_price_marks(self) -> bool:
+        """Appends every universe symbol's last price to
+        logs/price_marks.jsonl, once a day -- the raw material for joining
+        against dossier_snapshots.jsonl by symbol/date. ANCHORS are marked
+        too: they never trade, but their prices widen each ecosystem's
+        benchmark beyond the handful of tradeables, which is what makes the
+        alpha-vs-sector-beta split in the forward-return report meaningful.
+
+        Deliberately NOT dependent on IB: forward data can't be backfilled,
+        so a day with the Gateway down (or IB never configured) must not be
+        a permanently lost sample. IB is preferred when reachable; whatever
+        it misses is filled from Finnhub's /quote. Returns False when no
+        price source produced anything -- the caller leaves the pass due so
+        the next tick retries instead of marking a lost day done."""
+        symbols = [c.symbol for c in self.universe]
         if not symbols:
-            return
-        prices = await self.price_feed.last_prices(symbols)
+            return True
+        prices: dict[str, float] = {}
+        if self.price_feed is not None and await self.price_feed.ensure_connected():
+            prices = await self.price_feed.last_prices(symbols)
+        missing = [s for s in symbols if s not in prices]
+        if missing and self.finnhub is not None:
+            for symbol in missing:
+                try:
+                    quote = await self.finnhub.quote(symbol)
+                except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
+                    log.exception("%s: Finnhub quote failed during daily price marks.", symbol)
+                    continue
+                if quote is not None:
+                    prices[symbol] = quote
+        if not prices:
+            return False
         marked_at = datetime.now(timezone.utc).isoformat()
         path = Path(self.settings.log_dir) / "price_marks.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a") as f:
             for symbol, price in prices.items():
                 f.write(json.dumps({"marked_at": marked_at, "symbol": symbol, "price": price}) + "\n")
+        if len(prices) < len(symbols):
+            log.warning("Daily price marks: %d of %d symbols priced (no source had the rest).",
+                        len(prices), len(symbols))
+        return True
 
     def _reconcile_accepted_types(self) -> None:
         """Corrects any runtime-accepted symbol whose stored type contradicts
@@ -1434,14 +1667,18 @@ class Engine:
         graduates past the tradeable ceiling, or coverage thickens) with no
         one watching.
 
-        Only ever corrects toward the recommendation, and in practice that
-        means demoting a trade target to a news source -- the safe direction:
-        an anchor can never open a position. A demoted symbol's dossier is
-        archived by the same pass that handles any other orphan."""
+        DEMOTE-ONLY: it only ever turns a trade target into a news source,
+        never the reverse. Demotion is safe (an anchor can never open a
+        position); promotion is not -- an anchor was accepted under the
+        liberal bar with NO name-match or repeat-disclosure check, and
+        auto-promoting it to tradeable here would bypass exactly the guards
+        _auto_accept_candidates runs before any symbol may take positions.
+        A demoted symbol's dossier is archived by the same pass that
+        handles any other orphan."""
         for symbol, value in list(self.accepted_candidates.data.items()):
             as_type, source = self._accepted_entry(value)
             recommended = (self.candidates.get(symbol) or {}).get("recommended_as")
-            if recommended not in ("anchor", "tradeable") or recommended == as_type:
+            if recommended != "anchor" or recommended == as_type:
                 continue
             self.accepted_candidates.set(symbol, {"as": recommended, "source": source})
             spec = self.spec_by_symbol.get(symbol)

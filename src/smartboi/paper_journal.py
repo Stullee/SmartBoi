@@ -70,10 +70,39 @@ class PaperTradeJournal:
             return {}
         try:
             raw = json.loads(self.open_state_path.read_text())
-            return {symbol: PaperTrade(**fields) for symbol, fields in raw.items()}
+            trades = {symbol: PaperTrade(**fields) for symbol, fields in raw.items()}
         except (json.JSONDecodeError, OSError, TypeError):
             log.warning("Could not read %s, starting with no open paper trades.", self.open_state_path)
             return {}
+        # Self-heal the close-crash window: _close appends to the closed
+        # log BEFORE rewriting the open-state snapshot, so a crash between
+        # the two leaves the trade in both files -- on restart it would be
+        # marked again and closed a SECOND time at a different price,
+        # double-counting it in every win-rate/avg-R statistic.
+        closed = self._closed_trade_keys()
+        for symbol in list(trades):
+            trade = trades[symbol]
+            if (trade.symbol, trade.opened_at) in closed:
+                log.warning("%s: dropping open-state entry already present in the closed log "
+                            "(crash between close-log append and open-state write).", symbol)
+                del trades[symbol]
+        return trades
+
+    def _closed_trade_keys(self) -> set[tuple[str, str]]:
+        if not self.log_path.exists():
+            return set()
+        keys: set[tuple[str, str]] = set()
+        try:
+            lines = self.log_path.read_text().splitlines()
+        except OSError:
+            return set()
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            keys.add((row.get("symbol"), row.get("opened_at")))
+        return keys
 
     def _write_open_state(self) -> None:
         self.open_state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,27 +154,54 @@ class PaperTradeJournal:
         )
         return trade
 
-    def update(self, symbol: str, current_price: float, now: datetime | None = None) -> None:
+    def update(
+        self,
+        symbol: str,
+        current_price: float,
+        now: datetime | None = None,
+        high: float | None = None,
+        low: float | None = None,
+    ) -> None:
+        """Marks an open trade against the latest price. When the day's
+        `high`/`low` are provided (see prices.PriceBar), stop and target
+        are checked against the intraday EXTREMES, not just the close: a
+        stock that traded through the 8% stop midday and recovered by the
+        close is a real stop-out for any live position, and evaluating on
+        the close alone silently erased exactly those losses (while the
+        matching effect on 16% targets is far rarer) -- an optimistic bias
+        in precisely the statistic this journal exists to make honest.
+        Conservative fill assumptions: a stop fills at the stop price or
+        the close, whichever is WORSE for the trade (a gap through the
+        stop can't fill at the stop); a target fills at the target price
+        exactly (a limit order never fills better than its level). When
+        both levels traded in the same bar the stop wins -- with no
+        intraday sequencing available, assuming the loss is the honest
+        choice. Without high/low this degrades to the old close-only
+        behavior."""
         trade = self.open_trades.get(symbol)
         if trade is None:
             return
         now = now or datetime.now(timezone.utc)
         trade.last_price = current_price
+        day_high = high if high is not None else current_price
+        day_low = low if low is not None else current_price
 
         if trade.direction == "LONG":
-            hit_target = current_price >= trade.target_price
-            hit_stop = current_price <= trade.stop_price
+            hit_stop = day_low <= trade.stop_price
+            hit_target = day_high >= trade.target_price
+            stop_fill = min(trade.stop_price, current_price)
         else:
-            hit_target = current_price <= trade.target_price
-            hit_stop = current_price >= trade.stop_price
+            hit_stop = day_high >= trade.stop_price
+            hit_target = day_low <= trade.target_price
+            stop_fill = max(trade.stop_price, current_price)
 
         opened_at = datetime.fromisoformat(trade.opened_at)
         timed_out = (now - opened_at).days >= trade.horizon_days
 
-        if hit_target:
-            self._close(trade, "WIN", current_price, now)
-        elif hit_stop:
-            self._close(trade, "LOSS", current_price, now)
+        if hit_stop:
+            self._close(trade, "LOSS", stop_fill, now)
+        elif hit_target:
+            self._close(trade, "WIN", trade.target_price, now)
         elif timed_out:
             self._close(trade, "TIMEOUT", current_price, now)
         else:

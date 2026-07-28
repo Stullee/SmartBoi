@@ -132,8 +132,8 @@ def run_forward_returns(
     if not raw_snapshots:
         return "No dossier snapshots captured yet -- nothing to analyze. These accrue once a day."
     if not marks:
-        return ("No price marks captured yet -- nothing to join against. These need ENABLE_IB_PRICE_FEED "
-                "and a reachable IB Gateway, and accrue once a day.")
+        return ("No price marks captured yet -- nothing to join against. These accrue once a day from "
+                "IB when it's reachable, otherwise from Finnhub quotes (FINNHUB_API_KEY).")
 
     snapshots = dedup_snapshots(raw_snapshots)
     lines = []
@@ -146,12 +146,14 @@ def run_forward_returns(
 
     price_marks = price_marks_by_symbol(marks)
     ecosystem_by_symbol = {symbol: spec.ecosystem for symbol, spec in spec_by_symbol(universe).items()}
+    directional = [s for s in snapshots if s.get("direction") in ("LONG", "SHORT")]
     for horizon_days in horizons:
         joined = [
-            r for r in (compute_forward_return(s, price_marks, horizon_days) for s in snapshots)
+            r for r in (compute_forward_return(s, price_marks, horizon_days) for s in directional)
             if r is not None
         ]
-        lines.append(format_report(horizon_days, joined, price_marks, ecosystem_by_symbol))
+        lines.append(format_report(horizon_days, joined, price_marks, ecosystem_by_symbol,
+                                   attempted=len(directional)))
         lines.append("")
     return "\n".join(lines)
 
