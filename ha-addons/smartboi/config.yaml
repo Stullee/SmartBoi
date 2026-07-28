@@ -1,6 +1,6 @@
 ---
 name: SmartBoi (Evidence Synthesis, Paper-Only)
-version: "0.12.0"
+version: "0.12.1"
 slug: smartboi
 description: >-
   LLM-driven cross-company evidence synthesis for equity research: ingests

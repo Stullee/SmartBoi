@@ -18,8 +18,10 @@ For each horizon (default 5 and 20 trading-ish days), reports:
   - correlation between score and signed forward return
   - overall hit-rate (% of theses where the direction was right)
   - a per-symbol breakdown
-  - a benchmark-relative variant (return minus the symbol's own ecosystem's
-    mean return over the same window) to separate alpha from sector beta
+  - a benchmark-relative variant (return minus the mean RAW return of every
+    tradeable symbol in the same ecosystem over the same window, per
+    price_marks.jsonl -- not just symbols that happen to have a dossier)
+    to separate alpha from sector beta
 
 Forward data can't be backfilled -- this is only as good as how long the
 daily snapshot/price-mark capture has actually been running."""
@@ -33,7 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from smartboi.config import load_settings  # noqa: E402
-from smartboi.forward_returns import compute_forward_return, format_report, price_marks_by_symbol  # noqa: E402
+from smartboi.forward_returns import compute_forward_return, dedup_snapshots, format_report, price_marks_by_symbol  # noqa: E402
 from smartboi.universe import spec_by_symbol  # noqa: E402
 
 
@@ -59,12 +61,21 @@ def main() -> None:
     parser.add_argument("--horizons", default="5,20", help="Comma-separated forward-return windows in days")
     args = parser.parse_args()
 
-    snapshots = _read_jsonl(Path(args.snapshots))
+    raw_snapshots = _read_jsonl(Path(args.snapshots))
     marks = _read_jsonl(Path(args.marks))
-    if not snapshots:
+    if not raw_snapshots:
         raise SystemExit(f"No rows in {args.snapshots} -- nothing to analyze yet.")
     if not marks:
         raise SystemExit(f"No rows in {args.marks} -- nothing to join against yet.")
+
+    # A restart used to make the engine write a full duplicate snapshot
+    # batch (fixed, but logs captured before the fix already have the
+    # duplicates baked in) -- collapse to one row per (symbol, date) before
+    # anything downstream treats each row as an independent observation.
+    snapshots = dedup_snapshots(raw_snapshots)
+    dropped = len(raw_snapshots) - len(snapshots)
+    if dropped:
+        print(f"Dropped {dropped} duplicate snapshot row(s) (restart artifacts) -- {len(snapshots)} distinct (symbol, date) observations remain.\n")
 
     price_marks = price_marks_by_symbol(marks)
     settings = load_settings()
@@ -77,7 +88,7 @@ def main() -> None:
             r for r in (compute_forward_return(s, price_marks, horizon_days) for s in snapshots)
             if r is not None
         ]
-        print(format_report(horizon_days, joined, ecosystem_by_symbol))
+        print(format_report(horizon_days, joined, price_marks, ecosystem_by_symbol))
         print()
 
 

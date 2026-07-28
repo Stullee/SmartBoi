@@ -2,6 +2,8 @@ from smartboi.forward_returns import (
     bucket_returns,
     benchmark_relative_returns,
     compute_forward_return,
+    dedup_snapshots,
+    ecosystem_benchmark_return,
     format_report,
     pearson_correlation,
     per_symbol_breakdown,
@@ -28,6 +30,32 @@ def test_price_marks_by_symbol_indexes_by_date():
 def test_price_marks_by_symbol_skips_malformed_rows():
     rows = [{"symbol": "FORM", "marked_at": "", "price": 10.0}, {"symbol": None, "marked_at": "2026-07-01", "price": 10.0}]
     assert price_marks_by_symbol(rows) == {}
+
+
+# --- dedup_snapshots ---
+
+def test_dedup_snapshots_collapses_same_symbol_same_day():
+    rows = [
+        {"symbol": "IESC", "snapshotted_at": "2026-07-23T00:00:00+00:00", "score": 0.4},
+        {"symbol": "IESC", "snapshotted_at": "2026-07-23T08:00:00+00:00", "score": 0.4},  # restart duplicate
+        {"symbol": "IESC", "snapshotted_at": "2026-07-24T00:00:00+00:00", "score": 0.4},  # genuinely next day
+    ]
+    result = dedup_snapshots(rows)
+    assert len(result) == 2
+    assert [r["snapshotted_at"] for r in result] == ["2026-07-23T00:00:00+00:00", "2026-07-24T00:00:00+00:00"]
+
+
+def test_dedup_snapshots_keeps_different_symbols_same_day():
+    rows = [
+        {"symbol": "IESC", "snapshotted_at": "2026-07-23T00:00:00+00:00"},
+        {"symbol": "FORM", "snapshotted_at": "2026-07-23T00:00:00+00:00"},
+    ]
+    assert len(dedup_snapshots(rows)) == 2
+
+
+def test_dedup_snapshots_skips_malformed_rows():
+    rows = [{"symbol": None, "snapshotted_at": "2026-07-23"}, {"symbol": "IESC", "snapshotted_at": ""}]
+    assert dedup_snapshots(rows) == []
 
 
 # --- compute_forward_return ---
@@ -145,44 +173,111 @@ def test_per_symbol_breakdown_sorts_worst_first():
     assert breakdown[1]["count"] == 2
 
 
+# --- ecosystem_benchmark_return ---
+
+def test_ecosystem_benchmark_return_uses_every_priced_symbol_not_just_dossiers():
+    # IESC and POWL are both grid_datacenter; only IESC has a dossier, but
+    # POWL still gets a daily price mark and must count toward the benchmark.
+    price_marks = {
+        "IESC": {"2026-07-01": 100.0, "2026-07-06": 90.0},  # -10%
+        "POWL": {"2026-07-01": 50.0, "2026-07-06": 55.0},   # +10%
+    }
+    ecosystems = {"IESC": "grid_datacenter", "POWL": "grid_datacenter"}
+    result = ecosystem_benchmark_return(price_marks, "2026-07-01", 5, "grid_datacenter", ecosystems)
+    assert result == 0.0  # mean of -10% and +10%
+
+
+def test_ecosystem_benchmark_return_none_when_nothing_priced():
+    assert ecosystem_benchmark_return({}, "2026-07-01", 5, "grid_datacenter", {}) is None
+
+
+def test_ecosystem_benchmark_return_ignores_other_ecosystems():
+    price_marks = {
+        "IESC": {"2026-07-01": 100.0, "2026-07-06": 110.0},
+        "DCO": {"2026-07-01": 50.0, "2026-07-06": 25.0},  # defense_tier2, wildly different -- must not leak in
+    }
+    ecosystems = {"IESC": "grid_datacenter", "DCO": "defense_tier2"}
+    result = ecosystem_benchmark_return(price_marks, "2026-07-01", 5, "grid_datacenter", ecosystems)
+    assert result == 10.0
+
+
 # --- benchmark_relative_returns ---
 
-def test_benchmark_relative_returns_subtracts_ecosystem_mean():
-    rows = [
-        {"symbol": "FORM", "signed_return_pct": 10.0},
-        {"symbol": "UCTT", "signed_return_pct": -10.0},
-        {"symbol": "DCO", "signed_return_pct": 5.0},
-    ]
-    ecosystems = {"FORM": "semi_equipment", "UCTT": "semi_equipment", "DCO": "defense_tier2"}
-    bench = benchmark_relative_returns(rows, ecosystems)
-    form_row = next(r for r in bench if r["symbol"] == "FORM")
-    # semi_equipment mean = (10 + -10) / 2 = 0 -> benchmark-relative == raw
-    assert form_row["benchmark_relative_pct"] == 10.0
-    dco_row = next(r for r in bench if r["symbol"] == "DCO")
-    # Only one defense_tier2 row -> its own mean, so relative return is 0.
-    assert dco_row["benchmark_relative_pct"] == 0.0
+def test_benchmark_relative_returns_not_zero_by_construction_for_a_single_dossier_ecosystem():
+    # The old bug: with only IESC's own signed return counted as the
+    # "population," its benchmark equaled itself and alpha was always
+    # exactly 0.00. Now POWL's price (no dossier, but still marked daily)
+    # is part of the benchmark, so alpha reflects something real.
+    rows = [{
+        "symbol": "IESC", "direction": "LONG", "signed_return_pct": -10.0,
+        "entry_date": "2026-07-01", "horizon_days": 5,
+    }]
+    price_marks = {
+        "IESC": {"2026-07-01": 100.0, "2026-07-06": 90.0},
+        "POWL": {"2026-07-01": 50.0, "2026-07-06": 55.0},
+    }
+    ecosystems = {"IESC": "grid_datacenter", "POWL": "grid_datacenter"}
+    bench = benchmark_relative_returns(rows, price_marks, ecosystems)
+    # ecosystem raw mean = mean(-10%, +10%) = 0% -> alpha = -10 - 0 = -10
+    assert bench[0]["benchmark_relative_pct"] == -10.0
+
+
+def test_benchmark_relative_returns_sign_matches_short_direction():
+    # SHORT that fell 12% while its ecosystem's raw mean fell only 10% --
+    # captured MORE downside than the sector move -> positive alpha.
+    rows = [{
+        "symbol": "AAA", "direction": "SHORT", "signed_return_pct": 12.0,
+        "entry_date": "2026-07-01", "horizon_days": 5,
+    }]
+    price_marks = {
+        "AAA": {"2026-07-01": 100.0, "2026-07-06": 88.0},   # -12%
+        "BBB": {"2026-07-01": 100.0, "2026-07-06": 92.0},   # -8%
+    }
+    ecosystems = {"AAA": "defense_tier2", "BBB": "defense_tier2"}
+    bench = benchmark_relative_returns(rows, price_marks, ecosystems)
+    # raw ecosystem mean = mean(-12%, -8%) = -10% -> SHORT-signed benchmark = +10%
+    # alpha = 12 - 10 = 2
+    assert round(bench[0]["benchmark_relative_pct"], 4) == 2.0
+
+
+def test_benchmark_relative_returns_none_when_ecosystem_unpriceable():
+    rows = [{
+        "symbol": "ZZZZ", "direction": "LONG", "signed_return_pct": 5.0,
+        "entry_date": "2026-07-01", "horizon_days": 5,
+    }]
+    bench = benchmark_relative_returns(rows, {}, {})
+    assert bench[0]["ecosystem_benchmark_pct"] is None
+    assert bench[0]["benchmark_relative_pct"] is None
 
 
 def test_benchmark_relative_returns_unclassified_symbol_gets_question_mark():
-    rows = [{"symbol": "WEIRD", "signed_return_pct": 3.0}]
-    bench = benchmark_relative_returns(rows, {})
+    rows = [{
+        "symbol": "WEIRD", "direction": "LONG", "signed_return_pct": 3.0,
+        "entry_date": "2026-07-01", "horizon_days": 5,
+    }]
+    bench = benchmark_relative_returns(rows, {}, {})
     assert bench[0]["ecosystem"] == "?"
-    assert bench[0]["benchmark_relative_pct"] == 0.0
 
 
 # --- format_report ---
 
 def test_format_report_handles_no_data():
-    report = format_report(5, [], {})
+    report = format_report(5, [], {}, {})
     assert "No joinable" in report
 
 
 def test_format_report_includes_key_sections():
     rows = [
-        {"symbol": "FORM", "score": 0.6, "signed_return_pct": 8.0},
-        {"symbol": "UCTT", "score": 0.1, "signed_return_pct": -3.0},
+        {"symbol": "FORM", "direction": "LONG", "score": 0.6, "signed_return_pct": 8.0,
+         "entry_date": "2026-07-01", "horizon_days": 5},
+        {"symbol": "UCTT", "direction": "LONG", "score": 0.1, "signed_return_pct": -3.0,
+         "entry_date": "2026-07-01", "horizon_days": 5},
     ]
-    report = format_report(5, rows, {"FORM": "semi_equipment", "UCTT": "semi_equipment"})
+    price_marks = {
+        "FORM": {"2026-07-01": 10.0, "2026-07-06": 10.8},
+        "UCTT": {"2026-07-01": 20.0, "2026-07-06": 19.4},
+    }
+    report = format_report(5, rows, price_marks, {"FORM": "semi_equipment", "UCTT": "semi_equipment"})
     assert "score bucket" in report
     assert "correlation" in report
     assert "hit rate" in report.lower() or "Hit rate" in report

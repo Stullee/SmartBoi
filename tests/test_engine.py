@@ -104,6 +104,38 @@ def test_log_heartbeat_does_not_raise_and_logs(engine, caplog):
     assert any("heartbeat" in r.message for r in caplog.records)
 
 
+# --- Invariant: the daily snapshot/price-marks passes are scheduled off a
+# PERSISTED wall-clock timestamp, not a process-local timer -- a restart
+# must not re-trigger an immediately-due pass and write a duplicate batch.
+
+def test_daily_pass_due_on_first_ever_run(engine):
+    assert engine._daily_pass_due("dossier_snapshot") is True
+
+
+def test_daily_pass_not_due_right_after_marking_done(engine):
+    engine._mark_daily_pass_done("dossier_snapshot")
+    assert engine._daily_pass_due("dossier_snapshot") is False
+
+
+def test_daily_pass_due_state_survives_a_restart(tmp_path, monkeypatch):
+    # Simulates a restart: a second Engine instance constructed against the
+    # same on-disk data/ directory must see the first instance's persisted
+    # "already ran today" state, not start fresh (which would be exactly
+    # the process-local-timer bug this replaces).
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(_env_file=None, symbols="FORM", enable_dashboard=False)
+    first = Engine(settings)
+    first._mark_daily_pass_done("dossier_snapshot")
+
+    second = Engine(settings)
+    assert second._daily_pass_due("dossier_snapshot") is False
+
+
+def test_daily_pass_due_keys_are_independent(engine):
+    engine._mark_daily_pass_done("dossier_snapshot")
+    assert engine._daily_pass_due("price_marks") is True
+
+
 # --- Invariant: SEED_RELATIONSHIPS only ever seeds edges between symbols
 # actually in the LIVE (possibly custom SYMBOLS/ANCHOR_SYMBOLS) universe --
 # a custom deployment must never get default-universe edges for companies

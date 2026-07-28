@@ -118,6 +118,7 @@ class Engine:
         self.dossiers = DossierStore(DATA_DIR / "dossiers")
         self.journal = PaperTradeJournal(log_dir / "paper_trades.jsonl")
         self.universe_screen_state = JsonState(DATA_DIR / "universe_screen_state.json")
+        self.periodic_state = JsonState(DATA_DIR / "periodic_pass_state.json")
         self.backfill_state = JsonState(DATA_DIR / "relationship_backfill.json")
         self.candidates = JsonState(DATA_DIR / "universe_candidates.json")
         self.accepted_candidates = JsonState(DATA_DIR / "accepted_candidates.json")
@@ -158,8 +159,6 @@ class Engine:
         self._last_news_poll: float | None = None
         self._last_price_poll: float | None = None
         self._last_decay_pass: float | None = None
-        self._last_daily_snapshot: float | None = None
-        self._last_price_marks: float | None = None
         self._last_candidate_recheck: float | None = None
         self._last_heartbeat: float | None = None
         self._dashboard_task: asyncio.Task | None = None
@@ -383,8 +382,8 @@ class Engine:
                 await self._mark_and_execute()
                 # Piggybacked on this same (already-connected) price poll
                 # rather than a separate cadence -- see _run_daily_price_marks.
-                if self._due(self._last_price_marks, DAILY_SNAPSHOT_INTERVAL_SEC, now):
-                    self._last_price_marks = now
+                if self._daily_pass_due("price_marks"):
+                    self._mark_daily_pass_done("price_marks")
                     await self._run_daily_price_marks()
             else:
                 self._warn_once(
@@ -403,8 +402,8 @@ class Engine:
         if self._due(self._last_decay_pass, DECAY_PASS_INTERVAL_SEC, now):
             self._last_decay_pass = now
             self._run_decay_pass()
-        if self._due(self._last_daily_snapshot, DAILY_SNAPSHOT_INTERVAL_SEC, now):
-            self._last_daily_snapshot = now
+        if self._daily_pass_due("dossier_snapshot"):
+            self._mark_daily_pass_done("dossier_snapshot")
             self._run_daily_snapshot()
         if (
             self.edgar_client is not None
@@ -430,6 +429,31 @@ class Engine:
             return True
         interval = timedelta(days=self.settings.universe_screen_interval_days)
         return datetime.now(timezone.utc) - last_dt >= interval
+
+    def _daily_pass_due(self, state_key: str) -> bool:
+        """Same pattern as _universe_screen_due, for the once-a-day
+        dossier-snapshot/price-marks passes: scheduled off a PERSISTED
+        wall-clock timestamp (self.periodic_state), not a process-local
+        time.monotonic() marker. A process-local marker resets to "due
+        immediately" on every restart, and unlike the decay pass or the
+        candidate recheck (idempotent -- re-running them early changes
+        nothing), these two passes unconditionally APPEND a fresh row per
+        symbol every time they run -- so a deployment restarting several
+        times in one day would silently write a full duplicate batch on
+        every restart. Confirmed live: 6 duplicate dossier_snapshots.jsonl
+        batches from 6 restarts in one day, inflating downstream forward-
+        return analysis 6x for that day's rows."""
+        last = self.periodic_state.get(state_key)
+        if not last:
+            return True
+        try:
+            last_dt = datetime.fromisoformat(last)
+        except ValueError:
+            return True
+        return datetime.now(timezone.utc) - last_dt >= timedelta(seconds=DAILY_SNAPSHOT_INTERVAL_SEC)
+
+    def _mark_daily_pass_done(self, state_key: str) -> None:
+        self.periodic_state.set(state_key, datetime.now(timezone.utc).isoformat())
 
     # --- EDGAR ingestion ---
 

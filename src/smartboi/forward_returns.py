@@ -22,6 +22,34 @@ def _bucket_label(score: float) -> str:
     return "?"
 
 
+def dedup_snapshots(rows: list[dict]) -> list[dict]:
+    """Collapses to one row per (symbol, snapshot date). A restart used to
+    make engine.py write a full duplicate dossier_snapshots.jsonl batch
+    (see _daily_pass_due) -- several restarts on one day means several
+    byte-identical rows per symbol for that day, each one otherwise
+    counted as an independent observation and silently inflating a score
+    bucket's sample size (and skewing its mean) by however many times the
+    engine happened to restart that day. The fix in engine.py stops this
+    from happening going forward, but logs captured before that fix
+    already have the duplicates baked in, so this is applied unconditionally
+    regardless of when the log was written. Keeps the first-seen row for a
+    given (symbol, date) -- duplicates are byte-identical in practice, so
+    which one survives doesn't change the result, only the count."""
+    seen: set[tuple[str, str]] = set()
+    out = []
+    for row in rows:
+        symbol = row.get("symbol")
+        snapshotted_at = row.get("snapshotted_at") or ""
+        if not symbol or not snapshotted_at:
+            continue
+        key = (symbol, snapshotted_at[:10])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
 def price_marks_by_symbol(rows: list[dict]) -> dict[str, dict[str, float]]:
     """symbol -> {date (YYYY-MM-DD): price}. Last mark wins for a given
     day if there were somehow more than one (shouldn't happen -- price
@@ -155,27 +183,91 @@ def per_symbol_breakdown(rows: list[dict]) -> list[dict]:
     return out
 
 
-def benchmark_relative_returns(rows: list[dict], ecosystem_by_symbol: dict[str, str]) -> list[dict]:
-    """Each row's signed return minus its own ecosystem's mean signed
-    return over this same batch of rows -- separates alpha (the pick
-    itself) from sector beta (the whole ecosystem moved). A LONG book
-    losing because the semiconductor SECTOR fell is a different failure
-    than the individual picks being wrong, and only this view tells them
-    apart. Unclassified symbols (not in ecosystem_by_symbol) fall into a
-    "?" bucket rather than being dropped."""
-    grouped: dict[str, list[float]] = {}
+def ecosystem_benchmark_return(
+    price_marks: dict[str, dict[str, float]],
+    entry_date: str,
+    horizon_days: int,
+    ecosystem: str,
+    ecosystem_by_symbol: dict[str, str],
+    max_lookahead_days: int = 5,
+) -> float | None:
+    """Mean RAW (unsigned, price-only) return of every symbol in
+    `ecosystem` over [entry_date, entry_date + horizon_days], built from
+    every symbol price_marks tracks -- not just symbols that happen to
+    have a dossier. That distinction matters: an ecosystem with only one
+    dossier would otherwise have its "benchmark" computed from that same
+    dossier's own return, making alpha exactly 0 by construction rather
+    than a real measurement (confirmed live: IESC, the only grid_datacenter
+    dossier, showed 0.00 mean alpha for exactly this reason). Returns None
+    if no symbol in the ecosystem has both an entry- and exit-date price."""
+    returns = []
+    for symbol, eco in ecosystem_by_symbol.items():
+        if eco != ecosystem:
+            continue
+        marks = price_marks.get(symbol)
+        if not marks:
+            continue
+        entry = _price_on_or_after(marks, entry_date, max_lookahead_days)
+        if entry is None:
+            continue
+        entry_found_date, entry_price = entry
+        if entry_price == 0:
+            continue
+        target_date = (date.fromisoformat(entry_found_date) + timedelta(days=horizon_days)).isoformat()
+        exit_ = _price_on_or_after(marks, target_date, max_lookahead_days)
+        if exit_ is None:
+            continue
+        _, exit_price = exit_
+        returns.append((exit_price - entry_price) / entry_price * 100.0)
+    if not returns:
+        return None
+    return sum(returns) / len(returns)
+
+
+def benchmark_relative_returns(
+    rows: list[dict],
+    price_marks: dict[str, dict[str, float]],
+    ecosystem_by_symbol: dict[str, str],
+    max_lookahead_days: int = 5,
+) -> list[dict]:
+    """Each row's signed return minus its own ecosystem's mean RAW return
+    over the same [entry_date, entry_date + horizon] window (sign-matched
+    to the row's own direction: a LONG compares against the raw ecosystem
+    return directly, a SHORT against its negation, so a positive result
+    always means "beat what a symmetric bet on the whole sector would
+    have returned") -- separates alpha (the pick itself) from sector beta
+    (the whole ecosystem moved). A LONG book losing because the
+    semiconductor SECTOR fell is a different failure than the individual
+    picks being wrong, and only this view tells them apart. Unclassified
+    symbols (not in ecosystem_by_symbol) fall into a "?" bucket rather
+    than being dropped; rows whose ecosystem has no benchmarkable price
+    data get benchmark_relative_pct=None rather than a misleading 0.0."""
+    cache: dict[tuple[str, str, int], float | None] = {}
+    out = []
     for r in rows:
         eco = ecosystem_by_symbol.get(r["symbol"], "?")
-        grouped.setdefault(eco, []).append(r["signed_return_pct"])
-    ecosystem_mean = {eco: sum(vals) / len(vals) for eco, vals in grouped.items()}
-    return [
-        {**r, "ecosystem": ecosystem_by_symbol.get(r["symbol"], "?"),
-         "benchmark_relative_pct": r["signed_return_pct"] - ecosystem_mean[ecosystem_by_symbol.get(r["symbol"], "?")]}
-        for r in rows
-    ]
+        cache_key = (eco, r["entry_date"], r["horizon_days"])
+        if cache_key not in cache:
+            cache[cache_key] = ecosystem_benchmark_return(
+                price_marks, r["entry_date"], r["horizon_days"], eco, ecosystem_by_symbol, max_lookahead_days
+            )
+        raw_benchmark = cache[cache_key]
+        if raw_benchmark is None:
+            signed_benchmark = None
+            relative = None
+        else:
+            signed_benchmark = raw_benchmark if r["direction"] == "LONG" else -raw_benchmark
+            relative = r["signed_return_pct"] - signed_benchmark
+        out.append({**r, "ecosystem": eco, "ecosystem_benchmark_pct": signed_benchmark, "benchmark_relative_pct": relative})
+    return out
 
 
-def format_report(horizon_days: int, rows: list[dict], ecosystem_by_symbol: dict[str, str]) -> str:
+def format_report(
+    horizon_days: int,
+    rows: list[dict],
+    price_marks: dict[str, dict[str, float]],
+    ecosystem_by_symbol: dict[str, str],
+) -> str:
     """One horizon's full report as plain text: bucket table (raw and
     benchmark-relative), correlation, overall hit-rate, per-symbol
     breakdown. Returns a one-line "no data" message instead of empty
@@ -198,10 +290,14 @@ def format_report(horizon_days: int, rows: list[dict], ecosystem_by_symbol: dict
     overall_hit_rate = sum(1 for r in rows if r["signed_return_pct"] > 0) / len(rows)
     lines.append(f"Overall hit rate: {overall_hit_rate * 100:.1f}% ({len(rows)} theses)")
 
-    bench_rows = benchmark_relative_returns(rows, ecosystem_by_symbol)
+    bench_rows = benchmark_relative_returns(rows, price_marks, ecosystem_by_symbol)
+    benchmarked = [r for r in bench_rows if r["benchmark_relative_pct"] is not None]
+    unbenchmarked = len(bench_rows) - len(benchmarked)
     lines.append("")
-    lines.append("-- By score bucket (benchmark-relative: minus own ecosystem's mean return) --")
-    bench_for_bucket = [{**r, "signed_return_pct": r["benchmark_relative_pct"]} for r in bench_rows]
+    lines.append("-- By score bucket (benchmark-relative: minus own ecosystem's mean RAW return, sign-matched to direction) --")
+    if unbenchmarked:
+        lines.append(f"({unbenchmarked} row(s) skipped -- no other priced symbol in their ecosystem over this window)")
+    bench_for_bucket = [{**r, "signed_return_pct": r["benchmark_relative_pct"]} for r in benchmarked]
     lines.append(f"{'Bucket':<14}{'Count':<8}{'Mean Alpha %':<16}{'Hit Rate':<10}")
     for b in bucket_returns(bench_for_bucket):
         lines.append(f"{b['bucket']:<14}{b['count']:<8}{b['mean_return_pct']:<16.2f}{b['hit_rate'] * 100:<9.1f}%")

@@ -403,6 +403,16 @@ extra LLM cost, piggybacked on work the engine already does daily:
   tradeable (non-anchor) universe symbol, piggybacked on the existing 6h IB
   price poll. Written by `engine.py`'s `_run_daily_price_marks`.
 
+Both passes are scheduled off a PERSISTED wall-clock timestamp
+(`engine.py`'s `_daily_pass_due`/`periodic_pass_state.json`), not a
+process-local timer -- a process-local marker resets to "due immediately"
+on every restart, and since both passes unconditionally append a fresh row
+per symbol, several restarts in one day used to silently write a full
+duplicate batch on every restart (confirmed live: 6x on one day). Rows
+captured before this fix already have the duplicates baked in;
+`scripts/analyze_forward_returns.py` dedupes on (symbol, date) before
+analyzing, so old logs still produce a correct result.
+
 **`scripts/analyze_forward_returns.py`** joins the two by symbol/date and
 answers the actual question: does `confidence * magnitude` predict what
 the market does next?
@@ -418,9 +428,16 @@ above. For each horizon it reports: mean forward return by score bucket
 correlation between score and signed forward return; overall hit-rate (%
 of theses where the direction was right); a per-symbol breakdown, worst
 first; and a benchmark-relative variant -- each return minus its own
-ecosystem's mean return over the same window (ecosystem tags from
-`universe.py`), separating alpha (the pick itself) from sector beta (the
-whole ecosystem moved). Forward return is always signed in the THESIS
+ecosystem's mean RAW return over the same window, sign-matched to the
+row's own direction (a LONG compares against the ecosystem's raw return
+directly, a SHORT against its negation). The ecosystem benchmark is built
+from every symbol `price_marks.jsonl` tracks (ecosystem tags from
+`universe.py`), not just symbols that happen to have a dossier -- using
+only dossier-having symbols made a single-dossier ecosystem's "benchmark"
+trivially equal to its own return, zeroing out alpha by construction
+rather than measuring anything. Separates alpha (the pick itself) from
+sector beta (the whole ecosystem moved). Forward return is always signed
+in the THESIS
 direction (LONG: price up is a win; SHORT: price down is a win), so a
 positive number always means "right so far" regardless of direction. Only
 as good as how long the capture above has actually been running -- forward
@@ -496,10 +513,17 @@ of whether anything actually happened that cycle -- ingestion at this
 system's polling cadences (hourly EDGAR/news, 6h prices) can leave the log
 quiet for long stretches, and without a heartbeat there was no way to tell
 an idle-but-healthy engine from a hung one. `ib_async` (the IB Gateway
-client library) is set to WARNING alongside `httpx`/`httpcore`/
-`aiohttp.access` -- it logs routine Gateway connectivity blips and
-account-summary noise at ERROR even though they don't affect price marks,
-which otherwise drowns out anything that's an actual SmartBoi problem.
+client library) logs routine Gateway connectivity blips and account-
+summary noise (error codes 1100/1102/2104/2106/2158/322) at ERROR even
+though they don't affect price marks -- confirmed live, these drown out
+anything that's an actual SmartBoi problem. Its logger level is raised to
+WARNING alongside `httpx`/`httpcore`/`aiohttp.access` (quiets its INFO-
+level connection chatter), but that alone can't drop these -- ERROR is
+ABOVE WARNING in severity, so it still passes a level filter. A
+`logging.Filter` on the specific benign codes is what actually removes
+them, without raising the whole logger to CRITICAL and hiding a genuine
+IB failure along with the noise. See `logging_setup.py`'s
+`_IbBenignErrorFilter`.
 
 ## Running on Home Assistant OS
 
