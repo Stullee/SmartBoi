@@ -24,6 +24,7 @@ from pathlib import Path
 
 from smartboi.news import redact_token
 from smartboi.status import gather_dossiers, gather_paper_trade_stats
+from smartboi.event_study import format_event_study
 from smartboi.forward_returns import (
     compute_forward_return,
     dedup_snapshots,
@@ -156,6 +157,23 @@ def run_forward_returns(
                                    attempted=len(directional)))
         lines.append("")
     return "\n".join(lines)
+
+
+def run_event_study(
+    log_dir: str | Path,
+    horizons: tuple[int, ...] | list[int] = DEFAULT_HORIZONS,
+) -> str:
+    """The signal-episode event study (see event_study.py): forward
+    returns after each signal episode, split by what the engine did with
+    it -- the entry-timing guards' scorecard. Pure file reads of
+    signals.jsonl, decisions.jsonl, and price_marks.jsonl."""
+    log_dir = Path(log_dir)
+    signal_rows = read_jsonl(log_dir / "signals.jsonl")
+    if not signal_rows:
+        return "No signals logged yet -- the event study starts meaning something once signals fire."
+    decision_rows = read_jsonl(log_dir / "decisions.jsonl")
+    marks = read_jsonl(log_dir / "price_marks.jsonl")
+    return format_event_study(signal_rows, decision_rows, price_marks_by_symbol(marks), horizons)
 
 
 # Settings safe to print in a diagnostics bundle. An explicit ALLOW-list, not
@@ -315,6 +333,7 @@ def run_diagnostics(engine) -> str:
     add("\n--- Forward-validation capture ---")
     add(f"  dossier_snapshots.jsonl : {_jsonl_span(read_jsonl(log_dir / 'dossier_snapshots.jsonl'), 'snapshotted_at')}")
     add(f"  price_marks.jsonl       : {_jsonl_span(read_jsonl(log_dir / 'price_marks.jsonl'), 'marked_at')}")
+    add(f"  decisions.jsonl         : {_jsonl_span(read_jsonl(log_dir / 'decisions.jsonl'), 'at')}")
 
     problems = _recent_log_problems(log_dir)
     add(f"\n--- Recent warnings/errors (last {MAX_LOG_LINES}) ---")

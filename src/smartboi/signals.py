@@ -97,6 +97,37 @@ def signal_expired(signaled_at: str, deadline_days: int, now: datetime | None = 
     return (now - signaled).days >= deadline_days
 
 
+def log_decision(
+    log_path: Path,
+    event: str,
+    symbol: str,
+    direction: str,
+    episode: str,
+    price: float | None = None,
+    reason: str = "",
+) -> None:
+    """Appends one row to the decisions ledger (logs/decisions.jsonl): what
+    the engine DID with a signal episode -- "trade_opened", "drift_skip",
+    or "signal_expired" -- with the price at decision time when one was in
+    hand. Signals firing is only half the record: without this, a
+    drift-skip or expiry survives only as a log line, and there is no way
+    to ever learn whether the entry-timing guards helped (skipped moves
+    that were indeed over) or hurt (skipped moves that kept going). The
+    `episode` key is the dossier's signaled_at, the same key signals.jsonl
+    rows carry, so the two logs join cleanly (see event_study.py)."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as f:
+        f.write(json.dumps({
+            "event": event,
+            "symbol": symbol,
+            "direction": direction,
+            "episode": episode,
+            "price": price,
+            "reason": reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }) + "\n")
+
+
 def log_signal(log_path: Path, signal: SignalEvent, episode: str = "") -> None:
     """`episode` is the dossier's signaled_at timestamp: evaluation is
     status-blind (see module docstring), so one signal EPISODE re-logs a

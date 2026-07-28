@@ -52,7 +52,7 @@ from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal, cost_bps_per_side_for_cap
 from smartboi.prices import ReadOnlyPriceFeed
 from smartboi.ratelimit import SlidingWindowLimiter
-from smartboi.signals import evaluate, favorable_drift_pct, log_signal, signal_expired
+from smartboi.signals import evaluate, favorable_drift_pct, log_decision, log_signal, signal_expired
 from smartboi.skeptic import Skeptic
 from smartboi.state import JsonState
 from smartboi.status import snapshot_dossier
@@ -1469,9 +1469,27 @@ class Engine:
         dossier.signaled_direction = ""
         dossier.drift_alert_sent = False
 
-    def _expire_signal(self, dossier: Dossier, reason: str) -> None:
+    def _record_decision(self, event: str, symbol: str, direction: str, episode: str,
+                         price: float | None = None, reason: str = "") -> None:
+        """Appends to logs/decisions.jsonl -- what the engine DID with a
+        signal episode. Never allowed to break the engine: the ledger is
+        analysis material, not control flow."""
+        try:
+            log_decision(Path(self.settings.log_dir) / "decisions.jsonl",
+                         event, symbol, direction, episode, price=price, reason=reason)
+        except OSError:
+            log.exception("Could not append to decisions.jsonl")
+
+    def _expire_signal(self, dossier: Dossier, reason: str, price: float | None = None) -> None:
         log.info("[SIGNAL] %s: expiring unopened signal (%s) -- resetting to ACTIVE so fresh "
                  "evidence can re-trigger it with a clean baseline.", dossier.symbol, reason)
+        # Ledger BEFORE the reset wipes the episode key -- an expiry that
+        # leaves only a log line is unanalyzable (see event_study.py).
+        self._record_decision(
+            "signal_expired", dossier.symbol,
+            dossier.signaled_direction or dossier.direction,
+            dossier.signaled_at, price=price, reason=reason,
+        )
         self._reset_to_active(dossier)
         self.dossiers.save(dossier)
 
@@ -1525,6 +1543,14 @@ class Engine:
                         "at $%.2f (now $%.2f) -- likely already priced in, skipping entry.",
                         symbol, drift, dossier.signaled_price, price,
                     )
+                    # Once per episode (same gate as the alert): the price
+                    # at skip time is what lets the event study ask whether
+                    # the skipped move kept going or was indeed over.
+                    self._record_decision(
+                        "drift_skip", symbol, dossier.direction, dossier.signaled_at,
+                        price=price,
+                        reason=f"drifted {drift:.1f}% favorably from {dossier.signaled_price:.2f}",
+                    )
                     await self.alerts.send(
                         "signal_stale",
                         f"{symbol}: likely already priced in",
@@ -1534,11 +1560,12 @@ class Engine:
                         {"symbol": symbol, "drift_pct": drift, "signaled_price": dossier.signaled_price, "current_price": price},
                     )
                 if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
-                    self._expire_signal(dossier, f"price drifted {drift:.1f}% before an entry could be confirmed")
+                    self._expire_signal(dossier, f"price drifted {drift:.1f}% before an entry could be confirmed",
+                                        price=price)
                 return
 
         if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
-            self._expire_signal(dossier, "no confirmed entry within the deadline")
+            self._expire_signal(dossier, "no confirmed entry within the deadline", price=price)
             return
 
         citations = [
@@ -1568,6 +1595,8 @@ class Engine:
             cost_bps_round_trip=cost_per_side * 2,
             market_cap_musd=market_cap,
         )
+        self._record_decision("trade_opened", symbol, dossier.direction, dossier.signaled_at,
+                              price=price)
         await self.alerts.send(
             "paper_trade_opened",
             f"Paper trade opened: {trade.direction} {trade.symbol}",

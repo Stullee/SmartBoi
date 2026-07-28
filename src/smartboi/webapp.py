@@ -29,7 +29,7 @@ from smartboi.screen import (
     DEFAULT_MAX_CAP_MUSD as SCREEN_MAX_CAP_MUSD,
     DEFAULT_MIN_CAP_MUSD as SCREEN_MIN_CAP_MUSD,
 )
-from smartboi.tools import run_diagnostics, run_forward_returns, run_screen
+from smartboi.tools import run_diagnostics, run_event_study, run_forward_returns, run_screen
 from smartboi.status import (
     gather_dossiers,
     gather_graph_stats,
@@ -118,6 +118,7 @@ _INDEX_HTML = """<!doctype html>
   <label>max analysts <input type="text" id="screen-max-analysts" value="10" style="min-width:3rem"></label>
   <button id="btn-screen">Screen candidates</button>
   <button id="btn-analyze">Forward-return report</button>
+  <button id="btn-event-study">Signal event study</button>
   <button id="btn-diagnostics">Diagnostics bundle</button>
   <button id="btn-reset" style="border-color:rgba(239,83,80,0.5)">Reset added symbols</button>
 </div>
@@ -335,7 +336,7 @@ var TOOL_TIMEOUT_MS = 300000;
 function runTool(path, body, button) {
   var out = document.getElementById("tool-output");
   var buttons = [document.getElementById("btn-screen"), document.getElementById("btn-analyze"),
-                 document.getElementById("btn-diagnostics")];
+                 document.getElementById("btn-event-study"), document.getElementById("btn-diagnostics")];
   buttons.forEach(function(b) { b.disabled = true; });
   out.style.display = "block";
   out.textContent = "Running… (this can take a few minutes for a long ticker list)";
@@ -375,6 +376,9 @@ document.getElementById("btn-screen").addEventListener("click", function() {
 });
 document.getElementById("btn-analyze").addEventListener("click", function() {
   runTool("tools/forward-returns", {}, this);
+});
+document.getElementById("btn-event-study").addEventListener("click", function() {
+  runTool("tools/event-study", {}, this);
 });
 document.getElementById("btn-diagnostics").addEventListener("click", function() {
   runTool("tools/diagnostics", {}, this);
@@ -572,6 +576,19 @@ def create_app(engine) -> web.Application:
 
         return await _run_tool(run)
 
+    async def handle_tool_event_study(request: web.Request) -> web.Response:
+        """Runs the signal-episode event study (smartboi.tools.run_event_study)
+        over signals.jsonl + decisions.jsonl + price_marks.jsonl -- forward
+        returns after each signal episode, split by what the engine did with
+        it. Pure file reads -- no network, no LLM, nothing mutated."""
+        async def run() -> str:
+            # Threaded for the same reason as the forward-return report:
+            # these logs grow daily and parsing them on the event loop
+            # would stall the engine's polling.
+            return await asyncio.to_thread(run_event_study, engine.settings.log_dir)
+
+        return await _run_tool(run)
+
     async def handle_tool_diagnostics(request: web.Request) -> web.Response:
         """One pasteable runtime-state bundle (smartboi.tools.run_diagnostics)
         -- integrations, universe, graph, dossiers, where evidence is coming
@@ -610,6 +627,7 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/candidates/accept", handle_accept_candidate)
     app.router.add_post("/api/tools/screen", handle_tool_screen)
     app.router.add_post("/api/tools/forward-returns", handle_tool_forward_returns)
+    app.router.add_post("/api/tools/event-study", handle_tool_event_study)
     app.router.add_post("/api/tools/diagnostics", handle_tool_diagnostics)
     app.router.add_post("/api/universe/reset-accepted", handle_reset_accepted)
     return app

@@ -5,6 +5,7 @@ cooldown's definitive-only recording, and the full signal -> snapshot ->
 open -> close -> reset lifecycle."""
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -483,6 +484,83 @@ async def test_full_lifecycle_signal_open_close_reset(engine):
     assert dossier.status == "ACTIVE"
     assert dossier.signaled_at == ""
     assert dossier.signaled_price is None
+
+
+# --- Decisions ledger: every drift-skip / expiry / open leaves an
+# episode-keyed row in decisions.jsonl (see signals.log_decision and
+# event_study.py) -- without it the entry-timing guards are unfalsifiable.
+
+async def test_decisions_ledger_records_open_with_episode_key(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+    episode = engine.dossiers.load("FORM").signaled_at
+    assert episode
+
+    await engine._mark_and_execute()
+    assert engine.journal.has_open("FORM")
+
+    rows = [json.loads(line) for line in
+            (Path(engine.settings.log_dir) / "decisions.jsonl").read_text().splitlines()]
+    opened = [r for r in rows if r["event"] == "trade_opened"]
+    assert len(opened) == 1
+    assert opened[0]["symbol"] == "FORM"
+    assert opened[0]["episode"] == episode  # joins against signals.jsonl rows
+    assert opened[0]["price"] == 10.0
+
+
+async def test_decisions_ledger_records_drift_skip_once_per_episode(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+    # Price ran 10% favorably before entry -- drift guard skips, twice polled.
+    engine.price_feed.prices["FORM"] = 11.0
+    await engine._mark_and_execute()
+    await engine._mark_and_execute()
+    assert not engine.journal.has_open("FORM")
+
+    rows = [json.loads(line) for line in
+            (Path(engine.settings.log_dir) / "decisions.jsonl").read_text().splitlines()]
+    skips = [r for r in rows if r["event"] == "drift_skip"]
+    assert len(skips) == 1  # once per episode, not per poll
+    assert skips[0]["price"] == 11.0
+    assert "drifted" in skips[0]["reason"]
+
+
+async def test_decisions_ledger_records_expiry_with_reason(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+    dossier = engine.dossiers.load("FORM")
+    episode = dossier.signaled_at
+    # Simulate the thesis degrading while stuck SIGNALED (entry re-check path).
+    dossier.confidence = 0.1
+    dossier.magnitude = 0.1
+    engine.dossiers.save(dossier)
+    await engine._mark_and_execute()
+
+    rows = [json.loads(line) for line in
+            (Path(engine.settings.log_dir) / "decisions.jsonl").read_text().splitlines()]
+    expired = [r for r in rows if r["event"] == "signal_expired"]
+    assert len(expired) == 1
+    assert expired[0]["episode"] == episode
+    assert expired[0]["direction"] == "LONG"
+    assert expired[0]["reason"]
 
 
 # --- A model that fills in "NULL" rather than leaving the ticker null.
