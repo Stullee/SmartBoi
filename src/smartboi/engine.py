@@ -451,8 +451,11 @@ class Engine:
         ):
             self._last_candidate_recheck = now
             await self._run_candidate_ticker_recheck()
-            # Straight after the recheck, which is what populates the
-            # recommendation this acts on.
+            # Both act on the recommendation the recheck just refreshed:
+            # reconcile repairs existing acceptances, then auto-accept adds
+            # new ones. Reconcile runs FIRST so a correction lands before the
+            # daily auto-accept budget is spent.
+            self._reconcile_accepted_types()
             await self._auto_accept_candidates()
         if self._due(self._last_heartbeat, HEARTBEAT_INTERVAL_SEC, now):
             self._last_heartbeat = now
@@ -610,6 +613,18 @@ class Engine:
                 )
 
     @staticmethod
+    def _is_unsearchable(name: str) -> bool:
+        """Whether a free-text counterparty name is worth spending a Finnhub
+        ticker search on. Never-investable descriptions (government bodies,
+        generic customer classes) can't resolve, and Finnhub 422s on long or
+        punctuation-heavy queries rather than returning an empty result --
+        both just produce a daily warning per candidate forever."""
+        stripped = name.strip()
+        if not stripped or len(stripped) > 48:
+            return True
+        return Engine._looks_like_non_company(stripped)
+
+    @staticmethod
     def _looks_like_non_company(name: str) -> bool:
         lowered = name.lower()
         return any(keyword in lowered for keyword in _NON_COMPANY_KEYWORDS)
@@ -715,7 +730,15 @@ class Engine:
                 if not name:
                     continue
                 resolved = await self.edgar_client.find_ticker_by_name(name)
-                if not resolved and self.finnhub is not None:
+                if not resolved and self.finnhub is not None and not self._is_unsearchable(name):
+                    # Finnhub's search 422s on anything that isn't plausibly a
+                    # company query, and this runs daily over every
+                    # still-unresolved candidate -- confirmed live, ~40
+                    # warnings per pass for names like "State and federal
+                    # government agencies" that will never resolve to a
+                    # ticker no matter how often they're retried. Skipping
+                    # them saves the call and stops the noise from burying
+                    # real problems in the log.
                     resolved = await self.finnhub.search_ticker_by_name(name)
                 if not resolved:
                     continue
@@ -1354,6 +1377,42 @@ class Engine:
         with path.open("a") as f:
             for symbol, price in prices.items():
                 f.write(json.dumps({"marked_at": marked_at, "symbol": symbol, "price": price}) + "\n")
+
+    def _reconcile_accepted_types(self) -> None:
+        """Corrects any runtime-accepted symbol whose stored type contradicts
+        the engine's own recommendation for it.
+
+        Acceptance used to be a one-way door: whatever type went in stayed,
+        even once market data said otherwise. Confirmed live -- a deployment
+        held ten mega/large caps as TRADEABLE, including a $323B pharma,
+        every one of which the engine itself recommended as an anchor. The
+        accept guard now stops that at the door, but existing state needs
+        repairing too, and a recommendation can also change later (a company
+        graduates past the tradeable ceiling, or coverage thickens) with no
+        one watching.
+
+        Only ever corrects toward the recommendation, and in practice that
+        means demoting a trade target to a news source -- the safe direction:
+        an anchor can never open a position. A demoted symbol's dossier is
+        archived by the same pass that handles any other orphan."""
+        for symbol, value in list(self.accepted_candidates.data.items()):
+            as_type, source = self._accepted_entry(value)
+            recommended = (self.candidates.get(symbol) or {}).get("recommended_as")
+            if recommended not in ("anchor", "tradeable") or recommended == as_type:
+                continue
+            self.accepted_candidates.set(symbol, {"as": recommended, "source": source})
+            spec = self.spec_by_symbol.get(symbol)
+            if spec is not None:
+                corrected = CompanySpec(spec.symbol, spec.name, spec.ecosystem,
+                                        signal_source_only=(recommended == "anchor"),
+                                        notes=f"Accepted ({source}), corrected to {recommended} by reconciliation")
+                self.universe = [corrected if c.symbol == symbol else c for c in self.universe]
+                self.spec_by_symbol[symbol] = corrected
+            log.warning(
+                "[UNIVERSE] %s was accepted as %s but screens as %s (%s) -- corrected automatically.",
+                symbol, as_type, recommended,
+                (self.candidates.get(symbol) or {}).get("recommendation_reason", ""),
+            )
 
     def reset_accepted_candidates(self) -> dict:
         """Drops every runtime-accepted symbol, returning the universe to the

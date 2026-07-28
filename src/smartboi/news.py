@@ -29,6 +29,18 @@ _SEARCH_URL = "https://finnhub.io/api/v1/search"
 # last. Spacing requests just under the budget keeps a full pass legal.
 _REQUEST_GAP_SEC = 1.1
 _MAX_ATTEMPTS = 3
+# Consecutive plan-rejections of /search before it's treated as unavailable
+# rather than as a per-query failure. Small, because the signal is
+# unambiguous -- a plan either includes the endpoint or rejects everything.
+_SEARCH_UNAVAILABLE_AFTER = 3
+
+
+def _is_plan_rejection(exc: Exception) -> bool:
+    """A 422/401/403 from Finnhub means "this plan/request isn't allowed",
+    not "no result for that query" -- an absent company answers 200 with an
+    empty result list."""
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) in (401, 403, 422)
 
 # Finnhub puts the API key in the query string, so any logged exception
 # containing the request URL (httpx includes it) would leak the key into
@@ -84,6 +96,10 @@ class FinnhubClient:
         self._api_key = api_key
         self._client = httpx.AsyncClient(timeout=15.0)
         self._last_request = 0.0
+        # See search_ticker_by_name: /search isn't on every Finnhub plan, and
+        # an excluded plan rejects every query rather than saying so once.
+        self._search_422s = 0
+        self._search_unavailable = False
 
     async def _throttled_get(self, url: str, params: dict) -> httpx.Response:
         response: httpx.Response | None = None
@@ -140,14 +156,37 @@ class FinnhubClient:
         SEC-title match can't catch. Finnhub's /search is the same fuzzy,
         brand-aware lookup its own autocomplete uses -- free tier, no extra
         integration or cost beyond one more throttled request."""
+        if self._search_unavailable:
+            return None
         normalized_query = normalize_company_name(company_name)
         if not normalized_query:
             return None
         try:
             response = await self._throttled_get(_SEARCH_URL, {"q": company_name})
         except httpx.HTTPError as exc:
+            # /search is not included in every Finnhub plan, and an excluded
+            # plan answers 422 for every query rather than saying so once.
+            # Confirmed live: every search failed this way, including
+            # unambiguous names ("Eastman Kodak Company"), while news and
+            # profile calls on the same key kept working. Left unchecked that
+            # is one guaranteed-to-fail, rate-limited request per unresolved
+            # candidate per day -- ~two minutes of the shared 60/min budget
+            # spent achieving nothing, plus a warning apiece burying real
+            # problems. So repeated 422s trip a breaker for the process.
+            if _is_plan_rejection(exc):
+                self._search_422s += 1
+                if self._search_422s >= _SEARCH_UNAVAILABLE_AFTER:
+                    self._search_unavailable = True
+                    log.warning(
+                        "Finnhub ticker search rejected %d requests in a row -- it is not available on this "
+                        "API plan. Disabling it for this process; EDGAR's own filer-name lookup still runs, "
+                        "so candidates resolve slightly less often but nothing else changes.",
+                        self._search_422s,
+                    )
+                    return None
             log.warning("Ticker search failed for %r: %s", company_name, redact_token(exc))
             return None
+        self._search_422s = 0
         return _best_search_match(response.json().get("result", []), normalized_query)
 
     async def market_cap_musd(self, symbol: str) -> float | None:

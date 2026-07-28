@@ -282,3 +282,56 @@ async def test_paper_trades_never_open_on_a_non_tradeable_symbol(engine):
     await engine._mark_and_execute()
 
     assert not engine.journal.has_open("RTX")
+
+
+# --- Self-healing: acceptance used to be a one-way door, so a wrong type
+# stayed wrong. Confirmed live: ten mega/large caps held as TRADEABLE, every
+# one of which the engine itself recommended as an anchor.
+
+async def test_a_tradeable_that_screens_as_an_anchor_is_demoted_automatically(engine):
+    entry = _candidate(name="Merck", ticker="MRK", recommended_as="anchor")
+    entry["recommendation_reason"] = "market cap $322954M exceeds the tradeable ceiling"
+    engine.candidates.set("MRK", entry)
+    # Wrongly accepted before the guard existed.
+    engine.accepted_candidates.set("MRK", {"as": "tradeable", "source": "manual"})
+    engine.universe = list(engine.settings.universe)
+    engine._apply_accepted_candidates()
+    from smartboi.universe import spec_by_symbol as _sbs
+    engine.spec_by_symbol = _sbs(engine.universe)
+    assert engine.spec_by_symbol["MRK"].signal_source_only is False
+
+    engine._reconcile_accepted_types()
+
+    assert engine.spec_by_symbol["MRK"].signal_source_only is True
+    assert engine.accepted_candidates.get("MRK")["as"] == "anchor"
+
+
+async def test_reconciliation_leaves_a_correctly_typed_symbol_alone(engine):
+    engine.candidates.set("ZZZZ", _candidate(recommended_as="tradeable"))
+    await engine._auto_accept_candidates()
+    before = dict(engine.accepted_candidates.data)
+    engine._reconcile_accepted_types()
+    assert engine.accepted_candidates.data == before
+
+
+async def test_reconciliation_ignores_symbols_with_no_recommendation(engine):
+    """"unknown" or missing means there was no market data to judge on --
+    not a reason to change anything."""
+    engine.accepted_candidates.set("ZZZZ", {"as": "tradeable", "source": "manual"})
+    engine.candidates.set("ZZZZ", _candidate(recommended_as="unknown"))
+    engine._reconcile_accepted_types()
+    assert engine.accepted_candidates.get("ZZZZ")["as"] == "tradeable"
+
+
+# --- Not every discovered name is worth a Finnhub search ---
+
+def test_unsearchable_names_are_skipped():
+    for name in ("State and federal government agencies", "Major electric utilities",
+                 "Internal Revenue Service (IRS)", "",
+                 "Secretariat of the Federal Revenue Bureau of Brazil"):
+        assert Engine._is_unsearchable(name) is True
+
+
+def test_real_company_names_are_still_searched():
+    for name in ("Advantest", "SolarEdge Technologies Inc.", "Eastman Kodak Company"):
+        assert Engine._is_unsearchable(name) is False

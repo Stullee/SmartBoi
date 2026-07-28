@@ -61,3 +61,51 @@ def test_best_search_match_returns_none_when_nothing_plausible():
 
 def test_best_search_match_handles_empty_results():
     assert _best_search_match([], "acme corp") is None
+
+
+# --- Finnhub's /search isn't on every plan, and an excluded plan rejects
+# every query with 422 rather than saying so once. Confirmed live: every
+# search failed that way while news/profile calls on the same key worked,
+# costing one guaranteed-to-fail rate-limited request per unresolved
+# candidate per day.
+
+class _Rejecting422:
+    """Minimal stand-in for an httpx error carrying a 422 response."""
+    def __init__(self, status_code):
+        self.response = type("R", (), {"status_code": status_code})()
+
+
+def test_plan_rejection_recognises_auth_and_unprocessable_statuses():
+    from smartboi.news import _is_plan_rejection
+    for status in (401, 403, 422):
+        assert _is_plan_rejection(_Rejecting422(status)) is True
+    # A genuine transient failure must NOT trip the breaker.
+    for status in (429, 500, 503):
+        assert _is_plan_rejection(_Rejecting422(status)) is False
+    assert _is_plan_rejection(RuntimeError("no response attribute")) is False
+
+
+async def test_repeated_plan_rejections_disable_the_search(monkeypatch):
+    import httpx
+    from smartboi.news import FinnhubClient, _SEARCH_UNAVAILABLE_AFTER
+
+    client = FinnhubClient("key")
+    attempts = []
+
+    async def rejecting_get(url, params):
+        attempts.append(params.get("q"))
+        raise httpx.HTTPStatusError(
+            "422", request=None,
+            response=httpx.Response(422, request=httpx.Request("GET", "https://finnhub.io/x")),
+        )
+
+    monkeypatch.setattr(client, "_throttled_get", rejecting_get)
+
+    for i in range(_SEARCH_UNAVAILABLE_AFTER + 5):
+        assert await client.search_ticker_by_name(f"Company {i}") is None
+
+    # Stopped calling once the plan rejection was unambiguous, instead of
+    # retrying every candidate every day forever.
+    assert len(attempts) == _SEARCH_UNAVAILABLE_AFTER
+    assert client._search_unavailable is True
+    await client.aclose()
