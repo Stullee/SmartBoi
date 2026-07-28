@@ -18,12 +18,12 @@ RUN apt-get update \
 # IMPORTANT: after pushing new commits you intend to deploy, update
 # SMARTBOI_COMMIT to the new commit SHA, then use the add-on's "Rebuild"
 # button (not just "Restart") in the Home Assistant UI.
-ARG SMARTBOI_COMMIT=423dcca7ed7afa99d7ed23a597c260a2e8ad787d
+ARG SMARTBOI_COMMIT=0109aea65de60419302aa1d6da0eb978e9204018
 RUN pip install --no-cache-dir \
     "smartboi @ git+https://github.com/Stullee/SmartBoi.git@${SMARTBOI_COMMIT}"
 
 # Mirrors config.yaml's version -- bump both together on every release.
-ARG SMARTBOI_VERSION=0.17.0
+ARG SMARTBOI_VERSION=0.18.0
 ENV SMARTBOI_VERSION=${SMARTBOI_VERSION}
 ENV SMARTBOI_COMMIT=${SMARTBOI_COMMIT}
 
