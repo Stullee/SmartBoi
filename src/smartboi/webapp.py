@@ -375,7 +375,7 @@ document.getElementById("btn-diagnostics").addEventListener("click", function() 
   runTool("tools/diagnostics", {}, this);
 });
 document.getElementById("btn-reset").addEventListener("click", function() {
-  if (!confirm("Remove every symbol added at runtime and return to the curated universe?\n\n" +
+  if (!confirm("Remove every symbol added at runtime and return to the curated universe?\\n\\n" +
                "Dossiers for the removed symbols are ARCHIVED, not deleted. Candidates, trades " +
                "and captured logs are untouched.")) return;
   var out = document.getElementById("tool-output");
@@ -386,7 +386,7 @@ document.getElementById("btn-reset").addEventListener("click", function() {
   }).then(function(r) { return r.json(); }).then(function(res) {
     out.textContent = res.error ? ("Error: " + res.error)
       : ("Removed " + res.removed.length + " added symbol(s): " + (res.removed.join(", ") || "none") +
-         "\nUniverse is now " + res.universe_size + " symbols.");
+         "\\nUniverse is now " + res.universe_size + " symbols.");
     refresh();
   }).catch(function(err) { out.textContent = "Failed: " + err; });
 });
