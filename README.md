@@ -139,6 +139,16 @@ particular tickers gets none of this starter data; every edge in a
 custom universe comes from that universe's own filings instead (see
 `engine.py`'s `_seed_graph`).
 
+A relationship's `rel_type` must be one of `graph.REL_TYPES` (customer/
+supplier/competitor/regulator) -- the LLM extraction tool schema declares
+this as an enum, but Anthropic tool use doesn't hard-enforce it, so a
+stray value could still slip through. `engine.py`'s `_extract_relationships`
+drops (logs and skips) any relationship outside the enum before it ever
+reaches the graph, and `RelationshipGraph` prunes any already-persisted
+edge with an invalid `rel_type` on load, rewriting `graph.json` clean --
+self-healing for anything that got in before this guard existed, with no
+manual edit required.
+
 ### Bring your own universe
 
 The starter watchlist is just a default. Set `SYMBOLS` (your tradeable
@@ -434,6 +444,19 @@ Tradeable"/"+ Anchor" buttons) -- bounded to symbols the extraction
 pipeline itself already surfaced, never an arbitrary ticker, and it can
 only widen what's watched, never place an order or directly create a
 trade. See "Bring your own universe" above.
+
+## Observability
+
+A `heartbeat: universe=N dossiers=N signaled=N graph_edges=N ...` INFO line
+logs roughly every 10 minutes (`engine.py`'s `_log_heartbeat`) regardless
+of whether anything actually happened that cycle -- ingestion at this
+system's polling cadences (hourly EDGAR/news, 6h prices) can leave the log
+quiet for long stretches, and without a heartbeat there was no way to tell
+an idle-but-healthy engine from a hung one. `ib_async` (the IB Gateway
+client library) is set to WARNING alongside `httpx`/`httpcore`/
+`aiohttp.access` -- it logs routine Gateway connectivity blips and
+account-summary noise at ERROR even though they don't affect price marks,
+which otherwise drowns out anything that's an actual SmartBoi problem.
 
 ## Running on Home Assistant OS
 

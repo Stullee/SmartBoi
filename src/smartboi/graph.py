@@ -43,9 +43,25 @@ class RelationshipGraph:
         if self.path.exists():
             try:
                 raw = json.loads(self.path.read_text())
-                self.relationships = [Relationship(**r) for r in raw]
+                loaded = [Relationship(**r) for r in raw]
             except (json.JSONDecodeError, OSError, TypeError):
                 log.warning("Could not read %s, starting with an empty graph.", self.path)
+                return
+            # Self-healing cleanup: an invalid rel_type could only have
+            # gotten in from before engine.py's _extract_relationships
+            # started guarding against it (the LLM's tool schema declares
+            # an enum, but Anthropic tool use doesn't hard-enforce it, so a
+            # stray value could slip through). Dropped on load rather than
+            # left to silently mismatch REL_TYPES-based logic elsewhere.
+            self.relationships = [r for r in loaded if r.rel_type in REL_TYPES]
+            dropped = len(loaded) - len(self.relationships)
+            if dropped:
+                log.warning(
+                    "Dropped %d relationship(s) with an invalid rel_type on load: %s",
+                    dropped,
+                    ", ".join(f"{r.from_symbol}->{r.to_symbol} ({r.rel_type!r})" for r in loaded if r.rel_type not in REL_TYPES),
+                )
+                self._save()
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

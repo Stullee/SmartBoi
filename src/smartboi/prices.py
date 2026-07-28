@@ -87,12 +87,6 @@ class ReadOnlyPriceFeed:
                 prices[symbol] = price
         return prices
 
-    def account_net_liquidation(self) -> float | None:
-        for v in self.ib.accountValues():
-            if v.tag == "NetLiquidation":
-                return float(v.value)
-        return None
-
     def disconnect(self) -> None:
         if self.ib.isConnected():
             self.ib.disconnect()

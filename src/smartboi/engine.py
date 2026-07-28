@@ -42,7 +42,7 @@ from smartboi.dossier import (
     recompute_decay,
 )
 from smartboi.edgar import EdgarClient, FilingEvent
-from smartboi.graph import RelationshipExtractor, RelationshipGraph, Relationship
+from smartboi.graph import REL_TYPES, RelationshipExtractor, RelationshipGraph, Relationship
 from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal
 from smartboi.prices import ReadOnlyPriceFeed
@@ -80,6 +80,11 @@ DAILY_SNAPSHOT_INTERVAL_SEC = 86400
 # listing or a name happens to now match Finnhub's fuzzy search; there's no
 # reason to burn API calls checking more often than that.
 CANDIDATE_RECHECK_INTERVAL_SEC = 86400
+# One INFO line roughly this often (see _log_heartbeat) so an idle-but-
+# healthy engine -- nothing new to ingest this cycle, which is normal for
+# long stretches at this system's polling cadences -- is distinguishable in
+# the log from a hung one, instead of the log just going quiet for hours.
+HEARTBEAT_INTERVAL_SEC = 600
 # Filing forms run through relationship extraction, in addition to feeding
 # the dossier engine as direct evidence -- 8-Ks and Form 4s are event-driven
 # and rarely restate customer/supplier relationships, so extraction time is
@@ -156,6 +161,7 @@ class Engine:
         self._last_daily_snapshot: float | None = None
         self._last_price_marks: float | None = None
         self._last_candidate_recheck: float | None = None
+        self._last_heartbeat: float | None = None
         self._dashboard_task: asyncio.Task | None = None
         self._closing = False
 
@@ -342,6 +348,15 @@ class Engine:
     def _due(last: float | None, interval_sec: float, now: float) -> bool:
         return last is None or now - last >= interval_sec
 
+    def _log_heartbeat(self) -> None:
+        signaled = sum(1 for s in self.dossiers.all_symbols() if self.dossiers.load(s).status == "SIGNALED")
+        log.info(
+            "heartbeat: universe=%d dossiers=%d signaled=%d graph_edges=%d "
+            "pending_candidates=%d open_trades=%d",
+            len(self.symbol_list), len(self.dossiers.all_symbols()), signaled,
+            len(self.graph.relationships), len(self.candidates.data), len(self.journal.open_trades),
+        )
+
     async def _tick(self) -> None:
         now = time.monotonic()
         if (
@@ -397,6 +412,9 @@ class Engine:
         ):
             self._last_candidate_recheck = now
             await self._run_candidate_ticker_recheck()
+        if self._due(self._last_heartbeat, HEARTBEAT_INTERVAL_SEC, now):
+            self._last_heartbeat = now
+            self._log_heartbeat()
 
     def _universe_screen_due(self) -> bool:
         """Scheduled off the PERSISTED last-screen timestamp (wall clock),
@@ -474,6 +492,18 @@ class Engine:
             return
         now = datetime.now(timezone.utc).isoformat()
         for rel in relationships:
+            if rel.get("rel_type") not in REL_TYPES:
+                # The extraction tool schema declares an enum for rel_type,
+                # but Anthropic tool use doesn't hard-enforce it -- a stray
+                # value (seen live: "partner") can still slip through.
+                # Dropped outright rather than recorded as a candidate or
+                # written into the graph, where REL_TYPES-based logic
+                # elsewhere assumes only the four known values ever appear.
+                log.warning(
+                    "%s: dropping relationship with invalid rel_type %r (counterparty: %s)",
+                    symbol, rel.get("rel_type"), rel.get("counterparty_name"),
+                )
+                continue
             ticker = (rel.get("counterparty_ticker") or "").upper()
             if not ticker and rel.get("rel_type") != "regulator":
                 # A regulator (government body, agency) can never be a

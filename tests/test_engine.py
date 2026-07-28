@@ -95,6 +95,15 @@ async def test_same_headline_syndication_still_collapses_to_one_source(engine):
     assert len(dossier.evidence) == 1
 
 
+# --- Heartbeat: a periodic INFO line so an idle-but-healthy engine is
+# distinguishable in the log from a hung one ---
+
+def test_log_heartbeat_does_not_raise_and_logs(engine, caplog):
+    with caplog.at_level("INFO"):
+        engine._log_heartbeat()
+    assert any("heartbeat" in r.message for r in caplog.records)
+
+
 # --- Invariant: SEED_RELATIONSHIPS only ever seeds edges between symbols
 # actually in the LIVE (possibly custom SYMBOLS/ANCHOR_SYMBOLS) universe --
 # a custom deployment must never get default-universe edges for companies
@@ -137,6 +146,28 @@ async def test_relationship_extraction_falls_back_to_finnhub_search(engine):
 
     candidates = list(engine.candidates.data.values())
     assert any(c.get("ticker") == "ZZZZ" for c in candidates)
+
+
+# --- Invariant: a relationship whose rel_type isn't one of graph.REL_TYPES
+# is dropped outright -- never written to the graph, never recorded as a
+# candidate (the extraction tool schema declares an enum, but Anthropic
+# tool use doesn't hard-enforce it) ---
+
+async def test_extract_relationships_drops_invalid_rel_type(engine):
+    filing = FilingEvent(
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000001", primary_document="form.htm",
+    )
+    engine.extractor.default = [{
+        "counterparty_name": "UCTT", "counterparty_ticker": "UCTT",
+        "rel_type": "partner", "description": "a bogus rel_type outside the enum",
+        "confidence": 0.9, "quote": "q",
+    }]
+
+    await engine._extract_relationships("FORM", filing, "filing text")
+
+    assert engine.graph.relationships == []
+    assert engine.candidates.data == {}
 
 
 async def test_second_discovery_with_a_resolved_ticker_merges_the_orphan(engine):

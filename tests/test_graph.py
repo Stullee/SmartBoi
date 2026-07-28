@@ -25,6 +25,32 @@ def test_add_allows_different_rel_type_same_pair(tmp_path):
     assert len(graph.relationships) == 2
 
 
+def test_load_prunes_invalid_rel_type(tmp_path):
+    import json
+
+    path = tmp_path / "graph.json"
+    path.write_text(json.dumps([
+        {"from_symbol": "UCTT", "to_symbol": "AMAT", "rel_type": "customer", "description": "d",
+         "source": "s", "confidence": 0.8, "extracted_at": ""},
+        {"from_symbol": "PDFS", "to_symbol": "ATRO", "rel_type": "partner", "description": "d2",
+         "source": "s", "confidence": 0.7, "extracted_at": ""},
+    ]))
+    graph = RelationshipGraph(path)
+    assert len(graph.relationships) == 1
+    assert graph.relationships[0].rel_type == "customer"
+    # The pruned file is rewritten so the bad edge doesn't reappear on the next load.
+    reloaded = RelationshipGraph(path)
+    assert len(reloaded.relationships) == 1
+
+
+def test_load_with_no_invalid_edges_does_not_rewrite(tmp_path):
+    graph = RelationshipGraph(tmp_path / "graph.json")
+    graph.add(_rel())
+    mtime_before = graph.path.stat().st_mtime_ns
+    RelationshipGraph(graph.path)
+    assert graph.path.stat().st_mtime_ns == mtime_before
+
+
 def test_linked_symbols_both_directions(tmp_path):
     graph = RelationshipGraph(tmp_path / "graph.json")
     graph.add(_rel("UCTT", "AMAT", "customer"))
