@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 
+from smartboi.news import redact_token
+from smartboi.status import gather_dossiers, gather_paper_trade_stats
 from smartboi.forward_returns import (
     compute_forward_return,
     dedup_snapshots,
@@ -150,3 +154,175 @@ def run_forward_returns(
         lines.append(format_report(horizon_days, joined, price_marks, ecosystem_by_symbol))
         lines.append("")
     return "\n".join(lines)
+
+
+# Settings safe to print in a diagnostics bundle. An explicit ALLOW-list, not
+# a deny-list: the bundle is meant to be pasted into a chat or an issue, and a
+# deny-list silently starts leaking the moment a new secret-ish setting is
+# added. Everything omitted here is either a credential (anthropic_api_key,
+# finnhub_api_key), personal data (edgar_user_agent carries a real name and
+# email, as SEC requires), or a URL that can embed a token
+# (alert_webhook_url).
+_DIAGNOSTIC_SETTINGS = (
+    "signal_confidence_threshold", "min_independent_sources", "max_horizon_days",
+    "max_favorable_drift_pct", "signal_entry_deadline_days",
+    "stop_loss_pct", "take_profit_pct",
+    "max_daily_llm_calls", "max_propagated_evidence_per_link",
+    "propagated_evidence_cooldown_hours",
+    "extraction_model", "dossier_model", "skeptic_model",
+    "edgar_poll_interval_sec", "news_poll_interval_sec", "price_poll_interval_sec",
+    "edgar_lookback_days", "news_lookback_days",
+    "universe_min_market_cap_musd", "universe_max_market_cap_musd",
+    "universe_max_analyst_count", "universe_screen_interval_days",
+    "enable_auto_accept_candidates", "auto_accept_anchors", "auto_accept_tradeables",
+    "auto_accept_min_seen_count", "auto_accept_max_per_day",
+    "enable_relationship_backfill", "enable_ib_price_feed", "ib_host", "ib_port",
+)
+MAX_LOG_LINES = 40
+MAX_LISTED_ROWS = 60
+
+
+def _jsonl_span(rows: list[dict], key: str) -> str:
+    stamps = sorted(r.get(key, "")[:10] for r in rows if r.get(key))
+    return f"{len(rows)} row(s), {stamps[0]} .. {stamps[-1]}" if stamps else f"{len(rows)} row(s)"
+
+
+def _recent_log_problems(log_dir: Path) -> list[str]:
+    """The tail of WARNING/ERROR lines from smartboi.log. Run through
+    redact_token because a logged exception can carry a Finnhub request URL,
+    which has the API key in its query string -- this bundle is meant to be
+    pasted somewhere."""
+    path = Path(log_dir) / "smartboi.log"
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    problems = [ln for ln in lines if "| WARNING" in ln or "| ERROR" in ln]
+    return [redact_token(ln) for ln in problems[-MAX_LOG_LINES:]]
+
+
+def run_diagnostics(engine) -> str:
+    """One pasteable runtime-state bundle: what's enabled, what the universe
+    and graph look like, every dossier's score, where evidence is actually
+    coming from, spend, signals, trades, candidates, capture-log coverage and
+    recent problems.
+
+    Deliberately one report rather than several buttons -- diagnosing this
+    system has repeatedly needed several of these AT ONCE (the evidence-source
+    breakdown below is what exposed every news article being attributed to
+    "finnhub.io", which made independent_source_count structurally unable to
+    exceed 1 and blocked every signal). Pure reads; nothing here mutates
+    state or costs an API call."""
+    s = engine.settings
+    out: list[str] = []
+    add = out.append
+
+    add("=== SmartBoi diagnostics ===")
+    add(f"generated_at : {datetime.now(timezone.utc).isoformat()}")
+    add(f"version      : {os.environ.get('SMARTBOI_VERSION', 'dev')}")
+    add(f"commit       : {os.environ.get('SMARTBOI_COMMIT', 'unknown')}")
+
+    add("\n--- Integrations ---")
+    for label, on in (
+        ("EDGAR ingestion", engine.edgar_client is not None),
+        ("News ingestion", engine.finnhub is not None),
+        ("Dossier engine (Claude)", engine.updater is not None),
+        ("IB price feed", engine.price_feed is not None),
+        ("Webhook alerts", engine.alerts.enabled),
+    ):
+        add(f"  {label:26} {'ENABLED' if on else 'disabled'}")
+
+    tradeable = [c for c in engine.universe if not c.signal_source_only]
+    anchors = [c for c in engine.universe if c.signal_source_only]
+    add(f"\n--- Universe ({len(engine.universe)} symbols: {len(tradeable)} tradeable, {len(anchors)} anchors) ---")
+    for eco in dict.fromkeys(c.ecosystem for c in engine.universe):
+        t = [c.symbol for c in tradeable if c.ecosystem == eco]
+        a = [c.symbol for c in anchors if c.ecosystem == eco]
+        add(f"  {eco:16} tradeable({len(t)}): {' '.join(t) or '-'}")
+        add(f"  {'':16} anchors({len(a)}): {' '.join(a) or '-'}")
+
+    edges = engine.graph.relationships
+    add(f"\n--- Relationship graph ({len(edges)} edges) ---")
+    by_type: dict[str, int] = {}
+    for e in edges:
+        by_type[e.rel_type] = by_type.get(e.rel_type, 0) + 1
+    add("  by type: " + (", ".join(f"{k}={v}" for k, v in sorted(by_type.items())) or "-"))
+    for e in edges[:MAX_LISTED_ROWS]:
+        add(f"  {e.from_symbol:6} -> {e.to_symbol:6} {e.rel_type:11} conf={e.confidence:.2f}  {e.description[:70]}")
+    if len(edges) > MAX_LISTED_ROWS:
+        add(f"  ... {len(edges) - MAX_LISTED_ROWS} more")
+
+    dossiers = gather_dossiers(engine.dossiers)
+    add(f"\n--- Dossiers ({len(dossiers)}) ---")
+    if dossiers:
+        add(f"  {'SYM':7}{'DIR':6}{'CONF':>7}{'MAG':>7}{'SCORE':>8}{'SRC':>5}{'EV':>4}  {'STATUS':9} MASS(agree/opp)")
+        for d in dossiers[:MAX_LISTED_ROWS]:
+            add(f"  {d['symbol']:7}{d['direction']:6}{d['confidence']:7.3f}{d['magnitude']:7.3f}"
+                f"{d['confidence'] * d['magnitude']:8.3f}{d['independent_source_count']:5}{d['evidence_count']:4}"
+                f"  {d['status']:9} {d.get('mass_agree', 0):.2f}/{d.get('mass_opposing', 0):.2f}")
+    else:
+        add("  none yet")
+
+    # The single most diagnostic table here: independent_source_count counts
+    # DISTINCT source names, so if this collapses to one or two entries then
+    # corroboration is structurally impossible no matter how much news lands.
+    add("\n--- Evidence sources seen (dedup index) ---")
+    counts: dict[str, int] = {}
+    for value in engine.dedup._seen.values():
+        name = value[0] if isinstance(value, list) else value
+        counts[name] = counts.get(name, 0) + 1
+    add(f"  {len(engine.dedup._seen)} fingerprint(s) across {len(counts)} distinct source name(s)")
+    for name, n in sorted(counts.items(), key=lambda kv: -kv[1])[:MAX_LISTED_ROWS]:
+        add(f"  {n:6}  {name}")
+    if len(counts) <= 2:
+        add("  ^^ WARNING: near-single source identity means independent_source_count")
+        add("     can never exceed 1, so no dossier can ever reach the signal bar.")
+
+    u = engine.usage.snapshot()
+    add("\n--- LLM usage today ---")
+    add(f"  {u.date}: {u.calls}/{u.daily_call_budget} calls, {u.input_tokens:,} in / {u.output_tokens:,} out tokens")
+
+    log_dir = Path(s.log_dir)
+    signals = read_jsonl(log_dir / "signals.jsonl")
+    add(f"\n--- Signals ({len(signals)}) ---")
+    for sig in signals[-10:]:
+        add(f"  {sig.get('generated_at', '')[:16]} {sig.get('symbol', ''):7}{sig.get('direction', ''):6}"
+            f" conf={sig.get('confidence', 0):.2f} mag={sig.get('magnitude', 0):.2f} src={sig.get('independent_source_count', 0)}")
+    if not signals:
+        add("  none yet")
+
+    stats, closed = gather_paper_trade_stats(log_dir / "paper_trades.jsonl")
+    add("\n--- Paper trades ---")
+    add(f"  open: {len(engine.journal.open_trades)} ({', '.join(engine.journal.open_trades) or '-'})")
+    add(f"  closed: {stats.closed} (W{stats.wins}/L{stats.losses}/T{stats.timeouts}), "
+        f"win rate {stats.win_rate * 100:.0f}%, avg R {stats.avg_r:.2f}")
+
+    cands = engine.candidates.data
+    with_ticker = [c for c in cands.values() if c.get("ticker")]
+    add(f"\n--- Universe candidates ({len(cands)}) ---")
+    add(f"  with a resolved ticker : {len(with_ticker)}")
+    add(f"  recommended tradeable  : {sum(1 for c in with_ticker if c.get('recommended_as') == 'tradeable')}")
+    add(f"  recommended anchor     : {sum(1 for c in with_ticker if c.get('recommended_as') == 'anchor')}")
+    add(f"  no recommendation yet  : {sum(1 for c in with_ticker if not c.get('recommended_as'))}")
+    add(f"  blocked from auto-add  : {sum(1 for c in cands.values() if c.get('auto_accept_blocked'))}")
+    auto = sum(1 for v in engine.accepted_candidates.data.values() if isinstance(v, dict) and v.get("source") == "auto")
+    add(f"  accepted: {len(engine.accepted_candidates.data)} ({auto} auto, {len(engine.accepted_candidates.data) - auto} manual)")
+
+    add("\n--- Forward-validation capture ---")
+    add(f"  dossier_snapshots.jsonl : {_jsonl_span(read_jsonl(log_dir / 'dossier_snapshots.jsonl'), 'snapshotted_at')}")
+    add(f"  price_marks.jsonl       : {_jsonl_span(read_jsonl(log_dir / 'price_marks.jsonl'), 'marked_at')}")
+
+    problems = _recent_log_problems(log_dir)
+    add(f"\n--- Recent warnings/errors (last {MAX_LOG_LINES}) ---")
+    for line in problems:
+        add(f"  {line}")
+    if not problems:
+        add("  none")
+
+    add("\n--- Key settings (credentials and personal data omitted) ---")
+    for name in _DIAGNOSTIC_SETTINGS:
+        add(f"  {name:38} {getattr(s, name, '?')}")
+
+    return "\n".join(out)

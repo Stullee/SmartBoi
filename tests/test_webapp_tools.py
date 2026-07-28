@@ -121,3 +121,10 @@ async def test_tool_failure_returns_an_error_not_a_dead_dashboard(engine):
         response = await client.post("/api/tools/screen", json={"tickers": "INTT"})
         assert response.status == 500
         assert "error" in await response.json()
+
+
+async def test_diagnostics_endpoint_returns_a_bundle(engine):
+    async with TestClient(TestServer(create_app(engine))) as client:
+        response = await client.post("/api/tools/diagnostics", json={})
+        assert response.status == 200
+        assert "=== SmartBoi diagnostics ===" in (await response.json())["report"]

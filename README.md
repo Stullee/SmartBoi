@@ -532,9 +532,18 @@ A dashboard (`ENABLE_DASHBOARD=true` by default) runs alongside the engine.
 A **Tools** panel at the top runs the two analyses that previously needed a
 terminal on the Home Assistant host: **Screen candidates** (market-cap /
 analyst-coverage screen of specific tickers, or of every discovered
-candidate, with editable bounds) and **Forward-return report** (does
+candidate, with editable bounds), **Forward-return report** (does
 `confidence x magnitude` predict forward returns -- bucket table,
-correlation, hit rate, sector-relative alpha, per-symbol breakdown). Both are
+correlation, hit rate, sector-relative alpha, per-symbol breakdown), and
+**Diagnostics bundle** -- one pasteable snapshot of runtime state:
+integrations, universe, graph, every dossier's score, **where evidence is
+actually coming from**, spend, signals, trades, candidates, capture-log
+coverage, and recent warnings/errors. That evidence-source breakdown is the
+one that earns its keep: it is what exposes a collapsed source identity (every
+article attributed to a single name), which makes `independent_source_count`
+structurally unable to exceed 1 and silently blocks every signal. Credentials
+and personal data are omitted by an allow-list and log lines are scrubbed, so
+the bundle is safe to paste. Both are
 read-only: one does market-data lookups, the other reads the captured
 snapshot/price logs. Neither changes a dossier, the universe, or any trade,
 and one runs at a time so a screen can't outrun Finnhub's rate limit

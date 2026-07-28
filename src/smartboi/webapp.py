@@ -29,7 +29,7 @@ from smartboi.screen import (
     DEFAULT_MAX_CAP_MUSD as SCREEN_MAX_CAP_MUSD,
     DEFAULT_MIN_CAP_MUSD as SCREEN_MIN_CAP_MUSD,
 )
-from smartboi.tools import run_forward_returns, run_screen
+from smartboi.tools import run_diagnostics, run_forward_returns, run_screen
 from smartboi.status import (
     gather_dossiers,
     gather_graph_stats,
@@ -118,9 +118,11 @@ _INDEX_HTML = """<!doctype html>
   <label>max analysts <input type="text" id="screen-max-analysts" value="10" style="min-width:3rem"></label>
   <button id="btn-screen">Screen candidates</button>
   <button id="btn-analyze">Forward-return report</button>
+  <button id="btn-diagnostics">Diagnostics bundle</button>
 </div>
-<div class="toolhint">Both are read-only: screening does market-cap/analyst lookups, the report reads the captured
-  snapshot/price logs. Neither changes a dossier, the universe, or any trade.</div>
+<div class="toolhint">All three are read-only: screening does market-cap/analyst lookups, the other two read
+  already-persisted state. None changes a dossier, the universe, or any trade. The diagnostics bundle is safe to
+  paste &mdash; credentials and personal data are omitted and log lines are scrubbed.</div>
 <pre id="tool-output"></pre>
 
 <div id="app">Loading&hellip;</div>
@@ -324,7 +326,8 @@ var TOOL_TIMEOUT_MS = 300000;
 
 function runTool(path, body, button) {
   var out = document.getElementById("tool-output");
-  var buttons = [document.getElementById("btn-screen"), document.getElementById("btn-analyze")];
+  var buttons = [document.getElementById("btn-screen"), document.getElementById("btn-analyze"),
+                 document.getElementById("btn-diagnostics")];
   buttons.forEach(function(b) { b.disabled = true; });
   out.style.display = "block";
   out.textContent = "Running… (this can take a few minutes for a long ticker list)";
@@ -364,6 +367,9 @@ document.getElementById("btn-screen").addEventListener("click", function() {
 });
 document.getElementById("btn-analyze").addEventListener("click", function() {
   runTool("tools/forward-returns", {}, this);
+});
+document.getElementById("btn-diagnostics").addEventListener("click", function() {
+  runTool("tools/diagnostics", {}, this);
 });
 
 function refresh() {
@@ -536,12 +542,27 @@ def create_app(engine) -> web.Application:
 
         return await _run_tool(run)
 
+    async def handle_tool_diagnostics(request: web.Request) -> web.Response:
+        """One pasteable runtime-state bundle (smartboi.tools.run_diagnostics)
+        -- integrations, universe, graph, dossiers, where evidence is coming
+        from, spend, signals, trades, candidates, capture coverage, recent
+        problems. Pure reads; credentials and personal data are omitted by an
+        allow-list, and log lines are scrubbed, because this is meant to be
+        pasted somewhere."""
+        async def run() -> str:
+            # Threaded: reads several append-only logs that grow daily, which
+            # would otherwise stall the engine's polling for the duration.
+            return await asyncio.to_thread(run_diagnostics, engine)
+
+        return await _run_tool(run)
+
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_status)
     app.router.add_post("/api/candidates/accept", handle_accept_candidate)
     app.router.add_post("/api/tools/screen", handle_tool_screen)
     app.router.add_post("/api/tools/forward-returns", handle_tool_forward_returns)
+    app.router.add_post("/api/tools/diagnostics", handle_tool_diagnostics)
     return app
 
 
