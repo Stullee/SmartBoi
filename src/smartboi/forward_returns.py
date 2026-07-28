@@ -7,12 +7,18 @@ append-only daily logs captured for exactly this purpose -- see README's
 "Forward-validation data capture"."""
 from __future__ import annotations
 
+import random
 from datetime import date, timedelta
 
 # Score buckets: is the forward-return relationship monotonic across them?
 # A real edge should show higher buckets outperforming lower ones; if it
 # doesn't, raising the signal threshold is not obviously the fix either.
-SCORE_BUCKETS = ((0.0, 0.2), (0.2, 0.35), (0.35, 0.5), (0.5, 1.01))
+# The 0.65 boundary deliberately matches the default
+# SIGNAL_CONFIDENCE_THRESHOLD: the single most important question this
+# report answers is "does the region that actually trades (>= threshold)
+# beat the region just below it?", and a bucket straddling the threshold
+# (the old 0.5-1.01 top bucket) structurally could not answer it.
+SCORE_BUCKETS = ((0.0, 0.2), (0.2, 0.35), (0.35, 0.5), (0.5, 0.65), (0.65, 1.01))
 
 
 def _bucket_label(score: float) -> str:
@@ -130,25 +136,93 @@ def compute_forward_return(
     }
 
 
-def bucket_returns(rows: list[dict]) -> list[dict]:
+def effective_sample_count(rows: list[dict], horizon_days: int) -> int:
+    """A defensible EFFECTIVE observation count: per symbol, only rows
+    whose entry dates are at least horizon_days apart (greedy, in date
+    order) count -- consecutive daily snapshots of one persistent thesis
+    have almost-fully-overlapping forward windows and are close to copies
+    of a single data point, so the raw row count wildly overstates how
+    much independent evidence exists. This is what keeps a '58% hit rate
+    over 1,300 rows' headline from being read as decision-grade when it
+    rests on a few dozen genuinely independent thesis-windows."""
+    by_symbol: dict[str, list[str]] = {}
+    for r in rows:
+        by_symbol.setdefault(r["symbol"], []).append(r["entry_date"])
+    n_eff = 0
+    for dates in by_symbol.values():
+        last_counted: date | None = None
+        for d in sorted(dates):
+            current = date.fromisoformat(d)
+            if last_counted is None or (current - last_counted).days >= horizon_days:
+                n_eff += 1
+                last_counted = current
+    return n_eff
+
+
+def cluster_bootstrap_ci(
+    values_by_symbol: dict[str, list[float]],
+    n_boot: int = 2000,
+    confidence: float = 0.90,
+    seed: int = 42,
+) -> tuple[float, float] | None:
+    """Percentile bootstrap CI for the mean, resampling SYMBOLS (clusters)
+    with replacement rather than individual rows -- rows within a symbol
+    are heavily serially correlated (overlapping forward windows), so a
+    row-level bootstrap would be far too confident. None when there are
+    fewer than 2 symbols: a single cluster has no between-cluster
+    variation to estimate from, and printing a CI would be fiction."""
+    symbols = sorted(values_by_symbol)
+    if len(symbols) < 2:
+        return None
+    rng = random.Random(seed)
+    means = []
+    for _ in range(n_boot):
+        sample: list[float] = []
+        for _ in symbols:
+            sample.extend(values_by_symbol[rng.choice(symbols)])
+        if sample:
+            means.append(sum(sample) / len(sample))
+    if not means:
+        return None
+    means.sort()
+    tail = (1.0 - confidence) / 2
+    lo_idx = int(tail * len(means))
+    hi_idx = min(len(means) - 1, int((1.0 - tail) * len(means)))
+    return means[lo_idx], means[hi_idx]
+
+
+def bucket_returns(rows: list[dict], horizon_days: int | None = None) -> list[dict]:
     """Mean signed forward return and hit-rate per score bucket -- is the
     relationship monotonic (higher score, better forward return)? Buckets
-    with zero rows are omitted rather than shown as a misleading 0.0."""
-    grouped: dict[str, list[float]] = {}
+    with zero rows are omitted rather than shown as a misleading 0.0.
+    When horizon_days is given, each bucket also carries the number of
+    distinct symbols, the non-overlapping effective sample count, and a
+    symbol-clustered bootstrap CI for the mean -- the raw row count alone
+    badly overstates the evidence (see effective_sample_count)."""
+    grouped: dict[str, list[dict]] = {}
     for r in rows:
-        grouped.setdefault(_bucket_label(r["score"]), []).append(r["signed_return_pct"])
+        grouped.setdefault(_bucket_label(r["score"]), []).append(r)
     out = []
     for lo, hi in SCORE_BUCKETS:
         label = _bucket_label(lo)
-        vals = grouped.get(label)
-        if not vals:
+        bucket_rows = grouped.get(label)
+        if not bucket_rows:
             continue
-        out.append({
+        vals = [r["signed_return_pct"] for r in bucket_rows]
+        entry = {
             "bucket": label,
             "count": len(vals),
             "mean_return_pct": sum(vals) / len(vals),
             "hit_rate": sum(1 for v in vals if v > 0) / len(vals),
-        })
+        }
+        if horizon_days is not None:
+            by_symbol: dict[str, list[float]] = {}
+            for r in bucket_rows:
+                by_symbol.setdefault(r["symbol"], []).append(r["signed_return_pct"])
+            entry["n_symbols"] = len(by_symbol)
+            entry["n_effective"] = effective_sample_count(bucket_rows, horizon_days)
+            entry["ci_90"] = cluster_bootstrap_ci(by_symbol)
+        out.append(entry)
     return out
 
 
@@ -190,6 +264,7 @@ def ecosystem_benchmark_return(
     ecosystem: str,
     ecosystem_by_symbol: dict[str, str],
     max_lookahead_days: int = 5,
+    exclude_symbol: str = "",
 ) -> float | None:
     """Mean RAW (unsigned, price-only) return of every symbol in
     `ecosystem` over [entry_date, entry_date + horizon_days], built from
@@ -198,11 +273,18 @@ def ecosystem_benchmark_return(
     dossier would otherwise have its "benchmark" computed from that same
     dossier's own return, making alpha exactly 0 by construction rather
     than a real measurement (confirmed live: IESC, the only grid_datacenter
-    dossier, showed 0.00 mean alpha for exactly this reason). Returns None
-    if no symbol in the ecosystem has both an entry- and exit-date price."""
+    dossier, showed 0.00 mean alpha for exactly this reason).
+
+    `exclude_symbol` should be the symbol being benchmarked: including a
+    stock in its own benchmark shrinks every measured alpha toward zero by
+    ~1/N (and to exactly zero when it's the only priced member) -- the
+    benchmark must be "the rest of the sector", not "the sector including
+    the pick". Returns None if no OTHER symbol in the ecosystem has both
+    an entry- and exit-date price -- those rows are reported as
+    unbenchmarkable rather than given a fabricated 0.00 alpha."""
     returns = []
     for symbol, eco in ecosystem_by_symbol.items():
-        if eco != ecosystem:
+        if eco != ecosystem or symbol == exclude_symbol:
             continue
         marks = price_marks.get(symbol)
         if not marks:
@@ -242,14 +324,15 @@ def benchmark_relative_returns(
     symbols (not in ecosystem_by_symbol) fall into a "?" bucket rather
     than being dropped; rows whose ecosystem has no benchmarkable price
     data get benchmark_relative_pct=None rather than a misleading 0.0."""
-    cache: dict[tuple[str, str, int], float | None] = {}
+    cache: dict[tuple[str, str, str, int], float | None] = {}
     out = []
     for r in rows:
         eco = ecosystem_by_symbol.get(r["symbol"], "?")
-        cache_key = (eco, r["entry_date"], r["horizon_days"])
+        cache_key = (r["symbol"], eco, r["entry_date"], r["horizon_days"])
         if cache_key not in cache:
             cache[cache_key] = ecosystem_benchmark_return(
-                price_marks, r["entry_date"], r["horizon_days"], eco, ecosystem_by_symbol, max_lookahead_days
+                price_marks, r["entry_date"], r["horizon_days"], eco, ecosystem_by_symbol,
+                max_lookahead_days, exclude_symbol=r["symbol"],
             )
         raw_benchmark = cache[cache_key]
         if raw_benchmark is None:
@@ -262,45 +345,82 @@ def benchmark_relative_returns(
     return out
 
 
+def _bucket_table(rows: list[dict], horizon_days: int, value_header: str) -> list[str]:
+    lines = [
+        f"{'Bucket':<14}{'Rows':<7}{'Syms':<6}{'N_eff':<7}{value_header:<15}{'90% CI':<20}{'Hit Rate':<10}"
+    ]
+    for b in bucket_returns(rows, horizon_days):
+        ci = b.get("ci_90")
+        ci_text = f"[{ci[0]:+.2f}, {ci[1]:+.2f}]" if ci else "n/a (1 sym)"
+        lines.append(
+            f"{b['bucket']:<14}{b['count']:<7}{b.get('n_symbols', 0):<6}{b.get('n_effective', 0):<7}"
+            f"{b['mean_return_pct']:<15.2f}{ci_text:<20}{b['hit_rate'] * 100:<9.1f}%"
+        )
+    return lines
+
+
 def format_report(
     horizon_days: int,
     rows: list[dict],
     price_marks: dict[str, dict[str, float]],
     ecosystem_by_symbol: dict[str, str],
+    attempted: int | None = None,
 ) -> str:
     """One horizon's full report as plain text: bucket table (raw and
     benchmark-relative), correlation, overall hit-rate, per-symbol
     breakdown. Returns a one-line "no data" message instead of empty
     tables when there's nothing joinable for this horizon yet -- forward
-    data takes horizon_days to even exist."""
-    lines = [f"=== Forward returns, {horizon_days}-day horizon ({len(rows)} joined snapshot(s)) ==="]
+    data takes horizon_days to even exist.
+
+    `attempted` is the number of direction-bearing snapshots the join was
+    attempted for -- reporting joined-of-attempted makes silently dropped
+    rows (symbol left the universe mid-horizon, price marks stopped,
+    horizon not yet elapsed) visible instead of quietly censored, since a
+    delisting/acquisition mid-horizon is disproportionately an EXTREME
+    outcome and dropping those biases every statistic here.
+
+    Row counts vs N_eff: one thesis that persists for weeks contributes a
+    row per DAY with almost fully overlapping forward windows -- close to
+    copies of one observation. N_eff counts non-overlapping windows per
+    symbol (see effective_sample_count) and the CI is bootstrapped over
+    SYMBOLS, so the printed uncertainty reflects the genuinely independent
+    evidence, not the inflated row count."""
+    joined_note = (
+        f"{len(rows)} joined snapshot(s)"
+        if attempted is None
+        else f"{len(rows)} of {attempted} direction-bearing snapshot(s) joined; "
+             f"{attempted - len(rows)} unjoinable (no entry/exit price mark -- too recent, or marks stopped)"
+    )
+    lines = [f"=== Forward returns, {horizon_days}-day horizon ({joined_note}) ==="]
     if not rows:
         lines.append("No joinable snapshot/price-mark pairs yet for this horizon.")
         return "\n".join(lines)
 
     lines.append("")
     lines.append("-- By score bucket (raw, signed in thesis direction) --")
-    lines.append(f"{'Bucket':<14}{'Count':<8}{'Mean Return %':<16}{'Hit Rate':<10}")
-    for b in bucket_returns(rows):
-        lines.append(f"{b['bucket']:<14}{b['count']:<8}{b['mean_return_pct']:<16.2f}{b['hit_rate'] * 100:<9.1f}%")
+    lines.extend(_bucket_table(rows, horizon_days, "Mean Return %"))
 
     corr = pearson_correlation([r["score"] for r in rows], [r["signed_return_pct"] for r in rows])
     lines.append("")
     lines.append(f"Score vs. signed forward return correlation: {corr:.3f}" if corr is not None else "Score vs. signed forward return correlation: n/a (insufficient data)")
+    lines.append("(row-level, so overlapping windows inflate it -- trust the bucket CIs above over this number)")
     overall_hit_rate = sum(1 for r in rows if r["signed_return_pct"] > 0) / len(rows)
-    lines.append(f"Overall hit rate: {overall_hit_rate * 100:.1f}% ({len(rows)} theses)")
+    n_eff_total = effective_sample_count(rows, horizon_days)
+    lines.append(
+        f"Overall hit rate: {overall_hit_rate * 100:.1f}% "
+        f"({len(rows)} rows, ~{n_eff_total} independent thesis-windows)"
+    )
 
     bench_rows = benchmark_relative_returns(rows, price_marks, ecosystem_by_symbol)
     benchmarked = [r for r in bench_rows if r["benchmark_relative_pct"] is not None]
     unbenchmarked = len(bench_rows) - len(benchmarked)
     lines.append("")
-    lines.append("-- By score bucket (benchmark-relative: minus own ecosystem's mean RAW return, sign-matched to direction) --")
+    lines.append("-- By score bucket (benchmark-relative: minus the REST of own ecosystem's mean RAW return, sign-matched to direction) --")
     if unbenchmarked:
         lines.append(f"({unbenchmarked} row(s) skipped -- no other priced symbol in their ecosystem over this window)")
     bench_for_bucket = [{**r, "signed_return_pct": r["benchmark_relative_pct"]} for r in benchmarked]
-    lines.append(f"{'Bucket':<14}{'Count':<8}{'Mean Alpha %':<16}{'Hit Rate':<10}")
-    for b in bucket_returns(bench_for_bucket):
-        lines.append(f"{b['bucket']:<14}{b['count']:<8}{b['mean_return_pct']:<16.2f}{b['hit_rate'] * 100:<9.1f}%")
+    if bench_for_bucket:
+        lines.extend(_bucket_table(bench_for_bucket, horizon_days, "Mean Alpha %"))
 
     lines.append("")
     lines.append("-- Per-symbol breakdown (worst first) --")

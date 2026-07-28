@@ -129,8 +129,24 @@ def test_bucket_returns_groups_and_averages():
     assert low["count"] == 2
     assert low["mean_return_pct"] == 0.0
     assert low["hit_rate"] == 0.5
-    high = next(b for b in buckets if b["bucket"] == ">= 0.50")
+    high = next(b for b in buckets if b["bucket"] == "[0.50, 0.65)")
     assert high["mean_return_pct"] == 10.0
+
+
+def test_bucket_boundary_matches_signal_threshold():
+    # The top bucket starts exactly at the default signal threshold (0.65)
+    # so the report can answer "does the region that actually trades beat
+    # the region just below it?" -- a bucket straddling the threshold
+    # structurally couldn't.
+    rows = [
+        {"score": 0.64, "signed_return_pct": 1.0},
+        {"score": 0.65, "signed_return_pct": 5.0},
+    ]
+    buckets = bucket_returns(rows)
+    below = next(b for b in buckets if b["bucket"] == "[0.50, 0.65)")
+    trading = next(b for b in buckets if b["bucket"] == ">= 0.65")
+    assert below["count"] == 1 and below["mean_return_pct"] == 1.0
+    assert trading["count"] == 1 and trading["mean_return_pct"] == 5.0
 
 
 def test_bucket_returns_omits_empty_buckets():
@@ -204,10 +220,12 @@ def test_ecosystem_benchmark_return_ignores_other_ecosystems():
 # --- benchmark_relative_returns ---
 
 def test_benchmark_relative_returns_not_zero_by_construction_for_a_single_dossier_ecosystem():
-    # The old bug: with only IESC's own signed return counted as the
-    # "population," its benchmark equaled itself and alpha was always
-    # exactly 0.00. Now POWL's price (no dossier, but still marked daily)
-    # is part of the benchmark, so alpha reflects something real.
+    # Two bugs, both fixed here: (1) with only dossier-having symbols in
+    # the "population," a single-dossier ecosystem's benchmark equaled its
+    # own return and alpha was always exactly 0.00; (2) even with POWL's
+    # price included, IESC being part of its OWN benchmark shrank measured
+    # alpha toward zero by 1/N. The benchmark is now "the REST of the
+    # ecosystem": for IESC, that's POWL alone.
     rows = [{
         "symbol": "IESC", "direction": "LONG", "signed_return_pct": -10.0,
         "entry_date": "2026-07-01", "horizon_days": 5,
@@ -218,8 +236,36 @@ def test_benchmark_relative_returns_not_zero_by_construction_for_a_single_dossie
     }
     ecosystems = {"IESC": "grid_datacenter", "POWL": "grid_datacenter"}
     bench = benchmark_relative_returns(rows, price_marks, ecosystems)
-    # ecosystem raw mean = mean(-10%, +10%) = 0% -> alpha = -10 - 0 = -10
-    assert bench[0]["benchmark_relative_pct"] == -10.0
+    # benchmark = POWL alone = +10% -> alpha = -10 - 10 = -20
+    assert bench[0]["benchmark_relative_pct"] == -20.0
+
+
+def test_benchmark_excludes_the_subject_symbol():
+    # Direct check on ecosystem_benchmark_return's exclusion: with the
+    # subject excluded, only the OTHER symbol's return counts.
+    price_marks = {
+        "IESC": {"2026-07-01": 100.0, "2026-07-06": 90.0},   # -10%
+        "POWL": {"2026-07-01": 50.0, "2026-07-06": 55.0},    # +10%
+    }
+    ecosystems = {"IESC": "grid_datacenter", "POWL": "grid_datacenter"}
+    result = ecosystem_benchmark_return(
+        price_marks, "2026-07-01", 5, "grid_datacenter", ecosystems, exclude_symbol="IESC"
+    )
+    assert result == 10.0
+
+
+def test_benchmark_is_none_when_subject_is_the_only_priced_symbol():
+    # A one-symbol ecosystem must produce NO benchmark (row reported as
+    # unbenchmarkable), never a fabricated 0.00 alpha from comparing the
+    # pick against itself.
+    rows = [{
+        "symbol": "IESC", "direction": "LONG", "signed_return_pct": -10.0,
+        "entry_date": "2026-07-01", "horizon_days": 5,
+    }]
+    price_marks = {"IESC": {"2026-07-01": 100.0, "2026-07-06": 90.0}}
+    ecosystems = {"IESC": "grid_datacenter"}
+    bench = benchmark_relative_returns(rows, price_marks, ecosystems)
+    assert bench[0]["benchmark_relative_pct"] is None
 
 
 def test_benchmark_relative_returns_sign_matches_short_direction():
@@ -235,9 +281,9 @@ def test_benchmark_relative_returns_sign_matches_short_direction():
     }
     ecosystems = {"AAA": "defense_tier2", "BBB": "defense_tier2"}
     bench = benchmark_relative_returns(rows, price_marks, ecosystems)
-    # raw ecosystem mean = mean(-12%, -8%) = -10% -> SHORT-signed benchmark = +10%
-    # alpha = 12 - 10 = 2
-    assert round(bench[0]["benchmark_relative_pct"], 4) == 2.0
+    # benchmark = the REST of the ecosystem = BBB alone = -8% raw
+    # -> SHORT-signed benchmark = +8% -> alpha = 12 - 8 = 4
+    assert round(bench[0]["benchmark_relative_pct"], 4) == 4.0
 
 
 def test_benchmark_relative_returns_none_when_ecosystem_unpriceable():
@@ -283,3 +329,50 @@ def test_format_report_includes_key_sections():
     assert "hit rate" in report.lower() or "Hit rate" in report
     assert "Per-symbol" in report
     assert "FORM" in report and "UCTT" in report
+
+
+# --- Statistical honesty: effective sample counts and clustered CIs ---
+
+from smartboi.forward_returns import cluster_bootstrap_ci, effective_sample_count
+
+
+def test_effective_sample_count_collapses_overlapping_windows():
+    # 10 consecutive daily rows of one thesis with a 5-day horizon are ~2
+    # independent windows, not 10 observations.
+    rows = [
+        {"symbol": "FORM", "entry_date": f"2026-07-{d:02d}"} for d in range(1, 11)
+    ]
+    assert effective_sample_count(rows, horizon_days=5) == 2
+
+
+def test_effective_sample_count_sums_across_symbols():
+    rows = [
+        {"symbol": "FORM", "entry_date": "2026-07-01"},
+        {"symbol": "UCTT", "entry_date": "2026-07-01"},
+    ]
+    assert effective_sample_count(rows, horizon_days=5) == 2
+
+
+def test_cluster_bootstrap_ci_requires_two_symbols():
+    assert cluster_bootstrap_ci({"FORM": [1.0, 2.0, 3.0]}) is None
+
+
+def test_cluster_bootstrap_ci_brackets_the_mean():
+    values = {"AAA": [4.0, 6.0], "BBB": [5.0, 7.0], "CCC": [3.0, 5.0]}
+    ci = cluster_bootstrap_ci(values)
+    assert ci is not None
+    lo, hi = ci
+    assert lo <= 5.0 <= hi  # overall mean = 5.0
+    assert lo < hi
+
+
+def test_format_report_shows_join_accounting():
+    rows = [
+        {"symbol": "FORM", "direction": "LONG", "score": 0.7, "signed_return_pct": 8.0,
+         "entry_date": "2026-07-01", "horizon_days": 5},
+    ]
+    price_marks = {"FORM": {"2026-07-01": 10.0, "2026-07-06": 10.8}}
+    report = format_report(5, rows, price_marks, {"FORM": "semi_equipment"}, attempted=4)
+    assert "1 of 4" in report
+    assert "3 unjoinable" in report
+    assert "N_eff" in report

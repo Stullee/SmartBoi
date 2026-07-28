@@ -588,7 +588,15 @@ def create_app(engine) -> web.Application:
         and deliberately narrow: it removes additions, never the curated
         universe, never a candidate, never a trade or a captured log. The UI
         confirms before calling it."""
-        result = await asyncio.to_thread(engine.reset_accepted_candidates)
+        # Runs directly on the event loop, NOT in a worker thread: it
+        # mutates live engine state (universe, spec_by_symbol, the
+        # accepted-candidates dict) that the engine's own coroutines read
+        # and write between awaits -- a thread doing the same concurrently
+        # raced them ("dictionary changed size during iteration" aborting
+        # the reset half-done, or a spec swap landing mid-_process_evidence).
+        # It's a handful of small file writes and renames; the brief event-
+        # loop stall is the price of it being atomic w.r.t. the engine.
+        result = engine.reset_accepted_candidates()
         return web.json_response({"ok": True, **result})
 
     app = web.Application()

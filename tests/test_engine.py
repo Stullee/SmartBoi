@@ -317,14 +317,33 @@ async def test_candidate_recheck_recommends_anchor_for_large_cap(engine):
     assert engine.candidates.get("ZZZZ")["recommended_as"] == "anchor"
 
 
-async def test_candidate_recheck_skips_recommendation_for_accepted_candidates(engine):
+async def test_candidate_recheck_refreshes_recommendation_for_accepted_candidates(engine):
+    # Accepted symbols must KEEP getting recommendation refreshes: the
+    # reconcile pass (demote a trade target that now screens as an anchor)
+    # acts on recommended_as, and freezing it at acceptance time meant
+    # post-acceptance drift could never be detected.
     _seed_candidate(engine, "ZZZZ", ticker="ZZZZ", name="Already Added Co")
     engine.accepted_candidates.set("ZZZZ", "tradeable")
-    engine.finnhub.market_cap_by_symbol["ZZZZ"] = 500.0
+    engine.finnhub.market_cap_by_symbol["ZZZZ"] = 500_000.0  # graduated to mega-cap
 
     await engine._run_candidate_ticker_recheck()
 
-    assert "recommended_as" not in engine.candidates.get("ZZZZ")
+    assert engine.candidates.get("ZZZZ")["recommended_as"] == "anchor"
+
+
+async def test_reconcile_demotes_but_never_promotes(engine):
+    # Demotion (tradeable -> anchor) is safe and expected; promotion
+    # (anchor -> tradeable) must NOT happen automatically -- an anchor was
+    # accepted under the liberal bar with no name-match/seen-count check.
+    engine.accepted_candidates.set("AAAA", {"as": "tradeable", "source": "auto"})
+    engine.candidates.set("AAAA", {"name": "A", "ticker": "AAAA", "recommended_as": "anchor"})
+    engine.accepted_candidates.set("BBBB", {"as": "anchor", "source": "auto"})
+    engine.candidates.set("BBBB", {"name": "B", "ticker": "BBBB", "recommended_as": "tradeable"})
+
+    engine._reconcile_accepted_types()
+
+    assert engine.accepted_candidates.get("AAAA")["as"] == "anchor"      # demoted
+    assert engine.accepted_candidates.get("BBBB")["as"] == "anchor"      # NOT promoted
 
 
 # --- Invariant: evidence is registered only on definitive handling ---
@@ -373,7 +392,7 @@ async def test_retry_after_deferred_skeptic_does_not_repropose(engine):
         "FORM", "evidence text", "FORM", "", None, "news", "reuters.com",
         "https://x/1", "h1", "2026-07-23",
     )
-    assert first is False
+    assert first == "deferred"
     assert len(engine.updater.calls) == 1
 
     engine.skeptic.queue(verdict(refuted=False))  # retry: skeptic now answers
@@ -381,7 +400,7 @@ async def test_retry_after_deferred_skeptic_does_not_repropose(engine):
         "FORM", "evidence text", "FORM", "", None, "news", "reuters.com",
         "https://x/1", "h1", "2026-07-23",
     )
-    assert second is True
+    assert second == "handled"
     # The cached proposal from the first attempt was reused -- propose_update
     # was never called a second time for the same evidence.
     assert len(engine.updater.calls) == 1
@@ -520,3 +539,237 @@ async def test_a_bank_as_a_genuine_customer_is_kept(engine):
     await engine._extract_relationships("UFPT", filing, "text")
 
     assert any(r.to_symbol == "BAC" for r in engine.graph.relationships) or "BAC" in engine.candidates.data
+
+
+# --- Regression: EDGAR extraction must not require Finnhub (optional
+# integration) -- an unguarded finnhub call crashed the whole EDGAR poll on
+# every Finnhub-less deployment whenever a filing named a company that
+# EDGAR's own name lookup couldn't resolve. ---
+
+async def test_extract_relationships_survives_missing_finnhub(engine):
+    engine.finnhub = None
+    filing = FilingEvent(
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000001", primary_document="form.htm",
+    )
+    engine.extractor.default = [{
+        "counterparty_name": "Some Private Co", "counterparty_ticker": None,
+        "rel_type": "customer", "description": "our largest customer",
+        "confidence": 0.9, "quote": "q",
+    }]
+
+    completed = await engine._extract_relationships("FORM", filing, "filing text")
+
+    assert completed is True
+    assert "SOME PRIVATE CO" in engine.candidates.data  # recorded by name, no crash
+
+
+async def test_extract_relationships_reports_deferred_when_budget_exhausted(engine):
+    filing = FilingEvent(
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000001", primary_document="form.htm",
+    )
+    engine.extractor.default = None  # budget exhausted / transient API failure
+
+    assert await engine._extract_relationships("FORM", filing, "filing text") is False
+
+
+async def test_backfill_not_marked_done_when_extraction_deferred(engine):
+    engine.settings.enable_relationship_backfill = True
+    filing = FilingEvent(
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2025-09-01",
+        accession_number="0001234567-25-000001", primary_document="form.htm",
+    )
+    engine.edgar_client.latest_filings[("FORM", "10-K")] = filing
+    engine.edgar_client.text_by_accession[filing.accession_number] = "ten-k text"
+    engine.extractor.default = None  # extraction deferred (budget/API)
+
+    await engine._run_relationship_backfill()
+
+    # The symbol must stay pending -- marking it done would silently skip
+    # its 10-K (the graph's main relationship source) until next year.
+    assert engine.backfill_state.get("FORM") is None
+
+    # Once extraction succeeds, it IS marked done.
+    engine._backfill_retry_after = 0.0
+    engine.extractor.default = []
+    await engine._run_relationship_backfill()
+    assert engine.backfill_state.get("FORM") is not None
+
+
+# --- Regression: a SIGNALED dossier whose thesis collapses (or flips) must
+# not open a paper trade from the stale status. ---
+
+async def test_signal_expired_when_new_evidence_drops_below_threshold(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+    assert engine.dossiers.load("FORM").status == "SIGNALED"
+
+    # Strong opposing evidence arrives before any trade opened: direction
+    # flips/collapses below threshold -- the signal must expire, not linger.
+    engine.updater.default = proposal(direction="SHORT", magnitude=0.9, confidence=0.9)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.9, adjusted_magnitude=0.9)
+    for i in range(3):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"bad news {i}", source_type="news",
+            source_name=f"src{i}.com", url=f"https://y/{i}", headline=f"bad{i}", published_at="2026-07-23",
+        )
+
+    dossier = engine.dossiers.load("FORM")
+    assert dossier.status in ("ACTIVE", "SIGNALED")
+    if dossier.status == "SIGNALED":
+        # If it re-signaled SHORT above threshold that's a fresh, valid
+        # signal -- but it must carry a fresh baseline for the NEW direction.
+        assert dossier.signaled_direction == dossier.direction
+
+
+async def test_no_trade_opens_when_thesis_no_longer_qualifies_at_entry(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+    dossier = engine.dossiers.load("FORM")
+    assert dossier.status == "SIGNALED"
+
+    # Simulate the thesis degrading WITHOUT the merge-path expiry running
+    # (e.g. state persisted before this fix existed): confidence collapses
+    # but status stays SIGNALED on disk.
+    dossier.confidence = 0.1
+    dossier.magnitude = 0.1
+    engine.dossiers.save(dossier)
+
+    await engine._mark_and_execute()
+
+    assert not engine.journal.has_open("FORM")
+    assert engine.dossiers.load("FORM").status == "ACTIVE"  # expired, clean slate
+
+
+# --- Regression: retry of a partially-deferred item must not re-pay LLM
+# calls for sibling targets already definitively handled (not-new/refuted),
+# and must not burn extra propagation-cooldown slots. ---
+
+async def test_retry_does_not_repay_for_already_refuted_target(engine):
+    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "test", 0.9, "2026-07-23"))
+    engine.graph.add(Relationship("INTC", "UCTT", "customer", "Intel is a customer of UCTT", "test", 0.9, "2026-07-23"))
+
+    # Pass 1: FORM's evidence is refuted (propose + skeptic paid), UCTT's
+    # skeptic call is deferred -- the item as a whole stays unregistered.
+    engine.updater.default = proposal()
+    engine.skeptic.queue(verdict(refuted=True))   # FORM: refuted, definitive
+    engine.skeptic.queue(None)                    # UCTT: deferred
+    scored = await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="intel news", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+    )
+    assert scored is False
+    updater_calls_after_first = len(engine.updater.calls)
+    skeptic_calls_after_first = len(engine.skeptic.calls)
+
+    # Pass 2 (the retry): only UCTT should cost anything -- FORM was
+    # already definitively refuted and must not be re-judged (a second
+    # nondeterministic skeptic run could accept what the first refused).
+    engine.skeptic.default = verdict(refuted=False)
+    scored = await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="intel news", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+    )
+    assert scored is True
+    assert len(engine.updater.calls) == updater_calls_after_first  # UCTT's proposal was cached; FORM not re-proposed
+    assert len(engine.skeptic.calls) == skeptic_calls_after_first + 1  # only UCTT's deferred skeptic call
+
+
+async def test_propagation_slot_not_double_counted_on_retry_of_merged_target(engine):
+    # max_propagated_evidence_per_link=1 (fixture). FORM merges on pass 1;
+    # the ITEM stays unregistered because the direct-origin target (INTC is
+    # an anchor, so origin isn't a target here) -- use two linked targets:
+    # FORM merges, UCTT defers. The retry's has_evidence fast path for FORM
+    # must NOT record a second slot for the same underlying evidence.
+    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "test", 0.9, "2026-07-23"))
+    engine.graph.add(Relationship("INTC", "UCTT", "customer", "Intel is a customer of UCTT", "test", 0.9, "2026-07-23"))
+    engine.updater.default = proposal()
+    engine.skeptic.queue(verdict(refuted=False))  # FORM: merged
+    engine.skeptic.queue(None)                    # UCTT: deferred
+
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="intel news", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+    )
+    # FORM consumed its 1 slot; window for INTC->FORM is now full.
+    now = time.monotonic()
+    assert not engine._propagation_limiter.would_allow("INTC->FORM", now)
+    events_after_first = len(engine._propagation_limiter._events["INTC->FORM"])
+
+    engine.skeptic.default = verdict(refuted=False)
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="intel news", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+    )
+    # The retry re-handles FORM via has_evidence (already merged) -- it must
+    # not append a second phantom event for the same evidence.
+    assert len(engine._propagation_limiter._events["INTC->FORM"]) == events_after_first
+
+
+# --- Regression: a malformed LLM proposal must be dropped for that dossier,
+# not crash the poll (Anthropic tool use doesn't hard-enforce the schema). ---
+
+async def test_malformed_proposal_is_dropped_not_crashing(engine):
+    engine.updater.default = {"direction": "LONG"}  # missing magnitude/confidence/horizon
+    outcome = await engine._update_dossier(
+        "FORM", "evidence text", "FORM", "", None, "news", "reuters.com",
+        "https://x/1", "h1", "2026-07-23",
+    )
+    assert outcome == "handled"
+    assert engine.dossiers.load("FORM").evidence == []
+
+
+# --- Regression: daily price marks must not depend on IB -- Finnhub quotes
+# fill in, anchors are marked too (benchmark breadth), and a day with no
+# reachable source is left DUE (retried), never marked done and lost. ---
+
+async def test_daily_price_marks_fall_back_to_finnhub_and_include_anchors(engine):
+    engine.price_feed = FakePriceFeed(connected=False)
+    engine.finnhub.quotes_by_symbol = {"FORM": 10.0, "UCTT": 20.0, "INTC": 30.0}
+
+    assert await engine._run_daily_price_marks() is True
+
+    marks = (Path(engine.settings.log_dir) / "price_marks.jsonl").read_text().splitlines()
+    marked_symbols = {__import__("json").loads(m)["symbol"] for m in marks}
+    assert marked_symbols == {"FORM", "UCTT", "INTC"}  # INTC is the anchor
+
+
+async def test_daily_price_marks_report_failure_when_no_source(engine):
+    engine.price_feed = FakePriceFeed(connected=False)
+    engine.finnhub.quotes_by_symbol = {}
+
+    assert await engine._run_daily_price_marks() is False
+    assert not (Path(engine.settings.log_dir) / "price_marks.jsonl").exists()
+
+
+# --- Regression: an article with no timestamp must keep ONE stable
+# fingerprint across days -- substituting the sliding from_date used to
+# re-bill and re-merge the same story daily. ---
+
+async def test_undated_article_is_not_reprocessed_across_polls(engine):
+    engine.finnhub.articles_by_symbol["FORM"] = [
+        NewsArticle(symbol="FORM", headline="Undated story", summary="s", source="Reuters",
+                    url="https://finnhub.io/api/news/1", published_at=""),
+    ]
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+
+    await engine._poll_news()
+    calls_after_first = len(engine.updater.calls)
+    await engine._poll_news()  # same undated article returned again (e.g. next day)
+
+    assert len(engine.updater.calls) == calls_after_first  # deduped, not re-billed
+    assert len(engine.dossiers.load("FORM").evidence) == 1

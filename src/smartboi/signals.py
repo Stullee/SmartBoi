@@ -83,10 +83,16 @@ def signal_expired(signaled_at: str, deadline_days: int, now: datetime | None = 
     return (now - signaled).days >= deadline_days
 
 
-def log_signal(log_path: Path, signal: SignalEvent) -> None:
+def log_signal(log_path: Path, signal: SignalEvent, episode: str = "") -> None:
+    """`episode` is the dossier's signaled_at timestamp: evaluation is
+    status-blind (see module docstring), so one signal EPISODE re-logs a
+    row on every newly accepted evidence item that keeps it above
+    threshold -- without an episode key, downstream event-level analysis
+    ("how did signals perform?") would count each re-log as a separate
+    signal instead of collapsing them to one event."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a") as f:
-        f.write(json.dumps(asdict(signal)) + "\n")
+        f.write(json.dumps({**asdict(signal), "episode": episode}) + "\n")
     log.info(
         "[SIGNAL] %s %s confidence=%.2f magnitude=%.2f sources=%d: %s",
         signal.direction, signal.symbol, signal.confidence, signal.magnitude,
