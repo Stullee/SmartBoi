@@ -370,27 +370,95 @@ class Engine:
         return [c.symbol for c in self.universe]
 
     @staticmethod
-    def _accepted_entry(value) -> tuple[str, str]:
-        """(as_type, source) from an accepted_candidates.json entry. Entries
-        were originally a bare "tradeable"/"anchor" string and are now a
-        {"as", "source"} dict recording whether a human or the engine
-        accepted it (see accept_candidate) -- both shapes are read so an
-        existing file keeps working untouched across the upgrade."""
+    def _accepted_entry(value) -> tuple[str, str, str]:
+        """(as_type, source, ecosystem) from an accepted_candidates.json
+        entry. Entries were originally a bare "tradeable"/"anchor" string,
+        then a {"as", "source"} dict recording whether a human or the engine
+        accepted it, and now additionally carry the ecosystem accept_candidate
+        classified them into -- every shape is read, so an existing file keeps
+        working untouched across the upgrade."""
         if isinstance(value, dict):
-            return value.get("as", "tradeable"), value.get("source", "manual")
-        return value, "manual"
+            return (
+                value.get("as", "tradeable"),
+                value.get("source", "manual"),
+                value.get("ecosystem") or "accepted",
+            )
+        return value, "manual", "accepted"
 
     def _apply_accepted_candidates(self) -> None:
+        """Rebuilds runtime-accepted symbols into the live universe at
+        startup.
+
+        The ecosystem comes from the persisted entry, not a hardcoded
+        "accepted". accept_candidate has always classified an acceptance into
+        the ecosystem of whoever disclosed it (guess_ecosystem), but only
+        stored {"as", "source"} -- so the classification lived in memory and
+        died at every restart, and this function rebuilt all of them into the
+        literal "accepted" bucket. That bucket is in _UNCLASSIFIED_ECOSYSTEMS,
+        which makes _ecosystem_targets return [] and _can_produce_evidence
+        return False, so every restart quietly re-converted the accepted
+        anchors into inert symbols whose news is never fetched. Live, that was
+        64 anchors -- and auto-accept keeps manufacturing more at up to 20 a
+        day. See _reclassify_accepted_ecosystems for the repair of entries
+        written before the ecosystem was persisted."""
         known = {c.symbol for c in self.universe}
         for symbol, value in self.accepted_candidates.data.items():
             if symbol in known:
                 continue
-            as_type, source = self._accepted_entry(value)
+            as_type, source, ecosystem = self._accepted_entry(value)
             self.universe.append(
-                CompanySpec(symbol, symbol, "accepted", signal_source_only=(as_type == "anchor"),
+                CompanySpec(symbol, symbol, ecosystem, signal_source_only=(as_type == "anchor"),
                             notes=f"Accepted ({source}) from a discovered universe candidate")
             )
             known.add(symbol)
+
+    def _reclassify_accepted_ecosystems(self) -> int:
+        """One-shot repair for acceptances written before the ecosystem was
+        persisted: re-run guess_ecosystem over each unclassified accepted
+        symbol's own discovery record and write the answer back.
+
+        Without this, every already-accepted symbol stays in the
+        "accepted" bucket forever -- persisting the field only helps symbols
+        accepted from here on, and the live deployment has a 69-symbol
+        backlog that would never be revisited (a candidate is only accepted
+        once). Runs after the universe is built so guess_ecosystem resolves
+        against curated AND already-classified accepted specs, and iterates
+        until it stops making progress, so a chain (accepted symbol
+        discovered via another accepted symbol) resolves rather than
+        depending on dict order."""
+        repaired = 0
+        for _ in range(len(self.accepted_candidates.data) or 1):
+            progressed = 0
+            for symbol, value in list(self.accepted_candidates.data.items()):
+                as_type, source, ecosystem = self._accepted_entry(value)
+                if ecosystem not in _UNCLASSIFIED_ECOSYSTEMS:
+                    continue
+                related = (self.candidates.get(symbol) or {}).get("related_to") or []
+                guessed = guess_ecosystem(related, self.spec_by_symbol)
+                if guessed in _UNCLASSIFIED_ECOSYSTEMS:
+                    continue
+                self.accepted_candidates.set(
+                    symbol, {"as": as_type, "source": source, "ecosystem": guessed}
+                )
+                spec = self.spec_by_symbol.get(symbol)
+                if spec is not None:
+                    updated = CompanySpec(
+                        spec.symbol, spec.name, guessed,
+                        signal_source_only=spec.signal_source_only, notes=spec.notes,
+                    )
+                    self.universe = [updated if c.symbol == symbol else c for c in self.universe]
+                    self.spec_by_symbol[symbol] = updated
+                progressed += 1
+            repaired += progressed
+            if not progressed:
+                break
+        if repaired:
+            log.info(
+                "[UNIVERSE] Reclassified %d previously-unclassified accepted symbol(s) into a real "
+                "ecosystem. Their news can now reach a tradeable via ecosystem-fallback propagation; "
+                "before this they were inert on every restart.", repaired,
+            )
+        return repaired
 
     def accept_candidate(self, symbol: str, as_type: str, source: str = "manual") -> CompanySpec:
         """Adds a discovered universe candidate (see
@@ -448,7 +516,15 @@ class Engine:
         # recorded, so an auto-accepted symbol is distinguishable from one a
         # human chose -- _apply_accepted_candidates reads both shapes, so
         # existing files written before this keep working untouched.
-        self.accepted_candidates.set(symbol, {"as": as_type, "source": source})
+        #
+        # The ECOSYSTEM is persisted alongside. It used not to be, so this
+        # classification existed only in memory: the very next restart
+        # rebuilt the symbol into the flat "accepted" bucket, which
+        # _ecosystem_targets treats as unclassified and refuses to propagate
+        # from. Every acceptance was silently undone within hours.
+        self.accepted_candidates.set(
+            symbol, {"as": as_type, "source": source, "ecosystem": ecosystem}
+        )
         promoted = self._promote_pending_edges(symbol)
         log.info("[CANDIDATE] %s accepted (%s) into the universe as %s -- polled starting next cycle, "
                  "%d disclosed relationship(s) written into the graph.", symbol, source, as_type, promoted)
@@ -561,6 +637,10 @@ class Engine:
     async def start(self) -> None:
         self._check_model_provenance()
         self._seed_graph()
+        # Repairs acceptances written before the ecosystem was persisted (see
+        # _apply_accepted_candidates). Runs here rather than in __init__ so it
+        # resolves against the seeded graph and the fully-built universe.
+        self._reclassify_accepted_ecosystems()
 
         if self.settings.enable_edgar_ingestion and self.settings.edgar_user_agent.strip():
             self.edgar_client = EdgarClient(self.settings.edgar_user_agent, DATA_DIR / "edgar_cik_cache.json")
@@ -2607,11 +2687,18 @@ class Engine:
         A demoted symbol's dossier is archived by the same pass that
         handles any other orphan."""
         for symbol, value in list(self.accepted_candidates.data.items()):
-            as_type, source = self._accepted_entry(value)
+            as_type, source, ecosystem = self._accepted_entry(value)
             recommended = (self.candidates.get(symbol) or {}).get("recommended_as")
             if recommended != "anchor" or recommended == as_type:
                 continue
-            self.accepted_candidates.set(symbol, {"as": recommended, "source": source})
+            # The ecosystem is carried through, not dropped: this pass
+            # rewrites the entry wholesale, so omitting it would silently
+            # demote a classified symbol back into the inert "accepted"
+            # bucket -- the exact failure _apply_accepted_candidates was
+            # just fixed for.
+            self.accepted_candidates.set(
+                symbol, {"as": recommended, "source": source, "ecosystem": ecosystem}
+            )
             spec = self.spec_by_symbol.get(symbol)
             if spec is not None:
                 corrected = CompanySpec(spec.symbol, spec.name, spec.ecosystem,
