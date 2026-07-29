@@ -31,6 +31,7 @@ from smartboi.screen import (
 )
 from smartboi.tools import run_diagnostics, run_event_study, run_forward_returns, run_screen
 from smartboi.status import (
+    gather_coverage,
     gather_dossiers,
     gather_graph_stats,
     gather_paper_trade_stats,
@@ -266,10 +267,52 @@ function renderGraph(g) {
   }).join("");
 }
 
+// Coverage: how much of the TRADEABLE universe is actually live, which is a
+// different question from how many symbols are configured. A dossier count
+// far below the tradeable count means most of the universe is dark, not that
+// the market is quiet -- and the two connectivity rows say why.
+function renderCoverage(c) {
+  if (!c) return "";
+  function pct(n, d) { return d ? Math.round(n / d * 100) + "%" : "-"; }
+  function bar(n, d, label, hint) {
+    var p = d ? Math.min(100, n / d * 100) : 0;
+    // Amber below half, green at four fifths -- these are progress numbers,
+    // not alarms, so the scale is deliberately forgiving.
+    var colour = p >= 80 ? "#66bb6a" : (p >= 50 ? "#ffa726" : "#ef5350");
+    return '<div style="margin:0.55rem 0">' +
+      '<div style="display:flex;justify-content:space-between;font-size:0.85rem">' +
+        '<span>' + label + '</span>' +
+        '<span style="opacity:0.75">' + n + ' / ' + d + '  (' + pct(n, d) + ')</span>' +
+      '</div>' +
+      '<div style="height:7px;border-radius:4px;background:rgba(128,128,128,0.22);margin-top:0.25rem">' +
+        '<div style="height:7px;border-radius:4px;width:' + p + '%;background:' + colour + '"></div>' +
+      '</div>' +
+      (hint ? '<div style="font-size:0.75rem;opacity:0.55;margin-top:0.2rem">' + hint + '</div>' : "") +
+      '</div>';
+  }
+  var html = '<div class="card" style="grid-column:1/-1">';
+  html += '<div class="label">Coverage &mdash; ' + c.tradeables + ' tradeable, ' + c.anchors + ' anchors</div>';
+  html += bar(c.tradeables_with_dossier, c.tradeables, "Tradeables with a dossier",
+              "A thesis has started accumulating. This is the number to watch.");
+  html += bar(c.tradeables_connected, c.tradeables, "Tradeables connected to the graph",
+              "An unconnected tradeable can never receive an anchor's news &mdash; it can only build " +
+              "a dossier from its own coverage, and these names are chosen for having almost none.");
+  html += bar(c.anchors_live, c.anchors, "Anchors linked to a tradeable",
+              "An anchor is never its own analysis target, so one with no link to a tradeable is inert: " +
+              "its news reaches nothing and is discarded unread.");
+  if (c.tradeables_unconnected.length) {
+    html += '<div style="font-size:0.75rem;opacity:0.6;margin-top:0.5rem">Unconnected tradeables: ' +
+      c.tradeables_unconnected.join(" ") + '</div>';
+  }
+  html += "</div>";
+  return html;
+}
+
 function render(data) {
   var html = "";
   html += renderCapabilities(data.capabilities);
   html += '<div class="cards" style="margin-top:0.75rem">';
+  html += renderCoverage(data.coverage);
   html += '<div class="card"><div class="label">Universe</div><div class="value">' + data.universe_size + '</div></div>';
   html += '<div class="card"><div class="label">Graph edges</div><div class="value">' + data.graph.edge_count + '</div></div>';
   html += '<div class="card"><div class="label">Active dossiers</div><div class="value">' + data.dossiers.length + '</div></div>';
@@ -471,6 +514,7 @@ async def _status_payload(engine) -> dict:
             "ib": engine.price_feed is not None,
         },
         "universe_size": len(engine.symbol_list),
+        "coverage": gather_coverage(engine.universe, engine.graph, engine.dossiers),
         "dossiers": gather_dossiers(engine.dossiers),
         "graph": gather_graph_stats(engine.graph),
         "open_paper_trades": open_trades,

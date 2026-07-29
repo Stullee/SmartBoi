@@ -638,7 +638,30 @@ snapshot/price logs. Neither changes a dossier, the universe, or any trade,
 and one runs at a time so a screen can't outrun Finnhub's rate limit
 alongside the engine's own polling.
 
-Open `http://localhost:8100/` (or `DASHBOARD_PORT`): which integrations are
+Open `http://localhost:8100/` (or `DASHBOARD_PORT`). At the top is a
+**Coverage** panel -- how much of the *tradeable* universe is actually live,
+which is a different question from how many symbols are configured:
+
+- **Tradeables with a dossier**: how many trade targets have a thesis
+  accumulating at all. The headline number. Far below the tradeable count
+  means most of the universe is dark, not that the market is quiet.
+- **Tradeables connected to the graph**: an unconnected tradeable can never
+  receive an anchor's news. It can only build a dossier from its own
+  coverage -- and these names are selected for having almost none, so in
+  practice it never will.
+- **Anchors linked to a tradeable**: an anchor is never its own analysis
+  target, so one with no such link is inert by construction. Its news
+  resolves to zero targets in `_process_evidence` and is fingerprinted and
+  discarded unread, however much of it arrives.
+
+Those three together are what explains a gap between ingestion volume and
+signal output. Measured live on 2026-07-29, before the edge-promotion fix:
+16 dossiers against 48 tradeables, 20 of 48 tradeables connected, and only
+26 of 130 anchors live -- 10,373 dedup fingerprints against 52 LLM calls a
+day, with the loudest names in the universe (NVDA, MSFT, AMZN, GOOGL, TSM,
+AMAT...) fetched hourly and binned unread.
+
+Below that: which integrations are
 enabled, the relationship graph (grouped by filer -- each company's own
 disclosed customers/suppliers/competitors/regulators together, strongest
 confidence first, rather than one flat table sorted by extraction order),
