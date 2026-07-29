@@ -408,3 +408,62 @@ def test_backing_decays_away_with_the_evidence_that_carried_it():
 
     recompute_decay(dossier, NOW + timedelta(days=90))
     assert dossier.has_disclosed_link_evidence is False
+
+
+# --- Magnitude accumulates with corroboration, exactly as confidence does.
+# It used to be a bare max() -- the one aggregator invariant to N -- which
+# made a strategy defined as accumulating small second-order effects unable
+# to accumulate the very quantity that sizes the trade. ---
+
+def test_magnitude_grows_with_independent_sources():
+    dossier = Dossier(symbol="THRM")
+    for i, src in enumerate(("reuters.com", "bloomberg.com", "wsj.com")):
+        merge_evidence(dossier, _evidence(magnitude=0.22, source_name=src, evidence_id=f"e{i}"), now=NOW)
+
+    assert dossier.independent_source_count == 3
+    # 0.22 * (1 + 0.25*2) = 0.33 -- the live THRM case, which crossed a 0.2
+    # signal bar at confidence 0.80 only because of this term.
+    assert dossier.magnitude == pytest.approx(0.33)
+
+
+def test_a_single_source_gets_no_magnitude_bonus():
+    """A corroboration bonus without corroboration would just be a blanket
+    threshold cut wearing a disguise."""
+    dossier = Dossier(symbol="KULR")
+    merge_evidence(dossier, _evidence(magnitude=0.25), now=NOW)
+
+    assert dossier.independent_source_count == 1
+    assert dossier.magnitude == pytest.approx(0.25)
+
+
+def test_republishes_from_one_publisher_do_not_inflate_magnitude():
+    """Keyed to DISTINCT source names, not item count -- otherwise N
+    restatements of one wire story would size the trade."""
+    dossier = Dossier(symbol="SIF")
+    for i in range(4):
+        merge_evidence(dossier, _evidence(magnitude=0.28, source_name="reuters.com",
+                                          evidence_id=f"e{i}"), now=NOW)
+
+    assert dossier.independent_source_count == 1
+    assert dossier.magnitude == pytest.approx(0.28)
+
+
+def test_magnitude_is_capped_at_one():
+    dossier = Dossier(symbol="BIG")
+    for i, src in enumerate(("a.com", "b.com", "c.com", "d.com", "e.com")):
+        merge_evidence(dossier, _evidence(magnitude=0.9, source_name=src, evidence_id=f"e{i}"), now=NOW)
+
+    assert dossier.magnitude == 1.0
+
+
+def test_corroboration_only_counts_the_agreeing_side():
+    """Opposing evidence must not size the trade it argues against."""
+    dossier = Dossier(symbol="X")
+    merge_evidence(dossier, _evidence(direction="LONG", magnitude=0.3, confidence=0.9,
+                                      source_name="a.com", evidence_id="e1"), now=NOW)
+    merge_evidence(dossier, _evidence(direction="SHORT", magnitude=0.3, confidence=0.2,
+                                      source_name="b.com", evidence_id="e2"), now=NOW)
+
+    assert dossier.direction == "LONG"
+    assert dossier.independent_source_count == 1
+    assert dossier.magnitude == pytest.approx(0.3)

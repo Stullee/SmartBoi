@@ -147,6 +147,35 @@ _MAX_PENDING_EDGES = 12
 _MAX_REL_DESCRIPTION = 500
 
 
+# Ticker shapes that are NOT the operating-company common stock this system
+# builds a thesis about, and must never become trade targets:
+#
+# - a hyphen (or dot) marks a preferred series or a share class: SCE-PN is a
+#   Southern California Edison preferred, TAP-A a Molson Coors class share.
+#   A preferred is a fixed-income-like instrument -- it does not respond to
+#   an operating catalyst the way the common does, so a thesis built from
+#   customer-concentration news is simply not about that security.
+# - a five-letter symbol ending in Y or F is the OTC ADR / foreign-ordinary
+#   convention (SCRNY, CAJPY, MBGAF, BMWYY): thinly traded, often no SEC
+#   filings at all, and priced off an overnight home market.
+#
+# All of these remain perfectly good ANCHORS -- the underlying company's news
+# still propagates. Confirmed live: SCE-PN, TCPA, SCRNY and KODK were
+# auto-accepted as TRADEABLE, and SCE-PN accrued the fourth-highest dossier
+# score on the board off a utility bond-issuance story.
+def is_common_equity(symbol: str) -> bool:
+    return _non_common_reason(symbol) == ""
+
+
+def _non_common_reason(symbol: str) -> str:
+    symbol = symbol.upper()
+    if "-" in symbol or "." in symbol:
+        return "preferred series or share class"
+    if len(symbol) == 5 and symbol[-1] in ("Y", "F"):
+        return "OTC ADR or foreign ordinary"
+    return ""
+
+
 def _clamped_confidence(value, default: float = 0.5) -> float:
     """The extractor's confidence, coerced into [0, 1]. Anthropic tool use
     does not hard-enforce the declared schema, so this must survive a
@@ -327,6 +356,12 @@ class Engine:
         # no diffusion lag left to trade.
         entry = self.candidates.get(symbol) or {}
         recommended = entry.get("recommended_as")
+        if as_type == "tradeable" and not is_common_equity(symbol):
+            raise ValueError(
+                f"{symbol} does not look like common equity ({_non_common_reason(symbol)}). "
+                "Add it as an anchor instead -- the underlying company's news still propagates, "
+                "and the thesis this system builds is about operating-company equity."
+            )
         if as_type == "tradeable" and recommended == "anchor":
             raise ValueError(
                 f"{symbol} screens as an ANCHOR, not a trade target "
@@ -648,7 +683,7 @@ class Engine:
         # before the entry gate ever looked at it.
         if self._daily_pass_due("decay_pass"):
             self._archive_orphaned_dossiers()
-            self._run_decay_pass()
+            await self._run_decay_pass()
             self._mark_daily_pass_done("decay_pass")
         # Both daily passes are marked done AFTER a successful run, not
         # before: forward data can't be backfilled, so a pass that raised
@@ -740,6 +775,15 @@ class Engine:
         for symbol in self.symbol_list:
             if await self._is_unknown_to_edgar(symbol):
                 continue
+            # Deliberately NOT gated on _can_produce_evidence, unlike the
+            # news poll. An anchor's own 10-K/10-Q is how that anchor gets
+            # its edges in the first place (ENTG->TSM, MRNA->MRK, FDX->UPS
+            # were all discovered this way), so skipping edge-less anchors
+            # here would be self-locking: no edge -> never polled -> never
+            # extracted -> never gains an edge. The wasted work when a
+            # filing reaches no dossier is one HTTP fetch, not an LLM call
+            # (_process_evidence resolves zero targets and returns without
+            # scoring), and that is the correct price for graph discovery.
             try:
                 filings = await self.edgar_client.recent_filings(symbol, self.settings.edgar_forms_set, since_date)
             except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
@@ -1495,6 +1539,28 @@ class Engine:
                 "suppressing real signal.",
             )
 
+        if not targets:
+            # No target resolved. WHY decides whether this item is finished
+            # or merely postponed, and conflating the two silently destroyed
+            # evidence: a True return makes the caller register the dedup
+            # fingerprint, and a registered fingerprint is never reconsidered.
+            #
+            # Throttled-to-empty is the damaging case. The propagation
+            # cooldown is a RATE LIMIT, not a filter -- but when every link
+            # from a busy origin was inside its window, `targets` came back
+            # empty and the article was dropped permanently rather than
+            # retried after the window rolled off. That preferentially
+            # destroyed evidence from the most active anchors, which is
+            # exactly the evidence worth having.
+            if throttled:
+                log.info("%s: all %d propagation target(s) are inside the cooldown window -- "
+                         "leaving this item unregistered so it is retried once the window rolls off.",
+                         origin_symbol, throttled)
+                return False
+            log.debug("%s: no propagation target (no edge to a tradeable) -- nothing to score.",
+                      origin_symbol)
+            return True
+
         all_definitive = True
         for target_symbol, relationship_note, relationship_confidence in targets:
             outcome = await self._update_dossier(
@@ -1612,6 +1678,13 @@ class Engine:
             if proposed is None:
                 return self._mark_handled(proposal_key)  # malformed -- dropping is definitive
             if not proposed["is_new_information"]:
+                # Logged like its siblings (malformed warns, refuted infos).
+                # This is the only drop point that costs exactly ONE LLM call
+                # rather than two, so without a line here the daily call
+                # count cannot be decomposed from the outside -- and the
+                # updater prompt cannot be tuned without knowing what
+                # fraction of items it silently discards.
+                log.info("%s: evidence judged not new information -- not merged.", target_symbol)
                 return self._mark_handled(proposal_key)
             self._pending_proposals[proposal_key] = (proposed, time.monotonic())
 
@@ -1661,28 +1734,7 @@ class Engine:
         signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources,
                           self.settings.min_independent_sources_news_only)
         if signal is not None:
-            if dossier.status == "ACTIVE" or dossier.direction != dossier.signaled_direction:
-                # A fresh signal (or a thesis that flipped direction while
-                # still SIGNALED-but-unopened) gets a fresh price baseline --
-                # see _snapshot_signal_price and _try_open_from_signal below.
-                # Status/baseline are set BEFORE logging so every logged
-                # signal row carries its episode key (signaled_at) and
-                # re-logs of one episode can be collapsed downstream.
-                dossier.status = "SIGNALED"
-                await self._snapshot_signal_price(dossier)
-                self.dossiers.save(dossier)
-                # Pull the next price poll forward to the entry cadence
-                # rather than letting this wait up to price_poll_interval_sec
-                # (6h) for its first entry evaluation.
-                self._entry_pending = True
-            log_signal(Path(self.settings.log_dir) / "signals.jsonl", signal, episode=dossier.signaled_at)
-            await self.alerts.send(
-                "signal",
-                f"{signal.direction} signal: {signal.symbol}",
-                f"confidence={signal.confidence:.2f} magnitude={signal.magnitude:.2f} "
-                f"sources={signal.independent_source_count}. {signal.thesis_summary}",
-                asdict(signal),
-            )
+            await self._fire_signal(dossier, signal)
         elif dossier.status == "SIGNALED" and not self.journal.has_open(target_symbol):
             # Newly merged evidence dropped the thesis below the signal bar
             # (or flipped it) while it sat SIGNALED-but-unopened. Left
@@ -1694,6 +1746,42 @@ class Engine:
         return "handled"
 
     # --- Price marking / hypothetical execution ---
+
+    async def _fire_signal(self, dossier: Dossier, signal) -> None:
+        """Logs a signal and, for a fresh episode, flips the dossier to
+        SIGNALED with a fresh price baseline.
+
+        Shared by the two paths that can produce one: newly merged evidence
+        crossing the bar, and the daily decay pass re-scoring an existing
+        dossier. The decay path used to be able to EXPIRE a signal but never
+        to fire one, so a dossier that came to qualify without new evidence
+        -- because decay lifted a contested thesis, or because the bar
+        itself moved -- sat ACTIVE indefinitely with nothing to re-evaluate
+        it. Confirmed live: DCO at score 0.288 against a 0.2 threshold with
+        both source bars satisfied, ACTIVE, waiting for an article that
+        might never come."""
+        if dossier.status == "ACTIVE" or dossier.direction != dossier.signaled_direction:
+            # A fresh signal (or a thesis that flipped direction while still
+            # SIGNALED-but-unopened) gets a fresh price baseline -- see
+            # _snapshot_signal_price and _try_open_from_signal. Status and
+            # baseline are set BEFORE logging so every logged signal row
+            # carries its episode key (signaled_at) and re-logs of one
+            # episode can be collapsed downstream.
+            dossier.status = "SIGNALED"
+            await self._snapshot_signal_price(dossier)
+            self.dossiers.save(dossier)
+            # Pull the next price poll forward to the entry cadence rather
+            # than letting this wait up to price_poll_interval_sec (6h) for
+            # its first entry evaluation.
+            self._entry_pending = True
+        log_signal(Path(self.settings.log_dir) / "signals.jsonl", signal, episode=dossier.signaled_at)
+        await self.alerts.send(
+            "signal",
+            f"{signal.direction} signal: {signal.symbol}",
+            f"confidence={signal.confidence:.2f} magnitude={signal.magnitude:.2f} "
+            f"sources={signal.independent_source_count}. {signal.thesis_summary}",
+            asdict(signal),
+        )
 
     async def _snapshot_signal_price(self, dossier: Dossier) -> None:
         """Records the price the moment a dossier becomes SIGNALED, so
@@ -1958,16 +2046,32 @@ class Engine:
             dossier.has_disclosed_link_evidence,
         )
 
-    def _run_decay_pass(self) -> None:
+    async def _run_decay_pass(self) -> None:
         """Once a day, re-scores every dossier's aggregate confidence/
         magnitude/independent_source_count against its EXISTING evidence
         with no new evidence required -- otherwise a dormant dossier (no
         fresh news landing on it) would keep yesterday's confidence
         forever. See dossier.py's evidence_weight/evidence_is_stale for the
-        actual decay curve. A SIGNALED-but-not-yet-entered dossier that
-        decays below the signal threshold is expired back to ACTIVE (the
-        thesis is going cold without ever getting a confirmed entry); once
-        a paper trade has actually opened, decay no longer touches that
+        actual decay curve.
+
+        Re-scoring can move a dossier ACROSS the signal bar in EITHER
+        direction, and both are acted on here:
+
+        - a SIGNALED-but-unentered dossier that falls below is expired back
+          to ACTIVE (the thesis is going cold without ever getting a
+          confirmed entry);
+        - an ACTIVE dossier that now clears it signals.
+
+        The second case was missing, and it is not hypothetical. Evidence
+        merging is the only other thing that evaluates a dossier, so
+        anything that comes to qualify WITHOUT new evidence -- decay lifting
+        a contested thesis as the opposing side ages out faster, or the bar
+        itself moving under it -- had nothing to re-evaluate it and sat
+        ACTIVE indefinitely. Confirmed live: DCO at score 0.288 against a
+        0.2 threshold with both source bars satisfied, sitting ACTIVE,
+        waiting for an article that might never come.
+
+        Once a paper trade has actually opened, decay no longer touches that
         dossier -- the open trade has its own stop/target/horizon."""
         now = datetime.now(timezone.utc)
         for symbol in self.dossiers.all_symbols():
@@ -1983,16 +2087,32 @@ class Engine:
             # whose scores had settled could never persist them.
             before = self._decay_fingerprint(dossier)
             recompute_decay(dossier, now)
-            after = self._decay_fingerprint(dossier)
-            if before == after:
+            changed = before != self._decay_fingerprint(dossier)
+            if changed:
+                self.dossiers.save(dossier)
+
+            # Evaluated on EVERY pass, not only when the score moved. A
+            # dossier can sit above the bar with perfectly stable numbers --
+            # nothing decaying, no new evidence -- and it still needs to
+            # signal. Gating this on `changed` (as an earlier version did)
+            # reproduced the original bug in a subtler form: the one dossier
+            # that most obviously qualified was the one whose score had
+            # settled, so it was skipped every single day. evaluate() is a
+            # pure function over fields already in hand, so running it
+            # unconditionally costs nothing.
+            if self.journal.has_open(symbol):
                 continue
-            if dossier.status == "SIGNALED" and not self.journal.has_open(symbol):
-                signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources,
-                                  self.settings.min_independent_sources_news_only)
-                if signal is None:
+            signal = evaluate(dossier, self.settings.signal_confidence_threshold,
+                              self.settings.min_independent_sources,
+                              self.settings.min_independent_sources_news_only)
+            if signal is None:
+                if dossier.status == "SIGNALED":
                     self._expire_signal(dossier, self._below_bar_reason(dossier, "on the daily decay pass"))
-                    continue
-            self.dossiers.save(dossier)
+            elif dossier.status == "ACTIVE":
+                log.info("[SIGNAL] %s: qualifies on the daily decay pass with no new evidence "
+                         "(score=%.3f, sources=%d).", symbol,
+                         dossier.confidence * dossier.magnitude, dossier.independent_source_count)
+                await self._fire_signal(dossier, signal)
 
     # --- Forward-validation capture (Phase A): daily dossier score
     # snapshots and daily price marks, the raw material for eventually

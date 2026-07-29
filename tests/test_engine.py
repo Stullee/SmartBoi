@@ -13,7 +13,7 @@ import pytest
 
 from smartboi.config import Settings
 from smartboi.edgar import FilingEvent
-from smartboi.engine import Engine
+from smartboi.engine import Engine, is_common_equity
 from smartboi.graph import Relationship
 from smartboi.news import NewsArticle
 
@@ -1034,3 +1034,151 @@ async def test_undated_article_is_not_reprocessed_across_polls(engine):
 
     assert len(engine.updater.calls) == calls_after_first  # deduped, not re-billed
     assert len(engine.dossiers.load("FORM").evidence) == 1
+
+
+# --- The decay pass could expire a signal but never fire one, so a dossier
+# that came to qualify WITHOUT new evidence (decay lifting a contested
+# thesis, or the bar moving under it) sat ACTIVE with nothing to re-evaluate
+# it. Evidence merging was the only other evaluator. Confirmed live: DCO at
+# score 0.288 against a 0.2 threshold with both source bars satisfied. ---
+
+async def test_decay_pass_fires_a_signal_for_a_newly_qualifying_dossier(engine):
+    from smartboi.dossier import Dossier, EvidenceRecord, merge_evidence
+
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    dossier = Dossier(symbol="FORM")
+    for i, src in enumerate(("reuters.com", "bloomberg.com")):
+        merge_evidence(dossier, EvidenceRecord(
+            evidence_id=f"e{i}", source_type="8-K", source_name=src, url="u", headline="h",
+            published_at="2026-07-28T00:00:00+00:00", origin_symbol="FORM", is_propagated=False,
+            relationship_note="", direction="LONG", magnitude=0.9, confidence=0.9,
+            horizon_days=20, reasoning="r", skeptic_note="",
+        ))
+    dossier.status = "ACTIVE"
+    engine.dossiers.save(dossier)
+
+    await engine._run_decay_pass()
+
+    reloaded = engine.dossiers.load("FORM")
+    assert reloaded.status == "SIGNALED"
+    assert reloaded.signaled_at
+    assert engine._entry_pending is True
+    signals = (Path(engine.settings.log_dir) / "signals.jsonl").read_text().splitlines()
+    assert len(signals) == 1
+
+
+async def test_decay_pass_does_not_signal_a_dossier_with_an_open_trade(engine):
+    """An open paper trade owns its own stop/target/horizon -- re-signalling
+    underneath it would log a second episode for a position already taken."""
+    from smartboi.dossier import Dossier, EvidenceRecord, merge_evidence
+
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    dossier = Dossier(symbol="FORM")
+    for i, src in enumerate(("reuters.com", "bloomberg.com")):
+        merge_evidence(dossier, EvidenceRecord(
+            evidence_id=f"e{i}", source_type="8-K", source_name=src, url="u", headline="h",
+            published_at="2026-07-28T00:00:00+00:00", origin_symbol="FORM", is_propagated=False,
+            relationship_note="", direction="LONG", magnitude=0.9, confidence=0.9,
+            horizon_days=20, reasoning="r", skeptic_note="",
+        ))
+    engine.dossiers.save(dossier)
+    engine.journal.open("FORM", "LONG", 10.0, 8.0, 16.0, 20, "t", 0.9, 2, [])
+
+    await engine._run_decay_pass()
+
+    assert not (Path(engine.settings.log_dir) / "signals.jsonl").exists()
+
+
+# --- The propagation cooldown is a RATE LIMIT, not a filter. When every link
+# from a busy origin was inside its window, targets came back empty and the
+# caller registered the dedup fingerprint -- destroying the item permanently
+# rather than retrying it once the window rolled off. ---
+
+async def test_evidence_throttled_to_zero_targets_is_retried_not_discarded(engine):
+    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "t", 0.9, "2026-07-23"))
+    engine.updater.default = proposal()
+    engine.skeptic.default = verdict(refuted=False)
+
+    # max_propagated_evidence_per_link=1 in the fixture: the first item
+    # consumes INTC->FORM's only slot.
+    assert await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="first", source_type="news", source_name="reuters.com",
+        url="https://x/1", headline="h1", published_at="2026-07-23") is True
+
+    # The second finds every link throttled -> zero targets. It must report
+    # NOT-definitive so its fingerprint stays unregistered and it is retried.
+    assert await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="second", source_type="news", source_name="reuters.com",
+        url="https://x/2", headline="h2", published_at="2026-07-23") is False
+
+
+async def test_evidence_for_an_unconnected_anchor_is_definitively_done(engine):
+    """Empty because there is no edge is genuinely finished -- retrying it
+    forever would re-fetch the same article on every poll for nothing."""
+    assert await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="x", source_type="news", source_name="reuters.com",
+        url="https://x/3", headline="h3", published_at="2026-07-23") is True
+
+
+async def test_decay_pass_signals_a_dossier_whose_score_has_not_moved(engine):
+    """The regression that hid inside the first version of this fix: gating
+    the evaluation on "the score changed" skips exactly the dossier that
+    most obviously qualifies -- a stable one sitting above the bar with
+    nothing decaying. DCO sat there for a day."""
+    from smartboi.dossier import Dossier, EvidenceRecord, merge_evidence
+
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    dossier = Dossier(symbol="FORM")
+    for i, src in enumerate(("reuters.com", "bloomberg.com")):
+        merge_evidence(dossier, EvidenceRecord(
+            evidence_id=f"e{i}", source_type="8-K", source_name=src, url="u", headline="h",
+            published_at="2026-07-28T00:00:00+00:00", origin_symbol="FORM", is_propagated=False,
+            relationship_note="", direction="LONG", magnitude=0.9, confidence=0.9,
+            horizon_days=20, reasoning="r", skeptic_note="",
+        ))
+    engine.dossiers.save(dossier)
+
+    # First pass fires it; reset to ACTIVE so the second pass sees an
+    # unchanged score (nothing has decayed between two back-to-back runs).
+    await engine._run_decay_pass()
+    reset = engine.dossiers.load("FORM")
+    engine._reset_to_active(reset)
+    engine.dossiers.save(reset)
+
+    await engine._run_decay_pass()
+
+    assert engine.dossiers.load("FORM").status == "SIGNALED"
+
+
+# --- Preferred series, share classes and OTC ADR lines are not the
+# operating-company common stock this system builds a thesis about.
+# Confirmed live: SCE-PN (a Southern California Edison preferred) was
+# auto-accepted as TRADEABLE and accrued the fourth-highest dossier score on
+# the board off a utility bond-issuance story. ---
+
+def test_a_preferred_series_is_refused_as_a_trade_target(engine):
+    engine.candidates.set("SCE-PN", {"name": "Southern California Edison", "ticker": "SCE-PN",
+                                     "recommended_as": "tradeable", "seen_count": 3})
+    with pytest.raises(ValueError, match="preferred series or share class"):
+        engine.accept_candidate("SCE-PN", "tradeable")
+
+
+def test_an_otc_adr_line_is_refused_as_a_trade_target(engine):
+    engine.candidates.set("SCRNY", {"name": "Screen Holdings", "ticker": "SCRNY",
+                                    "recommended_as": "tradeable", "seen_count": 3})
+    with pytest.raises(ValueError, match="OTC ADR or foreign ordinary"):
+        engine.accept_candidate("SCRNY", "tradeable")
+
+
+def test_the_same_symbols_are_perfectly_good_anchors(engine):
+    """The underlying company's news still propagates -- only the position
+    is refused, not the information."""
+    engine.candidates.set("SCE-PN", {"name": "Southern California Edison", "ticker": "SCE-PN",
+                                     "recommended_as": "anchor", "seen_count": 3})
+    spec = engine.accept_candidate("SCE-PN", "anchor")
+    assert spec.signal_source_only is True
+
+
+def test_ordinary_common_stock_is_unaffected(engine):
+    for symbol in ("DCO", "THRM", "PLAB", "KODK", "GOOGL"):
+        assert is_common_equity(symbol), symbol
