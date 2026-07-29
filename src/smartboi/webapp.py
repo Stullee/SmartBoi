@@ -29,7 +29,13 @@ from smartboi.screen import (
     DEFAULT_MAX_CAP_MUSD as SCREEN_MAX_CAP_MUSD,
     DEFAULT_MIN_CAP_MUSD as SCREEN_MIN_CAP_MUSD,
 )
-from smartboi.tools import run_diagnostics, run_event_study, run_forward_returns, run_screen
+from smartboi.tools import (
+    run_diagnostics,
+    run_event_study,
+    run_forward_returns,
+    run_screen,
+    run_supplier_research,
+)
 from smartboi.status import (
     gather_coverage,
     gather_dossiers,
@@ -120,12 +126,19 @@ _INDEX_HTML = """<!doctype html>
   <button id="btn-screen">Screen candidates</button>
   <button id="btn-analyze">Forward-return report</button>
   <button id="btn-event-study">Signal event study</button>
+  <button id="btn-research">Research anchor suppliers (web)</button>
   <button id="btn-diagnostics">Diagnostics bundle</button>
   <button id="btn-rebuild-graph">Rebuild relationship graph</button>
   <button id="btn-reset" style="border-color:rgba(239,83,80,0.5)">Reset added symbols</button>
 </div>
 <div class="toolhint">The first three are read-only: screening does market-cap/analyst lookups, the other two
-  read already-persisted state. None changes a dossier, the universe, or any trade, and the diagnostics bundle is
+  read already-persisted state. <b>Research anchor suppliers</b> runs web searches to find small-cap counterparties
+  of your anchors &mdash; the direction SEC filings structurally never disclose, since a giant's 10-K names its big
+  customers, not its small suppliers. It writes universe <i>candidates</i> only and never a relationship edge: a
+  web-sourced link is a lead, not a disclosure, and edges at disclosed confidence are what satisfy the corroboration
+  bar that fires trades. Accept a candidate and its own 10-K is backfilled, which is where a real edge comes from.
+  It costs LLM budget (web search plus one call per anchor), covers ten anchors a run &mdash; most-inert first
+  &mdash; and skips ones already researched, so re-run to continue. None changes a dossier, the universe, or any trade, and the diagnostics bundle is
   safe to paste &mdash; credentials and personal data are omitted and log lines are scrubbed.
   <b>Reset added symbols</b> is the one that changes things: it removes every symbol added at runtime, returning the
   universe to the curated list, and archives (never deletes) the dossiers that orphans. It asks first.</div>
@@ -383,7 +396,8 @@ var TOOL_TIMEOUT_MS = 300000;
 function runTool(path, body, button) {
   var out = document.getElementById("tool-output");
   var buttons = [document.getElementById("btn-screen"), document.getElementById("btn-analyze"),
-                 document.getElementById("btn-event-study"), document.getElementById("btn-diagnostics")];
+                 document.getElementById("btn-event-study"), document.getElementById("btn-diagnostics"),
+                 document.getElementById("btn-research")];
   buttons.forEach(function(b) { b.disabled = true; });
   out.style.display = "block";
   out.textContent = "Running… (this can take a few minutes for a long ticker list)";
@@ -429,6 +443,14 @@ document.getElementById("btn-event-study").addEventListener("click", function() 
 });
 document.getElementById("btn-diagnostics").addEventListener("click", function() {
   runTool("tools/diagnostics", {}, this);
+});
+document.getElementById("btn-research").addEventListener("click", function() {
+  if (!confirm("Research the 10 most inert anchors for small-cap suppliers?\\n\\n" +
+      "This spends LLM budget (web search + one call per anchor) and can take a few minutes. " +
+      "It adds universe CANDIDATES for your review; it never adds a symbol or a relationship edge.")) {
+    return;
+  }
+  runTool("tools/supplier-research", {}, this);
 });
 document.getElementById("btn-rebuild-graph").addEventListener("click", function() {
   if (!confirm("Re-extract relationships from every tradeable's latest 10-K?\\n\\n" +
@@ -628,6 +650,20 @@ def create_app(engine) -> web.Application:
 
         return await _run_tool(run)
 
+    async def handle_tool_supplier_research(request: web.Request) -> web.Response:
+        """Researches anchors for the small-cap counterparties the filing
+        path structurally cannot find (smartboi.tools.run_supplier_research).
+
+        Writes universe CANDIDATES only -- never a graph edge. A web-sourced
+        relationship is not a disclosure, and an edge at or above
+        DISCLOSED_LINK_CONFIDENCE satisfies the corroboration bar that fires
+        trades; a candidate accepted from here gets its own 10-K backfilled,
+        and the edge is created only if a filing actually discloses it."""
+        async def run() -> str:
+            return await run_supplier_research(engine)
+
+        return await _run_tool(run)
+
     async def handle_tool_forward_returns(request: web.Request) -> web.Response:
         """Runs the forward-return analysis (smartboi.tools.run_forward_returns)
         over the captured snapshot/price logs. Pure file reads -- no network,
@@ -701,6 +737,7 @@ def create_app(engine) -> web.Application:
     app.router.add_get("/api/status", handle_status)
     app.router.add_post("/api/candidates/accept", handle_accept_candidate)
     app.router.add_post("/api/tools/screen", handle_tool_screen)
+    app.router.add_post("/api/tools/supplier-research", handle_tool_supplier_research)
     app.router.add_post("/api/tools/forward-returns", handle_tool_forward_returns)
     app.router.add_post("/api/tools/event-study", handle_tool_event_study)
     app.router.add_post("/api/tools/diagnostics", handle_tool_diagnostics)

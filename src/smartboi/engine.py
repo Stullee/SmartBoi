@@ -803,7 +803,22 @@ class Engine:
         signal this system ever produced: it never got a single entry
         evaluation. The tight cadence only applies while something is
         actually waiting, so the steady-state IB request rate is unchanged."""
-        if self._entry_pending:
+        # OPEN TRADES tighten it too, not just pending entries. They used
+        # not to: _entry_pending goes False the moment a signal becomes a
+        # position, so the interval reverted to 6 hours exactly when the
+        # system first had money (hypothetically) at risk. Marks are checked
+        # against the day's accumulating high/low, so a stop breached at
+        # 10am was visible at the next poll -- up to six hours later, and
+        # the fill recorded is `min(stop_price, price_at_detection)`, so a
+        # position still falling when we finally looked booked a WORSE fill
+        # than a real stop order would have taken. That biases the R
+        # statistic this journal exists to make honest.
+        #
+        # The cost is negligible and bounded by position count, not universe
+        # size: a handful of open symbols at the entry cadence is a few
+        # requests an hour, against IB's ~60-per-10-minutes and Finnhub's
+        # 60-per-minute.
+        if self._entry_pending or self.journal.open_trades:
             return min(self.settings.signal_entry_poll_interval_sec, self.settings.price_poll_interval_sec)
         return self.settings.price_poll_interval_sec
 
@@ -1623,23 +1638,54 @@ class Engine:
 
         Graph extraction only: an old 10-K is NOT fed to the dossier engine
         as evidence (year-old 'news' is long priced in; the relationships it
-        discloses are durable, the sentiment is not). Anchors are skipped --
-        a giant's 10-K never names its small suppliers, which is exactly why
-        the graph is discovered from the small companies' filings. Each
-        symbol is backfilled once ever (persisted), so a symbol accepted at
-        runtime (accept_candidate) gets backfilled on the very next tick
-        without needing a restart."""
+        discloses are durable, the sentiment is not). Each symbol is
+        backfilled once ever (persisted), so a symbol accepted at runtime
+        (accept_candidate) gets backfilled on the very next tick without
+        needing a restart.
+
+        ANCHORS ARE INCLUDED, tradeables first. They used to be skipped, on
+        the reasoning that a giant's 10-K never names its small suppliers --
+        which is why the graph is discovered from the small companies'
+        filings in the first place. That reasoning is half right and the
+        half it misses is expensive: regular polling only reads filings
+        inside edgar_lookback_days and 10-Ks are annual, so skipping the
+        backfill meant no anchor's 10-K was EVER read until it happened to
+        file a new one inside a 14-day window. Measured live, 98-134 of 161
+        anchors had no graph edge to any tradeable at all -- and an anchor
+        without such an edge is inert by construction, its news resolving to
+        zero targets and being discarded unread. The strategy is anchor news
+        propagating to thin-coverage names; most anchors were not
+        propagating anything.
+
+        Expect a lower yield per call than from the tradeable side, because
+        the original reasoning does hold for customer-concentration
+        disclosures: those name big customers, not small suppliers. What an
+        anchor 10-K does reliably name is single-source supplier risk
+        factors, JV partners and named competitors -- and those are exactly
+        the edges that turn an inert anchor live. TRADEABLES ARE ORDERED
+        FIRST so that the higher-yield work happens before a tight daily
+        budget defers the rest to tomorrow (see max_daily_usd -- deferral is
+        the designed behaviour here, not a failure).
+
+        Set BACKFILL_ANCHORS=false to restore the old tradeable-only
+        behaviour if the anchor yield does not justify its share of the
+        budget."""
         if time.monotonic() < self._backfill_retry_after:
             return
-        pending = [
-            spec.symbol
-            for spec in self.universe
+        tradeables = [
+            spec.symbol for spec in self.universe
             if not spec.signal_source_only and not self.backfill_state.get(spec.symbol)
         ]
+        anchors = [
+            spec.symbol for spec in self.universe
+            if spec.signal_source_only and not self.backfill_state.get(spec.symbol)
+        ] if self.settings.backfill_anchors else []
+        pending = tradeables + anchors
         if not pending:
             return
-        log.info("Relationship backfill: extracting from the most recent 10-K of %d symbol(s): %s",
-                 len(pending), ", ".join(pending))
+        log.info("Relationship backfill: extracting from the most recent 10-K of %d symbol(s) "
+                 "(%d tradeable, %d anchor): %s",
+                 len(pending), len(tradeables), len(anchors), ", ".join(pending[:40]))
         done = 0
         for symbol in pending:
             try:

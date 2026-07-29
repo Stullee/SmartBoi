@@ -38,6 +38,13 @@ from smartboi.forward_returns import (
 )
 from smartboi.screen import candidates_from_file, resolve_candidates_path
 from smartboi.universe import CompanySpec, spec_by_symbol
+from smartboi.research import (
+    MAX_ANCHORS_PER_RUN,
+    SupplierResearcher,
+    format_research_report,
+    merge_into_candidates,
+    researched_anchors,
+)
 from smartboi.universe_screen import format_screening_report, guess_ecosystem, screen_candidate
 
 log = logging.getLogger(__name__)
@@ -123,6 +130,56 @@ async def run_screen(
     return report
 
 
+async def run_supplier_research(engine) -> str:
+    """Researches the universe's anchors for small-cap counterparties the
+    filing path structurally cannot find (see research.py), writing what it
+    finds into the existing universe-candidate store.
+
+    Anchors are ordered by how INERT they are -- one with no graph edge to
+    any tradeable is discarded news, so it has the most to gain -- then by
+    ecosystem so a run covers ground rather than ten names from one sector.
+    Already-researched anchors are skipped, so re-running continues through
+    the list."""
+    if engine.settings.anthropic_api_key.strip() == "":
+        return "Supplier research needs ANTHROPIC_API_KEY (it is a web-search-backed Claude call)."
+
+    universe = set(engine.symbol_list)
+    tradeables = {c.symbol for c in engine.universe if not c.signal_source_only}
+    already = researched_anchors(engine.candidates)
+
+    def is_inert(symbol: str) -> bool:
+        return not any(linked in tradeables
+                       for linked, _ in engine.graph.linked_symbols(symbol, universe))
+
+    anchors = [c for c in engine.universe if c.signal_source_only and c.symbol not in already]
+    if not anchors:
+        return ("Every anchor has already been researched. Delete `last_researched_at` from "
+                "data/universe_candidates.json entries to re-run, or add more anchors.")
+    anchors.sort(key=lambda c: (not is_inert(c.symbol), c.ecosystem, c.symbol))
+    selected, skipped = anchors[:MAX_ANCHORS_PER_RUN], [c.symbol for c in anchors[MAX_ANCHORS_PER_RUN:]]
+
+    researcher = SupplierResearcher(
+        engine.settings.anthropic_api_key, engine.settings.synthesis_model, engine.usage,
+    )
+    results: list[tuple[str, list]] = []
+    new = updated = 0
+    try:
+        for spec in selected:
+            found = await researcher.research(
+                spec.symbol, spec.name or spec.symbol, spec.ecosystem,
+                engine.settings.universe_min_market_cap_musd,
+                engine.settings.universe_max_market_cap_musd,
+            )
+            results.append((spec.symbol, found))
+            if found:
+                added, touched = merge_into_candidates(engine.candidates, found)
+                new += added
+                updated += touched
+    finally:
+        await researcher.aclose()
+    return format_research_report(results, new, updated, skipped)
+
+
 def run_forward_returns(
     log_dir: str | Path,
     universe: list[CompanySpec],
@@ -206,7 +263,7 @@ _DIAGNOSTIC_SETTINGS = (
     "universe_max_analyst_count", "universe_screen_interval_days",
     "enable_auto_accept_candidates", "auto_accept_anchors", "auto_accept_tradeables",
     "auto_accept_min_seen_count", "auto_accept_max_per_day",
-    "enable_relationship_backfill", "enable_ib_price_feed", "ib_host", "ib_port",
+    "enable_relationship_backfill", "backfill_anchors", "enable_ib_price_feed", "ib_host", "ib_port",
 )
 MAX_LOG_LINES = 40
 MAX_LISTED_ROWS = 60

@@ -43,6 +43,18 @@ class Settings(BaseSettings):
     # and ANTHROPIC_API_KEY; each symbol is only ever backfilled once
     # (tracked in data/relationship_backfill.json).
     enable_relationship_backfill: bool = True
+    # Whether the backfill also reads ANCHOR 10-Ks. On by default: regular
+    # polling only reads filings inside edgar_lookback_days and 10-Ks are
+    # annual, so with this off no anchor's 10-K is ever read until it
+    # happens to file inside a 14-day window -- which is why 98-134 of 161
+    # anchors were measured live with no graph edge to any tradeable, and an
+    # anchor without one is inert (its news resolves to zero targets and is
+    # discarded unread). Expect a lower yield per call than the tradeable
+    # side: an anchor's customer-concentration disclosures name big
+    # customers, not small suppliers. What they do name is single-source
+    # supplier risk factors, JV partners and competitors -- the edges that
+    # make an inert anchor live. Tradeables are always processed first.
+    backfill_anchors: bool = True
     # SEC requires a descriptive User-Agent with real contact info on every
     # request ("Your Name your@email.com") or it will block/rate-limit --
     # not a secret, just informational, but required for EDGAR ingestion to
