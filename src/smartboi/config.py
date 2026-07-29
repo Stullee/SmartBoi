@@ -272,6 +272,27 @@ class Settings(BaseSettings):
     # spreads are widest, so a paper record that ignores costs is not
     # evidence of anything. Charged per side, so the round-trip is double.
     transaction_cost_bps_per_side: float = 25.0
+    # Which cost table the per-market-cap buckets come from (see
+    # paper_journal.COST_PROFILES). "institutional" assumes an order large
+    # enough to move a thin book -- 50/150/300 bps per side by cap bucket.
+    # "retail" assumes a position small enough that impact is negligible and
+    # the cost is the half-spread plus commission -- 15/35/75 bps per side.
+    #
+    # This is the single most consequential number in the paper record and
+    # it is NOT a modelling detail: on the 8%/16% grid, the sub-$300M
+    # institutional bucket (600bp round trip) turns a nominal 2:1 into
+    # +1.19R/-1.72R, needing a 59% hit rate to break even; the same trade on
+    # the retail table (150bp) is +1.71R/-1.26R, needing 42%. Both are
+    # printed per bucket in diagnostics so the assumption is never invisible.
+    #
+    # Defaults to institutional deliberately. An over-stated cost makes a
+    # real edge look smaller -- annoying but recoverable, since the journal
+    # records r_multiple_gross alongside the net figure. An under-stated one
+    # manufactures an edge that was never there, and there is no way to
+    # recover from having believed it. Only move this to "retail" if the
+    # position size the record is meant to represent genuinely cannot move
+    # the book.
+    transaction_cost_profile: str = "institutional"
 
     # --- Entry timing: "have we missed the correction already" guards.
     # Applied when a SIGNALED dossier is about to become a paper trade

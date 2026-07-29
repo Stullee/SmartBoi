@@ -2517,7 +2517,11 @@ class Engine:
                 market_cap = await self.finnhub.market_cap_musd(symbol)
             except Exception:  # noqa: BLE001 - a failed lookup must not block the entry; the cost model has a fallback
                 log.warning("%s: market-cap lookup for cost bucketing failed.", symbol)
-        cost_per_side = cost_bps_per_side_for_cap(market_cap, self.settings.transaction_cost_bps_per_side)
+        cost_per_side = cost_bps_per_side_for_cap(
+            market_cap,
+            self.settings.transaction_cost_bps_per_side,
+            self.settings.transaction_cost_profile,
+        )
         trade = self.journal.open(
             symbol, dossier.direction, price,
             self.settings.stop_loss_pct, self.settings.take_profit_pct,

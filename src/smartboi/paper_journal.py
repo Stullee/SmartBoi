@@ -29,11 +29,27 @@ log = logging.getLogger(__name__)
 # TRANSACTION_COST_BPS_PER_SIDE acts as a floor under all buckets, never a
 # ceiling over them.
 _CAP_BUCKET_BPS_PER_SIDE = ((1000.0, 50.0), (300.0, 150.0), (0.0, 300.0))
+# The same buckets sized for a position small enough that IMPACT is not a
+# factor and the cost is essentially the half-spread each way plus
+# commission. The institutional numbers above assume an order large enough
+# to move a thin book; a $2-5k position in a $150M-cap NASDAQ name crosses a
+# spread, not a market. Which of the two is right depends entirely on the
+# size the record is meant to represent, and that is not something this
+# codebase can know -- hence a setting, not a guess. Institutional stays the
+# DEFAULT: an over-stated cost makes a real edge look smaller, while an
+# under-stated one manufactures an edge that was never there, and only one
+# of those two errors is recoverable once the forward record exists.
+_RETAIL_CAP_BUCKET_BPS_PER_SIDE = ((1000.0, 15.0), (300.0, 35.0), (0.0, 75.0))
+COST_PROFILES: dict[str, tuple[tuple[float, float], ...]] = {
+    "institutional": _CAP_BUCKET_BPS_PER_SIDE,
+    "retail": _RETAIL_CAP_BUCKET_BPS_PER_SIDE,
+}
 # With no market cap available (Finnhub down/unconfigured, unknown ticker)
 # assume the MIDDLE bucket rather than the cheapest -- unknown liquidity is
 # not a reason to assume the best case in the record this journal exists
-# to keep honest.
-_UNKNOWN_CAP_BPS_PER_SIDE = 150.0
+# to keep honest. Derived from whichever profile is in force rather than
+# hard-coded, so the two stay consistent by construction.
+_UNKNOWN_CAP_BUCKET_INDEX = 1
 # Shorts below this market cap are flagged assumes_borrow: small-caps are
 # routinely hard-to-borrow, and a paper SHORT that a real account could
 # not have located shares for is not a fill -- the flag keeps those
@@ -41,16 +57,96 @@ _UNKNOWN_CAP_BPS_PER_SIDE = 150.0
 _BORROW_RISK_CAP_MUSD = 500.0
 
 
-def cost_bps_per_side_for_cap(market_cap_musd: float | None, floor_bps_per_side: float) -> float:
+def cost_buckets(profile: str = "institutional") -> tuple[tuple[float, float], ...]:
+    """The cap->bps/side table for a cost profile. An unrecognised name gets
+    the institutional (more expensive) table rather than raising: a typo in a
+    setting must not be able to make trades look cheaper than they are."""
+    return COST_PROFILES.get(profile, _CAP_BUCKET_BPS_PER_SIDE)
+
+
+def cost_bps_per_side_for_cap(
+    market_cap_musd: float | None,
+    floor_bps_per_side: float,
+    profile: str = "institutional",
+) -> float:
     """Per-side transaction-cost assumption for a trade in a name of the
     given market cap (in $M), never below the configured floor. None/zero
     cap (lookup failed) gets the middle bucket, not the cheapest."""
+    buckets = cost_buckets(profile)
+    unknown_bps = buckets[_UNKNOWN_CAP_BUCKET_INDEX][1]
     if market_cap_musd is None or market_cap_musd <= 0:
-        return max(floor_bps_per_side, _UNKNOWN_CAP_BPS_PER_SIDE)
-    for cap_floor, bps in _CAP_BUCKET_BPS_PER_SIDE:
+        return max(floor_bps_per_side, unknown_bps)
+    for cap_floor, bps in buckets:
         if market_cap_musd >= cap_floor:
             return max(floor_bps_per_side, bps)
-    return max(floor_bps_per_side, _UNKNOWN_CAP_BPS_PER_SIDE)
+    return max(floor_bps_per_side, unknown_bps)
+
+
+@dataclass(frozen=True)
+class TradeEconomics:
+    """What the configured stop/target grid is actually worth once the
+    round-trip cost is charged, for one cost bucket.
+
+    This exists because the 8%/16% grid LOOKS like 2:1 reward:risk and is
+    not. Cost is charged against notional while R is measured against the
+    stop distance, so the same bps figure is a far larger share of a risk
+    unit on a tight stop -- and it lands on BOTH sides, shrinking the win
+    and deepening the loss. At 600bp round-trip (the sub-$300M
+    institutional bucket) the real payoff of a nominal 2:1 grid is
+    +1.19R/-1.72R, which needs a 59% hit rate merely to break even. Nothing
+    in the pipeline surfaced that, so it is computed here and printed in
+    diagnostics rather than left to be discovered from a losing record."""
+
+    r_win: float
+    r_loss: float
+    breakeven_win_rate: float
+    cost_share_of_risk: float  # round-trip cost at the stop, as a fraction of one R
+
+
+def trade_economics(
+    stop_loss_pct: float,
+    take_profit_pct: float,
+    cost_bps_round_trip: float,
+    direction: str = "LONG",
+) -> TradeEconomics:
+    """Net-of-cost R at the target and at the stop, and the win rate at
+    which they cancel. Scale-invariant -- both P&L and cost are linear in
+    the entry price, so the entry price divides out and any positive value
+    gives the same answer."""
+    entry = 100.0
+    if direction == "LONG":
+        target = entry * (1 + take_profit_pct / 100)
+        stop = entry * (1 - stop_loss_pct / 100)
+    else:
+        target = entry * (1 - take_profit_pct / 100)
+        stop = entry * (1 + stop_loss_pct / 100)
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return TradeEconomics(0.0, 0.0, 1.0, 0.0)
+
+    def net_r(exit_price: float) -> float:
+        gross = exit_price - entry if direction == "LONG" else entry - exit_price
+        cost = (entry + exit_price) * (cost_bps_round_trip / 2.0) / 10_000.0
+        return (gross - cost) / risk
+
+    r_win = net_r(target)
+    r_loss = net_r(stop)
+    # Break-even p solves p*r_win + (1-p)*r_loss = 0. With r_loss < 0 and
+    # r_win > 0 that is -r_loss / (r_win - r_loss). A grid whose win leg is
+    # already negative after costs cannot break even at any hit rate, which
+    # is reported as 1.0 (i.e. "not achievable") rather than a nonsense
+    # fraction above 1.
+    if r_win <= 0:
+        breakeven = 1.0
+    else:
+        breakeven = min(1.0, -r_loss / (r_win - r_loss))
+    stop_cost = (entry + stop) * (cost_bps_round_trip / 2.0) / 10_000.0
+    return TradeEconomics(
+        r_win=round(r_win, 3),
+        r_loss=round(r_loss, 3),
+        breakeven_win_rate=round(breakeven, 4),
+        cost_share_of_risk=round(stop_cost / risk, 4),
+    )
 
 
 def assumes_borrow(direction: str, market_cap_musd: float | None) -> bool:

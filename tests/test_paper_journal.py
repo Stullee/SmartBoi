@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from smartboi.paper_journal import PaperTradeJournal
+from smartboi.paper_journal import PaperTrade, PaperTradeJournal
 
 
 def _journal(tmp_path):
@@ -236,7 +236,11 @@ def test_restart_drops_open_trade_already_present_in_closed_log(tmp_path):
 
 # --- Market-cap transaction-cost buckets + borrow flag ---
 
-from smartboi.paper_journal import assumes_borrow, cost_bps_per_side_for_cap
+from smartboi.paper_journal import (
+    assumes_borrow,
+    cost_bps_per_side_for_cap,
+    trade_economics,
+)
 
 
 def test_cost_buckets_follow_market_cap():
@@ -264,6 +268,89 @@ def test_assumes_borrow_only_for_small_or_unknown_shorts():
     assert not assumes_borrow("SHORT", 800.0)
     assert not assumes_borrow("LONG", 120.0)
     assert not assumes_borrow("LONG", None)
+
+
+def test_retail_profile_is_cheaper_in_every_bucket():
+    for cap in (5000.0, 600.0, 120.0):
+        retail = cost_bps_per_side_for_cap(cap, 0.0, "retail")
+        institutional = cost_bps_per_side_for_cap(cap, 0.0, "institutional")
+        assert retail < institutional, cap
+    # Unknown cap still takes the middle bucket of whichever table is in use.
+    assert cost_bps_per_side_for_cap(None, 0.0, "retail") == 35.0
+
+
+def test_unknown_profile_falls_back_to_the_expensive_table():
+    # A typo'd setting must never make trades look cheaper than they are.
+    assert cost_bps_per_side_for_cap(120.0, 0.0, "reatil") == 300.0
+    assert cost_bps_per_side_for_cap(120.0, 0.0, "") == 300.0
+
+
+def test_the_configured_floor_still_applies_under_the_retail_table():
+    assert cost_bps_per_side_for_cap(5000.0, floor_bps_per_side=25.0, profile="retail") == 25.0
+
+
+# --- What the stop/target grid is actually worth after costs ---
+
+
+def test_costless_grid_matches_its_nominal_reward_to_risk():
+    econ = trade_economics(8.0, 16.0, cost_bps_round_trip=0.0)
+    assert econ.r_win == 2.0
+    assert econ.r_loss == -1.0
+    # 2:1 breaks even at one win in three.
+    assert econ.breakeven_win_rate == pytest.approx(1 / 3, abs=1e-3)
+    assert econ.cost_share_of_risk == 0.0
+
+
+def test_microcap_costs_turn_a_nominal_two_to_one_into_a_coin_flip():
+    # 300bp/side institutional bucket -> 600bp round trip.
+    econ = trade_economics(8.0, 16.0, cost_bps_round_trip=600.0)
+    assert econ.r_win == pytest.approx(1.19, abs=0.01)
+    assert econ.r_loss == pytest.approx(-1.72, abs=0.01)
+    # The whole point of the function: nowhere near the nominal 33%.
+    assert econ.breakeven_win_rate == pytest.approx(0.591, abs=0.005)
+    # Cost alone eats most of a risk unit on a tight stop.
+    assert econ.cost_share_of_risk == pytest.approx(0.72, abs=0.01)
+
+
+def test_costs_land_on_both_legs_so_they_worsen_wins_and_losses_alike():
+    cheap = trade_economics(8.0, 16.0, cost_bps_round_trip=100.0)
+    dear = trade_economics(8.0, 16.0, cost_bps_round_trip=600.0)
+    assert dear.r_win < cheap.r_win
+    assert dear.r_loss < cheap.r_loss  # more negative, not merely smaller
+    assert dear.breakeven_win_rate > cheap.breakeven_win_rate
+
+
+def test_shorts_are_costed_on_their_own_geometry():
+    # A short's target is BELOW the entry, so its exit notional -- and hence
+    # its cost -- differs from the mirrored long. Same ballpark, not equal.
+    long_econ = trade_economics(8.0, 16.0, 600.0, "LONG")
+    short_econ = trade_economics(8.0, 16.0, 600.0, "SHORT")
+    assert short_econ.r_win != long_econ.r_win
+    assert short_econ.breakeven_win_rate == pytest.approx(0.576, abs=0.005)
+
+
+def test_a_grid_that_cannot_break_even_reports_so_rather_than_over_one():
+    # Cost exceeds the entire target move: the win leg is negative, so no
+    # hit rate saves it. Must not report a fraction above 1.
+    econ = trade_economics(8.0, 4.0, cost_bps_round_trip=1200.0)
+    assert econ.r_win < 0
+    assert econ.breakeven_win_rate == 1.0
+
+
+def test_economics_are_scale_invariant_in_the_entry_price():
+    # Cost and P&L are both linear in price, so the answer must not depend
+    # on the notional the calculation happened to pick.
+    assert trade_economics(8.0, 16.0, 600.0) == trade_economics(8.0, 16.0, 600.0)
+    # And it agrees with an actual journal trade's realized R at the stop.
+    journal_r = PaperTrade(
+        symbol="X", direction="LONG", entry_price=15.05, stop_price=15.05 * 0.92,
+        target_price=15.05 * 1.16, opened_at="2026-07-29T00:00:00+00:00",
+        horizon_days=20, thesis_summary="t", confidence=0.8,
+        independent_source_count=2, cost_bps_round_trip=600.0,
+    )
+    risk = 15.05 - 15.05 * 0.92
+    at_stop = journal_r._net_pnl(15.05 * 0.92) / risk
+    assert at_stop == pytest.approx(trade_economics(8.0, 16.0, 600.0).r_loss, abs=0.005)
 
 
 def test_open_records_cap_and_borrow_flag(tmp_path):

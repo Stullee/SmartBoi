@@ -130,6 +130,37 @@ async def test_diagnostics_endpoint_returns_a_bundle(engine):
         assert "=== SmartBoi diagnostics ===" in (await response.json())["report"]
 
 
+async def test_diagnostics_state_the_after_cost_break_even_win_rate(engine):
+    """The 8%/16% grid reads as 2:1 and isn't -- the sub-$300M bucket needs
+    59% to net zero. That number decides whether the whole record can ever
+    be profitable, so it has to appear without anyone asking for it."""
+    async with TestClient(TestServer(create_app(engine))) as client:
+        report = (await (await client.post("/api/tools/diagnostics", json={})).json())["report"]
+
+    assert "Cost drag on the 8%/16% grid" in report
+    assert "break-even win rate 59%" in report  # the <$300M institutional bucket
+    assert "break-even win rate 38%" in report  # and the >$1B one, for contrast
+    # The last bucket is a floor, not a catch-all; labelling it as one read
+    # as if 600bp applied to every trade.
+    assert "<$300M" in report
+    assert "any cap" not in report
+
+
+async def test_diagnostics_price_each_open_trade_at_its_own_cost_bucket(engine):
+    engine.journal.open(
+        "ESOA", "LONG", 15.05, 8.0, 16.0, 20, "t", 0.9, 3, [],
+        cost_bps_round_trip=600.0, market_cap_musd=180.0,
+    )
+    async with TestClient(TestServer(create_app(engine))) as client:
+        report = (await (await client.post("/api/tools/diagnostics", json={})).json())["report"]
+
+    # An open trade showing worse than -1.00R while still ABOVE its stop is
+    # not a marking bug -- it is the round-trip cost, and the per-trade line
+    # is what makes that legible.
+    assert "600bp round trip" in report
+    assert "win +1.19R / loss -1.72R" in report
+
+
 # --- Rebuild relationship graph: the recovery path for edges lost because
 # their counterparty was accepted into the universe only AFTER the
 # discovering filing had been extracted. ---

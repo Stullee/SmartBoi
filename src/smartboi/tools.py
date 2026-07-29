@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from smartboi.news import redact_token
+from smartboi.paper_journal import cost_buckets, trade_economics
 from smartboi.status import gather_dossiers, gather_paper_trade_stats
 from smartboi.event_study import (
     OUTCOME_LABELS,
@@ -250,6 +251,7 @@ _DIAGNOSTIC_SETTINGS = (
     "min_independent_sources_news_only", "max_horizon_days",
     "max_favorable_drift_pct", "signal_entry_deadline_days",
     "stop_loss_pct", "take_profit_pct", "transaction_cost_bps_per_side",
+    "transaction_cost_profile",
     "max_daily_llm_calls", "max_daily_usd", "max_propagated_evidence_per_link",
     "propagated_evidence_cooldown_hours",
     "enable_ecosystem_propagation", "max_ecosystem_evidence_per_link",
@@ -419,6 +421,47 @@ def run_diagnostics(engine) -> str:
     add(f"  open: {len(engine.journal.open_trades)} ({', '.join(engine.journal.open_trades) or '-'})")
     add(f"  closed: {stats.closed} (W{stats.wins}/L{stats.losses}/T{stats.timeouts}), "
         f"win rate {stats.win_rate * 100:.0f}%, avg R {stats.avg_r:.2f}")
+    for symbol, trade in engine.journal.open_trades.items():
+        econ = trade_economics(
+            s.stop_loss_pct, s.take_profit_pct, trade.cost_bps_round_trip, trade.direction
+        )
+        cap = f"${trade.market_cap_musd:.0f}M" if trade.market_cap_musd else "cap unknown"
+        add(f"    {symbol:6} {trade.direction:5} {cap:>12}  {trade.cost_bps_round_trip:.0f}bp round trip"
+            f"  -> win {econ.r_win:+.2f}R / loss {econ.r_loss:+.2f}R")
+
+    # The 8%/16% grid LOOKS like 2:1 and is not: cost is charged on notional
+    # while R is measured against the stop distance, so it lands on both
+    # legs and eats a large share of a tight stop. Printed per bucket
+    # because it is the difference between a strategy that needs a 42% hit
+    # rate and one that needs 59%, and nothing else in this output shows it.
+    add(f"\n--- Cost drag on the {s.stop_loss_pct:.0f}%/{s.take_profit_pct:.0f}% grid "
+        f"(profile: {s.transaction_cost_profile}) ---")
+    buckets = cost_buckets(s.transaction_cost_profile)
+    for index, (cap_floor, bps_per_side) in enumerate(buckets):
+        charged = max(bps_per_side, s.transaction_cost_bps_per_side)
+        econ = trade_economics(s.stop_loss_pct, s.take_profit_pct, charged * 2)
+        # Buckets run high cap to low, so the previous entry's floor is this
+        # one's ceiling -- printing only the floor labelled the last bucket
+        # "any cap", which reads as if it applied to every trade.
+        if index == 0:
+            band = f">${cap_floor:.0f}M"
+        elif cap_floor <= 0:
+            band = f"<${buckets[index - 1][0]:.0f}M"
+        else:
+            band = f"${cap_floor:.0f}M-${buckets[index - 1][0]:.0f}M"
+        add(f"  {band:>14}: {charged * 2:.0f}bp round trip -> win {econ.r_win:+.2f}R, "
+            f"loss {econ.r_loss:+.2f}R, break-even win rate "
+            f"{econ.breakeven_win_rate * 100:.0f}%, cost = {econ.cost_share_of_risk * 100:.0f}% of 1R")
+    add("  ^^ break-even is the hit rate at which this grid nets zero AFTER costs, not 33%.")
+    if any(
+        trade_economics(s.stop_loss_pct, s.take_profit_pct,
+                        max(bps, s.transaction_cost_bps_per_side) * 2).breakeven_win_rate >= 0.55
+        for _, bps in cost_buckets(s.transaction_cost_profile)
+    ):
+        add("  ^^ a bucket needs >=55% to break even: widen take_profit_pct, raise the tradeable")
+        add("     market-cap floor, or -- if the intended position size genuinely cannot move the")
+        add("     book -- set transaction_cost_profile to 'retail'. Do NOT do the last one to make")
+        add("     the record look better; r_multiple_gross is already stored for that comparison.")
 
     cands = engine.candidates.data
     with_ticker = [c for c in cands.values() if c.get("ticker")]
