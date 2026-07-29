@@ -94,6 +94,82 @@ def test_no_warning_when_sources_are_genuinely_diverse(engine):
     assert "WARNING: near-single source identity" not in report
 
 
+# --- Signal episodes and their outcomes: the bundle used to show a signal
+# firing and zero trades with nothing in between, so "why did this signal not
+# become a trade" -- the single most important question this system can be
+# asked -- still needed shell access to answer. ---
+
+def test_a_signal_episode_reports_what_happened_to_it(engine, tmp_path):
+    import json
+    from pathlib import Path
+
+    log_dir = Path(engine.settings.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    episode = "2026-07-28T19:15:00+00:00"
+    (log_dir / "signals.jsonl").write_text(json.dumps({
+        "symbol": "DCO", "direction": "LONG", "confidence": 0.62, "magnitude": 0.40,
+        "horizon_days": 20, "independent_source_count": 2, "thesis_summary": "t",
+        "generated_at": episode, "episode": episode,
+    }) + "\n")
+    (log_dir / "decisions.jsonl").write_text(json.dumps({
+        "event": "signal_expired", "symbol": "DCO", "direction": "LONG",
+        "episode": episode, "price": None,
+        "reason": "thesis fell below the signal bar on the daily decay pass (score 0.240 < 0.250)",
+        "at": "2026-07-29T04:00:00+00:00",
+    }) + "\n")
+
+    report = run_diagnostics(engine)
+
+    assert "Signal episodes (1" in report
+    assert "DCO" in report
+    assert "expired unopened" in report
+    assert "decay pass" in report
+
+
+def test_an_episode_with_no_ledger_row_is_called_out(engine, tmp_path):
+    import json
+    from pathlib import Path
+
+    log_dir = Path(engine.settings.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "signals.jsonl").write_text(json.dumps({
+        "symbol": "DCO", "direction": "LONG", "confidence": 0.62, "magnitude": 0.40,
+        "horizon_days": 20, "independent_source_count": 2, "thesis_summary": "t",
+        "generated_at": "2026-07-28T19:15:00+00:00", "episode": "2026-07-28T19:15:00+00:00",
+    }) + "\n")
+
+    report = run_diagnostics(engine)
+
+    assert "carry no ledger row" in report
+
+
+# --- The allow-list is the only thing keeping a credential out of a pasted
+# bundle, so it can't be a deny-list -- but that same design silently drops
+# NEW settings from the report. transaction_cost_bps_per_side and
+# min_independent_sources_news_only were both added and both invisible.
+
+def test_every_non_secret_setting_is_either_reported_or_deliberately_omitted():
+    """Fails when a setting is added to Settings without a decision about
+    whether the diagnostics bundle should show it. Add it to
+    _DIAGNOSTIC_SETTINGS, or to the omitted set here with a reason."""
+    from smartboi.tools import _DIAGNOSTIC_SETTINGS
+
+    # Secrets and personal data (never printable), plus fields whose value
+    # is either already shown elsewhere in the report or is pure plumbing.
+    DELIBERATELY_OMITTED = {
+        "anthropic_api_key", "finnhub_api_key", "edgar_user_agent", "alert_webhook_url",
+        "symbols", "anchor_symbols",          # shown in full by the Universe section
+        "ib_client_id", "log_level", "log_dir",
+        "enable_dashboard", "dashboard_port",  # self-evident to anyone reading a dashboard
+    }
+    reported = set(_DIAGNOSTIC_SETTINGS)
+    fields = set(Settings.model_fields)
+    undecided = fields - reported - DELIBERATELY_OMITTED
+    assert not undecided, f"settings neither reported nor deliberately omitted: {sorted(undecided)}"
+    # And nothing in the allow-list that no longer exists.
+    assert not reported - fields, f"_DIAGNOSTIC_SETTINGS names non-existent settings: {sorted(reported - fields)}"
+
+
 def test_runs_on_a_completely_fresh_deployment(engine):
     """Nothing captured, no dossiers, no graph -- must still produce a
     report rather than raising on an empty everything."""

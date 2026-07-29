@@ -71,8 +71,9 @@ DATA_DIR = Path("data")
 # most of a day of price marks.
 IB_RETRY_GAP_SEC = 900
 # Evidence time-decay is a slow-moving correction, not a live signal --
-# recomputing it once a day is plenty (see _run_decay_pass).
-DECAY_PASS_INTERVAL_SEC = 86400
+# recomputing it once a day is plenty (see _run_decay_pass). It runs off the
+# same persisted daily schedule as the snapshot passes below rather than a
+# process-local timer; see _daily_pass_due for why that distinction matters.
 # Daily dossier-score snapshot and daily price marks (see _run_daily_snapshot
 # / _run_daily_price_marks): the raw material for validating whether
 # confidence*magnitude predicts forward returns. Forward data can't be
@@ -120,6 +121,31 @@ _LENDER_PHRASES = (
     "lender", "credit facility", "credit agreement", "revolving credit",
     "revolving loan", "term loan", "delayed draw", "financing facilit",
     "loan and security agreement", "underwriter",
+    # A second wave that got through the list above and reached the graph
+    # live: M&T Bank recorded as a "supplier" to Taylor Devices off a
+    # "demand line of credit" disclosure. Bank debt is disclosed in a dozen
+    # near-synonyms and no single phrase covers them.
+    "line of credit", "loan agreement", "promissory note", "notes payable",
+    "bank facilit", "financing agreement", "mortgage", "borrower",
+)
+
+# Phrases that mark an extracted "relationship" as coming from an EXECUTIVE
+# BIOGRAPHY rather than a business dealing. 8-K item 5.02 officer
+# appointments (and the bio paragraphs carried into 10-K Part III) name a
+# string of well-known employers, and extraction reads "served as VP of
+# Illinois Tool Works" as a disclosed link to ITW. Confirmed live: EPAC->ITW,
+# EPAC->GE, VVX->RTX and NCSM->APO all came from CV history. These are worse
+# than merely useless -- a bio edge feeds an unrelated mega-cap's news into a
+# small-cap dossier, and the thesis built on it is pure noise. Phrases are
+# deliberately narrow (unambiguous CV markers only) so a genuine commercial
+# disclosure that happens to use "served" is not dropped with them.
+_BIOGRAPHY_PHRASES = (
+    "prior to joining", "before joining", "prior to his", "prior to her",
+    "previously served", "previously held", "previously was", "most recently served",
+    "held various positions", "held senior positions", "held a number of positions",
+    "began his career", "began her career", "began their career",
+    "where he served", "where she served", "where they served",
+    "was employed by", "his tenure at", "her tenure at", "years of experience at",
 )
 
 _NON_COMPANY_KEYWORDS = (
@@ -204,7 +230,15 @@ class Engine:
         self._last_edgar_poll: float | None = None
         self._last_news_poll: float | None = None
         self._last_price_poll: float | None = None
-        self._last_decay_pass: float | None = None
+        # Whether a SIGNALED-but-unopened dossier is waiting on the entry
+        # gate, which tightens the price-poll cadence (see
+        # _price_poll_interval). Kept as a flag rather than rescanning every
+        # dossier file each 30-second tick. Set True whenever a dossier
+        # becomes SIGNALED and recomputed exactly by _mark_and_execute, which
+        # already loads every dossier -- so it starts True (one accurate
+        # recompute on the first poll) and any stale True self-corrects on
+        # the very next poll, at the cost of one wasted price call.
+        self._entry_pending: bool = True
         self._last_candidate_recheck: float | None = None
         self._last_heartbeat: float | None = None
         # Backfill retries after a deferred extraction are held off until
@@ -473,6 +507,23 @@ class Engine:
     def _due(last: float | None, interval_sec: float, now: float) -> bool:
         return last is None or now - last >= interval_sec
 
+    def _price_poll_interval(self) -> float:
+        """price_poll_interval_sec normally (6h by default: marking open
+        trades to market needs nothing tighter), but the shorter
+        signal_entry_poll_interval_sec while an entry is pending.
+
+        Marking and entering are different jobs on different clocks. A
+        signal that fires mid-session and then waits up to six hours for the
+        next poll will usually be looked at while the market is shut -- and
+        in the meantime the daily decay pass or newly merged evidence can
+        expire it back to ACTIVE. That is exactly what happened to the first
+        signal this system ever produced: it never got a single entry
+        evaluation. The tight cadence only applies while something is
+        actually waiting, so the steady-state IB request rate is unchanged."""
+        if self._entry_pending:
+            return min(self.settings.signal_entry_poll_interval_sec, self.settings.price_poll_interval_sec)
+        return self.settings.price_poll_interval_sec
+
     def _log_heartbeat(self) -> None:
         signaled = sum(1 for s in self.dossiers.all_symbols() if self.dossiers.load(s).status == "SIGNALED")
         log.info(
@@ -502,7 +553,8 @@ class Engine:
         if self.finnhub is not None and self._due(self._last_news_poll, self.settings.news_poll_interval_sec, now):
             self._last_news_poll = now
             await self._poll_news()
-        if self.price_feed is not None and self._due(self._last_price_poll, self.settings.price_poll_interval_sec, now):
+        price_interval = self._price_poll_interval()
+        if self.price_feed is not None and self._due(self._last_price_poll, price_interval, now):
             if await self.price_feed.ensure_connected():
                 self._last_price_poll = now
                 await self._mark_and_execute()
@@ -513,17 +565,24 @@ class Engine:
                     "in the background. Set ENABLE_IB_PRICE_FEED=false if you don't want it yet.",
                 )
                 # Leave the poll pending but back off the connection attempt.
-                self._last_price_poll = now - self.settings.price_poll_interval_sec + IB_RETRY_GAP_SEC
+                self._last_price_poll = now - price_interval + IB_RETRY_GAP_SEC
         if (
             self.finnhub is not None
             and self.settings.enable_universe_autoscreen
             and self._universe_screen_due()
         ):
             await self._run_universe_screen()
-        if self._due(self._last_decay_pass, DECAY_PASS_INTERVAL_SEC, now):
-            self._last_decay_pass = now
+        # Scheduled off persisted wall-clock, not a process-local marker: a
+        # monotonic marker resets to "due immediately" on every restart, and
+        # this pass is no longer the harmless idempotent re-score it was when
+        # that was written -- it EXPIRES a SIGNALED dossier that has slipped
+        # below the bar. With a restart-triggered decay pass and a 6-hourly
+        # price poll, a marginal signal could be killed several times a day
+        # before the entry gate ever looked at it.
+        if self._daily_pass_due("decay_pass"):
             self._archive_orphaned_dossiers()
             self._run_decay_pass()
+            self._mark_daily_pass_done("decay_pass")
         # Both daily passes are marked done AFTER a successful run, not
         # before: forward data can't be backfilled, so a pass that raised
         # (disk error, feed dropping mid-fetch) must stay due and be
@@ -579,17 +638,22 @@ class Engine:
 
     def _daily_pass_due(self, state_key: str) -> bool:
         """Same pattern as _universe_screen_due, for the once-a-day
-        dossier-snapshot/price-marks passes: scheduled off a PERSISTED
-        wall-clock timestamp (self.periodic_state), not a process-local
-        time.monotonic() marker. A process-local marker resets to "due
-        immediately" on every restart, and unlike the decay pass or the
-        candidate recheck (idempotent -- re-running them early changes
-        nothing), these two passes unconditionally APPEND a fresh row per
-        symbol every time they run -- so a deployment restarting several
-        times in one day would silently write a full duplicate batch on
-        every restart. Confirmed live: 6 duplicate dossier_snapshots.jsonl
-        batches from 6 restarts in one day, inflating downstream forward-
-        return analysis 6x for that day's rows."""
+        dossier-snapshot / price-marks / decay passes: scheduled off a
+        PERSISTED wall-clock timestamp (self.periodic_state), not a
+        process-local time.monotonic() marker. A process-local marker resets
+        to "due immediately" on every restart, and unlike the candidate
+        recheck (idempotent -- re-running it early changes nothing), each of
+        these passes does something a restart must not be allowed to repeat:
+
+        - the snapshot/price-mark passes unconditionally APPEND a fresh row
+          per symbol, so a deployment restarting several times in one day
+          silently writes a full duplicate batch each time. Confirmed live:
+          6 duplicate dossier_snapshots.jsonl batches from 6 restarts in one
+          day, inflating downstream forward-return analysis 6x for that day.
+        - the decay pass EXPIRES a SIGNALED-but-unopened dossier that has
+          slipped below the signal bar, so a restart-triggered pass is an
+          extra chance to kill a pending signal before the (6-hourly) price
+          poll has evaluated it for entry even once."""
         last = self.periodic_state.get(state_key)
         if not last:
             return True
@@ -682,6 +746,13 @@ class Engine:
                     symbol, rel.get("counterparty_name"),
                 )
                 continue
+            if self._is_biography_relationship(rel):
+                log.info(
+                    "%s: dropping biography-derived relationship to %s (an executive's former "
+                    "employer is CV history, not a business relationship).",
+                    symbol, rel.get("counterparty_name"),
+                )
+                continue
             if rel.get("rel_type") not in REL_TYPES:
                 # The extraction tool schema declares an enum for rel_type,
                 # but Anthropic tool use doesn't hard-enforce it -- a stray
@@ -759,6 +830,15 @@ class Engine:
             return False
         text = f"{rel.get('description', '')} {rel.get('quote', '')}".lower()
         return any(phrase in text for phrase in _LENDER_PHRASES)
+
+    @staticmethod
+    def _is_biography_relationship(rel: dict) -> bool:
+        """Whether an extracted relationship came from an executive
+        biography. Applied to EVERY rel_type, unlike the lender filter: a CV
+        line gets labelled customer/supplier/competitor essentially at
+        random, so restricting by type would let most of them through."""
+        text = f"{rel.get('description', '')} {rel.get('quote', '')}".lower()
+        return any(phrase in text for phrase in _BIOGRAPHY_PHRASES)
 
     @staticmethod
     def _is_unsearchable(name: str) -> bool:
@@ -1419,6 +1499,10 @@ class Engine:
                 dossier.status = "SIGNALED"
                 await self._snapshot_signal_price(dossier)
                 self.dossiers.save(dossier)
+                # Pull the next price poll forward to the entry cadence
+                # rather than letting this wait up to price_poll_interval_sec
+                # (6h) for its first entry evaluation.
+                self._entry_pending = True
             log_signal(Path(self.settings.log_dir) / "signals.jsonl", signal, episode=dossier.signaled_at)
             await self.alerts.send(
                 "signal",
@@ -1434,7 +1518,7 @@ class Engine:
             # a thesis that no longer qualifies -- possibly in the OPPOSITE
             # direction from the one that signaled, against a baseline
             # snapped for the old thesis.
-            self._expire_signal(dossier, "evidence dropped below the signal threshold before an entry was confirmed")
+            self._expire_signal(dossier, self._below_bar_reason(dossier, "when fresh evidence merged"))
         return "handled"
 
     # --- Price marking / hypothetical execution ---
@@ -1480,6 +1564,27 @@ class Engine:
         except OSError:
             log.exception("Could not append to decisions.jsonl")
 
+    def _below_bar_reason(self, dossier: Dossier, when: str) -> str:
+        """Why evaluate() refused a dossier, in numbers -- which of the two
+        gates it failed and by how much. Recomputes the source bar the same
+        way signals.evaluate does so a news-only dossier reports the higher
+        bar it was actually held to, not the base one."""
+        required = self.settings.min_independent_sources
+        if not dossier.has_filing_evidence:
+            required = max(required, self.settings.min_independent_sources_news_only)
+        parts = []
+        if dossier.independent_source_count < required:
+            parts.append(
+                f"sources {dossier.independent_source_count}/{required}"
+                + (" (news-only bar)" if not dossier.has_filing_evidence else "")
+            )
+        score = dossier.confidence * dossier.magnitude
+        if score < self.settings.signal_confidence_threshold:
+            parts.append(f"score {score:.3f} < {self.settings.signal_confidence_threshold:.3f}")
+        if dossier.direction == "NONE":
+            parts.append("direction resolved to NONE")
+        return f"thesis fell below the signal bar {when} (" + ", ".join(parts or ["no longer qualifies"]) + ")"
+
     def _expire_signal(self, dossier: Dossier, reason: str, price: float | None = None) -> None:
         log.info("[SIGNAL] %s: expiring unopened signal (%s) -- resetting to ACTIVE so fresh "
                  "evidence can re-trigger it with a clean baseline.", dossier.symbol, reason)
@@ -1516,13 +1621,21 @@ class Engine:
         stayed SIGNALED. Opening from the stale status alone would take a
         position the current evidence no longer justifies -- possibly in
         the opposite direction from the thesis that actually signaled."""
-        if (
-            evaluate(dossier, self.settings.signal_confidence_threshold,
-                     self.settings.min_independent_sources,
-                     self.settings.min_independent_sources_news_only) is None
-            or dossier.direction != dossier.signaled_direction
-        ):
-            self._expire_signal(dossier, "thesis no longer qualifies at entry time")
+        # Each failure mode gets its own reason string, with the numbers that
+        # caused it: "no longer qualifies" told a reader nothing about WHY a
+        # signal died, and the decisions ledger exists precisely so that
+        # question is answerable after the fact.
+        if evaluate(dossier, self.settings.signal_confidence_threshold,
+                    self.settings.min_independent_sources,
+                    self.settings.min_independent_sources_news_only) is None:
+            self._expire_signal(dossier, self._below_bar_reason(dossier, "at entry time"))
+            return
+        if dossier.direction != dossier.signaled_direction:
+            self._expire_signal(
+                dossier,
+                f"thesis flipped {dossier.signaled_direction} -> {dossier.direction} "
+                "before an entry was confirmed",
+            )
             return
         try:
             price = await self.price_feed.last_price(symbol)
@@ -1610,6 +1723,7 @@ class Engine:
         return spec is not None and not spec.signal_source_only
 
     async def _mark_and_execute(self) -> None:
+        pending = False
         for symbol in self.dossiers.all_symbols():
             # Dossier FILES outlive universe membership: a symbol demoted to
             # anchor (or dropped entirely) keeps its file, and a stale
@@ -1622,6 +1736,13 @@ class Engine:
             if dossier.status != "SIGNALED" or self.journal.has_open(symbol):
                 continue
             await self._try_open_from_signal(symbol, dossier)
+            # _try_open_from_signal mutates this dossier in place: an expiry
+            # flips it to ACTIVE, an open leaves it SIGNALED with a trade on
+            # the books. Anything still SIGNALED and unopened (drift-blocked,
+            # or no price available) keeps the tight cadence alive.
+            if dossier.status == "SIGNALED" and not self.journal.has_open(symbol):
+                pending = True
+        self._entry_pending = pending
 
         open_symbols = list(self.journal.open_trades.keys())
         if not open_symbols:
@@ -1680,7 +1801,7 @@ class Engine:
                 signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources,
                                   self.settings.min_independent_sources_news_only)
                 if signal is None:
-                    self._expire_signal(dossier, "evidence decayed below the signal threshold before an entry was confirmed")
+                    self._expire_signal(dossier, self._below_bar_reason(dossier, "on the daily decay pass"))
                     continue
             self.dossiers.save(dossier)
 
@@ -1869,3 +1990,46 @@ class Engine:
                 + "\n"
             )
         self.universe_screen_state.set("last_screened_at", datetime.now(timezone.utc).isoformat())
+        self._prune_dead_symbols(results)
+
+    def _prune_dead_symbols(self, results: list) -> list[str]:
+        """Drops runtime-accepted symbols the screen found NO market data for
+        at all -- delisted, acquired, or an OTC/foreign line no data source
+        covers. Until now the screen only logged: a dead ticker kept costing
+        an EDGAR poll, a news poll and any resulting LLM calls on every
+        cycle, forever, while being incapable of ever being priced, marked
+        or traded. Confirmed live: a literal "NULL", plus BMWYY/VLKAY/HYMTF
+        as never-screened anchors.
+
+        Only RUNTIME-ACCEPTED symbols are pruned. A curated symbol (from
+        universe.py, or SYMBOLS/ANCHOR_SYMBOLS) is a deliberate human
+        choice: removing it here would be un-undoable from the dashboard and
+        would silently fight the operator's own list on every screen. Those
+        are reported loudly instead, and recorded so the diagnostics bundle
+        can show them without needing the log."""
+        dead = [r.symbol for r in results if r.market_cap_musd is None]
+        pruned, curated = [], []
+        for symbol in dead:
+            if symbol in self.accepted_candidates.data:
+                self.accepted_candidates.delete(symbol)
+                pruned.append(symbol)
+            else:
+                curated.append(symbol)
+        self.universe_screen_state.set("curated_no_market_data", sorted(curated))
+        if pruned:
+            self.universe = [c for c in self.universe if c.symbol not in set(pruned)]
+            self.spec_by_symbol = spec_by_symbol(self.universe)
+            self._archive_orphaned_dossiers()
+            log.warning(
+                "[UNIVERSE] Pruned %d runtime-accepted symbol(s) with no market data at all: %s. "
+                "They can never be priced or traded, so polling them was pure cost.",
+                len(pruned), ", ".join(pruned),
+            )
+        if curated:
+            log.warning(
+                "[UNIVERSE] %d CURATED symbol(s) returned no market data: %s. Left in place "
+                "(a curated list is a deliberate choice, not the screen's to overrule) -- remove "
+                "them from universe.py / SYMBOLS if they are genuinely dead.",
+                len(curated), ", ".join(sorted(curated)),
+            )
+        return pruned

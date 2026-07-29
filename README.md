@@ -284,10 +284,23 @@ the final list is still your call, same as accepting any other candidate.
 ## Entry timing: are we too late?
 
 A signal firing (evidence crossed the confidence/magnitude/corroboration
-bar) and a paper trade opening are deliberately two separate moments --
-the price feed only polls every `PRICE_POLL_INTERVAL_SEC` (6h by default),
-so time passes between "the evidence justified a position" and "we're
-about to actually take it." Two guards close that gap (both require
+bar) and a paper trade opening are deliberately two separate moments, so
+time passes between "the evidence justified a position" and "we're about
+to actually take it."
+
+How much time is itself a setting, and marking open trades and confirming
+an entry run on different clocks. Idle, the price feed polls every
+`PRICE_POLL_INTERVAL_SEC` (6h -- a swing/position system needs nothing
+tighter to mark positions to market). But while a `SIGNALED` dossier is
+waiting on the entry gate, it polls every
+`SIGNAL_ENTRY_POLL_INTERVAL_SEC` (15 min) instead. The first signal this
+system ever fired never got a single entry evaluation: it fired
+mid-session, the next poll was hours out and landed after the close, and
+the daily decay pass expired it before an entry was ever attempted. The
+tight cadence applies only while something is actually pending, so the
+steady-state request rate is unchanged.
+
+Two guards then decide whether the entry happens (both require
 `ENABLE_IB_PRICE_FEED=true` -- without a price feed there's no price to
 check a signal against, and signals just log as before):
 
@@ -307,6 +320,13 @@ check a signal against, and signals just log as before):
   old one no longer means anything.
 
 Both are visible on the dashboard's Dossiers table (Signaled @ column).
+
+Every one of these outcomes is written to `logs/decisions.jsonl` with the
+numbers that caused it -- which gate failed, by how much, and the price at
+the time -- and the diagnostics bundle prints one row per signal *episode*
+with its outcome. "Why did this signal not become a trade" is the single
+most important question this system can be asked, and answering it must
+never require shell access to the host.
 
 ## Evidence time-decay
 

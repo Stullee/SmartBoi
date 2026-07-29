@@ -31,6 +31,18 @@ class ScreenResult:
     reason: str
     market_cap_musd: float | None
     analyst_count: int | None
+    # Anchors are screened for LIVENESS ONLY (see screen_universe) -- their
+    # still_fits says nothing about the thin-coverage bounds, which by
+    # design don't apply to them. Callers acting on a failed screen must
+    # distinguish the two or they will "prune" every anchor.
+    is_anchor: bool = False
+
+
+# The one screen verdict that means "this ticker is dead", not "this ticker
+# no longer fits" -- no data source knows it at all. Acted on automatically
+# (see Engine._prune_dead_symbols), so it is a shared constant rather than a
+# string matched by eye in two places.
+_NO_MARKET_DATA = "no market cap data (possibly delisted/acquired, or just not covered)"
 
 
 def _fits_thin_coverage_bounds(
@@ -44,7 +56,7 @@ def _fits_thin_coverage_bounds(
     member still fit) and screen_candidate (does a NEW candidate fit) --
     same thresholds, same reasoning, written once."""
     if market_cap_musd is None:
-        return False, "no market cap data (possibly delisted/acquired, or just not covered)"
+        return False, _NO_MARKET_DATA
     if not (min_market_cap_musd <= market_cap_musd <= max_market_cap_musd):
         return False, f"market cap ${market_cap_musd:.0f}M outside [{min_market_cap_musd:.0f}M, {max_market_cap_musd:.0f}M]"
     if analyst_count is not None and analyst_count > max_analyst_count:
@@ -59,26 +71,49 @@ async def screen_universe(
     max_market_cap_musd: float,
     max_analyst_count: int,
 ) -> list[ScreenResult]:
-    """Anchors (signal_source_only=True) are skipped -- they're deliberately
-    large/heavily-covered by design (that's what makes their news worth
-    propagating), so the small/mid-cap/thin-coverage bounds don't apply to
-    them."""
+    """Anchors (signal_source_only=True) are exempt from the thin-coverage
+    bounds -- they're deliberately large and heavily covered by design,
+    which is what makes their news worth propagating. They are still
+    screened for LIVENESS: a ticker with no market data at all is delisted,
+    acquired, or an OTC/foreign line no data source covers, and a dead
+    anchor costs an EDGAR poll, a news poll and any resulting LLM calls
+    every single cycle while being incapable of contributing anything.
+    Confirmed live: BMWYY, VLKAY and HYMTF all sat in the universe as
+    anchors that nothing ever screened, because anchors were skipped
+    outright."""
     results = []
     for company in universe:
-        if company.signal_source_only:
-            continue
         market_cap = await finnhub.market_cap_musd(company.symbol)
+        if company.signal_source_only:
+            alive = market_cap is not None
+            results.append(ScreenResult(
+                company.symbol, alive,
+                "anchor, live" if alive else _NO_MARKET_DATA,
+                market_cap, None, is_anchor=True,
+            ))
+            continue
         analysts = await finnhub.analyst_count(company.symbol)
         fits, reason = _fits_thin_coverage_bounds(
             market_cap, analysts, min_market_cap_musd, max_market_cap_musd, max_analyst_count
         )
         results.append(ScreenResult(company.symbol, fits, reason, market_cap, analysts))
 
-    dropped = [r for r in results if not r.still_fits]
+    # Reported separately: a tradeable outgrowing the thin-coverage bounds
+    # and an anchor with no market data at all are different problems with
+    # different fixes, and one combined line said "no longer fits the
+    # small/mid-cap criteria" about anchors those criteria never applied to.
+    dropped = [r for r in results if not r.still_fits and not r.is_anchor]
     if dropped:
         log.warning(
             "Universe screen: %d symbol(s) no longer fit the small/mid-cap thin-coverage criteria: %s",
             len(dropped), ", ".join(f"{r.symbol} ({r.reason})" for r in dropped),
+        )
+    dead_anchors = [r for r in results if not r.still_fits and r.is_anchor]
+    if dead_anchors:
+        log.warning(
+            "Universe screen: %d anchor(s) returned no market data at all (delisted, acquired, or an "
+            "OTC/foreign line no source covers): %s",
+            len(dead_anchors), ", ".join(r.symbol for r in dead_anchors),
         )
     return results
 

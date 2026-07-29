@@ -166,6 +166,14 @@ class Settings(BaseSettings):
     ib_port: int = 7497
     ib_client_id: int = 27
     price_poll_interval_sec: int = 21600  # 6h -- a swing/position system has no need for tighter polling
+    # ...but MARKING open trades and CONFIRMING an entry are different jobs.
+    # A SIGNALED dossier is waiting on the entry gate, and at a 6-hour
+    # cadence three of every four checks land outside market hours -- the
+    # first signal this system ever fired (DCO, 2026-07-28) was reset to
+    # ACTIVE without a single entry evaluation ever running against it.
+    # While any entry is pending, prices are polled at this tighter interval
+    # instead (see Engine._price_poll_interval).
+    signal_entry_poll_interval_sec: int = 900
 
     # --- Universe auto-screen: prunes tickers that no longer fit (acquired,
     # delisted, graduated to broad analyst coverage) rather than trusting a
