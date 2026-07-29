@@ -24,7 +24,12 @@ from pathlib import Path
 
 from smartboi.news import redact_token
 from smartboi.status import gather_dossiers, gather_paper_trade_stats
-from smartboi.event_study import format_event_study
+from smartboi.event_study import (
+    OUTCOME_LABELS,
+    attach_outcomes,
+    collapse_episodes,
+    format_event_study,
+)
 from smartboi.forward_returns import (
     compute_forward_return,
     dedup_snapshots,
@@ -184,14 +189,17 @@ def run_event_study(
 # email, as SEC requires), or a URL that can embed a token
 # (alert_webhook_url).
 _DIAGNOSTIC_SETTINGS = (
-    "signal_confidence_threshold", "min_independent_sources", "max_horizon_days",
+    "signal_confidence_threshold", "min_independent_sources",
+    "min_independent_sources_news_only", "max_horizon_days",
     "max_favorable_drift_pct", "signal_entry_deadline_days",
-    "stop_loss_pct", "take_profit_pct",
+    "stop_loss_pct", "take_profit_pct", "transaction_cost_bps_per_side",
     "max_daily_llm_calls", "max_propagated_evidence_per_link",
     "propagated_evidence_cooldown_hours",
     "extraction_model", "dossier_model", "skeptic_model",
     "edgar_poll_interval_sec", "news_poll_interval_sec", "price_poll_interval_sec",
-    "edgar_lookback_days", "news_lookback_days",
+    "signal_entry_poll_interval_sec",
+    "enable_edgar_ingestion", "enable_news_ingestion", "edgar_forms",
+    "edgar_lookback_days", "news_lookback_days", "enable_universe_autoscreen",
     "universe_min_market_cap_musd", "universe_max_market_cap_musd",
     "universe_max_analyst_count", "universe_screen_interval_days",
     "enable_auto_accept_candidates", "auto_accept_anchors", "auto_accept_tradeables",
@@ -306,12 +314,44 @@ def run_diagnostics(engine) -> str:
 
     log_dir = Path(s.log_dir)
     signals = read_jsonl(log_dir / "signals.jsonl")
-    add(f"\n--- Signals ({len(signals)}) ---")
-    for sig in signals[-10:]:
-        add(f"  {sig.get('generated_at', '')[:16]} {sig.get('symbol', ''):7}{sig.get('direction', ''):6}"
-            f" conf={sig.get('confidence', 0):.2f} mag={sig.get('magnitude', 0):.2f} src={sig.get('independent_source_count', 0)}")
-    if not signals:
+    decisions = read_jsonl(log_dir / "decisions.jsonl")
+    # Episodes, not raw rows: evaluation is status-blind, so one signal
+    # re-logs a row per accepted evidence item and a raw list overstates how
+    # often signals actually fire. Joined against the decisions ledger so
+    # each episode carries WHAT HAPPENED TO IT. Without this the bundle
+    # showed a signal firing and zero trades with nothing in between, and
+    # "why did this signal not become a trade" -- the single most important
+    # question this system can be asked -- needed shell access to answer.
+    episodes = attach_outcomes(collapse_episodes(signals), decisions)
+    add(f"\n--- Signal episodes ({len(episodes)} from {len(signals)} logged row(s)) ---")
+    if episodes:
+        add(f"  {'FIRED':17}{'SYM':7}{'DIR':6}{'CONF':>6}{'MAG':>6}{'SCORE':>7}  {'OUTCOME':<24} WHY")
+        for e in episodes[-MAX_LISTED_ROWS:]:
+            score = (e.get("confidence") or 0.0) * (e.get("magnitude") or 0.0)
+            add(f"  {e['fired_at'][:16]:17}{e['symbol']:7}{(e.get('direction') or '-'):6}"
+                f"{e.get('confidence') or 0.0:6.2f}{e.get('magnitude') or 0.0:6.2f}{score:7.3f}"
+                f"  {OUTCOME_LABELS[e['outcome']]:<24} {e['decision_reason'][:100]}")
+        untracked = [e for e in episodes if e["outcome"] == "untracked"]
+        if untracked:
+            add(f"  ^^ {len(untracked)} episode(s) carry no ledger row -- either they fired before")
+            add("     decisions.jsonl existed, or they are still SIGNALED awaiting an entry decision")
+            add("     (cross-check STATUS in the dossier table above; an episode whose dossier is")
+            add("     back to ACTIVE with no ledger row was expired by a pre-ledger build).")
+    else:
         add("  none yet")
+
+    # Recomputed from the dossier rows above rather than read off
+    # engine._entry_pending: that flag is deliberately optimistic (it starts
+    # True and self-corrects on the first poll), which would read as "an
+    # entry is waiting" on a deployment with no dossiers at all.
+    waiting = [d["symbol"] for d in dossiers
+               if d["status"] == "SIGNALED" and d["symbol"] not in engine.journal.open_trades]
+    add("\n--- Entry pipeline ---")
+    add(f"  price feed              : {'IB' if engine.price_feed is not None else 'DISABLED -- no entry can ever be confirmed'}")
+    add(f"  waiting for an entry    : {' '.join(waiting) or 'nothing'}")
+    add(f"  price poll (idle)       : {s.price_poll_interval_sec}s")
+    add(f"  price poll (entry due)  : {s.signal_entry_poll_interval_sec}s")
+    add(f"  entry deadline          : {s.signal_entry_deadline_days}d, max favorable drift {s.max_favorable_drift_pct}%")
 
     stats, closed = gather_paper_trade_stats(log_dir / "paper_trades.jsonl")
     add("\n--- Paper trades ---")
@@ -329,6 +369,15 @@ def run_diagnostics(engine) -> str:
     add(f"  blocked from auto-add  : {sum(1 for c in cands.values() if c.get('auto_accept_blocked'))}")
     auto = sum(1 for v in engine.accepted_candidates.data.values() if isinstance(v, dict) and v.get("source") == "auto")
     add(f"  accepted: {len(engine.accepted_candidates.data)} ({auto} auto, {len(engine.accepted_candidates.data) - auto} manual)")
+    # Curated symbols the last screen found no market data for. Runtime-
+    # accepted dead symbols are pruned automatically (see
+    # Engine._prune_dead_symbols); these need a human to edit the list, so
+    # they have to be visible somewhere other than a log line.
+    curated_dead = engine.universe_screen_state.get("curated_no_market_data") or []
+    add(f"  last screened          : {engine.universe_screen_state.get('last_screened_at') or 'never'}")
+    if curated_dead:
+        add(f"  CURATED, no market data: {' '.join(curated_dead)}")
+        add("    ^^ delisted/acquired/uncovered -- remove from universe.py or SYMBOLS; polling them costs and returns nothing")
 
     add("\n--- Forward-validation capture ---")
     add(f"  dossier_snapshots.jsonl : {_jsonl_span(read_jsonl(log_dir / 'dossier_snapshots.jsonl'), 'snapshotted_at')}")

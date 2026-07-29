@@ -257,6 +257,53 @@ async def test_reset_removes_runtime_additions_and_archives_their_dossiers(engin
     assert "DCO" in engine.spec_by_symbol
 
 
+# --- Dead tickers: the screen used to only LOG them, so a delisted or
+# uncovered symbol kept costing an EDGAR poll, a news poll and any resulting
+# LLM calls forever while being incapable of ever being priced or traded.
+# Confirmed live: a literal "NULL", plus BMWYY/VLKAY/HYMTF sitting as anchors
+# the screen skipped entirely. ---
+
+async def test_dead_runtime_accepted_symbols_are_pruned_automatically(engine, tmp_path):
+    from smartboi.dossier import Dossier
+    from smartboi.universe_screen import ScreenResult
+
+    engine.candidates.set("ZZZZ", _candidate())
+    await engine._auto_accept_candidates()
+    engine.dossiers.save(Dossier(symbol="ZZZZ"))
+    assert "ZZZZ" in engine.spec_by_symbol
+
+    pruned = engine._prune_dead_symbols([ScreenResult("ZZZZ", False, "no market cap data", None, None)])
+
+    assert pruned == ["ZZZZ"]
+    assert "ZZZZ" not in engine.spec_by_symbol
+    assert "ZZZZ" not in engine.accepted_candidates.data
+    assert (tmp_path / "data" / "dossiers_archived" / "ZZZZ.json").exists()
+
+
+def test_a_dead_curated_symbol_is_reported_not_silently_removed(engine):
+    """A curated symbol is a deliberate human choice. Deleting it here would
+    be un-undoable from the dashboard and would fight the operator's own
+    list on every screen -- so it is surfaced for a human instead."""
+    from smartboi.universe_screen import ScreenResult
+
+    pruned = engine._prune_dead_symbols([ScreenResult("DCO", False, "no market cap data", None, None)])
+
+    assert pruned == []
+    assert "DCO" in engine.spec_by_symbol
+    assert engine.universe_screen_state.get("curated_no_market_data") == ["DCO"]
+
+
+def test_a_live_symbol_is_never_pruned(engine):
+    from smartboi.universe_screen import ScreenResult
+
+    pruned = engine._prune_dead_symbols([
+        ScreenResult("DCO", False, "market cap $9000M outside [75M, 5000M]", 9000.0, 4),
+    ])
+
+    assert pruned == []
+    assert "DCO" in engine.spec_by_symbol
+
+
 async def test_reset_leaves_discovered_candidates_alone(engine):
     """Candidates are facts discovered from filings -- clearing them would
     just make the engine rediscover the same names and re-pay for the

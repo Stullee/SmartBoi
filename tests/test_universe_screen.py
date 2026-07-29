@@ -41,13 +41,31 @@ async def test_screen_universe_flags_too_many_analysts():
     assert "analysts" in results[0].reason
 
 
-async def test_screen_universe_skips_anchors():
+async def test_screen_universe_exempts_anchors_from_thin_coverage_bounds():
+    """An anchor is deliberately large and heavily covered -- that's what
+    makes its news worth propagating -- so a market cap far above the
+    tradeable ceiling must not flag it."""
     finnhub = FakeFinnhub()
+    finnhub.market_cap_by_symbol["AMAT"] = 180_000.0
     universe = [_spec("AMAT", "semi_equipment", signal_source_only=True)]
 
     results = await screen_universe(universe, finnhub, min_market_cap_musd=100, max_market_cap_musd=3000, max_analyst_count=6)
 
-    assert results == []
+    assert results == [ScreenResult("AMAT", True, "anchor, live", 180_000.0, None, is_anchor=True)]
+
+
+async def test_screen_universe_flags_anchor_with_no_market_data():
+    """Anchors used to be skipped outright, so a dead one (delisted, or an
+    OTC ADR line no source covers -- BMWYY/VLKAY/HYMTF, all confirmed live)
+    was polled forever without anything ever noticing."""
+    finnhub = FakeFinnhub()
+    universe = [_spec("BMWYY", "auto_supply", signal_source_only=True)]
+
+    results = await screen_universe(universe, finnhub, min_market_cap_musd=100, max_market_cap_musd=3000, max_analyst_count=6)
+
+    assert results[0].still_fits is False
+    assert results[0].is_anchor is True
+    assert results[0].market_cap_musd is None
 
 
 async def test_screen_universe_no_market_cap_data_fails():

@@ -1,6 +1,6 @@
 ---
 name: SmartBoi (Evidence Synthesis, Paper-Only)
-version: "0.21.0"
+version: "0.22.0"
 slug: smartboi
 description: >-
   LLM-driven cross-company evidence synthesis for equity research: ingests
@@ -55,6 +55,7 @@ options:
   ib_port: 7497
   ib_client_id: 27
   price_poll_interval_sec: 21600
+  signal_entry_poll_interval_sec: 900
   enable_universe_autoscreen: true
   universe_screen_interval_days: 30
   universe_min_market_cap_musd: 75.0
@@ -102,6 +103,7 @@ schema:
   ib_port: port
   ib_client_id: int(1,32)
   price_poll_interval_sec: int(300,86400)
+  signal_entry_poll_interval_sec: int(60,86400)
   enable_universe_autoscreen: bool
   universe_screen_interval_days: int(1,365)
   universe_min_market_cap_musd: float(0,1000000)

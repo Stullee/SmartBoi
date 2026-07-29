@@ -606,6 +606,59 @@ async def test_lender_supplier_relationships_are_dropped(engine):
     assert engine.candidates.data == {}
 
 
+async def test_a_demand_line_of_credit_is_recognised_as_lending(engine):
+    """Bank debt is disclosed in a dozen near-synonyms and the first phrase
+    list only covered some of them: confirmed live, M&T Bank reached the
+    graph as a "supplier" to Taylor Devices off a demand line of credit."""
+    filing = FilingEvent(
+        symbol="TAYD", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000012", primary_document="f.htm",
+    )
+    engine.extractor.default = [{
+        "counterparty_name": "M&T Bank", "counterparty_ticker": "MTB",
+        "rel_type": "supplier",
+        "description": "M&T Bank provides a $10,000,000 demand line of credit to Taylor Devices.",
+        "confidence": 0.9, "quote": "q",
+    }]
+
+    await engine._extract_relationships("TAYD", filing, "text")
+
+    assert engine.graph.relationships == []
+    assert engine.candidates.data == {}
+
+
+# --- An 8-K item 5.02 officer appointment names a string of well-known
+# former employers, and extraction reads a CV line as a disclosed business
+# link. Confirmed live: EPAC->ITW, EPAC->GE, VVX->RTX, NCSM->APO. ---
+
+async def test_executive_biography_relationships_are_dropped(engine):
+    filing = FilingEvent(
+        symbol="EPAC", cik10="0000000001", form="8-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000013", primary_document="f.htm",
+    )
+    engine.extractor.default = [{
+        "counterparty_name": "Illinois Tool Works", "counterparty_ticker": "ITW",
+        "rel_type": "customer",
+        "description": "Prior to joining the Company, Mr. Smith served as VP of Illinois Tool Works.",
+        "confidence": 0.8, "quote": "Prior to joining the Company he held various positions at ITW.",
+    }]
+
+    await engine._extract_relationships("EPAC", filing, "text")
+
+    assert engine.graph.relationships == []
+    assert engine.candidates.data == {}
+
+
+def test_biography_filter_does_not_catch_a_commercial_disclosure():
+    """The phrase list is deliberately narrow: a genuine supply agreement
+    that happens to use "served" must survive it."""
+    assert not Engine._is_biography_relationship({
+        "rel_type": "customer",
+        "description": "Intel has served as our largest customer for three consecutive years.",
+        "quote": "Intel accounted for 22% of net sales.",
+    })
+
+
 async def test_a_bank_as_a_genuine_customer_is_kept(engine):
     """Only the "our lender" direction is a dead end -- a company SELLING to
     a bank is a real propagation path."""
@@ -735,6 +788,87 @@ async def test_no_trade_opens_when_thesis_no_longer_qualifies_at_entry(engine):
 
     assert not engine.journal.has_open("FORM")
     assert engine.dossiers.load("FORM").status == "ACTIVE"  # expired, clean slate
+
+    # The ledger must say WHY, with numbers: "no longer qualifies" made
+    # every expiry look identical and left the first real signal this system
+    # ever produced unexplainable after the fact.
+    rows = [json.loads(ln) for ln in (Path(engine.settings.log_dir) / "decisions.jsonl").read_text().splitlines()]
+    expired = [r for r in rows if r["event"] == "signal_expired" and r["symbol"] == "FORM"]
+    assert expired and "score" in expired[-1]["reason"]
+    assert "at entry time" in expired[-1]["reason"]
+
+
+async def test_expiry_reason_names_the_source_bar_that_failed(engine):
+    """The two gates fail for different reasons and need different fixes --
+    a thesis short of corroboration is not the same problem as one whose
+    score decayed."""
+    engine.settings.min_independent_sources_news_only = 3
+    dossier = engine.dossiers.load("FORM")
+    dossier.direction = "LONG"
+    dossier.confidence = 0.9
+    dossier.magnitude = 0.9
+    dossier.independent_source_count = 2
+    dossier.has_filing_evidence = False
+
+    reason = engine._below_bar_reason(dossier, "at entry time")
+
+    assert "sources 2/3" in reason and "news-only bar" in reason
+    assert "score" not in reason  # the score gate passed; don't blame it
+
+
+# --- Entry cadence: marking open trades and confirming an entry run on
+# different clocks. The first signal this system ever fired never got a
+# single entry evaluation, because the next price poll was up to six hours
+# out and the thesis was expired before it arrived. ---
+
+async def test_price_poll_tightens_while_an_entry_is_pending(engine):
+    engine.settings.price_poll_interval_sec = 21600
+    engine.settings.signal_entry_poll_interval_sec = 900
+
+    engine._entry_pending = False
+    assert engine._price_poll_interval() == 21600
+
+    engine._entry_pending = True
+    assert engine._price_poll_interval() == 900
+
+
+async def test_a_fresh_signal_marks_an_entry_as_pending(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    engine._entry_pending = False
+
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+
+    assert engine.dossiers.load("FORM").status == "SIGNALED"
+    assert engine._entry_pending is True
+
+    # Once the trade is open there is nothing waiting on the entry gate, so
+    # the cadence drops back to the idle interval.
+    await engine._mark_and_execute()
+    assert engine.journal.has_open("FORM")
+    assert engine._entry_pending is False
+
+
+# --- Regression: the decay pass EXPIRES pending signals, so it must not be
+# scheduled off a process-local timer. A monotonic marker resets to "due
+# immediately" on every restart, giving a marginal signal several extra
+# chances per day to be killed before the 6-hourly price poll ever looked
+# at it. ---
+
+def test_decay_pass_is_scheduled_off_persisted_wall_clock(engine):
+    assert engine._daily_pass_due("decay_pass") is True
+    engine._mark_daily_pass_done("decay_pass")
+    assert engine._daily_pass_due("decay_pass") is False
+
+    # A restart rebuilds the Engine from the same on-disk state: the pass
+    # must still be marked done, not re-run.
+    restarted = Engine(engine.settings)
+    assert restarted._daily_pass_due("decay_pass") is False
 
 
 # --- News-only corroboration bar: two publishers can be one reworded wire
