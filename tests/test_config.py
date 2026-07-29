@@ -61,3 +61,52 @@ def test_anchor_only_universe(monkeypatch):
     monkeypatch.setenv("ANCHOR_SYMBOLS", "AAPL")
     settings = Settings(_env_file=None)
     assert [c.symbol for c in settings.universe] == ["AAPL"]
+
+
+# --- The add-on's options/schema must track Settings.
+#
+# _addon_options.py turns every key in /data/options.json into an env var,
+# and those OVERRIDE the code defaults. So a Settings field missing from the
+# add-on schema cannot be tuned from the HA UI at all, and an options key
+# that is not a Settings field is silently exported as an env var nothing
+# reads -- a typo that looks configured and does nothing. Both are easy to
+# introduce (they live in a different file, in a different language) and
+# invisible until someone wonders why a setting has no effect. ---
+
+def _addon_config() -> dict:
+    import yaml
+    from pathlib import Path
+
+    return yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "ha-addons/smartboi/config.yaml").read_text()
+    )
+
+
+def test_every_addon_option_is_a_real_setting():
+    stray = set(_addon_config()["options"]) - set(Settings.model_fields)
+    assert not stray, f"add-on options that no Settings field reads: {sorted(stray)}"
+
+
+def test_every_addon_option_has_a_schema_entry():
+    config = _addon_config()
+    missing = set(config["options"]) - set(config["schema"])
+    assert not missing, f"options with no schema entry (HA will reject them): {sorted(missing)}"
+
+
+def test_every_schema_entry_has_a_default():
+    config = _addon_config()
+    missing = set(config["schema"]) - set(config["options"])
+    assert not missing, f"schema entries with no default: {sorted(missing)}"
+
+
+def test_the_addon_default_matches_the_code_default():
+    """Where the add-on ships a default it must be the same one the code
+    would have used, or a fresh install behaves differently from the docs."""
+    options = _addon_config()["options"]
+    defaults = Settings(_env_file=None)
+    for key in ("edgar_poll_interval_sec", "edgar_forms", "max_daily_usd",
+                "extraction_model", "dossier_model", "skeptic_model",
+                "synthesis_model", "backfill_anchors"):
+        assert options[key] == getattr(defaults, key), (
+            f"{key}: add-on ships {options[key]!r}, code default is {getattr(defaults, key)!r}"
+        )

@@ -26,19 +26,23 @@ options:
   anchor_symbols: ""
   enable_edgar_ingestion: true
   enable_relationship_backfill: true
+  backfill_anchors: true
   edgar_user_agent: ""
-  edgar_forms: "8-K,10-K,10-Q,4"
-  edgar_poll_interval_sec: 3600
+  edgar_forms: "8-K,8-K/A,10-K,10-Q,4,SC 13D,SC 13D/A,424B5,424B3"
+  edgar_poll_interval_sec: 900
   edgar_lookback_days: 14
   enable_news_ingestion: true
   finnhub_api_key: ""
   news_poll_interval_sec: 3600
   news_lookback_days: 3
   anthropic_api_key: ""
-  extraction_model: "claude-haiku-4-5-20251001"
-  dossier_model: "claude-haiku-4-5-20251001"
-  skeptic_model: "claude-haiku-4-5-20251001"
+  extraction_model: "claude-haiku-4-5"
+  dossier_model: "claude-haiku-4-5"
+  skeptic_model: "claude-haiku-4-5"
+  synthesis_model: "claude-opus-5"
+  synthesis_score_floor_pct: 0.6
   max_daily_llm_calls: 3000
+  max_daily_usd: 3.30
   max_propagated_evidence_per_link: 3
   propagated_evidence_cooldown_hours: 6
   enable_ecosystem_propagation: true
@@ -76,6 +80,7 @@ schema:
   anchor_symbols: str
   enable_edgar_ingestion: bool
   enable_relationship_backfill: bool
+  backfill_anchors: bool
   edgar_user_agent: str
   edgar_forms: str
   edgar_poll_interval_sec: int(60,86400)
@@ -88,7 +93,10 @@ schema:
   extraction_model: str
   dossier_model: str
   skeptic_model: str
+  synthesis_model: str
+  synthesis_score_floor_pct: float(0,5)
   max_daily_llm_calls: int(1,1000000)
+  max_daily_usd: float(0,10000)
   max_propagated_evidence_per_link: int(1,100)
   propagated_evidence_cooldown_hours: int(1,168)
   enable_ecosystem_propagation: bool
