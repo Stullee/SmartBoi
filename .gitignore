@@ -5,6 +5,10 @@ __pycache__/
 logs/
 data/*.json
 !data/.gitkeep
+# Captured deployment state used as offline audit input (mirrors the
+# deployment layout: data/ + logs/). Same reasons as the two rules above --
+# it is runtime record, not source, and it holds live position state.
+runtime_snapshot/
 *.egg-info/
 .pytest_cache/
 .DS_Store
