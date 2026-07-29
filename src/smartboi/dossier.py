@@ -99,6 +99,22 @@ class Dossier:
     # dossiers to a higher independent-source bar. A filing is a primary
     # disclosure and can't be a syndicated rewording of a news article.
     has_filing_evidence: bool = False
+    # Whether any non-stale agreeing evidence reached this dossier over a
+    # STRONGLY DISCLOSED relationship edge (see DISCLOSED_LINK_CONFIDENCE)
+    # -- a customer/supplier link a 10-K states outright, usually with a
+    # quantified share of revenue ("GM accounted for 25% of revenues").
+    #
+    # This satisfies the same bar a filing does, for the same reason. The
+    # elevated news-only bar defends against two outlets rewording one wire
+    # story into two apparent "sources"; it was never meant to ask whether
+    # the CAUSAL LINK is real. When the link comes from a primary filing
+    # disclosure, that question is already answered by a primary source,
+    # and demanding a third journalist instead means waiting until the
+    # market has made the connection itself -- which is precisely when the
+    # move is over. Confirmed live: DCO sat at 17 agreeing evidence items,
+    # mass 8.88, zero opposing, over 0.85-0.95 confidence disclosed links
+    # to RTX/LMT/NOC, and could not act for want of a third publisher.
+    has_disclosed_link_evidence: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -150,6 +166,16 @@ def has_evidence(dossier: Dossier, evidence_id: str) -> bool:
 # 1 day) isn't discarded almost immediately.
 _STALE_HORIZON_MULTIPLE = 2
 _MIN_STALE_DAYS = 14
+
+# The graph-edge confidence at which a relationship counts as DISCLOSED
+# rather than inferred -- the extractor assigns this band to links a filing
+# states outright, typically with a quantified share of revenue. Calibrated
+# against the live graph, where the quantified concentration disclosures
+# ("GM accounted for 25% of revenues", "RTX missile programs are a major
+# customer relationship") sit at 0.85-0.98, while speculative or
+# passing-mention links ("Google Drive is integrated with FedEx Office",
+# an indirect JV competitor) sit at 0.30-0.65.
+DISCLOSED_LINK_CONFIDENCE = 0.85
 # Weight an evidence item keeps right at its stale cutoff, before being
 # excluded entirely -- never fully zero a moment before exclusion, since
 # aged corroboration is still weak signal that a persistent theme existed.
@@ -285,6 +311,7 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
         dossier.mass_agree = 0.0
         dossier.mass_opposing = 0.0
         dossier.has_filing_evidence = False
+        dossier.has_disclosed_link_evidence = False
         return
 
     agreeing = [
@@ -294,6 +321,9 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     weighted = [(e, evidence_weight(e, now)) for e in agreeing]
     dossier.independent_source_count = len({e.source_name for e in agreeing})
     dossier.has_filing_evidence = any(e.source_type != "news" for e in agreeing)
+    dossier.has_disclosed_link_evidence = any(
+        (e.relationship_confidence or 0.0) >= DISCLOSED_LINK_CONFIDENCE for e in agreeing
+    )
     base_confidence = max(e.confidence * w for e, w in weighted)
     corroboration_bonus = 0.1 * max(0, dossier.independent_source_count - 1)
     raw_confidence = min(1.0, base_confidence + corroboration_bonus)

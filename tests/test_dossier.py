@@ -20,7 +20,7 @@ NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 
 
 def _evidence(direction="LONG", confidence=0.7, magnitude=0.6, horizon_days=20, source_name="reuters.com",
-              evidence_id="e1", published_at=None):
+              evidence_id="e1", published_at=None, relationship_confidence=None):
     return EvidenceRecord(
         evidence_id=evidence_id,
         source_type="news",
@@ -37,6 +37,7 @@ def _evidence(direction="LONG", confidence=0.7, magnitude=0.6, horizon_days=20, 
         horizon_days=horizon_days,
         reasoning="because reasons",
         skeptic_note="",
+        relationship_confidence=relationship_confidence,
     )
 
 
@@ -355,3 +356,55 @@ def test_losing_side_filing_does_not_set_the_flag():
     merge_evidence(dossier, contrary_filing, now=NOW)
     assert dossier.direction == "LONG"
     assert dossier.has_filing_evidence is False
+
+
+# --- Disclosed-link backing: whether the CAUSAL LINK behind a piece of
+# propagated evidence came from a primary filing disclosure. Drives the
+# corroboration bar in signals.evaluate. ---
+
+def test_a_strongly_disclosed_link_marks_the_dossier_as_backed():
+    dossier = Dossier(symbol="ULH")
+    # Live shape: "General Motors is ULH's top customer, ~25% of revenues",
+    # extracted from a 10-K at confidence 0.95.
+    merge_evidence(dossier, _evidence(relationship_confidence=0.95), now=NOW)
+    assert dossier.has_disclosed_link_evidence is True
+
+
+def test_a_weakly_inferred_link_leaves_the_dossier_unbacked():
+    dossier = Dossier(symbol="FDX")
+    # Live shape: "Google Drive is integrated with FedEx Office" at 0.60 --
+    # a real mention, not a revenue-material disclosed relationship.
+    merge_evidence(dossier, _evidence(relationship_confidence=0.60), now=NOW)
+    assert dossier.has_disclosed_link_evidence is False
+
+
+def test_direct_unpropagated_evidence_leaves_the_dossier_unbacked():
+    """Evidence about the company itself carries no relationship at all --
+    there is no disclosed link to lean on, so the bar stays where it was."""
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(relationship_confidence=None), now=NOW)
+    assert dossier.has_disclosed_link_evidence is False
+
+
+def test_backing_only_counts_on_the_agreeing_side():
+    """A disclosed link behind evidence for the LOSING direction says
+    nothing about the thesis the dossier actually resolved to."""
+    dossier = Dossier(symbol="ULH")
+    merge_evidence(dossier, _evidence(direction="SHORT", relationship_confidence=0.95,
+                                      evidence_id="e1", confidence=0.3, magnitude=0.3), now=NOW)
+    merge_evidence(dossier, _evidence(direction="LONG", relationship_confidence=None,
+                                      evidence_id="e2", confidence=0.9, magnitude=0.9), now=NOW)
+    assert dossier.direction == "LONG"
+    assert dossier.has_disclosed_link_evidence is False
+
+
+def test_backing_decays_away_with_the_evidence_that_carried_it():
+    """Once the only disclosed-link evidence goes stale it stops counting,
+    the same as every other aggregate -- a dossier cannot keep trading on a
+    relaxed bar forever off one long-dead article."""
+    dossier = Dossier(symbol="ULH")
+    merge_evidence(dossier, _evidence(relationship_confidence=0.95, horizon_days=20), now=NOW)
+    assert dossier.has_disclosed_link_evidence is True
+
+    recompute_decay(dossier, NOW + timedelta(days=90))
+    assert dossier.has_disclosed_link_evidence is False

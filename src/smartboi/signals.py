@@ -46,13 +46,32 @@ def evaluate(
     if dossier.direction == "NONE":
         return None
     required_sources = min_independent_sources
-    if min_independent_sources_news_only is not None and not dossier.has_filing_evidence:
-        # News-only corroboration is softer than it looks: two outlets
-        # rewording one wire story can slip past dedup's near-dup check as
-        # two "independent" sources, and that alone used to satisfy the
-        # gate that fires trades. A filing (8-K, Form 4, 10-Q...) is a
-        # primary disclosure that can't be a rewording of a news article,
-        # so a dossier corroborated purely by news must clear a higher bar.
+    primary_source_backing = dossier.has_filing_evidence or dossier.has_disclosed_link_evidence
+    if min_independent_sources_news_only is not None and not primary_source_backing:
+        # The elevated bar exists for ONE failure mode: two outlets
+        # rewording a single wire story slipping past dedup's near-dup
+        # check as two "independent" sources. It is not a general
+        # "be more sure" tax, and applying it as one actively fights this
+        # system's premise.
+        #
+        # Two things take a dossier out of that failure mode, and they are
+        # equivalent for this purpose:
+        #   - a filing (8-K, Form 4, 10-Q...) on the agreeing side, which
+        #     is a primary disclosure and cannot be a reworded article; or
+        #   - evidence propagated over a STRONGLY DISCLOSED relationship
+        #     edge (see dossier.DISCLOSED_LINK_CONFIDENCE), where the
+        #     causal link itself -- the part actually at risk of being
+        #     wrong -- comes from a 10-K, usually with a quantified share
+        #     of revenue attached.
+        #
+        # The second case is the whole strategy: the edge is reading one
+        # high-quality fact about an anchor and inferring the effect on a
+        # thinly-covered supplier BEFORE the market connects them. Waiting
+        # for a third publisher to write that connection down means waiting
+        # for the edge to disappear. Corroborating "did the event happen"
+        # is redundant when the event is an official guidance raise;
+        # corroborating "is the link real" is what matters, and a filing
+        # already did it.
         required_sources = max(required_sources, min_independent_sources_news_only)
     if dossier.independent_source_count < required_sources:
         return None
