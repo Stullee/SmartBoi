@@ -2493,6 +2493,22 @@ class Engine:
                 pending = True
         self._entry_pending = pending
 
+        # Enforced BEFORE the price fetch and independent of it: a trade on a
+        # symbol nothing can price would otherwise stay open forever, pinning
+        # its dossier at SIGNALED so no fresh signal could replace it.
+        for trade in self.journal.expire_past_horizon():
+            await self.alerts.send(
+                "paper_trade_closed",
+                f"Paper trade closed: {trade.symbol} {trade.status} (stale mark)",
+                f"{trade.direction} entry={trade.entry_price:.2f} exit={trade.exit_price:.2f} "
+                f"R={trade.r_multiple:.2f}. Closed at its horizon without a fresh price -- no "
+                "source could mark it.",
+                asdict(trade),
+            )
+            dossier = self.dossiers.load(trade.symbol)
+            self._reset_to_active(dossier)
+            self.dossiers.save(dossier)
+
         open_symbols = list(self.journal.open_trades.keys())
         if not open_symbols:
             return
@@ -2633,21 +2649,29 @@ class Engine:
         benchmark beyond the handful of tradeables, which is what makes the
         alpha-vs-sector-beta split in the forward-return report meaningful.
 
-        Deliberately NOT dependent on IB: forward data can't be backfilled,
-        so a day with the Gateway down (or IB never configured) must not be
-        a permanently lost sample. IB is preferred when reachable; whatever
-        it misses is filled from Finnhub's /quote. Returns False when no
-        price source produced anything -- the caller leaves the pass due so
-        the next tick retries instead of marking a lost day done."""
+        FINNHUB FIRST, IB only for the remainder -- the reverse of every
+        other price path here, and deliberately so. IB caps historical-data
+        requests at roughly 60 per rolling 10 minutes per connection; this
+        pass covers the WHOLE universe (209 symbols live), so routing it
+        through IB blows that budget by several times over and the pacing
+        violation lands on the shared connection that also has to price
+        entries. IB's request budget is worth reserving for the two jobs
+        that need a broker-quality bar: confirming an entry, and marking
+        the handful of open paper trades. A forward-validation mark only
+        needs a close, which Finnhub's /quote gives for one cheap HTTP
+        request per symbol with no pacing coupling at all.
+
+        Still not dependent on either source individually: forward data
+        can't be backfilled, so a day with one source down must not be a
+        permanently lost sample. Returns False when NO source produced
+        anything -- the caller leaves the pass due so the next tick retries
+        instead of marking a lost day done."""
         symbols = [c.symbol for c in self.universe]
         if not symbols:
             return True
         prices: dict[str, float] = {}
-        if self.price_feed is not None and await self.price_feed.ensure_connected():
-            prices = await self.price_feed.last_prices(symbols)
-        missing = [s for s in symbols if s not in prices]
-        if missing and self.finnhub is not None:
-            for symbol in missing:
+        if self.finnhub is not None:
+            for symbol in symbols:
                 try:
                     quote = await self.finnhub.quote(symbol)
                 except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
@@ -2655,6 +2679,9 @@ class Engine:
                     continue
                 if quote is not None:
                     prices[symbol] = quote
+        missing = [s for s in symbols if s not in prices]
+        if missing and self.price_feed is not None and await self.price_feed.ensure_connected():
+            prices.update(await self.price_feed.last_prices(missing))
         if not prices:
             return False
         marked_at = datetime.now(timezone.utc).isoformat()

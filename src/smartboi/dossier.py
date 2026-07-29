@@ -221,6 +221,14 @@ def independence_key(record: EvidenceRecord) -> str:
     return record.source_name
 
 
+# The decay-scaled confidence an evidence item must carry before it counts
+# as an INDEPENDENT SOURCE (as opposed to merely contributing to mass). The
+# skeptic can accept an item while scaling its confidence toward zero, and
+# such an item was still buying a full source slot -- worth both a
+# confidence bonus and a magnitude multiplier. Corroboration from evidence
+# the adversarial pass judged worthless is not corroboration.
+MIN_SOURCE_CONTRIBUTION = 0.15
+
 # Corroboration bonuses, applied per DOUBLING of the independent-source
 # count rather than per additional source (see _aggregate).
 #
@@ -411,12 +419,40 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
         if e.direction == dossier.direction and not evidence_is_stale(e, now)
     ]
     weighted = [(e, evidence_weight(e, now)) for e in agreeing]
-    dossier.independent_source_count = len({independence_key(e) for e in agreeing})
-    dossier.has_filing_evidence = any(e.source_type != "news" for e in agreeing)
+    # An item the skeptic scaled to (near) zero still counted as a full
+    # independent source, and a source slot is worth a lot: it lifts
+    # confidence AND multiplies magnitude. So evidence the adversarial pass
+    # judged worthless was buying the corroboration that fires the trade.
+    # It still contributes to mass and decay for exactly what it is worth --
+    # it just stops claiming a slot it did not earn.
+    contributing = [e for e, w in weighted if e.confidence * w >= MIN_SOURCE_CONTRIBUTION]
+    dossier.independent_source_count = len({independence_key(e) for e in contributing})
+    # Gated on LINK quality as well as source type. Any filing set this flag,
+    # including one propagated over an ECOSYSTEM edge -- an industry-level
+    # association at 0.25 confidence, not a disclosed relationship. That
+    # silently relaxed the news-only corroboration bar from three sources to
+    # two on the weakest link type in the system, which is the opposite of
+    # what the bar is for. Direct filings carry relationship_confidence=None
+    # and still qualify; so does propagation over a strongly disclosed edge.
+    dossier.has_filing_evidence = any(
+        e.source_type != "news"
+        and (e.relationship_confidence is None
+             or e.relationship_confidence >= DISCLOSED_LINK_CONFIDENCE)
+        for e in agreeing
+    )
     dossier.has_disclosed_link_evidence = any(
         (e.relationship_confidence or 0.0) >= DISCLOSED_LINK_CONFIDENCE for e in agreeing
     )
-    base_confidence = max(e.confidence * w for e, w in weighted)
+    # The base thesis is ONE item's decay-scaled confidence and magnitude,
+    # chosen jointly. These used to be independent maxima over the whole
+    # agreeing set, so a dossier could report the confidence of a certain-
+    # but-tiny item alongside the magnitude of a speculative-but-large one
+    # -- a combined score no single piece of evidence had ever proposed,
+    # and higher than any of them. The strongest item is the one with the
+    # largest confidence*magnitude product; corroboration bonuses then
+    # build on top of it exactly as before.
+    best, best_weight = max(weighted, key=lambda ew: ew[0].confidence * ew[0].magnitude * ew[1] * ew[1])
+    base_confidence = best.confidence * best_weight
     doublings = _corroboration_doublings(dossier.independent_source_count)
     corroboration_bonus = min(
         MAX_CONFIDENCE_CORROBORATION_BONUS, CONFIDENCE_CORROBORATION_STEP * doublings
@@ -451,7 +487,7 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     # Keyed to independent_source_count (distinct source_name), not raw item
     # count: dedup already collapses syndicated republishes onto one name,
     # so N restatements of a single wire story cannot inflate this.
-    base_magnitude = max(e.magnitude * w for e, w in weighted)
+    base_magnitude = best.magnitude * best_weight
     magnitude_bonus = 1.0 + MAGNITUDE_CORROBORATION_STEP * doublings
     dossier.magnitude = min(1.0, base_magnitude * magnitude_bonus)
     dossier.horizon_days = round(sum(e.horizon_days for e in agreeing) / len(agreeing))

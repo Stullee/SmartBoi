@@ -31,10 +31,26 @@ class PriceBar(NamedTuple):
     high: float
     low: float
 
-# Spaces out price lookups within one polling pass so a ~40-symbol universe
-# doesn't burst 40 historical-data requests at once against IB's pacing
-# limit (~60 requests per rolling 10-minute window per connection).
+# Spaces out price lookups within one polling pass so a universe of symbols
+# doesn't burst historical-data requests against IB's pacing limit (~60
+# requests per rolling 10-minute window per connection).
+#
+# This alone is NOT enough to stay legal across a large universe -- 60
+# requests per 600 seconds is one per 10s, so any pass longer than ~60
+# symbols has to not use IB at all. That is why the daily forward-validation
+# marks over the whole universe go to Finnhub first (see engine.py's
+# _run_daily_price_marks): IB's request budget is reserved for the two jobs
+# that actually need a broker-quality bar -- pricing an entry, and marking
+# the handful of open paper trades.
 _REQUEST_GAP_SEC = 1.0
+# Every IB call is wrapped in this. ib_async futures are resolved by the
+# Gateway's reply, and a dropped uplink (error 1100, which this deployment
+# logs regularly) does not resolve the pending ones -- so an un-timed-out
+# await can hang forever. The engine is a SINGLE task: one hung await stops
+# ingestion, scoring, signalling and entry evaluation together, silently and
+# with no error to log. A timeout converts that into "no price from IB",
+# which _price_bar already handles by falling through to Finnhub.
+_IB_CALL_TIMEOUT_SEC = 20.0
 
 
 class ReadOnlyPriceFeed:
@@ -93,16 +109,21 @@ class ReadOnlyPriceFeed:
             # _try_open_from_signal an exception is caught and returned from
             # WITHOUT ever reaching the entry-deadline check -- so a signal
             # could sit SIGNALED indefinitely on an unqualifiable symbol.
-            qualified = await self.ib.qualifyContractsAsync(candidate)
+            qualified = await asyncio.wait_for(
+                self.ib.qualifyContractsAsync(candidate), timeout=_IB_CALL_TIMEOUT_SEC
+            )
             if not qualified or not getattr(qualified[0], "conId", None):
                 log.warning("%s: could not qualify contract for price lookup.", symbol)
                 return None
             self._contracts[symbol] = qualified[0]
             contract = qualified[0]
 
-        bars = await self.ib.reqHistoricalDataAsync(
-            contract, endDateTime="", durationStr="2 D", barSizeSetting="1 day",
-            whatToShow="TRADES", useRTH=True,
+        bars = await asyncio.wait_for(
+            self.ib.reqHistoricalDataAsync(
+                contract, endDateTime="", durationStr="2 D", barSizeSetting="1 day",
+                whatToShow="TRADES", useRTH=True,
+            ),
+            timeout=_IB_CALL_TIMEOUT_SEC,
         )
         if not bars:
             return None

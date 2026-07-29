@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -280,3 +281,65 @@ def test_open_records_cap_and_borrow_flag(tmp_path):
     reloaded = PaperTradeJournal(tmp_path / "paper_trades.jsonl")
     assert reloaded.open_trades["UCTT"].assumes_borrow is True
     assert reloaded.open_trades["UCTT"].market_cap_musd == 120.0
+
+
+# --- A trade nothing can price must still hit its horizon.
+#
+# `update` is the only other close path and it needs a price, so a symbol no
+# source could price (delisted, halted, unqualifiable at IB, absent from
+# Finnhub's free tier) produced a position that never stopped out, never took
+# profit and never timed out -- open forever, its dossier pinned at SIGNALED
+# so no fresh signal could replace it, its P&L excluded from every statistic.
+
+def _open_trade(journal, symbol="FORM", horizon_days=20):
+    return journal.open(
+        symbol=symbol, direction="LONG", entry_price=10.0, stop_loss_pct=8.0,
+        take_profit_pct=16.0, horizon_days=horizon_days, thesis_summary="t",
+        confidence=0.8, independent_source_count=2, citations=[],
+    )
+
+
+def test_a_trade_past_its_horizon_closes_without_a_price(tmp_path):
+    journal = PaperTradeJournal(tmp_path / "paper_trades.jsonl")
+    trade = _open_trade(journal)
+    opened = datetime.fromisoformat(trade.opened_at)
+
+    expired = journal.expire_past_horizon(now=opened + timedelta(days=21))
+
+    assert [t.symbol for t in expired] == ["FORM"]
+    assert not journal.has_open("FORM")
+    assert expired[0].status == "TIMEOUT"
+
+
+def test_it_exits_at_the_last_mark_when_one_exists(tmp_path):
+    journal = PaperTradeJournal(tmp_path / "paper_trades.jsonl")
+    trade = _open_trade(journal)
+    journal.update("FORM", 10.5)  # a mark landed, then the feed went dark
+    opened = datetime.fromisoformat(trade.opened_at)
+
+    journal.expire_past_horizon(now=opened + timedelta(days=21))
+
+    closed = [json.loads(line) for line in journal.log_path.read_text().splitlines()]
+    assert closed[-1]["exit_price"] == 10.5
+
+
+def test_it_exits_flat_rather_than_inventing_a_price(tmp_path):
+    """A flat row is honest about having learned nothing."""
+    journal = PaperTradeJournal(tmp_path / "paper_trades.jsonl")
+    trade = _open_trade(journal)
+    opened = datetime.fromisoformat(trade.opened_at)
+
+    journal.expire_past_horizon(now=opened + timedelta(days=21))
+
+    closed = [json.loads(line) for line in journal.log_path.read_text().splitlines()]
+    assert closed[-1]["exit_price"] == 10.0  # the entry price
+    assert closed[-1]["r_multiple_gross"] == 0.0
+
+
+def test_a_trade_inside_its_horizon_is_left_alone(tmp_path):
+    journal = PaperTradeJournal(tmp_path / "paper_trades.jsonl")
+    trade = _open_trade(journal)
+    opened = datetime.fromisoformat(trade.opened_at)
+
+    assert journal.expire_past_horizon(now=opened + timedelta(days=19)) == []
+    assert journal.has_open("FORM")
