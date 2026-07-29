@@ -1,3 +1,4 @@
+import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -421,9 +422,13 @@ def test_magnitude_grows_with_independent_sources():
         merge_evidence(dossier, _evidence(magnitude=0.22, source_name=src, evidence_id=f"e{i}"), now=NOW)
 
     assert dossier.independent_source_count == 3
-    # 0.22 * (1 + 0.25*2) = 0.33 -- the live THRM case, which crossed a 0.2
-    # signal bar at confidence 0.80 only because of this term.
-    assert dossier.magnitude == pytest.approx(0.33)
+    # Per DOUBLING, not per source: 0.22 * (1 + 0.25*log2(3)) = 0.307. The
+    # linear form this replaced gave 0.33 here but ran away entirely once
+    # the independence key stopped collapsing distinct counterparties onto
+    # one publisher name -- a DCO-shaped dossier came out at magnitude 1.00.
+    # See MAGNITUDE_CORROBORATION_STEP.
+    assert dossier.magnitude == pytest.approx(0.22 * (1 + 0.25 * math.log2(3)))
+    assert dossier.magnitude > 0.22  # ...but corroboration still grows it
 
 
 def test_a_single_source_gets_no_magnitude_bonus():
@@ -467,3 +472,104 @@ def test_corroboration_only_counts_the_agreeing_side():
     assert dossier.direction == "LONG"
     assert dossier.independent_source_count == 1
     assert dossier.magnitude == pytest.approx(0.3)
+
+
+# --- What counts as INDEPENDENT corroboration.
+#
+# The unit used to be the publisher name alone. That quietly capped the whole
+# strategy: the live feed yields six publisher names for the entire universe
+# with one aggregator ("Yahoo") accounting for ~69% of items, so a thesis
+# built the way this system is designed to build one -- accumulating
+# second-order evidence across several disclosed counterparties -- could
+# hardly ever exceed two "independent sources". DCO carried 17 agreeing items
+# across RTX, LMT and NOC and counted 2; items 3 through 17 contributed
+# nothing to confidence and nothing to magnitude. ---
+
+def _propagated(origin, source_name, evidence_id, magnitude=0.3, confidence=0.6):
+    record = _evidence(magnitude=magnitude, confidence=confidence,
+                       source_name=source_name, evidence_id=evidence_id)
+    record.origin_symbol = origin
+    record.is_propagated = True
+    record.relationship_note = f"{origin} is a customer"
+    record.relationship_confidence = 0.9
+    return record
+
+
+def test_different_counterparties_are_independent_even_from_one_publisher():
+    """A Lockheed story and a Raytheon story are two different facts about
+    Ducommun. Which outlet published each is irrelevant to whether they
+    corroborate one another."""
+    dossier = Dossier(symbol="DCO")
+    merge_evidence(dossier, _propagated("LMT", "Yahoo", "e1"), now=NOW)
+    merge_evidence(dossier, _propagated("RTX", "Yahoo", "e2"), now=NOW)
+    merge_evidence(dossier, _propagated("NOC", "Yahoo", "e3"), now=NOW)
+
+    assert dossier.independent_source_count == 3
+
+
+def test_one_counterparty_via_one_publisher_stays_a_single_source():
+    """The anti-syndication defence is untouched: the publisher is still part
+    of the key, so repeated coverage of ONE company by ONE outlet cannot
+    manufacture corroboration."""
+    dossier = Dossier(symbol="DCO")
+    merge_evidence(dossier, _propagated("LMT", "Yahoo", "e1"), now=NOW)
+    merge_evidence(dossier, _propagated("LMT", "Yahoo", "e2"), now=NOW)
+
+    assert dossier.independent_source_count == 1
+
+
+def test_one_counterparty_across_two_publishers_still_counts_two():
+    dossier = Dossier(symbol="DCO")
+    merge_evidence(dossier, _propagated("LMT", "Yahoo", "e1"), now=NOW)
+    merge_evidence(dossier, _propagated("LMT", "Benzinga", "e2"), now=NOW)
+
+    assert dossier.independent_source_count == 2
+
+
+def test_direct_evidence_is_still_keyed_on_the_publisher_alone():
+    """Direct evidence has no counterparty to distinguish it -- the origin IS
+    the dossier's own symbol, so folding it into the key would make every
+    direct item from one publisher collapse exactly as before, and every
+    item from two publishers count two. Unchanged behaviour, asserted."""
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(source_name="reuters.com", evidence_id="e1"), now=NOW)
+    merge_evidence(dossier, _evidence(source_name="reuters.com", evidence_id="e2"), now=NOW)
+    assert dossier.independent_source_count == 1
+
+    merge_evidence(dossier, _evidence(source_name="bloomberg.com", evidence_id="e3"), now=NOW)
+    assert dossier.independent_source_count == 2
+
+
+# --- Corroboration bonuses are per DOUBLING, not per source. Linear was
+# defensible only while the count could not realistically exceed 2-3; with
+# the independence key fixed, a well-corroborated dossier reaches 7+ and the
+# linear form returned confidence 1.00 and magnitude 1.00 -- certainty and a
+# maximum re-rating, from individually modest second-order items. ---
+
+def test_corroboration_bonuses_are_unchanged_at_one_and_two_sources():
+    """Where every live dossier actually sits. The recalibration must not be
+    a stealth loosening at today's operating point."""
+    one = Dossier(symbol="A")
+    merge_evidence(one, _evidence(confidence=0.6, magnitude=0.4), now=NOW)
+    assert one.confidence == pytest.approx(0.6)
+    assert one.magnitude == pytest.approx(0.4)
+
+    two = Dossier(symbol="B")
+    merge_evidence(two, _evidence(confidence=0.6, magnitude=0.4, source_name="a.com", evidence_id="e1"), now=NOW)
+    merge_evidence(two, _evidence(confidence=0.6, magnitude=0.4, source_name="b.com", evidence_id="e2"), now=NOW)
+    assert two.confidence == pytest.approx(0.7)   # 0.6 + 0.10
+    assert two.magnitude == pytest.approx(0.5)    # 0.4 * 1.25
+
+
+def test_corroboration_growth_is_sublinear_and_bounded():
+    dossier = Dossier(symbol="DCO")
+    for i in range(16):
+        merge_evidence(dossier, _propagated(f"ANCHOR{i}", "Yahoo", f"e{i}",
+                                            magnitude=0.30, confidence=0.60), now=NOW)
+
+    assert dossier.independent_source_count == 16
+    # 0.60 + min(0.25, 0.10*log2(16)) = 0.60 + 0.25 -- capped, so accumulated
+    # weak items can never manufacture near-certainty.
+    assert dossier.confidence == pytest.approx(0.85)
+    # 0.30 * (1 + 0.25*log2(16)) = 0.30 * 2.0
+    assert dossier.magnitude == pytest.approx(0.60)

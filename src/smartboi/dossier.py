@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -185,19 +186,77 @@ _MIN_STALE_DAYS = 14
 # an indirect JV competitor) sit at 0.30-0.65.
 DISCLOSED_LINK_CONFIDENCE = 0.85
 
-# Per-extra-independent-source multiplier on magnitude (see _aggregate).
-# Deliberately larger than confidence's +0.1 additive step: confidence is a
-# probability and saturates at 1.0 by the third source anyway, whereas
-# magnitude is the size of the expected move and is where accumulated
-# corroboration actually has somewhere to go.
+def independence_key(record: EvidenceRecord) -> str:
+    """What makes two evidence items INDEPENDENT corroboration of each other
+    -- the unit `independent_source_count` counts (see _aggregate).
+
+    For DIRECT evidence it is the publisher/form, unchanged: dedup.py already
+    collapses syndicated republishes of one wire story onto a single
+    publisher name, and an 8-K, a Form 4 and a 10-Q are separate primary
+    disclosures rather than restatements of each other.
+
+    For PROPAGATED evidence the origin symbol is part of the key, and this is
+    the correction. A story about Lockheed and a story about Raytheon are two
+    different facts about Ducommun; they are not one story counted twice, and
+    which outlet happened to publish each is irrelevant to whether they
+    corroborate each other. Keying on publisher alone collapsed them anyway,
+    and that quietly capped the entire strategy: the live feed yields six
+    publisher names for the whole universe with one aggregator ("Yahoo")
+    accounting for ~69% of items, so a thesis built the way this system is
+    designed to build one -- accumulating second-order evidence across
+    several disclosed counterparties -- could hardly ever exceed two
+    "independent sources". DCO carried 17 agreeing items across RTX, LMT and
+    NOC, over 0.85-0.95 disclosed links, with zero opposing mass, and counted
+    2. Items 3 through 17 contributed nothing to confidence and nothing to
+    magnitude.
+
+    The anti-syndication defence is fully preserved, because the publisher is
+    still in the key: two Yahoo articles about the same counterparty on the
+    same day remain one source (and dedup drops the second before it ever
+    gets here). What changes is only that facts about DIFFERENT companies
+    stop being counted as one fact."""
+    if record.is_propagated and record.origin_symbol:
+        return f"{record.origin_symbol}|{record.source_name}"
+    return record.source_name
+
+
+# Corroboration bonuses, applied per DOUBLING of the independent-source
+# count rather than per additional source (see _aggregate).
+#
+# Both were linear in (S - 1), which was defensible only while S could not
+# realistically exceed 2 or 3 -- and it could not, because the independence
+# key was the publisher name and the live feed yields six of those for the
+# whole universe. Fixing that key (see independence_key) makes S=7 ordinary
+# for a well-corroborated thesis, and under the linear form a DCO-shaped
+# dossier came out at confidence 1.00 and magnitude 1.00: certainty, and the
+# largest re-rating the scale can express, from eighteen individually modest
+# second-order items. That is not a stricter system, it is a differently
+# broken one, and it would fire trades on everything.
+#
+# Logarithmic is both the honest shape and the standard one for combining N
+# noisy independent estimates: the second source is worth far more than the
+# eighth, and these items are not fully independent anyway (they share a
+# sector factor). Calibrated so S=1 and S=2 are IDENTICAL to the old linear
+# values -- that is where every live dossier currently sits, so this changes
+# nothing at today's operating point and only governs the range that was
+# previously unreachable.
+#
+#   S:              1      2      3      4      8     16
+#   magnitude x  1.00   1.25   1.40   1.50   1.75   2.00
+#   confidence + 0.00   0.10   0.16   0.20   0.25   0.25 (capped)
 MAGNITUDE_CORROBORATION_STEP = 0.25
+CONFIDENCE_CORROBORATION_STEP = 0.10
+# Corroboration must never be able to manufacture near-certainty out of a
+# pile of individually weak items -- past this the strongest single agreeing
+# item's own confidence is what has to carry the thesis.
+MAX_CONFIDENCE_CORROBORATION_BONUS = 0.25
 
 # Bumped whenever a change alters how confidence/magnitude are computed from
 # the same evidence. Stamped onto every daily dossier snapshot so the
 # forward-validation record can be split at the boundary instead of silently
 # mixing scores that mean different things -- forward data cannot be
 # backfilled, and re-scoring old rows with new logic would be look-ahead.
-SCORING_VERSION = 2
+SCORING_VERSION = 3
 # Weight an evidence item keeps right at its stale cutoff, before being
 # excluded entirely -- never fully zero a moment before exclusion, since
 # aged corroboration is still weak signal that a persistent theme existed.
@@ -248,6 +307,16 @@ def evidence_weight(record: EvidenceRecord, now: datetime) -> float:
         return _DECAY_FLOOR
     fraction = (age - horizon) / (cutoff - horizon)
     return 1.0 - fraction * (1.0 - _DECAY_FLOOR)
+
+
+def _corroboration_doublings(independent_source_count: int) -> float:
+    """log2 of the independent-source count, floored at 0 -- how many times
+    the corroboration has DOUBLED. This is the multiplier both bonuses are
+    applied per, so that the second independent source is worth much more
+    than the eighth. See MAGNITUDE_CORROBORATION_STEP."""
+    if independent_source_count < 2:
+        return 0.0
+    return math.log2(independent_source_count)
 
 
 def _side_mass(dossier: Dossier, direction: str, now: datetime) -> float:
@@ -341,13 +410,16 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
         if e.direction == dossier.direction and not evidence_is_stale(e, now)
     ]
     weighted = [(e, evidence_weight(e, now)) for e in agreeing]
-    dossier.independent_source_count = len({e.source_name for e in agreeing})
+    dossier.independent_source_count = len({independence_key(e) for e in agreeing})
     dossier.has_filing_evidence = any(e.source_type != "news" for e in agreeing)
     dossier.has_disclosed_link_evidence = any(
         (e.relationship_confidence or 0.0) >= DISCLOSED_LINK_CONFIDENCE for e in agreeing
     )
     base_confidence = max(e.confidence * w for e, w in weighted)
-    corroboration_bonus = 0.1 * max(0, dossier.independent_source_count - 1)
+    doublings = _corroboration_doublings(dossier.independent_source_count)
+    corroboration_bonus = min(
+        MAX_CONFIDENCE_CORROBORATION_BONUS, CONFIDENCE_CORROBORATION_STEP * doublings
+    )
     raw_confidence = min(1.0, base_confidence + corroboration_bonus)
 
     w_agree = w_long if dossier.direction == "LONG" else w_short
@@ -379,7 +451,7 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     # count: dedup already collapses syndicated republishes onto one name,
     # so N restatements of a single wire story cannot inflate this.
     base_magnitude = max(e.magnitude * w for e, w in weighted)
-    magnitude_bonus = 1.0 + MAGNITUDE_CORROBORATION_STEP * max(0, dossier.independent_source_count - 1)
+    magnitude_bonus = 1.0 + MAGNITUDE_CORROBORATION_STEP * doublings
     dossier.magnitude = min(1.0, base_magnitude * magnitude_bonus)
     dossier.horizon_days = round(sum(e.horizon_days for e in agreeing) / len(agreeing))
     # The last few agreeing items' reasoning, not just the single latest --
