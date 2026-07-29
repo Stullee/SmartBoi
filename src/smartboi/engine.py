@@ -678,12 +678,14 @@ class Engine:
             self.extractor = RelationshipExtractor(self.settings.anthropic_api_key, self.settings.extraction_model, self.usage)
             self.updater = DossierUpdater(self.settings.anthropic_api_key, self.settings.dossier_model, self.usage)
             self.skeptic = Skeptic(self.settings.anthropic_api_key, self.settings.skeptic_model, self.usage)
-            # Same model as the skeptic: synthesis is the hardest judgement
-            # in the system (is this N facts or one fact N times?) and it
-            # runs at most once a day per tradeable, so it is the cheapest
-            # place in the pipeline to spend on reasoning quality.
+            # Its OWN model, and the only expensive one in the pipeline.
+            # Synthesis is the hardest judgement here (is this N facts or
+            # one fact N times?) and the only pass that can make it, and
+            # it runs at most once a day per near-the-bar dossier -- so a
+            # dozen-odd calls carry the reasoning budget for the whole
+            # system. See config.py's model-tiering note.
             self.synthesizer = DossierSynthesizer(
-                self.settings.anthropic_api_key, self.settings.skeptic_model, self.usage
+                self.settings.anthropic_api_key, self.settings.synthesis_model, self.usage
             )
             log.info(
                 "Dossier engine (Claude): ENABLED (daily LLM call budget: %d, see MAX_DAILY_LLM_CALLS)",
@@ -2661,6 +2663,15 @@ class Engine:
         Failure is a no-op, not a block: a transient error or an exhausted
         budget leaves the arithmetic aggregate exactly as it was."""
         if self.synthesizer is None or dossier.direction not in ("LONG", "SHORT"):
+            return
+        # Only where it can change the outcome. Synthesis is a CAP -- it can
+        # veto and trim, never lift -- so on a dossier far below the bar the
+        # only reachable outcomes are "unchanged" and "even further below",
+        # neither of which changes a decision. Skipping those is what keeps
+        # the one expensive pass in the pipeline at a handful of calls a day
+        # rather than one per watchlist entry.
+        floor = self.settings.signal_confidence_threshold * self.settings.synthesis_score_floor_pct
+        if dossier.confidence * dossier.magnitude < floor:
             return
         spec = self.spec_by_symbol.get(dossier.symbol)
         verdict = await self.synthesizer.synthesize(

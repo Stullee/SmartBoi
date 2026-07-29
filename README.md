@@ -385,7 +385,7 @@ second (skeptic) if it's judged new -- and propagation multiplies that by
 however many linked targets an origin has, so a heavily-covered anchor with
 several links can generate real spend fast. Two guards, both in `config.py`:
 
-- **Daily spend budget** (`MAX_DAILY_USD`, default $25) and **daily call
+- **Daily spend budget** (`MAX_DAILY_USD`, default $3.30 -- about $100/month) and **daily call
   budget** (`MAX_DAILY_LLM_CALLS`, default 3000), both checked before every
   call. Either one exhausted defers further evidence (never discards it)
   until UTC midnight -- exactly the same "retry later" path as a transient
@@ -397,7 +397,19 @@ several links can generate real spend fast. Two guards, both in `config.py`:
   `llm.MODEL_PRICES_PER_MTOK`, with an unknown model priced at the most
   expensive entry so a model-string typo never looks free). The call cap is
   kept because it bounds request VOLUME, which dollars do not. See the
-  dashboard for actual calls/tokens/spend
+  dashboard for actual calls/tokens/spend. Hitting the cap is not a failure
+  mode -- it also spreads a relationship-extraction burst (the
+  150k-char-per-call pass, which spikes whenever the universe grows) over
+  several days instead of consuming a month of budget in an afternoon.
+
+  Models are tiered by VALUE PER CALL, not by how important the call sounds
+  (see `config.py`). The per-item dossier update and skeptic run on Haiku:
+  they see ONE evidence item each, and no amount of model quality lets a
+  per-item scorer answer the questions that decide whether a thesis is real
+  -- overlap, coherence, staleness. The synthesis pass, which is the only
+  one that *can* answer them, runs on Opus, once a day, and only for a
+  dossier already near the signal bar. About a dozen expensive calls a day
+  carry the reasoning budget for the whole system
   used today.
 - **Propagated-evidence cooldown** (`MAX_PROPAGATED_EVIDENCE_PER_LINK`,
   default 3 per `PROPAGATED_EVIDENCE_COOLDOWN_HOURS`, default 6h): caps how
