@@ -96,6 +96,27 @@ class Settings(BaseSettings):
     max_propagated_evidence_per_link: int = 3
     propagated_evidence_cooldown_hours: int = 6
 
+    # --- Ecosystem-fallback propagation ---
+    # An anchor with no DISCLOSED edge to any tradeable is inert: it is never
+    # its own analysis target, so its news resolves to zero targets and is
+    # discarded unread. Measured live, that was 104 of 130 anchors --
+    # including NVDA, AMAT, LRCX, TSM, MSFT, AMZN, UPS and CSX, the loudest
+    # and most information-dense feeds in the universe.
+    #
+    # The graph cannot fix this quickly: edges come from 10-K/10-Q text, so
+    # it grows at filing season, not at news speed. This falls back to the
+    # ECOSYSTEM link -- fan an inert anchor's news out to the tradeables in
+    # its own ecosystem, flagged as an undisclosed, industry-level
+    # association rather than a contractual one. That is also the link the
+    # literature actually measured: Menzly & Ozbas (2010, JF 65:1555) is
+    # industry-level cross-predictability, not firm-level.
+    enable_ecosystem_propagation: bool = True
+    # Tighter than max_propagated_evidence_per_link on purpose: an ecosystem
+    # association is weaker evidence than a disclosed contract, and it fans
+    # out to every tradeable in the ecosystem rather than to named
+    # counterparties, so it deserves a smaller share of the daily budget.
+    max_ecosystem_evidence_per_link: int = 1
+
     # --- Evidence / signal thresholds ---
     # A dossier signals once confidence * magnitude clears this bar AND has
     # at least min_independent_sources independent corroborating items --

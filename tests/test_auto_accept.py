@@ -455,6 +455,9 @@ def test_a_promoted_anchor_can_actually_reach_a_dossier(engine):
     discarded without an LLM call. This is the end-to-end assertion --
     without the stashed relationship an accepted anchor is inert, with it
     the anchor is immediately worth polling."""
+    # Ecosystem fallback off: this isolates the DISCLOSED-EDGE path, which
+    # is what promotion is about. The fallback has its own coverage.
+    engine.settings.enable_ecosystem_propagation = False
     engine.candidates.set("INRT", _candidate(ticker="INRT", recommended_as="anchor"))
     engine.accept_candidate("INRT", "anchor", source="auto")
     assert engine._can_produce_evidence("INRT") is False  # unconnected: inert
@@ -509,3 +512,59 @@ def test_an_anchor_linked_only_to_another_anchor_stays_inert(engine):
     engine.accept_candidate("ZZZZ", "anchor", source="auto")
     engine.graph.add(Relationship("RTX", "ZZZZ", "supplier", "d", "s", 0.9, "2026-07-29"))
     assert engine._can_produce_evidence("ZZZZ") is False
+
+
+# --- Retroactive relevance filtering. The lender and biography filters run
+# at EXTRACTION time, so entries recorded before they shipped stayed fully
+# eligible for auto-accept off a persistent candidate list. Confirmed live:
+# Danaher, ManpowerGroup, IDEX and SPX were all auto-accepted as anchors off
+# one EPAC executive's CV. ---
+
+async def test_a_biography_candidate_is_blocked_retroactively(engine):
+    entry = _candidate(name="Danaher Corporation", ticker="DHR", recommended_as="anchor")
+    entry["description"] = ("CEO Paul Sternlieb held management roles at Danaher (2011-2014), "
+                            "a major diversified conglomerate.")
+    entry["rel_types"] = ["competitor"]
+    engine.candidates.set("DHR", entry)
+
+    await engine._auto_accept_candidates()
+
+    assert "DHR" not in engine.spec_by_symbol
+    assert "biography" in engine.candidates.get("DHR")["auto_accept_blocked"]
+
+
+async def test_a_lender_candidate_is_blocked_retroactively(engine):
+    entry = _candidate(name="Piper Sandler & Co.", ticker="PIPR", recommended_as="anchor")
+    entry["description"] = "Piper Sandler is the counterparty to KLXE's Equity Distribution Agreement."
+    entry["rel_types"] = ["supplier"]
+    engine.candidates.set("PIPR", entry)
+    # "underwriter" is in the lender phrase list; use a phrase that is.
+    entry["description"] = "Serves as underwriter and agent for the at-the-market offering program."
+    engine.candidates.set("PIPR", entry)
+
+    await engine._auto_accept_candidates()
+
+    assert "PIPR" not in engine.spec_by_symbol
+    assert "credit provider" in engine.candidates.get("PIPR")["auto_accept_blocked"]
+
+
+async def test_a_genuine_commercial_candidate_is_untouched(engine):
+    entry = _candidate(name="General Motors", ticker="GMX", recommended_as="anchor")
+    entry["description"] = "General Motors accounted for approximately 25% of total revenues in 2025."
+    engine.candidates.set("GMX", entry)
+
+    await engine._auto_accept_candidates()
+
+    assert "GMX" in engine.spec_by_symbol
+
+
+def test_an_already_accepted_candidate_is_not_retro_blocked(engine):
+    """Blocking something already in the universe would say nothing about
+    its membership -- that is reset_accepted_candidates' job."""
+    entry = _candidate(name="Danaher Corporation", ticker="DHR", recommended_as="anchor")
+    entry["description"] = "CEO Paul Sternlieb held management roles at Danaher."
+    engine.candidates.set("DHR", entry)
+    engine.accept_candidate("DHR", "anchor", source="auto")
+
+    assert engine._block_junk_candidates() == 0
+    assert engine.candidates.get("DHR").get("auto_accept_blocked") is None

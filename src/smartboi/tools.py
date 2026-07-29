@@ -195,6 +195,7 @@ _DIAGNOSTIC_SETTINGS = (
     "stop_loss_pct", "take_profit_pct", "transaction_cost_bps_per_side",
     "max_daily_llm_calls", "max_propagated_evidence_per_link",
     "propagated_evidence_cooldown_hours",
+    "enable_ecosystem_propagation", "max_ecosystem_evidence_per_link",
     "extraction_model", "dossier_model", "skeptic_model",
     "edgar_poll_interval_sec", "news_poll_interval_sec", "price_poll_interval_sec",
     "signal_entry_poll_interval_sec",
