@@ -427,6 +427,51 @@ can still slip past any headline similarity check, but an SEC filing is a
 primary disclosure that cannot be a rewording of a news article, so any
 filing-corroborated dossier keeps the normal bar.
 
+### What the elevated bar is, and is not, for
+
+That elevated bar guards against exactly one failure mode: two outlets
+rewording a single wire story into two apparent "sources". It is **not** a
+general "be more certain" tax, and applying it as one actively fights this
+system's premise.
+
+The edge here is reading one high-quality fact about an anchor and
+inferring the effect on a thinly-covered supplier *before the market
+connects them*. Waiting for a third publisher to write that connection down
+means waiting for the edge to disappear -- by the time three outlets have
+published "DCO benefits from RTX's guidance raise", the price has moved.
+Corroborating *"did the event happen"* is redundant when the event is an
+official guidance raise or an 8-K. What needs corroborating is *"is the
+causal link real"* -- and the relationship graph answers that from primary
+sources.
+
+So a dossier also keeps the normal bar when its agreeing evidence arrived
+over a **strongly disclosed relationship edge**
+(`dossier.DISCLOSED_LINK_CONFIDENCE`, 0.85): a customer/supplier link a
+10-K states outright, usually with a quantified share of revenue attached.
+The live graph separates cleanly at that line -- the quantified
+concentration disclosures sit at 0.85-0.98:
+
+```
+ULH  -> GM   customer  conf=0.95   GM is ULH's top customer, ~25% of revenues
+THRM -> GM   customer  conf=0.95   GM accounted for 12% of product revenues
+DCO  -> LMT  customer  conf=0.95   a major customer with significant revenue
+PUMP -> XOM  customer  conf=0.95   ~24.9% of revenue
+```
+
+while speculative or passing-mention links sit at 0.30-0.65 (`FDX -> GOOGL`
+"Google Drive is integrated with FedEx Office", an indirect JV competitor)
+and correctly leave the elevated bar in place -- those are precisely the
+causal claims that *do* need more corroboration.
+
+Backing relaxes the elevated bar back to the normal one; it never drops
+below `MIN_INDEPENDENT_SOURCES`, so a single uncorroborated article can
+still never fire a signal.
+
+This was found live. DCO sat at 17 agreeing evidence items, decay-weighted
+mass 8.88, **zero opposing**, a score 44% above threshold, over 0.85-0.95
+10-K-disclosed links to RTX/LMT/NOC -- and could not act, for want of a
+third journalist.
+
 ## Contested evidence
 
 A dossier's direction and confidence are no longer decided by comparing

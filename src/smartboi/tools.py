@@ -374,10 +374,14 @@ def run_diagnostics(engine) -> str:
     # Engine._prune_dead_symbols); these need a human to edit the list, so
     # they have to be visible somewhere other than a log line.
     curated_dead = engine.universe_screen_state.get("curated_no_market_data") or []
+    curated_unknown = engine.universe_screen_state.get("curated_unknown_to_edgar") or []
     add(f"  last screened          : {engine.universe_screen_state.get('last_screened_at') or 'never'}")
     if curated_dead:
         add(f"  CURATED, no market data: {' '.join(curated_dead)}")
         add("    ^^ delisted/acquired/uncovered -- remove from universe.py or SYMBOLS; polling them costs and returns nothing")
+    if curated_unknown:
+        add(f"  CURATED, unknown to SEC: {' '.join(curated_unknown)}")
+        add("    ^^ no CIK in EDGAR's ticker map -- can never produce filing evidence; remove from universe.py or SYMBOLS")
 
     add("\n--- Forward-validation capture ---")
     add(f"  dossier_snapshots.jsonl : {_jsonl_span(read_jsonl(log_dir / 'dossier_snapshots.jsonl'), 'snapshotted_at')}")

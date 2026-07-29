@@ -378,8 +378,10 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
     # behind semis, grid and battery.
     # ================================================================
     # --- Tradeable (all unverified -- screen before relying on these) ---
-    CompanySpec("AXL", "American Axle & Manufacturing", "auto_supply",
-                notes="unverified -- driveline; historically discloses GM as a very large stated share of net sales"),
+    # AXL and SUP were dropped 2026-07, along with NR in energy_services
+    # below: EDGAR's ticker map has no CIK for any of them, so they can
+    # never produce filing evidence and every hourly poll did nothing but
+    # log a warning.
     CompanySpec("STRT", "Strattec Security", "auto_supply",
                 notes="unverified -- locks/latches/keys; discloses GM, Ford and Stellantis concentration explicitly"),
     CompanySpec("SRI", "Stoneridge", "auto_supply",
@@ -388,8 +390,6 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
                 notes="unverified -- turbochargers; revenue tied to named OEM platform awards"),
     CompanySpec("THRM", "Gentherm", "auto_supply",
                 notes="unverified -- thermal seat/comfort systems; discloses OEM customer concentration"),
-    CompanySpec("SUP", "Superior Industries International", "auto_supply",
-                notes="unverified -- aluminium wheels; concentrated OEM customer base"),
     # --- Anchors: the OEMs whose production and platform news propagates
     # down, plus the tier-1s a small supplier is most likely to name ---
     CompanySpec("GM", "General Motors", "auto_supply", signal_source_only=True,
@@ -417,8 +417,6 @@ DEFAULT_UNIVERSE: list[CompanySpec] = [
     # activity is driven by rig counts and operator capex budgets -- a
     # cycle with no relationship to AI/electrification capex.
     # ================================================================
-    CompanySpec("NR", "Newpark Resources", "energy_services",
-                notes="unverified -- drilling fluids/site access; concentrated operator customers"),
     CompanySpec("OIS", "Oil States International", "energy_services",
                 notes="unverified -- completion and production equipment"),
     CompanySpec("PUMP", "ProPetro Holding", "energy_services",

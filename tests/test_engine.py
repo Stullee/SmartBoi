@@ -812,7 +812,7 @@ async def test_expiry_reason_names_the_source_bar_that_failed(engine):
 
     reason = engine._below_bar_reason(dossier, "at entry time")
 
-    assert "sources 2/3" in reason and "news-only bar" in reason
+    assert "sources 2/3" in reason and "no filing or disclosed-link backing" in reason
     assert "score" not in reason  # the score gate passed; don't blame it
 
 

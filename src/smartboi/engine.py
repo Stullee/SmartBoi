@@ -671,6 +671,8 @@ class Engine:
     async def _poll_edgar(self) -> None:
         since_date = (date.today() - timedelta(days=self.settings.edgar_lookback_days)).isoformat()
         for symbol in self.symbol_list:
+            if await self._is_unknown_to_edgar(symbol):
+                continue
             try:
                 filings = await self.edgar_client.recent_filings(symbol, self.settings.edgar_forms_set, since_date)
             except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
@@ -681,6 +683,47 @@ class Engine:
                     await self._process_filing(symbol, filing)
                 except Exception:  # noqa: BLE001 - one bad filing must not abort the rest of the poll
                     log.exception("%s: processing filing %s failed", symbol, filing.accession_number)
+
+    async def _is_unknown_to_edgar(self, symbol: str) -> bool:
+        """Whether EDGAR's ticker map has no CIK for this symbol -- and, if
+        it is a runtime-accepted one, drops it from the universe on the spot.
+
+        A symbol EDGAR does not know cannot ever produce filing evidence,
+        which for a system built on primary disclosures makes it inert. It
+        still costs a submissions lookup every hourly poll and emits a
+        warning every time. Confirmed live: AXL, SUP, NR, NULL, CNCO, EES,
+        BMWYY, VLKAY, HYMTF and JBT logged this once an hour, forever,
+        drowning real problems in the bundle's warnings tail.
+
+        This is a stronger and faster signal than the monthly market-cap
+        screen: a foreign ADR line (BMWYY, VLKAY, HYMTF) has a perfectly
+        good market cap and would never be pruned by that path, yet files
+        nothing with the SEC. Curated symbols are recorded for the
+        diagnostics bundle rather than removed, same rule as the screen --
+        a curated list is a deliberate choice."""
+        if await self.edgar_client.cik_for(symbol) is not None:
+            return False
+        if symbol in self.accepted_candidates.data:
+            self.accepted_candidates.delete(symbol)
+            self.universe = [c for c in self.universe if c.symbol != symbol]
+            self.spec_by_symbol = spec_by_symbol(self.universe)
+            self._archive_orphaned_dossiers()
+            log.warning(
+                "[UNIVERSE] %s dropped: EDGAR has no CIK for it, so it can never produce filing "
+                "evidence. Polling it was pure cost.", symbol,
+            )
+            return True
+        unknown = set(self.universe_screen_state.get("curated_unknown_to_edgar") or [])
+        if symbol not in unknown:
+            unknown.add(symbol)
+            self.universe_screen_state.set("curated_unknown_to_edgar", sorted(unknown))
+            self._warn_once(
+                f"edgar-unknown-{symbol}",
+                f"[UNIVERSE] {symbol} is CURATED but EDGAR has no CIK for it -- it can never produce "
+                "filing evidence. Left in place (a curated list is not the engine's to overrule); "
+                "remove it from universe.py / SYMBOLS if it is genuinely delisted.",
+            )
+        return True
 
     async def _process_filing(self, symbol: str, filing: FilingEvent) -> None:
         fp = f"filing:{symbol}:{filing.accession_number}"
@@ -1570,13 +1613,14 @@ class Engine:
         way signals.evaluate does so a news-only dossier reports the higher
         bar it was actually held to, not the base one."""
         required = self.settings.min_independent_sources
-        if not dossier.has_filing_evidence:
+        unbacked = not (dossier.has_filing_evidence or dossier.has_disclosed_link_evidence)
+        if unbacked:
             required = max(required, self.settings.min_independent_sources_news_only)
         parts = []
         if dossier.independent_source_count < required:
             parts.append(
                 f"sources {dossier.independent_source_count}/{required}"
-                + (" (news-only bar)" if not dossier.has_filing_evidence else "")
+                + (" (no filing or disclosed-link backing)" if unbacked else "")
             )
         score = dossier.confidence * dossier.magnitude
         if score < self.settings.signal_confidence_threshold:
@@ -1774,6 +1818,17 @@ class Engine:
 
     # --- Evidence time-decay ---
 
+    @staticmethod
+    def _decay_fingerprint(dossier: Dossier) -> tuple:
+        return (
+            dossier.direction,
+            round(dossier.confidence, 3),
+            round(dossier.magnitude, 3),
+            dossier.independent_source_count,
+            dossier.has_filing_evidence,
+            dossier.has_disclosed_link_evidence,
+        )
+
     def _run_decay_pass(self) -> None:
         """Once a day, re-scores every dossier's aggregate confidence/
         magnitude/independent_source_count against its EXISTING evidence
@@ -1790,11 +1845,16 @@ class Engine:
             dossier = self.dossiers.load(symbol)
             if not dossier.evidence:
                 continue
-            before = (dossier.direction, round(dossier.confidence, 3), round(dossier.magnitude, 3),
-                      dossier.independent_source_count)
+            # Every field recompute_decay writes that can change a SIGNAL
+            # DECISION belongs in this comparison, not just the scores: an
+            # unchanged tuple skips the save entirely, so anything omitted
+            # is recomputed in memory and thrown away on a dormant dossier.
+            # The two backing flags gate which corroboration bar applies
+            # (see signals.evaluate), so leaving them out meant a dossier
+            # whose scores had settled could never persist them.
+            before = self._decay_fingerprint(dossier)
             recompute_decay(dossier, now)
-            after = (dossier.direction, round(dossier.confidence, 3), round(dossier.magnitude, 3),
-                     dossier.independent_source_count)
+            after = self._decay_fingerprint(dossier)
             if before == after:
                 continue
             if dossier.status == "SIGNALED" and not self.journal.has_open(symbol):

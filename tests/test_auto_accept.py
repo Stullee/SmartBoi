@@ -293,6 +293,44 @@ def test_a_dead_curated_symbol_is_reported_not_silently_removed(engine):
     assert engine.universe_screen_state.get("curated_no_market_data") == ["DCO"]
 
 
+async def test_a_symbol_edgar_does_not_know_is_dropped_on_the_next_poll(engine, tmp_path):
+    """Stronger and faster than the monthly market-cap screen: a foreign ADR
+    line has a perfectly good market cap and files nothing with the SEC, so
+    the screen would never catch it. Confirmed live: BMWYY/VLKAY/HYMTF plus
+    a literal "NULL" logged a CIK warning once an hour, forever."""
+    from smartboi.dossier import Dossier
+
+    engine.candidates.set("BMWYY", _candidate(ticker="BMWYY", recommended_as="anchor"))
+    await engine._auto_accept_candidates()
+    assert "BMWYY" in engine.spec_by_symbol
+    engine.dossiers.save(Dossier(symbol="BMWYY"))
+
+    # EDGAR's ticker map has no CIK for it.
+    engine.edgar_client.cik_for = lambda symbol: _none()
+
+    assert await engine._is_unknown_to_edgar("BMWYY") is True
+    assert "BMWYY" not in engine.spec_by_symbol
+    assert "BMWYY" not in engine.accepted_candidates.data
+    assert (tmp_path / "data" / "dossiers_archived" / "BMWYY.json").exists()
+
+
+async def test_a_curated_symbol_unknown_to_edgar_is_reported_not_removed(engine):
+    engine.edgar_client.cik_for = lambda symbol: _none()
+
+    assert await engine._is_unknown_to_edgar("DCO") is True
+    assert "DCO" in engine.spec_by_symbol
+    assert engine.universe_screen_state.get("curated_unknown_to_edgar") == ["DCO"]
+
+
+async def test_a_symbol_edgar_knows_is_polled_normally(engine):
+    assert await engine._is_unknown_to_edgar("DCO") is False
+    assert "DCO" in engine.spec_by_symbol
+
+
+async def _none():
+    return None
+
+
 def test_a_live_symbol_is_never_pruned(engine):
     from smartboi.universe_screen import ScreenResult
 

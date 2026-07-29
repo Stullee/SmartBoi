@@ -65,6 +65,40 @@ def test_filing_corroborated_dossier_keeps_the_normal_bar():
                     min_independent_sources_news_only=3) is not None
 
 
+def test_disclosed_link_evidence_keeps_the_normal_bar():
+    """The elevated bar guards against two outlets rewording one wire story.
+    Evidence propagated over a link a 10-K states outright (usually with a
+    quantified share of revenue) is not in that failure mode: the part
+    actually at risk of being wrong -- is the causal link real -- was
+    answered by a primary source. Confirmed live: DCO sat at 17 agreeing
+    items, mass 8.88, zero opposing, over 0.85-0.95 disclosed links to
+    RTX/LMT/NOC, and could not act for want of a third publisher."""
+    dossier = _dossier(independent_source_count=2, has_filing_evidence=False,
+                       has_disclosed_link_evidence=True)
+    assert evaluate(dossier, confidence_threshold=0.5, min_independent_sources=2,
+                    min_independent_sources_news_only=3) is not None
+
+
+def test_disclosed_link_backing_never_goes_below_the_base_bar():
+    """Backing relaxes the ELEVATED bar back to the normal one -- it must
+    never let a single uncorroborated source through."""
+    dossier = _dossier(independent_source_count=1, has_filing_evidence=False,
+                       has_disclosed_link_evidence=True)
+    assert evaluate(dossier, confidence_threshold=0.5, min_independent_sources=2,
+                    min_independent_sources_news_only=3) is None
+
+
+def test_a_weakly_inferred_link_does_not_relax_the_bar():
+    """Only STRONGLY disclosed edges count. A passing-mention or speculative
+    link (live examples: FDX->GOOGL at 0.60, GTX->HON at 0.65, IESC->TSLA at
+    0.30) is exactly the kind of causal claim the extra corroboration is
+    for, so it must leave the elevated bar in place."""
+    dossier = _dossier(independent_source_count=2, has_filing_evidence=False,
+                       has_disclosed_link_evidence=False)
+    assert evaluate(dossier, confidence_threshold=0.5, min_independent_sources=2,
+                    min_independent_sources_news_only=3) is None
+
+
 def test_news_only_bar_disabled_when_none():
     dossier = _dossier(independent_source_count=2, has_filing_evidence=False)
     assert evaluate(dossier, confidence_threshold=0.5, min_independent_sources=2,
