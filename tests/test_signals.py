@@ -142,3 +142,51 @@ def test_signal_expired_past_deadline():
 def test_signal_not_expired_before_deadline():
     signaled_at = (NOW - timedelta(days=2)).isoformat()
     assert not signal_expired(signaled_at, deadline_days=5, now=NOW)
+
+
+# --- Regular-trading-hours predicate. The live record contains two paper
+# trades booked at 13:18Z = 09:18 ET, twelve minutes before the open, at a
+# price no order could have been filled at. ---
+
+from zoneinfo import ZoneInfo
+
+from smartboi.signals import is_regular_trading_hours
+
+
+def _utc(iso: str) -> datetime:
+    return datetime.fromisoformat(iso)
+
+
+def test_the_two_trades_the_live_record_should_never_have_opened():
+    # ESOA and PUMP, 2026-07-29 13:18Z. 09:18 ET.
+    assert not is_regular_trading_hours(_utc("2026-07-29T13:18:20+00:00"))
+    assert not is_regular_trading_hours(_utc("2026-07-29T13:18:21+00:00"))
+
+
+def test_the_session_boundaries_are_inclusive_open_exclusive_close():
+    assert not is_regular_trading_hours(_utc("2026-07-29T13:29:59+00:00"))  # 09:29 ET
+    assert is_regular_trading_hours(_utc("2026-07-29T13:30:00+00:00"))      # 09:30 ET
+    assert is_regular_trading_hours(_utc("2026-07-29T19:59:59+00:00"))      # 15:59 ET
+    assert not is_regular_trading_hours(_utc("2026-07-29T20:00:00+00:00"))  # 16:00 ET
+
+
+def test_weekends_are_closed_all_day():
+    for hour in range(0, 24):
+        stamp = _utc(f"2026-07-25T{hour:02d}:00:00+00:00")  # Saturday
+        assert not is_regular_trading_hours(stamp), hour
+    assert not is_regular_trading_hours(_utc("2026-07-26T17:00:00+00:00"))  # Sunday
+
+
+def test_the_window_tracks_dst_rather_than_a_fixed_utc_offset():
+    """A hard-coded UTC window is wrong for half the year: the ET session is
+    13:30-20:00 UTC in summer and 14:30-21:00 in winter. 14:00 UTC is inside
+    the session in July and an hour before the open in January."""
+    assert is_regular_trading_hours(_utc("2026-07-15T14:00:00+00:00"))       # EDT, 10:00 ET
+    assert not is_regular_trading_hours(_utc("2026-01-14T14:00:00+00:00"))   # EST, 09:00 ET
+    assert is_regular_trading_hours(_utc("2026-01-14T15:00:00+00:00"))       # EST, 10:00 ET
+
+
+def test_a_naive_or_non_utc_stamp_is_still_converted_correctly():
+    aware_utc = _utc("2026-07-29T13:18:20+00:00")
+    # Same instant, expressed in another zone -- must give the same answer.
+    assert is_regular_trading_hours(aware_utc.astimezone(ZoneInfo("Asia/Tokyo"))) is False

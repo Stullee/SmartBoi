@@ -17,12 +17,22 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from smartboi.dossier import Dossier
+from smartboi.dossier import SCORING_VERSION, Dossier
 
 log = logging.getLogger(__name__)
+
+# US equity regular trading hours, in exchange-local time. Entries are
+# gated on these (see is_regular_trading_hours) because a paper trade
+# booked at a price no order could have been filled at is not a paper
+# trade, it is a fabricated fill -- and the live record contains two of
+# them, opened at 09:18 ET, twelve minutes before the open.
+_MARKET_TZ = ZoneInfo("America/New_York")
+_MARKET_OPEN = dt_time(9, 30)
+_MARKET_CLOSE = dt_time(16, 0)
 
 
 @dataclass(frozen=True)
@@ -35,6 +45,23 @@ class SignalEvent:
     independent_source_count: int
     thesis_summary: str
     generated_at: str
+    # The bar this signal actually cleared, and the scoring rules that
+    # produced the score, stamped onto the row itself.
+    #
+    # These are not diagnostics. Every threshold here is overridable from
+    # the add-on's options.json (which wins over the code default), so the
+    # documented 0.65 and the bar a given row actually cleared can differ
+    # without anything recording it -- and a forward record whose admission
+    # criterion is unknown per row cannot be partitioned later. That is not
+    # a reporting inconvenience: SCORING_VERSION exists precisely so the
+    # record can be split at a rules boundary instead of silently mixing
+    # scores that mean different things, and a split needs the rules to be
+    # ON the row. Forward data cannot be backfilled, so a row written
+    # without them is unrecoverable -- it can never be re-stamped, because
+    # nothing remembers what was in force when it was written.
+    threshold_in_force: float = 0.0
+    min_sources_in_force: int = 0
+    scoring_version: int = 0
 
 
 def evaluate(
@@ -86,7 +113,43 @@ def evaluate(
         independent_source_count=dossier.independent_source_count,
         thesis_summary=dossier.thesis_summary,
         generated_at=datetime.now(timezone.utc).isoformat(),
+        # `required_sources`, not min_independent_sources: the news-only
+        # elevation above is part of the bar this row cleared, and stamping
+        # the unelevated setting would misdescribe exactly the rows where
+        # the distinction mattered.
+        threshold_in_force=confidence_threshold,
+        min_sources_in_force=required_sources,
+        scoring_version=SCORING_VERSION,
     )
+
+
+def is_regular_trading_hours(now: datetime | None = None) -> bool:
+    """Whether US equities are in their regular session right now.
+
+    An entry booked outside this window is not a fill anybody could have
+    got. The price sources do not refuse to answer out of hours -- IB and
+    Finnhub both return the last session's close -- so without this check
+    the engine happily opens a position at a stale price and stamps it with
+    the current timestamp. The live record has two: ESOA and PUMP, both
+    booked 13:18Z, which is 09:18 ET, twelve minutes before the open. Every
+    subsequent statistic about those trades inherits an entry price that
+    was never available.
+
+    Exchange-local rather than a fixed UTC offset, so this stays correct
+    across DST: the ET session is 13:30-20:00 UTC in summer and 14:30-21:00
+    in winter, and a hard-coded UTC window is wrong for half the year.
+
+    KNOWN GAP: market holidays. They are all weekdays, so a holiday still
+    passes this check and the same stale-close problem applies to that one
+    day. A holiday calendar needs annual maintenance and silently rots when
+    it stops getting it, which is a worse failure than the one it fixes --
+    so this covers nights and weekends (where the observed damage was) and
+    the residual is documented rather than half-solved."""
+    now = now or datetime.now(timezone.utc)
+    local = now.astimezone(_MARKET_TZ)
+    if local.weekday() >= 5:  # Saturday/Sunday
+        return False
+    return _MARKET_OPEN <= local.time() < _MARKET_CLOSE
 
 
 def favorable_drift_pct(direction: str, signaled_price: float, current_price: float) -> float:

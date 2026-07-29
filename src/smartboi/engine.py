@@ -42,6 +42,7 @@ from smartboi.dedup import DedupIndex, fingerprint, source_domain
 from smartboi.edgar import _truncate_head_tail, describe_8k_items
 from smartboi.dossier import (
     DIRECTIONS,
+    SCORING_VERSION,
     Dossier,
     DossierStore,
     DossierSynthesizer,
@@ -57,7 +58,14 @@ from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal, cost_bps_per_side_for_cap
 from smartboi.prices import PriceBar, ReadOnlyPriceFeed
 from smartboi.ratelimit import SlidingWindowLimiter
-from smartboi.signals import evaluate, favorable_drift_pct, log_decision, log_signal, signal_expired
+from smartboi.signals import (
+    evaluate,
+    favorable_drift_pct,
+    is_regular_trading_hours,
+    log_decision,
+    log_signal,
+    signal_expired,
+)
 from smartboi.skeptic import Skeptic
 from smartboi.state import JsonState
 from smartboi.status import snapshot_dossier
@@ -701,6 +709,23 @@ class Engine:
                 "-- anything older by then is not scored.",
             )
 
+        # Logged unconditionally, at startup, in one greppable line. Every
+        # one of these is overridable from the add-on's options.json, which
+        # wins over the code default -- so "the documented threshold" and
+        # "the threshold this deployment is running" are different
+        # questions, and until now the log answered neither: `grep -i
+        # threshold` over the entire live log returned nothing at all.
+        log.info(
+            "Signal bar in force: score >= %.3f, sources >= %d (>= %d when news-only), "
+            "scoring_version=%d, synthesis floor %.3f. These are what the record is being "
+            "written against -- the code defaults are 0.65/2/3 and options.json overrides them.",
+            self.settings.signal_confidence_threshold,
+            self.settings.min_independent_sources,
+            self.settings.min_independent_sources_news_only,
+            SCORING_VERSION,
+            self.settings.signal_confidence_threshold * self.settings.synthesis_score_floor_pct,
+        )
+
         if self.settings.enable_ib_price_feed:
             self.price_feed = ReadOnlyPriceFeed(
                 self.settings.ib_host, self.settings.ib_port, self.settings.ib_client_id
@@ -945,8 +970,15 @@ class Engine:
         # capture. Duplicate rows from a partial write are handled
         # downstream (dedup_snapshots / last-mark-wins), a lost day is not.
         if self._daily_pass_due("dossier_snapshot"):
-            self._run_daily_snapshot()
-            self._mark_daily_pass_done("dossier_snapshot")
+            # Gated on the return value, exactly like price marks below.
+            # This used to call and mark unconditionally, so the comment
+            # above described a property only ONE of the two passes had --
+            # and it was missing from the pass whose data is the less
+            # replaceable of the two. A snapshot that wrote nothing (no
+            # dossiers loaded yet on a cold start, a read that returned
+            # empty) was recorded as a completed day, and the day was gone.
+            if self._run_daily_snapshot():
+                self._mark_daily_pass_done("dossier_snapshot")
         # Daily price marks are deliberately NOT gated on IB being enabled
         # or reachable -- they are the raw material for the forward-return
         # validation, and a missed day is permanently unbackfillable. IB is
@@ -1155,6 +1187,23 @@ class Engine:
             return False
         now = datetime.now(timezone.utc).isoformat()
         for rel in relationships:
+            # The tool schema says these are objects; the model does not
+            # always agree, and a bare string here used to raise
+            # AttributeError on the first .get() below. That exception
+            # escapes AFTER the call has been paid for and BEFORE
+            # backfill_state is set, so the filing stays permanently due:
+            # every future poll re-pays for the same extraction and dies at
+            # the same element. Two mega-cap filings were stuck in exactly
+            # that loop. Skipping the malformed element keeps the other
+            # relationships in the response -- which are usually fine --
+            # instead of discarding a paid-for call over one bad entry.
+            if not isinstance(rel, dict):
+                log.warning(
+                    "%s: relationship extraction returned a non-object entry (%r) -- skipping it. "
+                    "The rest of the response is still applied.",
+                    symbol, rel,
+                )
+                continue
             if self._is_lender_relationship(rel):
                 log.info(
                     "%s: dropping lender relationship to %s (a credit provider is a disclosed "
@@ -2438,6 +2487,19 @@ class Engine:
                 "before an entry was confirmed",
             )
             return
+        # Outside the regular session no price source refuses to answer --
+        # they return the last close -- so without this the engine opens at
+        # a price no order could have been filled at and stamps it with the
+        # current time. Checked BEFORE the price fetch (an out-of-hours poll
+        # need not spend an API call) but AFTER the deadline, which is the
+        # ordering that matters: the deadline check used to sit below an
+        # early return and the result was a signal that never opened AND
+        # never expired. Any new early return here has to carry the deadline
+        # with it or it recreates exactly that.
+        if not is_regular_trading_hours():
+            if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
+                self._expire_signal(dossier, "the entry deadline passed outside regular trading hours")
+            return
         # IB first, Finnhub second (see _price_bar). Entry used to be the one
         # place in the system with NO fallback -- _snapshot_signal_price and
         # _run_daily_price_marks both already fell back to Finnhub, but the
@@ -2773,19 +2835,36 @@ class Engine:
     # all except price marks needing a live price to mark. Forward data
     # can't be backfilled, so this starts accruing from day one. ---
 
-    def _run_daily_snapshot(self) -> None:
+    def _run_daily_snapshot(self) -> bool:
         """Appends every dossier's current score to
         logs/dossier_snapshots.jsonl, once a day, unconditionally (even a
         dossier with zero evidence gets a real score=0 row) -- see
         status.py's snapshot_dossier. No LLM/API cost: pure reads of
-        already-persisted dossier state."""
+        already-persisted dossier state.
+
+        Returns False when it wrote NOTHING, so the caller leaves the pass
+        due and the next tick retries rather than recording a day that has
+        no rows in it. Forward data cannot be backfilled: a day marked done
+        without being captured is not a gap that gets filled in later, it is
+        a sample that never existed. Writing zero rows is the failure this
+        guards -- it is the shape a cold start takes (dossier directory not
+        yet populated when the first tick fires), and it is indistinguishable
+        after the fact from a genuinely empty day."""
         snapshotted_at = datetime.now(timezone.utc).isoformat()
         path = Path(self.settings.log_dir) / "dossier_snapshots.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
         with path.open("a") as f:
             for symbol in self.dossiers.all_symbols():
                 dossier = self.dossiers.load(symbol)
                 f.write(json.dumps(snapshot_dossier(dossier, snapshotted_at)) + "\n")
+                written += 1
+        if not written:
+            log.warning(
+                "Daily dossier snapshot wrote no rows -- no dossiers exist yet. Leaving the pass "
+                "due so the next tick retries; a day marked done with no rows is unbackfillable."
+            )
+        return written > 0
 
     async def _run_daily_price_marks(self) -> bool:
         """Appends every universe symbol's last price to

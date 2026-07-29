@@ -14,6 +14,8 @@ import pytest
 
 from smartboi.config import Settings
 from smartboi.edgar import FilingEvent
+import smartboi.engine
+from smartboi.dossier import SCORING_VERSION
 from smartboi.engine import ECOSYSTEM_LINK_CONFIDENCE, Engine, is_common_equity
 from smartboi.ratelimit import SlidingWindowLimiter
 from smartboi.graph import Relationship
@@ -1801,3 +1803,143 @@ async def test_synthesis_runs_on_a_dossier_near_the_bar(engine):
     await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
 
     assert [c["symbol"] for c in engine.synthesizer.calls] == ["FORM"]
+
+
+# --- Audit #1/#3/#4/#9. Four findings from the 2026-07-29 multi-agent audit
+# of the live deployment. Each one is a case where the code silently did
+# something other than what its own comment or docstring claimed. ---
+
+
+async def test_every_signal_row_records_the_bar_it_actually_cleared(engine):
+    """The bar is overridable from the add-on's options.json, so the
+    documented 0.65 and the bar a row cleared can differ with nothing
+    recording it. The live record has 13 signals and no way to tell which
+    rules admitted any of them -- which makes SCORING_VERSION's whole
+    purpose (split the record at a rules boundary) unexecutable."""
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+
+    rows = [json.loads(line) for line in
+            (Path(engine.settings.log_dir) / "signals.jsonl").read_text().splitlines()]
+    assert rows
+    for row in rows:
+        # The fixture runs a 0.5 bar, not the documented 0.65 -- which is
+        # exactly the situation this field exists to make legible.
+        assert row["threshold_in_force"] == 0.5
+        assert row["min_sources_in_force"] == 2
+        assert row["scoring_version"] == SCORING_VERSION
+
+
+async def test_the_news_only_elevation_is_what_gets_stamped_not_the_base_setting(engine):
+    """A news-only dossier clears an ELEVATED source bar. Stamping the
+    unelevated setting would misdescribe precisely the rows where the
+    distinction decided the outcome."""
+    engine.settings.min_independent_sources_news_only = 3
+    engine.updater.default = proposal(direction="LONG", magnitude=0.9, confidence=0.9, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.9, adjusted_magnitude=0.9)
+    for i, source in enumerate(("reuters.com", "bloomberg.com", "wsj.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+
+    rows = [json.loads(line) for line in
+            (Path(engine.settings.log_dir) / "signals.jsonl").read_text().splitlines()]
+    assert rows
+    assert all(row["min_sources_in_force"] == 3 for row in rows)
+
+
+def test_a_snapshot_that_wrote_nothing_leaves_the_day_due(engine):
+    """The comment above both daily passes says they are marked done only
+    after a successful run, because 'a lost day is not' recoverable. That
+    was true of price marks and false of the snapshot pass, which marked
+    done unconditionally -- on the pass whose data is the less replaceable
+    of the two."""
+    assert engine.dossiers.all_symbols() == []
+    assert engine._run_daily_snapshot() is False
+    assert engine._daily_pass_due("dossier_snapshot")  # still due, will retry
+
+
+def test_a_snapshot_that_wrote_rows_marks_the_day_done(engine):
+    dossier = engine.dossiers.load("FORM")
+    dossier.direction = "LONG"
+    engine.dossiers.save(dossier)
+
+    assert engine._run_daily_snapshot() is True
+    rows = (Path(engine.settings.log_dir) / "dossier_snapshots.jsonl").read_text().splitlines()
+    assert len(rows) == 1
+
+
+async def test_no_trade_opens_outside_regular_trading_hours(engine, monkeypatch):
+    """Two live paper trades were booked at 09:18 ET. No price source
+    refuses to answer out of hours -- they return the last close -- so the
+    engine opened at a price no order could have been filled at."""
+    monkeypatch.setattr(smartboi.engine, "is_regular_trading_hours", lambda now=None: False)
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+    assert engine.dossiers.load("FORM").status == "SIGNALED"
+
+    await engine._mark_and_execute()
+    assert not engine.journal.has_open("FORM")
+
+    # And it opens on the next poll once the session is in -- blocked, not lost.
+    monkeypatch.setattr(smartboi.engine, "is_regular_trading_hours", lambda now=None: True)
+    await engine._mark_and_execute()
+    assert engine.journal.has_open("FORM")
+
+
+async def test_an_out_of_hours_signal_still_expires_at_its_deadline(engine, monkeypatch):
+    """The regression this ordering exists to prevent: the deadline check
+    once sat below an early return, and the result was a signal that never
+    opened AND never expired -- it held the tightened entry cadence open
+    forever and blocked the dossier from ever signalling cleanly again."""
+    monkeypatch.setattr(smartboi.engine, "is_regular_trading_hours", lambda now=None: False)
+    dossier = engine.dossiers.load("FORM")
+    dossier.direction = dossier.signaled_direction = "LONG"
+    dossier.status = "SIGNALED"
+    dossier.confidence, dossier.magnitude = 0.9, 0.9
+    dossier.independent_source_count = 2
+    dossier.signaled_at = (
+        datetime.now(timezone.utc)
+        - timedelta(days=engine.settings.signal_entry_deadline_days + 1)
+    ).isoformat()
+    engine.dossiers.save(dossier)
+
+    await engine._try_open_from_signal("FORM", engine.dossiers.load("FORM"))
+
+    assert engine.dossiers.load("FORM").status != "SIGNALED"
+    assert not engine.journal.has_open("FORM")
+
+
+async def test_a_non_object_relationship_does_not_kill_the_paid_for_extraction(engine):
+    """A bare string in the relationships array raised AttributeError on the
+    first .get() -- after the call was paid for and before backfill_state
+    was set, so the filing stayed due and every future poll re-paid and died
+    at the same element. Two mega-cap filings were stuck in that loop."""
+    engine.extractor.default = [
+        "UCTT",  # the malformed element that used to raise
+        {"counterparty_name": "Ultra Clean Holdings", "counterparty_ticker": "UCTT",
+         "rel_type": "customer", "description": "d", "evidence_quote": "q", "confidence": 0.9},
+    ]
+
+    ran = await engine._extract_relationships(
+        "FORM", FilingEvent(symbol="FORM", cik10="0000000001", form="10-K",
+                            filing_date="2026-07-20", accession_number="a-1",
+                            primary_document="d.htm"),
+        "filing text",
+    )
+
+    # The call is not wasted: it ran, and the well-formed edge survived.
+    assert ran is True
+    assert any(r.to_symbol == "UCTT" for r in engine.graph.relationships)
