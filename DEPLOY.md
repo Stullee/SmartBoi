@@ -43,7 +43,39 @@ follow TradingBot's `DEPLOY.md` section 1 to set one up first.
 See `ha-addons/smartboi/DOCS.md` (also shown in the add-on's Documentation
 tab in HA) for the full list of configuration options.
 
-## 3. (Optional) Turn on the price feed
+## 3. Picking up a new release
+
+**Rebuild does not re-read `config.yaml`.** Home Assistant caches each
+add-on's definition per repository, and Rebuild only rebuilds the Docker
+image from that cached definition -- so a release that adds a new
+configuration option will build fine and still show you the old
+Configuration form, with the new option missing. This has caused confusion
+more than once; it is a caching quirk, not a broken build.
+
+To actually pick up a release:
+
+1. `Settings -> Add-ons -> Add-on Store -> ⋮ -> Check for updates`. This
+   re-reads `repository.yaml` and every add-on's `config.yaml`.
+2. Open the SmartBoi add-on -- it should now offer **Update** to the new
+   version. Use Update, not Rebuild.
+3. Check the **Configuration** tab for any new options.
+
+If step 1 doesn't surface the new version, remove and re-add the
+repository URL under `⋮ -> Repositories` to force a full re-read.
+
+**Options do not inherit repository defaults on an existing install.** A
+value you set once is yours forever, even after the default in this repo
+changes -- so after any release that recalibrates a default (`75/10`
+universe bounds, `max_horizon_days: 21`), open the Configuration tab and
+check it rather than assuming the new default applied.
+
+A missing option is harmless in the meantime: the add-on only exports
+environment variables for options actually present in its stored config,
+so anything absent falls back to the default compiled into
+`src/smartboi/config.py`. A new setting is therefore *active* from the
+moment you update the image, whether or not the form shows it yet.
+
+## 4. (Optional) Turn on the price feed
 
 Once you're ready to see actual hypothetical P&L rather than just
 detected-and-logged signals: set `enable_ib_price_feed: true` and
