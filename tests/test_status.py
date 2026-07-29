@@ -69,3 +69,101 @@ def test_gather_graph_stats_empty_graph(tmp_path):
     graph = RelationshipGraph(tmp_path / "graph.json")
     stats = gather_graph_stats(graph)
     assert stats == {"edge_count": 0, "by_symbol": []}
+
+
+# --- Coverage: how much of the TRADEABLE universe is actually live. A
+# dossier count far below the tradeable count means most of the universe is
+# dark, not that the market is quiet -- and the connectivity rows say why. ---
+
+def _spec(symbol, anchor=False):
+    from smartboi.universe import CompanySpec
+
+    return CompanySpec(symbol, symbol, "test", signal_source_only=anchor)
+
+
+def _rel(a, b):
+    from smartboi.graph import Relationship
+
+    return Relationship(a, b, "customer", "d", "s", 0.9, "2026-07-29")
+
+
+def test_coverage_counts_tradeables_anchors_and_dossiers(tmp_path):
+    from smartboi.dossier import Dossier, DossierStore
+    from smartboi.graph import RelationshipGraph
+    from smartboi.status import gather_coverage
+
+    store = DossierStore(tmp_path / "d")
+    store.save(Dossier(symbol="ULH"))
+    graph = RelationshipGraph(tmp_path / "g.json")
+    universe = [_spec("ULH"), _spec("THRM"), _spec("GM", anchor=True)]
+
+    c = gather_coverage(universe, graph, store)
+
+    assert c["tradeables"] == 2
+    assert c["anchors"] == 1
+    assert c["tradeables_with_dossier"] == 1
+
+
+def test_coverage_ignores_a_dossier_for_a_non_tradeable(tmp_path):
+    """Dossier FILES outlive universe membership (a demoted or dropped
+    symbol keeps its file), so counting files would overstate coverage."""
+    from smartboi.dossier import Dossier, DossierStore
+    from smartboi.graph import RelationshipGraph
+    from smartboi.status import gather_coverage
+
+    store = DossierStore(tmp_path / "d")
+    store.save(Dossier(symbol="GM"))       # an anchor
+    store.save(Dossier(symbol="GONE"))     # no longer in the universe at all
+    graph = RelationshipGraph(tmp_path / "g.json")
+
+    c = gather_coverage([_spec("ULH"), _spec("GM", anchor=True)], graph, store)
+
+    assert c["tradeables_with_dossier"] == 0
+
+
+def test_coverage_reports_connectivity_in_both_directions(tmp_path):
+    """Edges are stored filer -> counterparty, but propagation traverses
+    both ways (graph.linked_symbols), so connectivity must too."""
+    from smartboi.dossier import DossierStore
+    from smartboi.graph import RelationshipGraph
+    from smartboi.status import gather_coverage
+
+    graph = RelationshipGraph(tmp_path / "g.json")
+    graph.add(_rel("ULH", "GM"))
+    universe = [_spec("ULH"), _spec("THRM"), _spec("GM", anchor=True)]
+
+    c = gather_coverage(universe, graph, DossierStore(tmp_path / "d"))
+
+    assert c["tradeables_connected"] == 1
+    assert c["tradeables_unconnected"] == ["THRM"]
+    assert c["anchors_live"] == 1
+    assert c["anchors_inert"] == []
+
+
+def test_an_anchor_linked_only_to_another_anchor_counts_as_inert(tmp_path):
+    """An anchor is never its own analysis target, so an anchor-to-anchor
+    edge still resolves to zero targets -- 'live' means linked to something
+    tradeable, not merely linked."""
+    from smartboi.dossier import DossierStore
+    from smartboi.graph import RelationshipGraph
+    from smartboi.status import gather_coverage
+
+    graph = RelationshipGraph(tmp_path / "g.json")
+    graph.add(_rel("GM", "F"))
+    universe = [_spec("ULH"), _spec("GM", anchor=True), _spec("F", anchor=True)]
+
+    c = gather_coverage(universe, graph, DossierStore(tmp_path / "d"))
+
+    assert c["anchors_live"] == 0
+    assert c["anchors_inert"] == ["F", "GM"]
+
+
+def test_coverage_on_an_empty_universe_does_not_divide_by_zero(tmp_path):
+    from smartboi.dossier import DossierStore
+    from smartboi.graph import RelationshipGraph
+    from smartboi.status import gather_coverage
+
+    c = gather_coverage([], RelationshipGraph(tmp_path / "g.json"), DossierStore(tmp_path / "d"))
+
+    assert c["tradeables"] == 0 and c["anchors"] == 0
+    assert c["tradeables_with_dossier"] == 0

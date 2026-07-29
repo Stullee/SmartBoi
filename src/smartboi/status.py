@@ -58,6 +58,56 @@ def gather_dossiers(store: DossierStore) -> list[dict]:
     return rows
 
 
+def gather_coverage(universe, graph: RelationshipGraph, store: DossierStore) -> dict:
+    """How much of the tradeable universe is actually being covered -- the
+    "are we there yet" readout.
+
+    Three numbers, each answering a different question:
+
+    - dossiers vs tradeables: how many trade targets have any accumulated
+      thesis at all. This is the headline: a dossier count far below the
+      tradeable count means most of the universe is dark, not that the
+      market is quiet.
+    - CONNECTED tradeables: how many have at least one graph edge, i.e. can
+      ever receive propagated evidence from an anchor. An unconnected
+      tradeable can only ever build a dossier from its own direct news --
+      and these are selected for thin coverage, so in practice it will not.
+    - LIVE anchors: how many anchors have an edge to a tradeable. An anchor
+      is never its own analysis target, so one without such an edge is
+      inert by construction: its news resolves to zero targets and is
+      discarded unread, no matter how much of it there is.
+
+    Measured live 2026-07-29, before the edge-promotion fix: 16 dossiers
+    against 48 tradeables, 20 of 48 tradeables connected, and 26 of 130
+    anchors live. Those three numbers together explain the whole gap
+    between ingestion volume and signal output, which is why they belong on
+    the dashboard rather than in a log line."""
+    tradeables = [c.symbol for c in universe if not c.signal_source_only]
+    anchors = [c.symbol for c in universe if c.signal_source_only]
+    tradeable_set = set(tradeables)
+
+    linked: dict[str, set[str]] = {}
+    for r in graph.relationships:
+        linked.setdefault(r.from_symbol, set()).add(r.to_symbol)
+        linked.setdefault(r.to_symbol, set()).add(r.from_symbol)
+
+    with_dossier = {s for s in store.all_symbols() if s in tradeable_set}
+    connected = [s for s in tradeables if linked.get(s)]
+    # An anchor-to-anchor edge yields no analysis target either, so "live"
+    # means specifically "linked to something tradeable".
+    live_anchors = [a for a in anchors if linked.get(a, set()) & tradeable_set]
+
+    return {
+        "tradeables": len(tradeables),
+        "anchors": len(anchors),
+        "tradeables_with_dossier": len(with_dossier),
+        "tradeables_connected": len(connected),
+        "tradeables_unconnected": sorted(tradeable_set - set(connected)),
+        "anchors_live": len(live_anchors),
+        "anchors_inert": sorted(set(anchors) - set(live_anchors)),
+    }
+
+
 def gather_graph_stats(graph: RelationshipGraph) -> dict:
     """Relationships grouped by the filer (`from_symbol` -- "the company the
     evidence is about", see graph.py's Relationship) instead of one flat
