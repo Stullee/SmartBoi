@@ -100,28 +100,58 @@ class Settings(BaseSettings):
     # --- Claude: relationship extraction, dossier updates, skeptic pass ---
     anthropic_api_key: str = ""
     #
-    # Models are tiered by how hard the judgement is, not uniformly. Every call site ran
-    # on the cheapest model the API offers while the daily budget sat at ~6%
-    # used -- the two calls that actually decide whether real money would be
-    # committed were the two being economised on.
+    # Models are tiered by VALUE PER CALL against a real monthly budget
+    # (max_daily_usd), not by how important the call sounds.
     #
-    # dossier/skeptic: these produce the confidence and magnitude that gate a
-    #   trade at a hard threshold. Reasoning quality here is the product.
-    # extraction: the largest input-token consumer (a 150k-char filing per
-    #   call) but a reading task rather than a judgement one, and its output
-    #   is already backstopped by the name-verification and biography/lender
-    #   filters in engine.py. A mid-tier model is the right trade.
+    # The instinct is to put the strongest model on the passes that gate a
+    # trade -- the per-item dossier update and the skeptic. That is the wrong
+    # trade, for a structural reason rather than a cost one: those two passes
+    # see ONE evidence item each, and no amount of model quality lets a
+    # per-item scorer answer the questions that actually decide whether a
+    # thesis is real. Are these ten items ten facts, or one fact counted ten
+    # times? Do they cohere, or are they unrelated coincidences pointing the
+    # same way? Has the market already connected them? A per-item call cannot
+    # see any of that, and the aggregate over those calls is pure arithmetic.
+    # Buying a smarter classifier buys a better guess at a question that was
+    # never the hard one.
     #
-    # Cost is bounded and visible: see max_daily_usd and the dashboard's
-    # usage panel. Changing any of these is safe -- llm.py builds the
-    # model-appropriate request shape, so a model that rejects `temperature`
-    # or requires `budget_tokens` is handled rather than 400-ing into a
-    # silent retry loop. Note that changing them also resets the forward-
-    # testing clock (see _check_model_provenance and EvidenceRecord's
-    # scored_by_model), which is deliberate and will be warned about.
-    extraction_model: str = "claude-sonnet-5"
-    dossier_model: str = "claude-opus-5"
-    skeptic_model: str = "claude-opus-5"
+    # So the money goes where reasoning converts into a better decision:
+    #
+    # extraction (haiku): by far the largest input-token consumer -- a
+    #   150k-char filing per call -- and a reading task, already backstopped
+    #   by engine.py's name-verification and biography/lender filters. Paying
+    #   a premium per token here is paying it on the cheapest kind of work.
+    # dossier + skeptic (haiku): high volume, two calls per evidence item.
+    #   These are triage -- is this new, which direction, roughly how big, is
+    #   it refutable. The catalyst rubric now in their prompts (see
+    #   dossier._CATALYST_RUBRIC) is exactly the scaffolding a small model
+    #   uses well: it replaces judgement with a lookup.
+    # synthesis (opus): once a day, only for a dossier near the signal bar,
+    #   reading the COMPLETE evidence file. Low volume, and the only pass
+    #   that can see overlap, coherence and staleness. Its verdict caps the
+    #   score, so this is the call that decides whether accumulated evidence
+    #   becomes a position.
+    #
+    # Roughly a dozen expensive calls a day instead of several hundred, on
+    # the one pass where thinking changes the answer. Changing any of these
+    # is safe -- llm.py builds the model-appropriate request shape, so a
+    # model that rejects `temperature` or needs `budget_tokens` is handled
+    # rather than 400-ing into a silent retry loop. Note that changing them
+    # resets the forward-testing clock (see _check_model_provenance and
+    # EvidenceRecord.scored_by_model), which is deliberate and warned about.
+    extraction_model: str = "claude-haiku-4-5"
+    dossier_model: str = "claude-haiku-4-5"
+    skeptic_model: str = "claude-haiku-4-5"
+    synthesis_model: str = "claude-opus-5"
+    # Synthesis only runs on a dossier whose arithmetic score is at least
+    # this fraction of the signal threshold. It is a CAP -- it can veto and
+    # trim, never lift -- so on a dossier far below the bar the only possible
+    # outcomes are "no change" and "further below the bar", neither of which
+    # changes a decision and both of which cost an Opus call. Restricting it
+    # to dossiers near a decision is what keeps the expensive pass at a
+    # handful of calls a day as the universe grows from 17 dossiers toward
+    # 48, instead of scaling linearly with the watchlist.
+    synthesis_score_floor_pct: float = 0.6
 
     # --- Cost controls. Every LLM call (extraction/dossier-update/skeptic)
     # checks these before spending anything -- see usage.py and
@@ -147,7 +177,20 @@ class Settings(BaseSettings):
     # cap is kept because it bounds request VOLUME, which dollars do not.
     # Priced from llm.MODEL_PRICES_PER_MTOK; an unrecognised model is priced
     # at the most expensive entry rather than free.
-    max_daily_usd: float = 25.0
+    # $3.30/day is ~$100/month. Deliberately close to what the previous
+    # all-Haiku configuration actually cost (~$4/day measured live), because
+    # the tiering above spends the same order of money in a different place
+    # rather than spending more of it.
+    #
+    # This is a HARD ceiling, and hitting it is not a failure mode: evidence
+    # is deferred, never discarded, and picked up when the budget resets at
+    # UTC midnight -- the same path as a transient API error. That makes the
+    # cap do something useful beyond bounding the bill: a burst of
+    # relationship extraction (the 150k-char-per-call pass, which spikes
+    # whenever the universe grows or a backfill is queued) spreads itself
+    # over several days instead of consuming a month of budget in an
+    # afternoon.
+    max_daily_usd: float = 3.30
     # Caps how many pieces of PROPAGATED evidence (about a linked company,
     # never the dossier's own direct evidence) get forwarded to one target
     # from one origin within a rolling window -- without this, a heavily-

@@ -1635,7 +1635,9 @@ async def test_synthesis_cannot_inflate_a_score(engine):
     """A cap, never a lift -- otherwise one confident model call could
     manufacture a trade on evidence that never accumulated."""
     engine.synthesizer = FakeSynthesizer(default=synthesis(confidence=1.0, magnitude=1.0))
-    dossier = await _build_thesis(engine, confidence=0.3, magnitude=0.3)
+    # Above the near-the-bar floor, so synthesis actually runs and the
+    # assertion tests the cap rather than the skip.
+    dossier = await _build_thesis(engine, confidence=0.6, magnitude=0.6)
     before_c, before_m = dossier.confidence, dossier.magnitude
 
     await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
@@ -1767,3 +1769,35 @@ async def test_the_same_cold_start_closes_the_trade_when_the_target_trades(engin
     assert closed[-1]["r_multiple"] is not None       # net of the cost model
     assert closed[-1]["cost_bps_round_trip"] > 0      # ...and costs were charged
     assert engine.dossiers.load("FORM").status == "ACTIVE"
+
+
+async def test_synthesis_is_skipped_well_below_the_bar(engine):
+    """The expensive pass only runs where it can change the outcome. It can
+    only veto or trim, so on a dossier far below the signal bar the reachable
+    outcomes are "unchanged" and "further below" -- neither changes a
+    decision, and both cost an Opus call. This is what keeps the one
+    expensive pass at a handful of calls a day as the watchlist grows."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis())
+    dossier = await _build_thesis(engine, confidence=0.2, magnitude=0.2)
+    assert dossier.confidence * dossier.magnitude < (
+        engine.settings.signal_confidence_threshold * engine.settings.synthesis_score_floor_pct
+    )
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert engine.synthesizer.calls == []
+
+
+async def test_synthesis_runs_on_a_dossier_near_the_bar(engine):
+    """Near-but-below still gets checked: a thesis that would fire tomorrow
+    on one more item is exactly where an over-counting veto is worth paying
+    for."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis())
+    floor = (engine.settings.signal_confidence_threshold
+             * engine.settings.synthesis_score_floor_pct)
+    dossier = await _build_thesis(engine, confidence=0.7, magnitude=0.6)
+    assert dossier.confidence * dossier.magnitude >= floor
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert [c["symbol"] for c in engine.synthesizer.calls] == ["FORM"]
