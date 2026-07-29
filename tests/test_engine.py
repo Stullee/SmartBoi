@@ -13,7 +13,8 @@ import pytest
 
 from smartboi.config import Settings
 from smartboi.edgar import FilingEvent
-from smartboi.engine import Engine, is_common_equity
+from smartboi.engine import ECOSYSTEM_LINK_CONFIDENCE, Engine, is_common_equity
+from smartboi.ratelimit import SlidingWindowLimiter
 from smartboi.graph import Relationship
 from smartboi.news import NewsArticle
 
@@ -1113,8 +1114,11 @@ async def test_evidence_throttled_to_zero_targets_is_retried_not_discarded(engin
 
 
 async def test_evidence_for_an_unconnected_anchor_is_definitively_done(engine):
-    """Empty because there is no edge is genuinely finished -- retrying it
-    forever would re-fetch the same article on every poll for nothing."""
+    """Empty because there is no target at all is genuinely finished --
+    retrying it forever would re-fetch the same article on every poll for
+    nothing. Ecosystem fallback is off here so this isolates the
+    no-targets path; its own behaviour is covered below."""
+    engine.settings.enable_ecosystem_propagation = False
     assert await engine._process_evidence(
         origin_symbol="INTC", evidence_text="x", source_type="news", source_name="reuters.com",
         url="https://x/3", headline="h3", published_at="2026-07-23") is True
@@ -1182,3 +1186,181 @@ def test_the_same_symbols_are_perfectly_good_anchors(engine):
 def test_ordinary_common_stock_is_unaffected(engine):
     for symbol in ("DCO", "THRM", "PLAB", "KODK", "GOOGL"):
         assert is_common_equity(symbol), symbol
+
+
+# --- Ecosystem-fallback propagation. An anchor with no DISCLOSED edge to a
+# tradeable is inert -- it is never its own analysis target, so its news
+# resolves to zero targets and is discarded unread. That was 104 of 130
+# anchors live, including NVDA, AMAT, TSM, MSFT, AMZN, UPS and CSX. The
+# graph can only grow at filing season, so the fallback is the ecosystem
+# link -- which is also the one the literature actually measured
+# (Menzly & Ozbas 2010, industry-level cross-predictability). ---
+
+async def test_an_inert_anchor_reaches_same_ecosystem_tradeables(engine):
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+
+    # INTC is an anchor with no graph edge at all.
+    assert engine.graph.relationships == []
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="Intel guides capex up", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h", published_at="2026-07-29")
+
+    # FORM and UCTT share INTC's ecosystem and are tradeable.
+    assert engine.dossiers.load("FORM").evidence
+    assert engine.dossiers.load("UCTT").evidence
+
+
+async def test_ecosystem_evidence_is_marked_as_not_a_disclosed_link(engine):
+    """It must be visibly weaker than a disclosed contract, both to the LLM
+    (which is told in words and in a number) and to the signal gate."""
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="x", source_type="news", source_name="reuters.com",
+        url="https://x/1", headline="h", published_at="2026-07-29")
+
+    call = engine.updater.calls[0]
+    assert call["relationship_confidence"] == ECOSYSTEM_LINK_CONFIDENCE
+    assert "NOT a contractual relationship" in call["relationship_note"]
+
+
+async def test_ecosystem_evidence_cannot_relax_the_corroboration_bar(engine):
+    """ECOSYSTEM_LINK_CONFIDENCE sits below DISCLOSED_LINK_CONFIDENCE on
+    purpose: this evidence can raise a thesis but must never let a
+    news-only dossier through on the lower source bar."""
+    from smartboi.dossier import DISCLOSED_LINK_CONFIDENCE
+
+    assert ECOSYSTEM_LINK_CONFIDENCE < DISCLOSED_LINK_CONFIDENCE
+
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="x", source_type="news", source_name="reuters.com",
+        url="https://x/1", headline="h", published_at="2026-07-29")
+
+    assert engine.dossiers.load("FORM").has_disclosed_link_evidence is False
+
+
+async def test_a_disclosed_edge_suppresses_the_ecosystem_fallback(engine):
+    """A disclosed contract is strictly better evidence -- the fallback must
+    not run alongside it or double up on the same target."""
+    engine.graph.add(Relationship("FORM", "INTC", "customer", "Intel is a customer of FORM", "t", 0.95, "2026-07-29"))
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="x", source_type="news", source_name="reuters.com",
+        url="https://x/1", headline="h", published_at="2026-07-29")
+
+    notes = [c["relationship_note"] for c in engine.updater.calls]
+    assert all("ecosystem" not in n for n in notes)
+    # UCTT shares the ecosystem but has no disclosed link -- it must NOT be
+    # reached, because FORM's disclosed edge suppressed the fallback wholesale.
+    assert not engine.dossiers.load("UCTT").evidence
+
+
+async def test_a_throttled_disclosed_link_does_not_fall_back(engine):
+    """Otherwise the fallback routes around the very cooldown it just hit,
+    reaching the same target by a weaker route."""
+    engine.graph.add(Relationship("FORM", "INTC", "customer", "Intel is a customer of FORM", "t", 0.95, "2026-07-29"))
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+
+    # max_propagated_evidence_per_link=1 in the fixture: this consumes it.
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="first", source_type="news", source_name="reuters.com",
+        url="https://x/1", headline="h1", published_at="2026-07-29")
+    before = len(engine.updater.calls)
+
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="second", source_type="news", source_name="bloomberg.com",
+        url="https://x/2", headline="h2", published_at="2026-07-29")
+
+    assert len(engine.updater.calls) == before  # throttled, and no weaker route taken
+
+
+async def test_ecosystem_fanout_is_rate_limited_on_its_own_budget(engine):
+    engine.settings.max_ecosystem_evidence_per_link = 1
+    engine._ecosystem_limiter = SlidingWindowLimiter(1, 6 * 3600)
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+
+    for i in range(3):
+        await engine._process_evidence(
+            origin_symbol="INTC", evidence_text=f"item {i}", source_type="news",
+            source_name=f"src{i}.com", url=f"https://x/{i}", headline=f"h{i}",
+            published_at="2026-07-29")
+
+    # One item per (origin -> target) pair inside the window, for each of the
+    # two same-ecosystem tradeables.
+    assert len(engine.updater.calls) == 2
+
+
+def test_an_unclassified_bucket_is_never_treated_as_an_ecosystem(engine):
+    """"accepted" is where a runtime-accepted symbol lands when its
+    discoverer's ecosystem can't be inferred. It has held dozens of
+    mutually unrelated companies at once -- fanning news across it would be
+    noise dressed as a sector link."""
+    from smartboi.universe import CompanySpec
+
+    engine.universe.append(CompanySpec("JUNKA", "JUNKA", "accepted", signal_source_only=True))
+    engine.universe.append(CompanySpec("JUNKT", "JUNKT", "accepted"))
+    engine.spec_by_symbol = {c.symbol: c for c in engine.universe}
+
+    assert engine._ecosystem_targets("JUNKA") == []
+    assert engine._can_produce_evidence("JUNKA") is False
+
+
+def test_a_tradeable_does_not_fan_out_to_its_ecosystem_peers(engine):
+    """A tradeable is already its own analysis target; spraying its news
+    across its peers is a competitor read-across thesis this system has no
+    disclosed basis for."""
+    assert engine._ecosystem_targets("FORM") == []
+
+
+def test_ecosystem_propagation_can_be_turned_off(engine):
+    engine.settings.enable_ecosystem_propagation = False
+    assert engine._can_produce_evidence("INTC") is False
+
+
+# --- The biography filter, against every case confirmed live in the graph
+# and the candidate list, plus the genuine disclosures it must not touch.
+# The first version caught 1 of 9. ---
+
+BIO_DESCRIPTIONS = [
+    "Paul Sternlieb held a Group President role at Illinois Tool Works' Food Equipment Group before JBT.",
+    "CFO Darren Kozik started his career at GE in 1999 and worked in various roles.",
+    "CEO Paul Sternlieb held management roles at Danaher (2011-2014), a major diversified conglomerate.",
+    "EVP Operations Eric Chack held global operations leadership roles at IDEX Corporation.",
+    "CFO Darren Kozik served as Senior Vice President at ManpowerGroup before joining EPAC.",
+    "LOAR's management team previously led K&F Industries before its sale to Meggitt.",
+    "TransDigm acquired McKechnie Aerospace in 2010, where LOAR's management team worked together.",
+    "RTX is cited as the former employer of Shawn M. Mural, the CFO of V2X, who worked there for 24 years.",
+]
+
+COMMERCIAL_DESCRIPTIONS = [
+    "General Motors is a major OEM customer. In 2025, GM accounted for 12% of product revenues.",
+    "PACCAR is one of SRI's principal customers, accounting for 15% of net sales in 2025.",
+    "Second largest customer representing approximately 21.5% of net sales for the year ended 2025.",
+    "Boeing is one of DCO's largest customers, generating 13% of 2025 net revenues.",
+    "General Motors is ULH's top customer, representing approximately 25% of total revenues.",
+    "ExxonMobil accounted for approximately 24.9% of total revenue for the year ended 2025.",
+    "NIPSCO has an agreement to provide electricity to Amazon Data Services' data centers.",
+    "Willdan implements Consolidated Edison's Small and Medium Business Program in New York City.",
+    "GE Vernova accounted for more than 10% of consolidated revenues in 2025 and 2024.",
+    "L3Harris Technologies is Ultralife's largest customer, comprising 27% of total revenues.",
+    "Hudson entered an agreement with Lennox International to be the exclusive supplier of reclaimed refrigerants.",
+    "Norfolk Southern and CSX jointly own Conrail Inc. NSR has a 58% economic and 50% voting interest.",
+]
+
+
+@pytest.mark.parametrize("description", BIO_DESCRIPTIONS)
+def test_executive_biographies_are_recognised(description):
+    assert Engine._is_biography_relationship({"description": description}) is True
+
+
+@pytest.mark.parametrize("description", COMMERCIAL_DESCRIPTIONS)
+def test_genuine_disclosures_survive_the_biography_filter(description):
+    assert Engine._is_biography_relationship({"description": description}) is False

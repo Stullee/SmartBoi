@@ -57,7 +57,7 @@ from smartboi.skeptic import Skeptic
 from smartboi.state import JsonState
 from smartboi.status import snapshot_dossier
 from smartboi.universe import SEED_RELATIONSHIPS, CompanySpec, spec_by_symbol
-from smartboi.universe_screen import recommend_candidate_type, screen_universe
+from smartboi.universe_screen import guess_ecosystem, recommend_candidate_type, screen_universe
 from smartboi.usage import UsageTracker
 from smartboi.webapp import run_dashboard
 
@@ -146,6 +146,21 @@ _LENDER_PHRASES = (
 _MAX_PENDING_EDGES = 12
 _MAX_REL_DESCRIPTION = 500
 
+# Ecosystem buckets that are not real ecosystems: "accepted" is where a
+# runtime-accepted symbol lands when its discoverer's ecosystem can't be
+# inferred, and "?" is guess_ecosystem's own no-answer. Both have held
+# dozens of mutually unrelated companies at once, so neither is a basis for
+# fanning news between their members.
+_UNCLASSIFIED_ECOSYSTEMS = frozenset({"accepted", "?", ""})
+
+# Confidence stamped on an ecosystem-fallback link. Deliberately far below
+# dossier.DISCLOSED_LINK_CONFIDENCE (0.85): ecosystem-propagated evidence
+# must never satisfy the disclosed-link corroboration relaxation in
+# signals.evaluate, so it can raise a thesis but can never single-handedly
+# qualify one. It is also passed to the dossier updater and the skeptic, so
+# both are told in numbers how weak the causal link is.
+ECOSYSTEM_LINK_CONFIDENCE = 0.25
+
 
 # Ticker shapes that are NOT the operating-company common stock this system
 # builds a thesis about, and must never become trade targets:
@@ -188,12 +203,29 @@ def _clamped_confidence(value, default: float = 0.5) -> float:
 
 _BIOGRAPHY_PHRASES = (
     "prior to joining", "before joining", "prior to his", "prior to her",
-    "previously served", "previously held", "previously was", "most recently served",
+    "previously served", "previously held", "previously was", "previously led",
+    "most recently served",
     "held various positions", "held senior positions", "held a number of positions",
     "began his career", "began her career", "began their career",
+    "started his career", "started her career", "started their career",
     "where he served", "where she served", "where they served",
     "was employed by", "his tenure at", "her tenure at", "years of experience at",
+    "former employer", "worked there for", "worked together",
 )
+
+# "...held a Group President role at Illinois Tool Works", "...held global
+# operations leadership roles at IDEX". Individually, "role at" is too broad
+# to filter on and an executive title is far too broad; TOGETHER they are a
+# CV line and essentially nothing else. Requiring both is what lets the
+# filter catch these without touching a commercial disclosure -- none of
+# "GM accounted for 12% of product revenues", "PACCAR is one of SRI's
+# principal customers" or "Boeing generated 13% of 2025 net revenues"
+# contains either half.
+_BIOGRAPHY_TITLES = (
+    "ceo", "cfo", "coo", "cto", "chief ", "president", "vice president",
+    "evp", "svp", "management team", "board member", "director of",
+)
+_BIOGRAPHY_ROLE_MARKERS = ("role at", "roles at", "positions at", "position at")
 
 _NON_COMPANY_KEYWORDS = (
     "government", "department", "agency", "administration", "bureau",
@@ -237,6 +269,15 @@ class Engine:
 
         self._propagation_limiter = SlidingWindowLimiter(
             settings.max_propagated_evidence_per_link,
+            settings.propagated_evidence_cooldown_hours * 3600,
+        )
+        # Ecosystem fan-out gets its OWN, tighter budget rather than sharing
+        # the disclosed-link one: it reaches every tradeable in an ecosystem
+        # rather than a named counterparty, so at 20 anchors x 4 tradeables
+        # a single shared allowance would let the weaker evidence crowd out
+        # the stronger.
+        self._ecosystem_limiter = SlidingWindowLimiter(
+            settings.max_ecosystem_evidence_per_link,
             settings.propagated_evidence_cooldown_hours * 3600,
         )
         # Caches a dossier-update proposal (evidence_id -> proposed dict)
@@ -369,7 +410,17 @@ class Engine:
                 "Add it as an anchor instead -- its news will still propagate. "
                 "If you really want it tradeable, put it in SYMBOLS."
             )
-        spec = CompanySpec(symbol, symbol, "accepted", signal_source_only=(as_type == "anchor"),
+        # Classified into the ecosystem of whoever disclosed it, not parked
+        # in a flat "accepted" bucket. That bucket had become a pseudo-
+        # ecosystem holding 64 unrelated anchors (PepsiCo, United Airlines,
+        # Brookfield...) next to five unrelated tradeables, which is
+        # meaningless on its own and actively harmful to ecosystem-fallback
+        # propagation (see _ecosystem_targets), where it would have fanned
+        # airline news into a photographic-film company.
+        ecosystem = guess_ecosystem(entry.get("related_to") or [], self.spec_by_symbol)
+        if ecosystem in ("?", ""):
+            ecosystem = "accepted"
+        spec = CompanySpec(symbol, symbol, ecosystem, signal_source_only=(as_type == "anchor"),
                             notes=f"Accepted ({source}) from a discovered universe candidate")
         self.universe.append(spec)
         self.spec_by_symbol[symbol] = spec
@@ -992,7 +1043,12 @@ class Engine:
         line gets labelled customer/supplier/competitor essentially at
         random, so restricting by type would let most of them through."""
         text = f"{rel.get('description', '')} {rel.get('quote', '')}".lower()
-        return any(phrase in text for phrase in _BIOGRAPHY_PHRASES)
+        if any(phrase in text for phrase in _BIOGRAPHY_PHRASES):
+            return True
+        return (
+            any(t in text for t in _BIOGRAPHY_TITLES)
+            and any(m in text for m in _BIOGRAPHY_ROLE_MARKERS)
+        )
 
     @staticmethod
     def _is_unsearchable(name: str) -> bool:
@@ -1212,6 +1268,46 @@ class Engine:
             if changed:
                 self.candidates.set(ticker, entry)
 
+    def _block_junk_candidates(self) -> int:
+        """Applies the extraction-time relevance filters RETROACTIVELY to
+        candidates already on file.
+
+        The lender and biography filters run inside _extract_relationships,
+        so they protect everything discovered after they shipped -- but the
+        candidate list is persistent and long-lived, and entries recorded
+        before them stayed perfectly eligible for auto-accept. Confirmed
+        live: Danaher, ManpowerGroup, IDEX and SPX were all auto-accepted as
+        anchors off a single EPAC executive's CV, and Piper Sandler entered
+        as a 'supplier' for acting as an at-the-market offering agent.
+
+        Marked rather than deleted: a candidate is a discovered fact, and
+        the dashboard shows the block reason so a human can disagree. Only
+        not-yet-accepted entries are touched -- retro-blocking something
+        already in the universe would say nothing about the symbol's
+        membership, which reset_accepted_candidates exists to manage."""
+        blocked = 0
+        for key, entry in list(self.candidates.data.items()):
+            ticker = (entry.get("ticker") or "").upper()
+            if entry.get("auto_accept_blocked") or ticker in self.accepted_candidates.data:
+                continue
+            description = entry.get("description") or ""
+            rel_types = entry.get("rel_types") or [""]
+            reason = ""
+            if self._is_biography_relationship({"description": description}):
+                reason = "derived from an executive biography (a former employer is CV history, not a business relationship)"
+            elif any(self._is_lender_relationship({"rel_type": t, "description": description}) for t in rel_types):
+                reason = "a credit provider rather than a supply-chain counterparty (its news has no path to this company's fundamentals)"
+            if not reason:
+                continue
+            entry["auto_accept_blocked"] = f"{reason} -- filtered retroactively"
+            self.candidates.set(key, entry)
+            blocked += 1
+            log.info("[CANDIDATE] %s blocked from auto-add: %s", ticker or key, reason)
+        if blocked:
+            log.warning("[CANDIDATE] %d already-discovered candidate(s) blocked from auto-add by the "
+                        "relevance filters, which had only applied to newly-extracted ones.", blocked)
+        return blocked
+
     async def _auto_accept_candidates(self) -> None:
         """Acts on the tradeable-vs-anchor recommendation the engine already
         computed for each discovered candidate (see
@@ -1251,6 +1347,7 @@ class Engine:
         cross the signal threshold on its own."""
         if not self.settings.enable_auto_accept_candidates:
             return
+        self._block_junk_candidates()
         today = datetime.now(timezone.utc).date().isoformat()
         if self.auto_accept_state.get("date") != today:
             self.auto_accept_state.set("date", today)
@@ -1267,6 +1364,15 @@ class Engine:
                 return
             ticker = (entry.get("ticker") or "").upper()
             if not ticker or ticker in self.spec_by_symbol or ticker in self.accepted_candidates.data:
+                continue
+            if entry.get("auto_accept_blocked"):
+                # The field was previously only ever WRITTEN -- the
+                # name-mismatch guard set it and returned in the same breath,
+                # so nothing ever read it back. That made it useless as a
+                # durable decision: any other code path that marked a
+                # candidate unfit (see _block_junk_candidates) was silently
+                # ignored on the next pass. The dashboard and the diagnostics
+                # bundle both surface this field, so it has to actually gate.
                 continue
             recommendation = entry.get("recommended_as")
             if recommendation not in ("anchor", "tradeable"):
@@ -1372,6 +1478,31 @@ class Engine:
 
     # --- News ingestion ---
 
+    def _ecosystem_targets(self, origin_symbol: str) -> list[str]:
+        """Tradeables sharing an inert anchor's ecosystem -- the fallback
+        propagation path when no disclosed edge exists (see
+        _process_evidence and enable_ecosystem_propagation).
+
+        Anchors only: a tradeable is already its own analysis target, and
+        fanning one small-cap's news across its peers is a different
+        (competitor read-across) thesis that this system has no disclosed
+        basis for.
+
+        The "accepted" bucket is excluded deliberately. It is not an
+        ecosystem -- it is where runtime-accepted symbols land when their
+        discoverer's ecosystem can't be inferred, and it has held dozens of
+        mutually unrelated companies at once. Fanning news across it would
+        be pure noise dressed as a sector link."""
+        spec = self.spec_by_symbol.get(origin_symbol)
+        if spec is None or not spec.signal_source_only:
+            return []
+        if spec.ecosystem in _UNCLASSIFIED_ECOSYSTEMS:
+            return []
+        return [
+            c.symbol for c in self.universe
+            if not c.signal_source_only and c.ecosystem == spec.ecosystem and c.symbol != origin_symbol
+        ]
+
     def _can_produce_evidence(self, symbol: str) -> bool:
         """Whether news about this symbol can reach ANY dossier.
 
@@ -1381,21 +1512,27 @@ class Engine:
         such edge, _process_evidence resolves zero targets and the article
         is fingerprinted and dropped without a single LLM call.
 
+        ...or, with enable_ecosystem_propagation, if it shares a classified
+        ecosystem with at least one tradeable (see _ecosystem_targets).
+        Keeping the two in agreement matters: this decides whether the
+        symbol is POLLED at all, so an anchor that the fallback would happily
+        fan out from must not be skipped before its news is ever fetched.
+
         Measured live 2026-07-29: 104 of 130 anchors had no edge to any
         tradeable -- including every loud name in the universe (NVDA, MSFT,
         AMZN, GOOGL, META, TSLA, INTC, AMAT, LRCX, TSM, UPS, CSX...). They
         accounted for ~2,500 wasted Finnhub calls a day and the bulk of
-        10,373 dedup fingerprints, against 52 LLM calls actually spent.
-        Skipping them changes no behaviour by construction, and reverses
-        itself the moment an edge appears."""
+        10,373 dedup fingerprints, against 52 LLM calls actually spent."""
         spec = self.spec_by_symbol.get(symbol)
         if spec is None or not spec.signal_source_only:
             return True
         universe = set(self.symbol_list)
-        return any(
+        if any(
             not (self.spec_by_symbol.get(linked) or spec).signal_source_only
             for linked, _ in self.graph.linked_symbols(symbol, universe)
-        )
+        ):
+            return True
+        return bool(self.settings.enable_ecosystem_propagation and self._ecosystem_targets(symbol))
 
     async def _poll_news(self) -> None:
         to_date = date.today().isoformat()
@@ -1500,6 +1637,7 @@ class Engine:
         # direct/non-propagated evidence, which has no edge at all).
         targets: list[tuple[str, str, float | None]] = []
         propagation_keys: dict[str, str] = {}  # target_symbol -> limiter key, propagated targets only
+        ecosystem_keys: set[str] = set()  # of those, the ones on the ecosystem limiter
 
         origin_spec = self.spec_by_symbol.get(origin_symbol)
         if origin_spec is None or not origin_spec.signal_source_only:
@@ -1529,6 +1667,33 @@ class Engine:
                 continue
             propagation_keys[linked_symbol] = key
             targets.append((linked_symbol, rel.description, rel.confidence))
+        # Ecosystem fallback: only for an origin with NO disclosed link to
+        # any tradeable at all. A disclosed contractual relationship is
+        # strictly better evidence, so this never runs alongside one and
+        # never doubles up on a target that already has one.
+        #
+        # `not throttled` is load-bearing, not belt-and-braces. Without it,
+        # an origin whose disclosed links were all inside their cooldown
+        # window would fall through to the ecosystem path and reach the very
+        # same targets by a weaker route -- defeating the rate limit it just
+        # hit, and swapping good evidence for worse.
+        if not propagation_keys and not throttled and self.settings.enable_ecosystem_propagation:
+            for linked_symbol in self._ecosystem_targets(origin_symbol):
+                key = f"eco:{origin_symbol}->{linked_symbol}"
+                if not self._ecosystem_limiter.would_allow(key, now):
+                    throttled += 1
+                    continue
+                propagation_keys[linked_symbol] = key
+                ecosystem_keys.add(key)
+                targets.append((
+                    linked_symbol,
+                    f"{origin_symbol} and {linked_symbol} are both in the {origin_spec.ecosystem} "
+                    "ecosystem. NOTE: this is an industry-level association inferred from sector "
+                    "membership, NOT a contractual relationship disclosed in any filing -- there is "
+                    "no stated customer, supplier or competitor link between these two companies.",
+                    ECOSYSTEM_LINK_CONFIDENCE,
+                ))
+
         if throttled:
             self._warn_once(
                 f"throttled:{origin_symbol}",
@@ -1574,7 +1739,9 @@ class Engine:
             # window with phantom events that throttled genuinely new
             # propagation for hours.
             if outcome == "handled" and target_symbol in propagation_keys:
-                self._propagation_limiter.record(propagation_keys[target_symbol], now)
+                key = propagation_keys[target_symbol]
+                limiter = self._ecosystem_limiter if key in ecosystem_keys else self._propagation_limiter
+                limiter.record(key, now)
             all_definitive = all_definitive and outcome != "deferred"
         return all_definitive
 

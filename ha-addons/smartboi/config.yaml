@@ -1,6 +1,6 @@
 ---
 name: SmartBoi (Evidence Synthesis, Paper-Only)
-version: "0.26.0"
+version: "0.27.0"
 slug: smartboi
 description: >-
   LLM-driven cross-company evidence synthesis for equity research: ingests
@@ -41,6 +41,8 @@ options:
   max_daily_llm_calls: 3000
   max_propagated_evidence_per_link: 3
   propagated_evidence_cooldown_hours: 6
+  enable_ecosystem_propagation: true
+  max_ecosystem_evidence_per_link: 1
   signal_confidence_threshold: 0.65
   min_independent_sources: 2
   min_independent_sources_news_only: 3
@@ -89,6 +91,8 @@ schema:
   max_daily_llm_calls: int(1,1000000)
   max_propagated_evidence_per_link: int(1,100)
   propagated_evidence_cooldown_hours: int(1,168)
+  enable_ecosystem_propagation: bool
+  max_ecosystem_evidence_per_link: int(0,20)
   signal_confidence_threshold: float(0,1)
   min_independent_sources: int(1,10)
   min_independent_sources_news_only: int(1,10)
