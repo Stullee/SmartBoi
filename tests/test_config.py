@@ -106,7 +106,27 @@ def test_the_addon_default_matches_the_code_default():
     defaults = Settings(_env_file=None)
     for key in ("edgar_poll_interval_sec", "edgar_forms", "max_daily_usd",
                 "extraction_model", "dossier_model", "skeptic_model",
-                "synthesis_model", "backfill_anchors"):
+                "synthesis_model", "backfill_anchors", "transaction_cost_profile"):
         assert options[key] == getattr(defaults, key), (
             f"{key}: add-on ships {options[key]!r}, code default is {getattr(defaults, key)!r}"
         )
+
+
+def test_the_dockerfile_version_mirrors_the_addon_version():
+    """The Dockerfile carries its own copy of the version (it becomes
+    SMARTBOI_VERSION in the container, which is what diagnostics reports).
+    Bumping config.yaml alone leaves the running add-on reporting the
+    previous release -- which is exactly how a deployment gets diagnosed as
+    'two versions behind' when it isn't."""
+    import re
+    from pathlib import Path
+
+    dockerfile = (
+        Path(__file__).resolve().parents[1] / "ha-addons/smartboi/Dockerfile"
+    ).read_text()
+    match = re.search(r"^ARG SMARTBOI_VERSION=(.+)$", dockerfile, re.MULTILINE)
+    assert match, "Dockerfile has no ARG SMARTBOI_VERSION"
+    assert match.group(1).strip() == str(_addon_config()["version"]), (
+        f"Dockerfile ships {match.group(1).strip()!r}, config.yaml says "
+        f"{_addon_config()['version']!r}"
+    )
