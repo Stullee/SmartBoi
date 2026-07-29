@@ -176,6 +176,20 @@ _MIN_STALE_DAYS = 14
 # passing-mention links ("Google Drive is integrated with FedEx Office",
 # an indirect JV competitor) sit at 0.30-0.65.
 DISCLOSED_LINK_CONFIDENCE = 0.85
+
+# Per-extra-independent-source multiplier on magnitude (see _aggregate).
+# Deliberately larger than confidence's +0.1 additive step: confidence is a
+# probability and saturates at 1.0 by the third source anyway, whereas
+# magnitude is the size of the expected move and is where accumulated
+# corroboration actually has somewhere to go.
+MAGNITUDE_CORROBORATION_STEP = 0.25
+
+# Bumped whenever a change alters how confidence/magnitude are computed from
+# the same evidence. Stamped onto every daily dossier snapshot so the
+# forward-validation record can be split at the boundary instead of silently
+# mixing scores that mean different things -- forward data cannot be
+# backfilled, and re-scoring old rows with new logic would be look-ahead.
+SCORING_VERSION = 2
 # Weight an evidence item keeps right at its stale cutoff, before being
 # excluded entirely -- never fully zero a moment before exclusion, since
 # aged corroboration is still weak signal that a persistent theme existed.
@@ -335,7 +349,30 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     dossier.mass_agree = w_agree
     dossier.mass_opposing = w_opposing
 
-    dossier.magnitude = max(e.magnitude * w for e, w in weighted)
+    # Magnitude accumulates with corroboration, exactly as confidence does.
+    #
+    # This used to be a bare max() -- the one aggregator provably invariant
+    # to N -- while confidence got a +0.1-per-source term. That is
+    # structurally incompatible with a strategy defined as accumulating
+    # individually-small second-order effects: ten independent items each
+    # implying a 2% move returned exactly one item's 2%. Worse, because the
+    # max decays toward _DECAY_FLOOR as its strongest item ages, a dossier's
+    # magnitude FELL while fresh corroboration kept landing.
+    #
+    # The consequence was a hard, silent ceiling. At a 0.20 signal bar, a
+    # best-item magnitude of 0.25 demanded confidence 0.80; below 0.20 the
+    # bar was unreachable at any confidence, forever. The live board's
+    # magnitudes ran 0.10-0.40, so most of it could never signal no matter
+    # how much agreeing evidence arrived. DCO carried 17 agreeing items with
+    # zero opposing and 0.85-0.95 disclosed links; items 4 through 17
+    # contributed nothing at all.
+    #
+    # Keyed to independent_source_count (distinct source_name), not raw item
+    # count: dedup already collapses syndicated republishes onto one name,
+    # so N restatements of a single wire story cannot inflate this.
+    base_magnitude = max(e.magnitude * w for e, w in weighted)
+    magnitude_bonus = 1.0 + MAGNITUDE_CORROBORATION_STEP * max(0, dossier.independent_source_count - 1)
+    dossier.magnitude = min(1.0, base_magnitude * magnitude_bonus)
     dossier.horizon_days = round(sum(e.horizon_days for e in agreeing) / len(agreeing))
     # The last few agreeing items' reasoning, not just the single latest --
     # a one-sentence blurb from only the newest item is a thin "current

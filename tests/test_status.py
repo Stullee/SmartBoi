@@ -167,3 +167,18 @@ def test_coverage_on_an_empty_universe_does_not_divide_by_zero(tmp_path):
 
     assert c["tradeables"] == 0 and c["anchors"] == 0
     assert c["tradeables_with_dossier"] == 0
+
+
+def test_snapshot_records_which_scoring_logic_produced_it():
+    """A change to how magnitude or confidence is aggregated makes old and
+    new rows incomparable. Stamping the version lets the forward-return
+    analysis split at the boundary instead of silently mixing them --
+    forward data can't be backfilled and old rows must never be re-scored."""
+    from smartboi.dossier import SCORING_VERSION, Dossier
+    from smartboi.status import snapshot_dossier
+
+    row = snapshot_dossier(Dossier(symbol="DCO", direction="LONG", confidence=0.7,
+                                   magnitude=0.4, independent_source_count=2),
+                           "2026-07-29T00:00:00+00:00")
+
+    assert row["scoring_version"] == SCORING_VERSION

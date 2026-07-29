@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from smartboi.dossier import Dossier, DossierStore
+from smartboi.dossier import SCORING_VERSION, Dossier, DossierStore
 from smartboi.graph import RelationshipGraph
 
 
@@ -216,6 +216,13 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str) -> dict:
     deliberately unconditional rather than only logging on a change."""
     return {
         "snapshotted_at": snapshotted_at,
+        # Which scoring logic produced these numbers (see
+        # dossier.SCORING_VERSION). Without it a change to how magnitude or
+        # confidence is aggregated silently mixes incomparable rows into one
+        # forward-return series; with it the analysis can split at the
+        # boundary. Forward data can't be backfilled and old rows must never
+        # be re-scored with new logic, so the split is the only honest option.
+        "scoring_version": SCORING_VERSION,
         "symbol": d.symbol,
         "direction": d.direction,
         "confidence": round(d.confidence, 4),
