@@ -281,7 +281,8 @@ class Engine:
         # _check_model_provenance for why a change to these matters.
         self.model_state = JsonState(DATA_DIR / "model_provenance.json")
         self.alerts = AlertSender(settings.alert_webhook_url)
-        self.usage = UsageTracker(DATA_DIR / "llm_usage.json", settings.max_daily_llm_calls)
+        self.usage = UsageTracker(DATA_DIR / "llm_usage.json", settings.max_daily_llm_calls,
+                                  daily_usd_budget=settings.max_daily_usd)
 
         self.universe: list[CompanySpec] = list(settings.universe)
         self._apply_accepted_candidates()
@@ -2008,8 +2009,10 @@ class Engine:
         cached = self._pending_proposals.get(proposal_key)
         proposed = cached[0] if cached is not None else None
         if proposed is None:
+            target_spec = self.spec_by_symbol.get(target_symbol)
             raw = await self.updater.propose_update(
-                dossier, evidence_text, origin_symbol, relationship_note, relationship_confidence
+                dossier, evidence_text, origin_symbol, relationship_note, relationship_confidence,
+                ecosystem=target_spec.ecosystem if target_spec is not None else "",
             )
             if raw is None:
                 return "deferred"  # transient LLM failure or budget exhausted -- retry later

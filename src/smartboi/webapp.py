@@ -330,6 +330,9 @@ function render(data) {
     data.usage.calls + ' / ' + data.usage.daily_call_budget + '</div></div>';
   html += '<div class="card"><div class="label">LLM tokens today (in/out)</div><div class="value" style="font-size:1rem">' +
     (data.usage.input_tokens / 1000).toFixed(1) + 'k / ' + (data.usage.output_tokens / 1000).toFixed(1) + 'k</div></div>';
+  html += '<div class="card"><div class="label">LLM spend today</div><div class="value">$' +
+    (data.usage.usd_spent || 0).toFixed(2) +
+    (data.usage.daily_usd_budget ? ' / $' + data.usage.daily_usd_budget.toFixed(0) : '') + '</div></div>';
   html += "</div>";
 
   html += "<h2>Dossiers</h2>" + renderDossiers(data.dossiers);

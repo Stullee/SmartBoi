@@ -28,13 +28,17 @@ import logging
 
 from anthropic import AsyncAnthropic
 
+from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
 from smartboi.usage import UsageTracker
 
 log = logging.getLogger(__name__)
 
 _TOOL = {
     "name": "skeptic_verdict",
-    "description": "Try to refute a proposed trading-thesis update. Default to refuting when unsure.",
+    "description": (
+        "Stress-test a proposed trading-thesis update: refute it, confirm it, or re-scale it "
+        "up or down. Do not default in either direction -- judge what the evidence supports."
+    ),
     "input_schema": {
         "type": "object",
         "properties": {
@@ -59,18 +63,28 @@ _TOOL = {
             "reasoning": {"type": "string", "description": "One or two sentences."},
             "adjusted_confidence": {
                 "type": "number", "minimum": 0, "maximum": 1,
-                "description": "Your own confidence in the proposed direction, which may be lower than the original proposal's.",
+                "description": (
+                    "Your own confidence in the proposed direction. This may be lower than the "
+                    "proposal's -- and it may also be HIGHER. Raise it when the proposer under-"
+                    "called a concrete, primary-source fact (a signed contract award, an FDA "
+                    "clearance, an official guidance revision, a disclosed quantified figure): "
+                    "hedging on something a filing states outright is an error in the same way "
+                    "over-reading a promotional headline is."
+                ),
             },
             "adjusted_magnitude": {
                 "type": "number", "minimum": 0, "maximum": 1,
                 "description": (
-                    "Your own view of the magnitude, which may be lower than the original proposal's. "
-                    "Use this -- accepting with a SMALLER magnitude, not refuted=true -- when the origin "
-                    "fact is real and the direction is right, but the proposed size is too large for how "
-                    "loosely/genericly the disclosed relationship actually connects the two companies. "
-                    "Refusing real-but-modest evidence outright throws away exactly the kind of small, "
-                    "accumulating corroboration this strategy is built to combine over time; scaling it "
-                    "down lets it count for what it's actually worth instead."
+                    "Your own view of the magnitude. Use this -- accepting with a SMALLER magnitude, "
+                    "not refuted=true -- when the origin fact is real and the direction is right, but "
+                    "the proposed size is too large for how loosely/genericly the disclosed "
+                    "relationship actually connects the two companies. Refusing real-but-modest "
+                    "evidence outright throws away exactly the kind of small, accumulating "
+                    "corroboration this strategy is built to combine over time; scaling it down lets "
+                    "it count for what it's actually worth instead. It may equally be HIGHER than "
+                    "proposed: a committed, quantified change to future revenue (an awarded contract "
+                    "with a stated value, a cleared device, a guidance revision) is a large event, and "
+                    "scoring one like a promotional press release is as much an error as the reverse."
                 ),
             },
         },
@@ -120,7 +134,13 @@ _SYSTEM_PROMPT = (
     "propagated item on principle means this strategy's core thesis never gets tested either "
     "way. When you're refuting SOLELY because of size/proportionality (point 2) rather than "
     "because the origin fact or reasoning itself is weak (points 1 and 3), prefer scaling "
-    "adjusted_magnitude down over refusing outright."
+    "adjusted_magnitude down over refusing outright.\n\n"
+    "Your adjustments run in BOTH directions. The proposer can under-call a concrete "
+    "primary-source catalyst just as easily as it can over-read a promotional headline -- an "
+    "awarded contract with a stated dollar value, a cleared medical device, an official "
+    "guidance revision or a disclosed quantified figure is a large, committed change to "
+    "future revenue, and hedging it down to a token magnitude is an error, not caution. "
+    "Adjust up when that is what the evidence supports."
 )
 
 
@@ -172,13 +192,12 @@ class Skeptic:
         try:
             response = await self._client.messages.create(
                 model=self._model,
-                max_tokens=300,
-                # Pinned to 0 -- the verdict (and adjusted numbers) decide
-                # whether evidence counts toward a hard trade threshold;
-                # the API's default 1.0 made refute/accept partly sampling
-                # noise, and a retried item could flip outcome run-to-run.
-                temperature=0,
-                system=_SYSTEM_PROMPT,
+                # See llm.py: model-appropriate thinking/effort/temperature,
+                # and a max_tokens that leaves room for thinking before the
+                # tool call. The old 300 would truncate on any thinking-
+                # capable model, and a truncated response carries no verdict.
+                **request_kwargs(self._model, max_tokens=3000, effort="high"),
+                system=cacheable_system(_SYSTEM_PROMPT),
                 tools=[_TOOL],
                 tool_choice={"type": "tool", "name": "skeptic_verdict"},
                 messages=[{"role": "user", "content": prompt}],
@@ -186,10 +205,10 @@ class Skeptic:
         except Exception as exc:  # noqa: BLE001 - fail safe: nothing merges without a real verdict
             log.warning("Skeptic review failed (%s) -- will retry this evidence on a later poll.", exc)
             return None
-        self._usage.record(response.usage.input_tokens, response.usage.output_tokens)
-        for block in response.content:
-            if block.type == "tool_use":
-                return block.input
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens, model=self._model)
+        verdict = first_tool_use(response)
+        if verdict is not None:
+            return verdict
         return {"refuted": True, "reasoning": "model returned no verdict", "adjusted_confidence": 0.0, "adjusted_magnitude": 0.0}
 
     async def aclose(self) -> None:

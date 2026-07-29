@@ -71,9 +71,29 @@ class Settings(BaseSettings):
 
     # --- Claude: relationship extraction, dossier updates, skeptic pass ---
     anthropic_api_key: str = ""
-    extraction_model: str = "claude-haiku-4-5-20251001"
-    dossier_model: str = "claude-haiku-4-5-20251001"
-    skeptic_model: str = "claude-haiku-4-5-20251001"
+    #
+    # Models are tiered by how hard the judgement is, not uniformly. Every call site ran
+    # on the cheapest model the API offers while the daily budget sat at ~6%
+    # used -- the two calls that actually decide whether real money would be
+    # committed were the two being economised on.
+    #
+    # dossier/skeptic: these produce the confidence and magnitude that gate a
+    #   trade at a hard threshold. Reasoning quality here is the product.
+    # extraction: the largest input-token consumer (a 150k-char filing per
+    #   call) but a reading task rather than a judgement one, and its output
+    #   is already backstopped by the name-verification and biography/lender
+    #   filters in engine.py. A mid-tier model is the right trade.
+    #
+    # Cost is bounded and visible: see max_daily_usd and the dashboard's
+    # usage panel. Changing any of these is safe -- llm.py builds the
+    # model-appropriate request shape, so a model that rejects `temperature`
+    # or requires `budget_tokens` is handled rather than 400-ing into a
+    # silent retry loop. Note that changing them also resets the forward-
+    # testing clock (see _check_model_provenance and EvidenceRecord's
+    # scored_by_model), which is deliberate and will be warned about.
+    extraction_model: str = "claude-sonnet-5"
+    dossier_model: str = "claude-opus-5"
+    skeptic_model: str = "claude-opus-5"
 
     # --- Cost controls. Every LLM call (extraction/dossier-update/skeptic)
     # checks these before spending anything -- see usage.py and
@@ -87,6 +107,19 @@ class Settings(BaseSettings):
     # spend that won't rot when Anthropic's prices change. See the
     # dashboard for actual calls/tokens used today.
     max_daily_llm_calls: int = 3000
+    # Hard daily ceiling on estimated API SPEND, in USD, checked alongside
+    # the call cap before every LLM call. 0 disables it (call cap only).
+    #
+    # The call cap alone is no longer a usable spend proxy, and its failure
+    # mode is expensive: per-call cost now spans more than an order of
+    # magnitude across the configured models, and adaptive thinking makes
+    # output tokens unbounded by max_tokens in practice. A 3000-call day
+    # costs a few dollars on Haiku and several hundred on Opus at full
+    # thinking. This is the number that actually bounds the bill; the call
+    # cap is kept because it bounds request VOLUME, which dollars do not.
+    # Priced from llm.MODEL_PRICES_PER_MTOK; an unrecognised model is priced
+    # at the most expensive entry rather than free.
+    max_daily_usd: float = 25.0
     # Caps how many pieces of PROPAGATED evidence (about a linked company,
     # never the dossier's own direct evidence) get forwarded to one target
     # from one origin within a rolling window -- without this, a heavily-

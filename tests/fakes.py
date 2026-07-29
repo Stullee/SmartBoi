@@ -100,11 +100,12 @@ class _ScriptedCallable:
 
 
 class FakeUpdater(_ScriptedCallable):
-    async def propose_update(self, dossier, evidence_text, origin_symbol, relationship_note, relationship_confidence=None):
+    async def propose_update(self, dossier, evidence_text, origin_symbol, relationship_note,
+                             relationship_confidence=None, ecosystem=""):
         self.calls.append({
             "symbol": dossier.symbol, "evidence_text": evidence_text,
             "origin_symbol": origin_symbol, "relationship_note": relationship_note,
-            "relationship_confidence": relationship_confidence,
+            "relationship_confidence": relationship_confidence, "ecosystem": ecosystem,
         })
         return self._next()
 

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from anthropic import AsyncAnthropic
 
+from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
 from smartboi.usage import UsageTracker
 
 log = logging.getLogger(__name__)
@@ -516,6 +517,103 @@ _UPDATE_TOOL = {
     },
 }
 
+# What a genuinely tradeable catalyst looks like, with worked magnitude
+# anchors. Without this the model was asked to size a price impact with no
+# frame of reference at all, and it did what an unanchored scorer always
+# does: clustered everything into a narrow, timid band. The live board ran
+# magnitudes of 0.10-0.40 across every kind of evidence -- a $150M contract
+# award and a conference appearance landed in the same range.
+#
+# Tiered by what the evidence IS, not by how excited the language is. The
+# distinguishing feature of tier 1 is a primary-source commitment with a
+# number attached; of tier 3, that it is somebody's opinion about a
+# company rather than something that happened to it.
+_CATALYST_RUBRIC = (
+    "CATALYST TIERS -- anchor `magnitude` to these rather than to how strongly the "
+    "source is worded:\n"
+    "  TIER 1 (magnitude 0.50-0.90): a committed, quantified change to future revenue "
+    "or cost. A signed or awarded contract with a stated value or ceiling; an FDA "
+    "510(k)/PMA clearance or CE mark; a named multi-year supply agreement or qualified "
+    "design win at a named OEM; an official guidance revision; a plant/fab/line "
+    "announcement with a stated site and timeline; a major customer loss or program "
+    "cancellation (negative).\n"
+    "  TIER 2 (magnitude 0.20-0.50): a concrete operational fact that changes the "
+    "outlook without a number attached to THIS company. A disclosed customer's capex "
+    "guide-up or guide-down where this company is a named supplier; a competitor's "
+    "disclosed capacity loss or exit; a product launch entering an existing market; a "
+    "capacity expansion; a regulatory decision affecting the addressable market; an "
+    "insider OPEN-MARKET purchase of size (not an award or a tax-withholding sale).\n"
+    "  TIER 3 (magnitude 0.00-0.10): commentary rather than event. Analyst notes and "
+    "price-target changes, sector sentiment, conference and trade-show appearances, "
+    "promotional press releases with no committed counterparty, index/screen mentions, "
+    "routine governance changes, and pre-planned 10b5-1 insider sales.\n"
+    "A tier-1 fact reaching this company through a LINKED company still deserves a "
+    "tier-2-or-better magnitude: the fact is real and quantified, and only the share "
+    "of it that lands here is uncertain -- that uncertainty belongs in `confidence`, "
+    "not in a magnitude collapsed to zero."
+)
+
+# What "a catalyst" concretely means in each of this universe's ecosystems.
+# Generic prompting made the model reason about a defense-supplier contract
+# award and a data-center power purchase agreement identically, when what
+# actually moves each name is domain-specific and well known.
+ECOSYSTEM_CATALYSTS = {
+    "semi_equipment": (
+        "Semiconductor equipment/materials. What moves these names: wafer-fab-equipment "
+        "capex revisions at TSMC/Intel/Samsung/Micron, tool orders and shipment "
+        "deferrals, new fab announcements and groundbreakings, node transitions, export "
+        "controls and license decisions, and photomask/test/inspection demand following "
+        "a customer's utilization commentary."
+    ),
+    "defense_tier2": (
+        "Defense and aerospace tier-2 suppliers. What moves these names: DoD contract "
+        "awards and IDIQ task orders (the daily defense.gov contract announcements are "
+        "the primary source), program-of-record milestones and production-rate "
+        "decisions, foreign military sales approvals, prime-contractor backlog and book-"
+        "to-bill commentary, and build-rate changes at Boeing/Airbus for the commercial "
+        "aerostructures side."
+    ),
+    "grid_datacenter": (
+        "Grid, electrification and data-center buildout. What moves these names: "
+        "hyperscaler capex guidance, named data-center site announcements, power "
+        "purchase agreements and interconnection-queue decisions, utility rate cases "
+        "and capital plans, transformer/switchgear lead times, and transmission "
+        "project approvals."
+    ),
+    "battery_storage": (
+        "Battery and energy storage. What moves these names: offtake and supply "
+        "agreements with named cell or vehicle makers, DOE grants and loan-programme "
+        "decisions, gigafactory milestones, qualification/homologation wins, lithium "
+        "and cathode input pricing, and EV production-schedule changes at the OEMs."
+    ),
+    "medtech_supply": (
+        "Medical-device supply chain. What moves these names: FDA 510(k) and PMA "
+        "clearances and their timing, recalls and warning letters, reimbursement "
+        "(CMS) decisions, procedure-volume commentary from the large device makers, "
+        "and single-use component demand tied to a named customer's launch."
+    ),
+    "auto_supply": (
+        "Automotive supply. What moves these names: OEM production schedules and "
+        "shutdowns, platform/program wins and losses, content-per-vehicle changes, "
+        "recalls, and the EV-vs-ICE mix at a disclosed customer."
+    ),
+    "energy_services": (
+        "Oilfield services and equipment. What moves these names: E&P capex budgets, "
+        "rig and frac-spread counts, completion activity, day rates, and a named "
+        "customer's drilling programme changes."
+    ),
+    "industrial_machinery": (
+        "Industrial machinery. What moves these names: order intake and book-to-bill, "
+        "machine-tool and capital-equipment demand cycles, tariffs on inputs, and "
+        "reshoring/capex announcements by disclosed customers."
+    ),
+    "transport_logistics": (
+        "Trucking and logistics. What moves these names: contract rate renewals, spot-"
+        "rate direction, freight volumes at a disclosed shipper, fuel surcharges, "
+        "driver availability, and a large customer's inventory cycle."
+    ),
+}
+
 _SYSTEM_PROMPT = (
     "You maintain a trading thesis for one company, built up from many small pieces of "
     "evidence over time rather than reacting to any single headline. You will be given "
@@ -526,9 +624,14 @@ _SYSTEM_PROMPT = (
     "company's news within minutes but rarely connects it to this one for days or weeks "
     "-- that lag is the opportunity this thesis exists to capture. Weigh how directly the "
     "evidence bears on THIS company: direct news usually implies a shorter horizon and "
-    "higher confidence than propagated news. Be conservative -- most news is noise, most "
-    "single articles should not flip an established thesis, and vague or promotional "
-    "language deserves low confidence."
+    "higher confidence than propagated news.\n\n"
+    + _CATALYST_RUBRIC +
+    "\n\nMost news is noise and most single articles should not flip an established "
+    "thesis. But 'be conservative' is a rule about VAGUE evidence, not a discount "
+    "applied to everything: a concrete tier-1 fact deserves the magnitude it implies, "
+    "and scoring a real contract award like a promotional press release is as wrong as "
+    "the reverse. Reserve low confidence for evidence that is genuinely vague, "
+    "promotional, already priced in, or not specific to this company."
 )
 
 
@@ -540,7 +643,7 @@ class DossierUpdater:
 
     async def propose_update(
         self, dossier: Dossier, evidence_text: str, origin_symbol: str, relationship_note: str,
-        relationship_confidence: float | None = None,
+        relationship_confidence: float | None = None, ecosystem: str = "",
     ) -> dict | None:
         if not self._usage.budget_remaining():
             log.info("%s: daily LLM call budget reached -- deferring dossier update.", dossier.symbol)
@@ -563,22 +666,28 @@ class DossierUpdater:
             if relationship_note
             else f"This evidence is about {dossier.symbol} directly."
         )
+        # What counts as a catalyst is domain-specific, and the model was
+        # previously left to infer it. A defense supplier's contract award
+        # and a data-center operator's power purchase agreement are not the
+        # same kind of event, and naming the ecosystem's actual drivers is
+        # free -- it is already on the CompanySpec.
+        sector = ECOSYSTEM_CATALYSTS.get(ecosystem, "")
+        sector_note = f"\n\nSector context for {dossier.symbol}: {sector}" if sector else ""
         prompt = (
             f"Company: {dossier.symbol}\n"
             f"Current thesis: {current}\n"
-            f"{propagation}\n\n"
+            f"{propagation}{sector_note}\n\n"
             f"New evidence:\n{evidence_text}"
         )
         try:
             response = await self._client.messages.create(
                 model=self._model,
-                max_tokens=500,
-                # Pinned to 0: this call's confidence/magnitude directly
-                # gate trades at a hard threshold, and the API default of
-                # 1.0 made every score a single high-temperature sample --
-                # some threshold crossings were sampling noise, not evidence.
-                temperature=0,
-                system=_SYSTEM_PROMPT,
+                # Model-appropriate thinking/effort/temperature -- see llm.py.
+                # max_tokens is a ceiling over thinking AND the tool call on
+                # every thinking-capable model, so 500 (the old value) would
+                # truncate before the tool_use block was ever emitted.
+                **request_kwargs(self._model, max_tokens=4000, effort="high"),
+                system=cacheable_system(_SYSTEM_PROMPT),
                 tools=[_UPDATE_TOOL],
                 tool_choice={"type": "tool", "name": "update_thesis"},
                 messages=[{"role": "user", "content": prompt}],
@@ -586,11 +695,8 @@ class DossierUpdater:
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the ingestion loop
             log.warning("%s: dossier update proposal failed: %s", dossier.symbol, exc)
             return None
-        self._usage.record(response.usage.input_tokens, response.usage.output_tokens)
-        for block in response.content:
-            if block.type == "tool_use":
-                return block.input
-        return None
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens, model=self._model)
+        return first_tool_use(response)
 
     async def aclose(self) -> None:
         await self._client.close()
