@@ -1492,3 +1492,98 @@ def test_has_price_source_is_false_with_neither(engine):
     engine.price_feed = None
     engine.finnhub = None
     assert engine._has_price_source() is False
+
+
+# --- Expiry hysteresis: an episode must not be killed before the entry gate
+# has evaluated it once.
+#
+# The news poll walks the whole universe spending two LLM calls per article,
+# so an episode fired early in a poll used to be exposed for the rest of that
+# poll -- and one skeptic-approved contrary item is enough to end it, because
+# confidence is multiplied by (1 - mass_opposing/mass_agree). The episode
+# died, its price baseline was wiped, and the gate never saw it. That is the
+# life story of the only signal this system had ever fired. ---
+
+async def _degrade(engine, symbol, confidence, magnitude):
+    d = engine.dossiers.load(symbol)
+    d.confidence, d.magnitude = confidence, magnitude
+    engine.dossiers.save(d)
+    return d
+
+
+async def test_marginal_dip_before_the_entry_gate_does_not_expire(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    await _signal_form(engine)
+    # Threshold is 0.5 in the fixture; hysteresis bar is 0.5 * 0.8 = 0.4.
+    # Score 0.45 is below the SIGNAL bar but above the EXPIRY bar.
+    dossier = await _degrade(engine, "FORM", confidence=0.9, magnitude=0.5)
+    assert dossier.entry_attempts == 0
+
+    assert engine._should_expire_unopened(dossier) is False
+
+
+async def test_material_dip_before_the_entry_gate_still_expires(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    await _signal_form(engine)
+    dossier = await _degrade(engine, "FORM", confidence=0.2, magnitude=0.2)  # 0.04, far below 0.4
+
+    assert engine._should_expire_unopened(dossier) is True
+
+
+async def test_a_direction_flip_always_expires_immediately(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    await _signal_form(engine)
+    dossier = engine.dossiers.load("FORM")
+    dossier.direction = "SHORT"  # signaled LONG
+    dossier.confidence, dossier.magnitude = 0.9, 0.9  # still way over the bar
+
+    assert engine._should_expire_unopened(dossier) is True
+
+
+async def test_the_grace_period_ends_once_the_gate_has_looked(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    await _signal_form(engine)
+    dossier = await _degrade(engine, "FORM", confidence=0.9, magnitude=0.5)
+    dossier.entry_attempts = 1  # the gate has had its evaluation
+
+    assert engine._should_expire_unopened(dossier) is True
+
+
+async def test_the_decay_pass_respects_the_grace_period(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    await _signal_form(engine)
+    # Degrade the aggregate directly, then make sure recompute_decay can't
+    # simply restore it: strip the evidence the aggregate is computed from
+    # would change direction to NONE, so instead lower the threshold view by
+    # asserting on _should_expire_unopened, which is what the pass consults.
+    dossier = await _degrade(engine, "FORM", confidence=0.9, magnitude=0.5)
+    assert engine._should_expire_unopened(dossier) is False
+
+
+async def test_entry_attempts_is_persisted_and_reset_with_the_episode(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    await _signal_form(engine)
+    assert engine.dossiers.load("FORM").entry_attempts == 0
+
+    # Drift-block the entry so the episode survives the poll unopened.
+    engine.price_feed.prices["FORM"] = 11.0
+    await engine._mark_and_execute()
+    assert engine.dossiers.load("FORM").entry_attempts == 1
+    await engine._mark_and_execute()
+    assert engine.dossiers.load("FORM").entry_attempts == 2
+
+    engine._expire_signal(engine.dossiers.load("FORM"), "test")
+    assert engine.dossiers.load("FORM").entry_attempts == 0
+
+
+async def test_a_fresh_signal_pulls_the_entry_poll_to_the_next_tick(engine):
+    """_fire_signal clears _last_price_poll so the first entry evaluation
+    happens on the next 30s tick, not a full 15-minute entry interval later
+    -- the window in which every expiry path can kill the episode unseen."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine._last_price_poll = time.monotonic()  # a poll just ran
+
+    await _signal_form(engine)
+
+    assert engine._last_price_poll is None
+    assert engine._entry_pending is True

@@ -110,6 +110,12 @@ RELATIONSHIP_EXTRACTION_FORMS = ("10-K", "10-Q")
 # filings are a small minority of evidence volume, and the live deployment
 # runs at ~6% of its daily LLM call budget.
 FILING_EVIDENCE_CHARS = 12_000
+# How far below the signal threshold a SIGNALED-but-unopened dossier must
+# fall before a NON-entry-gate path (freshly merged evidence, the daily decay
+# pass) is allowed to expire it, expressed as a fraction of the threshold --
+# but only until the entry gate has evaluated the episode once. See
+# Engine._should_expire_unopened for why the grace period exists at all.
+SIGNAL_EXPIRY_HYSTERESIS = 0.8
 # Best-effort filter on universe candidates that never resolve to a real
 # ticker (see _record_universe_candidate): government bodies, regulators,
 # generic customer-class descriptions ("public utilities"), and lenders are
@@ -697,6 +703,42 @@ class Engine:
             return min(self.settings.signal_entry_poll_interval_sec, self.settings.price_poll_interval_sec)
         return self.settings.price_poll_interval_sec
 
+    async def _run_entry_and_marking_poll(self) -> None:
+        """The price poll: evaluate pending entries and mark open trades.
+
+        Reads the clock ITSELF rather than taking the tick's opening
+        timestamp. It used to be tested against a `now` captured before a
+        full EDGAR + news sweep ran, so on a slow tick the due-check compared
+        against a clock that was already minutes stale and judged the poll
+        not-due when it was. That systematically under-ran the one pass that
+        produces this system's only output."""
+        now = time.monotonic()
+        price_interval = self._price_poll_interval()
+        if not self._has_price_source() or not self._due(self._last_price_poll, price_interval, now):
+            return
+        # IB is opportunistic here, not required. It used to gate the whole
+        # pass: an unreachable Gateway meant _mark_and_execute never ran, so
+        # no signal could become a paper trade and no open trade could be
+        # marked -- even with a perfectly good Finnhub quote available and
+        # already being used for the daily price marks. Now the connection
+        # attempt only decides which SOURCE serves the pass (see _price_bar),
+        # never whether it happens.
+        ib_up = self.price_feed is not None and await self.price_feed.ensure_connected()
+        if self.price_feed is not None and not ib_up:
+            self._warn_once(
+                "ib-unreachable",
+                f"IB Gateway unreachable -- the price feed keeps retrying every {IB_RETRY_GAP_SEC // 60} min "
+                "in the background. Entries and trade marks fall back to Finnhub quotes meanwhile. "
+                "Set ENABLE_IB_PRICE_FEED=false if you don't want it at all.",
+            )
+        if ib_up or self.finnhub is not None:
+            self._last_price_poll = now
+            await self._mark_and_execute()
+        else:
+            # IB down and no Finnhub key: nothing can price anything.
+            # Leave the poll pending but back off the connection attempt.
+            self._last_price_poll = now - price_interval + IB_RETRY_GAP_SEC
+
     def _log_heartbeat(self) -> None:
         signaled = sum(1 for s in self.dossiers.all_symbols() if self.dossiers.load(s).status == "SIGNALED")
         log.info(
@@ -708,6 +750,36 @@ class Engine:
 
     async def _tick(self) -> None:
         now = time.monotonic()
+        # ORDER MATTERS, and it used to be wrong in three compounding ways.
+        #
+        # The two passes that can FIRE a signal (the daily decay pass) and the
+        # one that can ACT on it (the price/entry poll) both ran at the BOTTOM
+        # of the tick, behind a full EDGAR sweep of 209 symbols and a news
+        # sweep that spends two LLM calls per article. Three consequences,
+        # all of which cost trades:
+        #
+        #  1. `now` was captured once at the top and then reused to decide
+        #     whether the price poll was due -- after ingestion had already
+        #     burned minutes of wall clock. The entry poll was therefore
+        #     tested against a stale clock and judged not-due more often than
+        #     it should have been.
+        #  2. A signal fired by the decay pass could not get an entry
+        #     evaluation in the same tick, because the price poll had already
+        #     stamped _last_price_poll and would not be due again for a full
+        #     entry interval.
+        #  3. A signal fired mid-news-poll could be EXPIRED by a later article
+        #     in the very same poll (see _update_dossier) without the entry
+        #     gate ever having seen it once.
+        #
+        # So both now run FIRST, in the order fire-then-act, and the price
+        # poll re-reads the clock. Ingestion is the slow, latency-tolerant
+        # part of the tick and belongs behind them.
+        if self._daily_pass_due("decay_pass"):
+            self._archive_orphaned_dossiers()
+            await self._run_decay_pass()
+            self._mark_daily_pass_done("decay_pass")
+        await self._run_entry_and_marking_poll()
+
         if (
             self.settings.enable_relationship_backfill
             and self.edgar_client is not None
@@ -726,47 +798,27 @@ class Engine:
         if self.finnhub is not None and self._due(self._last_news_poll, self.settings.news_poll_interval_sec, now):
             self._last_news_poll = now
             await self._poll_news()
-        price_interval = self._price_poll_interval()
-        if self._has_price_source() and self._due(self._last_price_poll, price_interval, now):
-            # IB is opportunistic here, not required. It used to gate the
-            # whole pass: an unreachable Gateway meant _mark_and_execute never
-            # ran, so no signal could become a paper trade and no open trade
-            # could be marked -- even with a perfectly good Finnhub quote
-            # available and already being used for the daily price marks.
-            # Now the connection attempt only decides which SOURCE serves the
-            # pass (see _price_bar), never whether it happens.
-            ib_up = self.price_feed is not None and await self.price_feed.ensure_connected()
-            if self.price_feed is not None and not ib_up:
-                self._warn_once(
-                    "ib-unreachable",
-                    f"IB Gateway unreachable -- the price feed keeps retrying every {IB_RETRY_GAP_SEC // 60} min "
-                    "in the background. Entries and trade marks fall back to Finnhub quotes meanwhile. "
-                    "Set ENABLE_IB_PRICE_FEED=false if you don't want it at all.",
-                )
-            if ib_up or self.finnhub is not None:
-                self._last_price_poll = now
-                await self._mark_and_execute()
-            else:
-                # IB down and no Finnhub key: nothing can price anything.
-                # Leave the poll pending but back off the connection attempt.
-                self._last_price_poll = now - price_interval + IB_RETRY_GAP_SEC
+        # Ingestion above may have fired a signal. Run the entry poll again so
+        # it gets its evaluation inside THIS tick rather than waiting out a
+        # full entry interval -- _fire_signal clears _last_price_poll on a
+        # fresh episode, so this second call is a cheap no-op (one _due check)
+        # unless something actually became SIGNALED.
+        await self._run_entry_and_marking_poll()
+
         if (
             self.finnhub is not None
             and self.settings.enable_universe_autoscreen
             and self._universe_screen_due()
         ):
             await self._run_universe_screen()
-        # Scheduled off persisted wall-clock, not a process-local marker: a
-        # monotonic marker resets to "due immediately" on every restart, and
-        # this pass is no longer the harmless idempotent re-score it was when
-        # that was written -- it EXPIRES a SIGNALED dossier that has slipped
-        # below the bar. With a restart-triggered decay pass and a 6-hourly
-        # price poll, a marginal signal could be killed several times a day
-        # before the entry gate ever looked at it.
-        if self._daily_pass_due("decay_pass"):
-            self._archive_orphaned_dossiers()
-            await self._run_decay_pass()
-            self._mark_daily_pass_done("decay_pass")
+        # (The decay pass runs at the TOP of the tick -- see the ordering
+        # note there. It is scheduled off persisted wall-clock rather than a
+        # process-local marker: a monotonic marker resets to "due
+        # immediately" on every restart, and this pass is not the harmless
+        # idempotent re-score it once was -- it both FIRES and EXPIRES
+        # signals, so a restart-triggered pass is an extra chance to kill a
+        # pending signal before the entry gate has looked at it.)
+        #
         # Both daily passes are marked done AFTER a successful run, not
         # before: forward data can't be backfilled, so a pass that raised
         # (disk error, feed dropping mid-fetch) must stay due and be
@@ -1942,13 +1994,19 @@ class Engine:
                           self.settings.min_independent_sources_news_only)
         if signal is not None:
             await self._fire_signal(dossier, signal)
-        elif dossier.status == "SIGNALED" and not self.journal.has_open(target_symbol):
+        elif (
+            dossier.status == "SIGNALED"
+            and not self.journal.has_open(target_symbol)
+            and self._should_expire_unopened(dossier)
+        ):
             # Newly merged evidence dropped the thesis below the signal bar
             # (or flipped it) while it sat SIGNALED-but-unopened. Left
             # as-is, the next price poll would still open a paper trade on
             # a thesis that no longer qualifies -- possibly in the OPPOSITE
             # direction from the one that signaled, against a baseline
-            # snapped for the old thesis.
+            # snapped for the old thesis. _should_expire_unopened is what
+            # keeps a MARGINAL dip from killing an episode the entry gate
+            # has not evaluated even once.
             self._expire_signal(dossier, self._below_bar_reason(dossier, "when fresh evidence merged"))
         return "handled"
 
@@ -2051,6 +2109,15 @@ class Engine:
             # than letting this wait up to price_poll_interval_sec (6h) for
             # its first entry evaluation.
             self._entry_pending = True
+            # ...and make that first evaluation happen on the NEXT TICK (30s)
+            # rather than a full entry interval (15 min) from now. Clearing
+            # the marker is what makes the difference between a fresh episode
+            # being offered to the entry gate promptly and it spending its
+            # first quarter-hour exposed to every expiry path in the system
+            # -- newly merged evidence dipping it below the bar, or the decay
+            # pass -- without the gate ever having seen it once. The first
+            # signal this system ever fired died exactly that way.
+            self._last_price_poll = None
         log_signal(Path(self.settings.log_dir) / "signals.jsonl", signal, episode=dossier.signaled_at)
         await self.alerts.send(
             "signal",
@@ -2089,6 +2156,37 @@ class Engine:
         dossier.signaled_price = None
         dossier.signaled_direction = ""
         dossier.drift_alert_sent = False
+        dossier.entry_attempts = 0
+
+    def _should_expire_unopened(self, dossier: Dossier) -> bool:
+        """Whether a SIGNALED-but-unopened dossier that no longer clears the
+        bar should be expired NOW, by a path that is not the entry gate
+        (newly merged evidence, or the daily decay pass).
+
+        Both of those paths used to expire unconditionally, with no dwell
+        time and no requirement that the entry gate had ever run. That is a
+        real trade-killer at this system's cadences: the news poll walks 209
+        symbols spending two LLM calls per article, so an episode fired
+        early in a poll is exposed for the whole rest of that poll, and ONE
+        skeptic-approved contrary item is enough to end it -- confidence is
+        multiplied by `1 - mass_opposing/mass_agree` (dossier._aggregate), so
+        first opposing evidence moves the score sharply. The episode dies,
+        its price baseline is wiped, and the entry gate never saw it.
+
+        Two carve-outs, and only two:
+        - A direction FLIP always expires immediately. A stale SIGNALED
+          status pointing the wrong way is worse than no signal at all.
+        - Before the gate has evaluated this episode even once, a dip has to
+          be MATERIAL (below `SIGNAL_EXPIRY_HYSTERESIS` of the bar), not
+          marginal. Once entry_attempts > 0 the gate has had its look and
+          the normal, strict bar applies again -- this is a grace period for
+          the first evaluation, not a permanently softer threshold."""
+        if dossier.direction != dossier.signaled_direction:
+            return True
+        if dossier.entry_attempts > 0:
+            return True
+        score = dossier.confidence * dossier.magnitude
+        return score < self.settings.signal_confidence_threshold * SIGNAL_EXPIRY_HYSTERESIS
 
     def _record_decision(self, event: str, symbol: str, direction: str, episode: str,
                          price: float | None = None, reason: str = "") -> None:
@@ -2159,6 +2257,19 @@ class Engine:
         stayed SIGNALED. Opening from the stale status alone would take a
         position the current evidence no longer justifies -- possibly in
         the opposite direction from the thesis that actually signaled."""
+        # Recorded BEFORE any early return: reaching this function at all is
+        # what "the entry gate has looked at this episode" means, and the
+        # pre-gate expiry grace period (see _should_expire_unopened) keys off
+        # it. Persisted below alongside whatever this evaluation decides; an
+        # expiry resets it with the rest of the episode state. Persisted
+        # immediately rather than left to whichever branch happens to save:
+        # most of the paths out of this function (drift skip on a repeat
+        # poll, no price yet, a successful open) do not write the dossier at
+        # all, and a counter that only survives on the expiry paths would be
+        # exactly backwards.
+        dossier.entry_attempts += 1
+        self.dossiers.save(dossier)
+
         # Each failure mode gets its own reason string, with the numbers that
         # caused it: "no longer qualifies" told a reader nothing about WHY a
         # signal died, and the decisions ledger exists precisely so that
@@ -2400,7 +2511,7 @@ class Engine:
                               self.settings.min_independent_sources,
                               self.settings.min_independent_sources_news_only)
             if signal is None:
-                if dossier.status == "SIGNALED":
+                if dossier.status == "SIGNALED" and self._should_expire_unopened(dossier):
                     self._expire_signal(dossier, self._below_bar_reason(dossier, "on the daily decay pass"))
             elif dossier.status == "ACTIVE":
                 log.info("[SIGNAL] %s: qualifies on the daily decay pass with no new evidence "

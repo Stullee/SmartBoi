@@ -85,6 +85,14 @@ class Dossier:
     signaled_price: float | None = None
     signaled_direction: str = ""
     drift_alert_sent: bool = False
+    # How many times the entry gate has actually evaluated THIS episode (see
+    # engine._try_open_from_signal). Reset with the rest of the episode
+    # state. Exists so the pre-gate expiry paths -- newly merged evidence and
+    # the daily decay pass -- can tell "this thesis degraded after it had its
+    # chance to enter" from "this thesis was killed before the gate ever saw
+    # it", and only apply the strict bar to the former. See
+    # engine._should_expire_unopened.
+    entry_attempts: int = 0
     # Decay-weighted evidence mass for/against the resolved direction, as
     # of the last _aggregate call (see dossier.py's _side_mass) -- exposed
     # so the dashboard can show WHY a confidence is low: a small agreeing

@@ -47,6 +47,22 @@ class ReadOnlyPriceFeed:
 
     async def connect(self) -> None:
         await self.ib.connectAsync(self._host, self._port, clientId=self._client_id, timeout=15)
+        # Allow DELAYED data (type 3) as a fallback when the account has no
+        # live market-data subscription for a name. Without this, an
+        # unsubscribed symbol answers reqHistoricalDataAsync with nothing at
+        # all, which this module can only report as "no price" -- and a
+        # no-price symbol at the entry gate is a trade that never happens.
+        # Delayed bars are 15-20 minutes old, which is immaterial to a
+        # strategy holding for weeks and infinitely better than none.
+        #
+        # This is a market-data mode, not an order permission: it cannot
+        # place, route or modify anything, so the paper-only guarantee in
+        # this module's docstring is untouched. Best-effort -- an older
+        # Gateway that doesn't accept it must not break the connection.
+        try:
+            self.ib.reqMarketDataType(3)
+        except Exception as exc:  # noqa: BLE001 - purely an upgrade; never fail the connect over it
+            log.debug("IB did not accept the delayed market-data request: %s", exc)
         log.info("Connected read-only price feed to IB at %s:%s (client_id=%s)", self._host, self._port, self._client_id)
 
     async def ensure_connected(self) -> bool:
