@@ -62,8 +62,19 @@ class FakeFinnhub:
     async def search_ticker_by_name(self, company_name):
         return self.ticker_by_name.get(company_name)
 
+    async def quote_bar(self, symbol):
+        """Values may be a plain float (high=low=close, the common case) or a
+        (close, high, low) tuple for tests that exercise intraday stop/target
+        evaluation off the Finnhub fallback -- same convention as
+        FakePriceFeed."""
+        value = self.quotes_by_symbol.get(symbol)
+        if value is None:
+            return None
+        return value if isinstance(value, tuple) else (value, value, value)
+
     async def quote(self, symbol):
-        return self.quotes_by_symbol.get(symbol)
+        bar = await self.quote_bar(symbol)
+        return bar[0] if bar is not None else None
 
     async def aclose(self):
         pass

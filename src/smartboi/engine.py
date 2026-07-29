@@ -6,10 +6,14 @@ implements point-by-point.
 Every optional integration degrades gracefully instead of failing to
 start -- see config.py's docstring. Add EDGAR_USER_AGENT and/or
 FINNHUB_API_KEY to start collecting evidence; add ANTHROPIC_API_KEY to
-start scoring it into dossiers; add IB (ENABLE_IB_PRICE_FEED=true) to start
-actually opening/marking hypothetical positions. Signals are detected and
-logged (signals.jsonl) the moment ANTHROPIC_API_KEY is present, regardless
-of whether IB is configured yet.
+start scoring it into dossiers. Signals are detected and logged
+(signals.jsonl) the moment ANTHROPIC_API_KEY is present. Opening and
+marking hypothetical positions needs a price source -- IB
+(ENABLE_IB_PRICE_FEED=true) when available, otherwise Finnhub's /quote,
+which the same FINNHUB_API_KEY already covers (see _price_bar). IB is
+preferred, never required: it was the sole entry price source for a while,
+which meant an unreachable Gateway silently blocked the system's only
+output.
 
 Evidence is only marked as seen (dedup-registered) once it has been
 handled DEFINITIVELY -- scored into dossiers, judged not-new, or refuted
@@ -35,7 +39,7 @@ from pathlib import Path
 from smartboi.alerts import AlertSender
 from smartboi.config import Settings
 from smartboi.dedup import DedupIndex, fingerprint, source_domain
-from smartboi.edgar import _truncate_head_tail
+from smartboi.edgar import _truncate_head_tail, describe_8k_items
 from smartboi.dossier import (
     DIRECTIONS,
     Dossier,
@@ -50,7 +54,7 @@ from smartboi.edgar import EdgarClient, FilingEvent
 from smartboi.graph import REL_TYPES, RelationshipExtractor, RelationshipGraph, Relationship
 from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal, cost_bps_per_side_for_cap
-from smartboi.prices import ReadOnlyPriceFeed
+from smartboi.prices import PriceBar, ReadOnlyPriceFeed
 from smartboi.ratelimit import SlidingWindowLimiter
 from smartboi.signals import evaluate, favorable_drift_pct, log_decision, log_signal, signal_expired
 from smartboi.skeptic import Skeptic
@@ -96,6 +100,16 @@ HEARTBEAT_INTERVAL_SEC = 600
 # and rarely restate customer/supplier relationships, so extraction time is
 # spent on the two disclosure-heavy forms.
 RELATIONSHIP_EXTRACTION_FORMS = ("10-K", "10-Q")
+# How much of a filing's text reaches the dossier updater as one evidence
+# item. Raised from 4,000: with 8-K exhibits now included (see
+# edgar.fetch_evidence_text), the highest-value content in the whole system
+# -- the company's own press release announcing a contract award, product
+# launch or guidance revision -- arrives in this string, and 4,000 chars
+# (~1,000 tokens) truncated a typical release mid-way through the paragraph
+# carrying the actual numbers. ~3,000 tokens per filing item is affordable:
+# filings are a small minority of evidence volume, and the live deployment
+# runs at ~6% of its daily LLM call budget.
+FILING_EVIDENCE_CHARS = 12_000
 # Best-effort filter on universe candidates that never resolve to a real
 # ticker (see _record_universe_candidate): government bodies, regulators,
 # generic customer-class descriptions ("public utilities"), and lenders are
@@ -595,9 +609,15 @@ class Engine:
                 log.warning(
                     "Read-only IB price feed: could not connect to %s:%s at startup -- will keep retrying "
                     "every %d min in the background. Signals are still detected and logged "
-                    "(logs/signals.jsonl) while unreachable.",
+                    "(logs/signals.jsonl), and entries/marks fall back to Finnhub quotes, while unreachable.",
                     self.settings.ib_host, self.settings.ib_port, IB_RETRY_GAP_SEC // 60,
                 )
+        if not self._has_price_source():
+            log.warning(
+                "No price source configured (ENABLE_IB_PRICE_FEED is off and there is no FINNHUB_API_KEY) "
+                "-- signals will be detected and logged, but no paper trade can ever be OPENED or marked. "
+                "A Finnhub free-tier key alone is enough for the full paper-trade loop.",
+            )
         else:
             self._warn_once(
                 "ib",
@@ -707,16 +727,27 @@ class Engine:
             self._last_news_poll = now
             await self._poll_news()
         price_interval = self._price_poll_interval()
-        if self.price_feed is not None and self._due(self._last_price_poll, price_interval, now):
-            if await self.price_feed.ensure_connected():
-                self._last_price_poll = now
-                await self._mark_and_execute()
-            else:
+        if self._has_price_source() and self._due(self._last_price_poll, price_interval, now):
+            # IB is opportunistic here, not required. It used to gate the
+            # whole pass: an unreachable Gateway meant _mark_and_execute never
+            # ran, so no signal could become a paper trade and no open trade
+            # could be marked -- even with a perfectly good Finnhub quote
+            # available and already being used for the daily price marks.
+            # Now the connection attempt only decides which SOURCE serves the
+            # pass (see _price_bar), never whether it happens.
+            ib_up = self.price_feed is not None and await self.price_feed.ensure_connected()
+            if self.price_feed is not None and not ib_up:
                 self._warn_once(
                     "ib-unreachable",
                     f"IB Gateway unreachable -- the price feed keeps retrying every {IB_RETRY_GAP_SEC // 60} min "
-                    "in the background. Set ENABLE_IB_PRICE_FEED=false if you don't want it yet.",
+                    "in the background. Entries and trade marks fall back to Finnhub quotes meanwhile. "
+                    "Set ENABLE_IB_PRICE_FEED=false if you don't want it at all.",
                 )
+            if ib_up or self.finnhub is not None:
+                self._last_price_poll = now
+                await self._mark_and_execute()
+            else:
+                # IB down and no Finnhub key: nothing can price anything.
                 # Leave the poll pending but back off the connection attempt.
                 self._last_price_poll = now - price_interval + IB_RETRY_GAP_SEC
         if (
@@ -901,12 +932,21 @@ class Engine:
 
         # Head + tail rather than a flat prefix: the first few thousand
         # characters of a filing are mostly the SEC cover page and checkbox
-        # boilerplate, so a flat text[:4000] often fed the dossier engine
+        # boilerplate, so a flat text[:N] often fed the dossier engine
         # near-zero actual content -- the disclosed items sit further in.
         evidence_text = (
             f"SEC {filing.form} filed {filing.filing_date} for {symbol}:\n"
-            f"{_truncate_head_tail(text, 4000)}"
+            f"{_truncate_head_tail(text, FILING_EVIDENCE_CHARS)}"
         )
+        # The item codes go in the HEADLINE, not only the body: the headline
+        # is what survives into the evidence record and into a paper trade's
+        # citations, so "DCO 8-K (Item 1.01: Entry into a Material Definitive
+        # Agreement)" is a readable audit trail where "DCO 8-K filed
+        # 2026-07-28" was not.
+        item_description = describe_8k_items(filing.items) if filing.form.startswith("8-K") else ""
+        headline = f"{symbol} {filing.form} filed {filing.filing_date}"
+        if item_description:
+            headline = f"{headline} -- {item_description}"
         scored = await self._process_evidence(
             origin_symbol=symbol,
             evidence_text=evidence_text,
@@ -922,7 +962,7 @@ class Engine:
             # story than two truly independent confirmations.
             source_name=f"SEC EDGAR ({filing.form})",
             url=filing.document_url,
-            headline=f"{symbol} {filing.form} filed {filing.filing_date}",
+            headline=headline,
             published_at=filing.filing_date,
         )
         if scored:
@@ -1914,6 +1954,76 @@ class Engine:
 
     # --- Price marking / hypothetical execution ---
 
+    def _has_price_source(self) -> bool:
+        """Whether ANY price source exists -- IB or Finnhub's /quote.
+
+        The entry gate used to be reachable only through IB: _tick called
+        _mark_and_execute exclusively under `self.price_feed is not None`, so
+        a deployment without ENABLE_IB_PRICE_FEED could accumulate evidence,
+        cross the bar, fire a signal and log it -- and then never, under any
+        circumstances, open the paper trade that is the entire point of the
+        system. Finnhub's /quote was already trusted enough to set the
+        signal-time drift BASELINE (_snapshot_signal_price) and to write the
+        daily forward-validation price marks (_run_daily_price_marks); there
+        was never a reason it couldn't also price an entry."""
+        return self.price_feed is not None or self.finnhub is not None
+
+    async def _price_bar(self, symbol: str) -> PriceBar | None:
+        """One symbol's latest bar, IB first and Finnhub second.
+
+        IB is preferred where it works: it is a real historical daily bar
+        with true session extremes. But it fails in ways that are invisible
+        from here and routine in practice -- a Gateway whose market-data
+        farms are down (live: "farms not connected: eufarm; euhmds"), a
+        symbol with no market-data subscription on the account, a share
+        class SMART won't route. Every one of those returns None, and a None
+        at the entry gate used to mean no trade, ever, with no fallback and
+        no diagnostic. Finnhub's /quote covers US common stock on the free
+        tier and carries the session high/low, so it is a genuine substitute
+        rather than a degraded one."""
+        if self.price_feed is not None:
+            try:
+                bar = await self.price_feed.last_bar(symbol)
+            except Exception:  # noqa: BLE001 - fall through to Finnhub, never propagate
+                log.exception("%s: IB price lookup failed -- trying Finnhub.", symbol)
+            else:
+                if bar is not None:
+                    return bar
+        if self.finnhub is not None:
+            try:
+                quote = await self.finnhub.quote_bar(symbol)
+            except Exception:  # noqa: BLE001 - a missing price is a no-op, never a crash
+                log.exception("%s: Finnhub quote lookup failed.", symbol)
+                return None
+            if quote is not None:
+                return PriceBar(close=quote[0], high=quote[1], low=quote[2])
+        return None
+
+    async def _price_bars(self, symbols: list[str]) -> dict[str, PriceBar]:
+        """Same IB-then-Finnhub resolution as _price_bar, batched. IB is
+        asked for the whole list at once (it paces its own requests), then
+        Finnhub fills in whatever IB could not price -- the same shape
+        _run_daily_price_marks already used, so an open paper trade is
+        marked to market on exactly the days the forward-validation record
+        has a price for it, not fewer."""
+        bars: dict[str, PriceBar] = {}
+        if self.price_feed is not None:
+            try:
+                bars = dict(await self.price_feed.last_bars(symbols))
+            except Exception:  # noqa: BLE001 - fall through to Finnhub
+                log.exception("IB batch price lookup failed -- trying Finnhub.")
+        missing = [s for s in symbols if s not in bars]
+        if missing and self.finnhub is not None:
+            for symbol in missing:
+                try:
+                    quote = await self.finnhub.quote_bar(symbol)
+                except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
+                    log.exception("%s: Finnhub quote lookup failed.", symbol)
+                    continue
+                if quote is not None:
+                    bars[symbol] = PriceBar(close=quote[0], high=quote[1], low=quote[2])
+        return bars
+
     async def _fire_signal(self, dossier: Dossier, signal) -> None:
         """Logs a signal and, for a fresh episode, flips the dossier to
         SIGNALED with a fresh price baseline.
@@ -1963,13 +2073,13 @@ class Engine:
         dossier.drift_alert_sent = False
         dossier.signaled_price = None
         try:
-            if self.price_feed is not None and await self.price_feed.ensure_connected():
-                dossier.signaled_price = await self.price_feed.last_price(dossier.symbol)
-            if dossier.signaled_price is None and self.finnhub is not None:
-                # Finnhub's /quote keeps the drift baseline usable when IB
-                # is down or not configured -- a missing baseline silently
-                # disables the "are we too late" check for this signal.
-                dossier.signaled_price = await self.finnhub.quote(dossier.symbol)
+            if self.price_feed is not None:
+                await self.price_feed.ensure_connected()
+            # _price_bar is IB-then-Finnhub: Finnhub's /quote keeps the drift
+            # baseline usable when IB is down or not configured -- a missing
+            # baseline silently disables the "are we too late" check.
+            bar = await self._price_bar(dossier.symbol)
+            dossier.signaled_price = bar.close if bar is not None else None
         except Exception:  # noqa: BLE001 - a missing baseline just disables the drift check for this signal
             log.exception("%s: could not snapshot signal-time price.", dossier.symbol)
 
@@ -2065,12 +2175,29 @@ class Engine:
                 "before an entry was confirmed",
             )
             return
-        try:
-            price = await self.price_feed.last_price(symbol)
-        except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
-            log.exception("%s: could not fetch entry price.", symbol)
-            return
+        # IB first, Finnhub second (see _price_bar). Entry used to be the one
+        # place in the system with NO fallback -- _snapshot_signal_price and
+        # _run_daily_price_marks both already fell back to Finnhub, but the
+        # gate that actually opens the trade did not, so an IB outage was a
+        # total block on the system's only output.
+        bar = await self._price_bar(symbol)
+        price = bar.close if bar is not None else None
         if price is None:
+            # No price from ANY source. Deliberately still deadline-checked
+            # rather than a bare return: the deadline check used to sit below
+            # this early return, so a signal on an unpriceable symbol never
+            # opened AND never expired -- it stayed SIGNALED forever, holding
+            # the tightened entry poll cadence open and blocking the dossier
+            # from ever producing a fresh, cleanly-baselined signal later.
+            if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
+                self._expire_signal(dossier, "no price available from any source within the entry deadline")
+            else:
+                self._warn_once(
+                    f"no-entry-price:{symbol}",
+                    f"{symbol}: signal is waiting on the entry gate but no price source could price it "
+                    "(IB unreachable/unsubscribed and no Finnhub quote). It will expire at the entry "
+                    f"deadline ({self.settings.signal_entry_deadline_days}d) if nothing can price it.",
+                )
             return
 
         if dossier.signaled_price is not None:
@@ -2175,7 +2302,7 @@ class Engine:
         open_symbols = list(self.journal.open_trades.keys())
         if not open_symbols:
             return
-        bars = await self.price_feed.last_bars(open_symbols)
+        bars = await self._price_bars(open_symbols)
         for symbol, bar in bars.items():
             trade = self.journal.open_trades.get(symbol)
             if trade is None:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1364,3 +1365,130 @@ def test_executive_biographies_are_recognised(description):
 @pytest.mark.parametrize("description", COMMERCIAL_DESCRIPTIONS)
 def test_genuine_disclosures_survive_the_biography_filter(description):
     assert Engine._is_biography_relationship({"description": description}) is False
+
+
+# --- Price-source independence: the entry gate must not be IB-only.
+#
+# For a long stretch this system could accumulate evidence, cross the signal
+# bar, fire a signal and log it -- and then never open the paper trade that
+# is its entire output -- because _tick only ran _mark_and_execute under
+# `self.price_feed is not None`, and _try_open_from_signal only ever asked
+# IB for a price. Both the drift BASELINE (_snapshot_signal_price) and the
+# daily forward-validation marks already fell back to Finnhub's /quote; the
+# gate that actually opens the trade did not. Confirmed live: a Gateway
+# reporting "farms not connected: eufarm; euhmds" against a universe of 48
+# tradeables and zero paper trades ever opened. ---
+
+async def _signal_form(engine, sources=("reuters.com", "bloomberg.com")):
+    """Drives FORM to SIGNALED off two independent news sources."""
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(sources):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+    return engine.dossiers.load("FORM")
+
+
+async def test_entry_opens_from_finnhub_quote_with_no_ib_feed_at_all(engine):
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol["FORM"] = 10.0
+
+    dossier = await _signal_form(engine)
+    assert dossier.status == "SIGNALED"
+    assert dossier.signaled_price == 10.0  # baseline came from Finnhub too
+
+    await engine._mark_and_execute()
+
+    assert engine.journal.has_open("FORM")
+    assert engine.journal.open_trades["FORM"].entry_price == 10.0
+
+
+async def test_entry_falls_back_to_finnhub_when_ib_cannot_price_the_symbol(engine):
+    # IB is connected but has no price for FORM (no market-data subscription,
+    # unqualifiable contract, dead data farm) -- the live failure mode.
+    engine.price_feed = FakePriceFeed(prices={})
+    engine.finnhub.quotes_by_symbol["FORM"] = 12.5
+
+    await _signal_form(engine)
+    await engine._mark_and_execute()
+
+    assert engine.journal.has_open("FORM")
+    assert engine.journal.open_trades["FORM"].entry_price == 12.5
+
+
+async def test_ib_price_is_preferred_over_finnhub_when_both_have_one(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.finnhub.quotes_by_symbol["FORM"] = 99.0
+
+    await _signal_form(engine)
+    await engine._mark_and_execute()
+
+    assert engine.journal.open_trades["FORM"].entry_price == 10.0
+
+
+async def test_open_trade_is_marked_from_finnhub_intraday_band(engine):
+    """The Finnhub fallback carries the session high/low, so a stop that
+    traded intraday still stops the trade out -- a close-only fallback would
+    have quietly erased exactly those losses (see paper_journal.update)."""
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol["FORM"] = 10.0
+    await _signal_form(engine)
+    await engine._mark_and_execute()
+    trade = engine.journal.open_trades["FORM"]
+
+    # Closed above the stop, but the session low traded through it.
+    engine.finnhub.quotes_by_symbol["FORM"] = (10.0, 10.2, trade.stop_price - 0.05)
+    await engine._mark_and_execute()
+
+    assert not engine.journal.has_open("FORM")
+    closed = [json.loads(line) for line in engine.journal.log_path.read_text().splitlines()]
+    assert closed[-1]["status"] == "LOSS"
+
+
+async def test_unpriceable_signal_expires_at_the_entry_deadline(engine):
+    """No price from ANY source used to be a bare `return` that sat ABOVE
+    the deadline check, so such a signal never opened and never expired --
+    it held the tightened entry-poll cadence open forever and blocked the
+    dossier from ever producing a fresh, cleanly-baselined signal."""
+    engine.price_feed = None  # and no Finnhub quote for FORM either
+
+    dossier = await _signal_form(engine)
+    assert dossier.status == "SIGNALED"
+    episode = dossier.signaled_at
+
+    # Still inside the deadline: stays SIGNALED, waiting.
+    await engine._mark_and_execute()
+    assert engine.dossiers.load("FORM").status == "SIGNALED"
+
+    # Backdate past signal_entry_deadline_days.
+    dossier = engine.dossiers.load("FORM")
+    signaled = datetime.fromisoformat(dossier.signaled_at)
+    dossier.signaled_at = (
+        signaled - timedelta(days=engine.settings.signal_entry_deadline_days + 1)
+    ).isoformat()
+    engine.dossiers.save(dossier)
+
+    await engine._mark_and_execute()
+
+    reset = engine.dossiers.load("FORM")
+    assert reset.status == "ACTIVE"
+    rows = [json.loads(line) for line in
+            (Path(engine.settings.log_dir) / "decisions.jsonl").read_text().splitlines()]
+    expired = [r for r in rows if r["event"] == "signal_expired"]
+    assert len(expired) == 1
+    assert "no price available from any source" in expired[0]["reason"]
+    assert expired[0]["episode"]  # episode-keyed, so event_study can join it
+    assert episode  # the original episode key existed before the backdate
+
+
+def test_has_price_source_is_true_with_finnhub_alone(engine):
+    engine.price_feed = None
+    assert engine._has_price_source() is True
+
+
+def test_has_price_source_is_false_with_neither(engine):
+    engine.price_feed = None
+    engine.finnhub = None
+    assert engine._has_price_source() is False

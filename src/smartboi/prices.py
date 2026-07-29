@@ -67,12 +67,22 @@ class ReadOnlyPriceFeed:
         contract = self._contracts.get(symbol)
         if contract is None:
             candidate = Stock(symbol, "SMART", "USD")
-            [qualified] = await self.ib.qualifyContractsAsync(candidate)
-            if qualified is None or not getattr(qualified, "conId", None):
+            # Indexed, not destructured. `[qualified] = await ...` raised
+            # ValueError("not enough values to unpack") whenever IB returned
+            # an EMPTY list, which is its normal answer for a symbol it can't
+            # resolve -- a delisted ticker, a share class SMART doesn't route,
+            # or (the case that actually bit) a Gateway whose security-
+            # definition farm is not connected yet. That turned a routine
+            # "no price for this symbol" into an exception, and in
+            # _try_open_from_signal an exception is caught and returned from
+            # WITHOUT ever reaching the entry-deadline check -- so a signal
+            # could sit SIGNALED indefinitely on an unqualifiable symbol.
+            qualified = await self.ib.qualifyContractsAsync(candidate)
+            if not qualified or not getattr(qualified[0], "conId", None):
                 log.warning("%s: could not qualify contract for price lookup.", symbol)
                 return None
-            self._contracts[symbol] = qualified
-            contract = qualified
+            self._contracts[symbol] = qualified[0]
+            contract = qualified[0]
 
         bars = await self.ib.reqHistoricalDataAsync(
             contract, endDateTime="", durationStr="2 D", barSizeSetting="1 day",

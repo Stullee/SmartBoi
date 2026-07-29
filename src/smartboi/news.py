@@ -190,22 +190,52 @@ class FinnhubClient:
         self._search_422s = 0
         return _best_search_match(response.json().get("result", []), normalized_query)
 
-    async def quote(self, symbol: str) -> float | None:
-        """Current/last price via Finnhub's free-tier /quote -- the
-        IB-independent price source for daily forward-validation marks and
-        signal-time drift baselines (see engine.py). Finnhub answers an
-        unknown symbol with 200 and c=0, so 0 maps to None rather than
-        being recorded as a real price."""
+    async def quote_bar(self, symbol: str) -> tuple[float, float, float] | None:
+        """(close, high, low) for the current session via Finnhub's free-tier
+        /quote -- the IB-independent price source for daily forward-validation
+        marks, signal-time drift baselines, ENTRY prices and marking open
+        paper trades (see engine.py). Finnhub answers an unknown symbol with
+        200 and c=0, so 0 maps to None rather than being recorded as a real
+        price.
+
+        Returned as a plain tuple rather than a prices.PriceBar so this module
+        stays free of the ib_async import chain -- engine.py, which already
+        imports both, does the conversion.
+
+        The high/low matter, they are not decoration: paper_journal.update()
+        checks stops and targets against the session's intraday EXTREMES, and
+        feeding it close-only bars silently erases exactly the stop-outs that
+        traded through the level and recovered (see that method's docstring).
+        Finnhub's /quote carries `h`/`l` for free in the same response, so
+        there is no reason to degrade to a close-only mark. When either is
+        missing or nonsensical (a fresh pre-market quote can report h=l=0),
+        each falls back to the close independently, which is exactly the
+        old close-only behaviour for that side."""
         try:
             response = await self._throttled_get(_QUOTE_URL, {"symbol": symbol})
         except httpx.HTTPError as exc:
             log.warning("%s: Finnhub quote fetch failed: %s", symbol, redact_token(exc))
             return None
         try:
-            price = float(response.json().get("c") or 0.0)
-        except (TypeError, ValueError):
+            row = response.json()
+            close = float(row.get("c") or 0.0)
+            high = float(row.get("h") or 0.0)
+            low = float(row.get("l") or 0.0)
+        except (TypeError, ValueError, AttributeError):
             return None
-        return price if price > 0 else None
+        if close <= 0:
+            return None
+        # A high below the close (or a low above it) is incoherent -- clamp to
+        # the close rather than handing paper_journal a band that would
+        # instantly trigger a phantom stop or target.
+        high = max(high, close) if high > 0 else close
+        low = min(low, close) if low > 0 else close
+        return close, high, low
+
+    async def quote(self, symbol: str) -> float | None:
+        """Last price only -- see quote_bar for the full session band."""
+        bar = await self.quote_bar(symbol)
+        return bar[0] if bar is not None else None
 
     async def market_cap_musd(self, symbol: str) -> float | None:
         try:

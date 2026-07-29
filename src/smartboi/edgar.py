@@ -57,6 +57,72 @@ _FORM4_TRANSACTION_CODES = {
 }
 
 
+# What an 8-K's item codes MEAN, spelled out for the dossier engine.
+#
+# The submissions endpoint already returns these per filing (recent["items"],
+# e.g. "1.01,9.01") and they were being thrown away. They are the cheapest
+# high-signal metadata EDGAR offers: they say what KIND of event a filing
+# reports before a single byte of the document is fetched, and the
+# difference between "Item 1.01 Entry into a Material Definitive Agreement"
+# (a contract win -- exactly the catalyst this system exists to trade) and
+# "Item 5.02 Departure of Directors" (usually noise) is the difference
+# between a thesis and a wasted LLM call.
+#
+# Only the codes that carry real directional signal are spelled out; an
+# unmapped code is still passed through verbatim so nothing is silently lost.
+EIGHT_K_ITEMS = {
+    "1.01": "Entry into a Material Definitive Agreement (a new contract, order, supply agreement or partnership)",
+    "1.02": "Termination of a Material Definitive Agreement (a contract or customer relationship ending)",
+    "1.03": "Bankruptcy or Receivership",
+    "1.05": "Material Cybersecurity Incident",
+    "2.01": "Completion of Acquisition or Disposition of Assets",
+    "2.02": "Results of Operations and Financial Condition (earnings release, and any guidance in it)",
+    "2.03": "Creation of a Material Direct Financial Obligation (new debt)",
+    "2.04": "Triggering Event Accelerating a Financial Obligation (a covenant breach or acceleration)",
+    "2.05": "Costs Associated with Exit or Disposal Activities (restructuring)",
+    "2.06": "Material Impairment (a write-down)",
+    "3.01": "Notice of Delisting or Failure to Satisfy a Listing Rule",
+    "3.02": "Unregistered Sales of Equity Securities (dilution)",
+    "4.01": "Changes in Registrant's Certifying Accountant (an auditor change)",
+    "4.02": "Non-Reliance on Previously Issued Financial Statements (a restatement)",
+    "5.01": "Changes in Control of Registrant",
+    "5.02": "Departure or Election of Directors or Principal Officers",
+    "7.01": "Regulation FD Disclosure (usually the company's own press release, attached as an exhibit)",
+    "8.01": "Other Events (usually a press release the company chose to file: product launches, contract awards, operational updates)",
+    "9.01": "Financial Statements and Exhibits (the exhibit list -- the substance is in the attached exhibit)",
+}
+
+# Exhibit document types whose content is the actual news. EX-99.x is where
+# a company files its own press release: the product launch, the contract
+# award, the earnings release with the guidance in it. EX-10.x is the text
+# of the material agreement itself when Item 1.01 is reported.
+#
+# This is the single most consequential thing EDGAR ingestion was missing.
+# An 8-K's PRIMARY document is a cover page -- checkbox boilerplate plus one
+# sentence reading "On [date] the Company issued a press release... a copy is
+# attached hereto as Exhibit 99.1 and is incorporated herein by reference."
+# Fetching only that (which is what fetch_text did) handed the dossier engine
+# a filing that says a press release exists and not one word of what it said,
+# so the updater correctly judged it "not new information" and the catalyst
+# was discarded. Every product release, contract award and guidance revision
+# this system's universe announced went into the bin this way.
+_EVIDENCE_EXHIBIT_PREFIXES = ("EX-99", "EX-10")
+# Filename fallback for when the directory listing carries no usable type
+# field -- EDGAR filenames for these exhibits are overwhelmingly of the form
+# "ex991.htm" / "ex-99_1.htm" / "dco-ex991_6.htm".
+_EXHIBIT_NAME_RE = re.compile(r"ex[-_]?(99|10)[-_.]?\d*", re.IGNORECASE)
+_TEXTUAL_EXTENSIONS = (".htm", ".html", ".txt")
+
+
+def describe_8k_items(items: str) -> str:
+    """Human/LLM-readable expansion of an 8-K's comma-separated item codes.
+    Unmapped codes pass through verbatim rather than being dropped."""
+    codes = [c.strip() for c in (items or "").split(",") if c.strip()]
+    if not codes:
+        return ""
+    return "; ".join(f"Item {c}: {EIGHT_K_ITEMS[c]}" if c in EIGHT_K_ITEMS else f"Item {c}" for c in codes)
+
+
 @dataclass(frozen=True)
 class FilingEvent:
     symbol: str
@@ -65,6 +131,10 @@ class FilingEvent:
     filing_date: str
     accession_number: str
     primary_document: str
+    # Comma-separated 8-K item codes as EDGAR reports them ("1.01,9.01").
+    # Empty for every other form. Defaulted so existing construction sites
+    # (and tests) that don't care keep working unchanged.
+    items: str = ""
 
     @property
     def document_url(self) -> str:
@@ -88,6 +158,9 @@ class FilingEvent:
     def index_url(self) -> str:
         accession_nodash = self.accession_number.replace("-", "")
         return f"https://www.sec.gov/Archives/edgar/data/{int(self.cik10)}/{accession_nodash}/"
+
+    def document_url_for(self, filename: str) -> str:
+        return f"{self.index_url}{filename}"
 
 
 def _truncate_head_tail(text: str, max_chars: int) -> str:
@@ -342,15 +415,24 @@ class EdgarClient:
         data = response.json()
         recent = data.get("filings", {}).get("recent", {})
         events = []
-        for form, filing_date, accession, primary_doc in zip(
-            recent.get("form", []),
-            recent.get("filingDate", []),
-            recent.get("accessionNumber", []),
-            recent.get("primaryDocument", []),
-        ):
+        # `items` is zip-padded rather than zipped directly: EDGAR populates
+        # it only for 8-Ks, and on some submissions payloads the list is
+        # shorter than the others. A bare zip() would silently TRUNCATE the
+        # whole filing list to the length of the shortest column and drop
+        # real filings, so the columns are indexed instead.
+        forms_col = recent.get("form", [])
+        dates_col = recent.get("filingDate", [])
+        accessions_col = recent.get("accessionNumber", [])
+        docs_col = recent.get("primaryDocument", [])
+        items_col = recent.get("items", [])
+        for i in range(min(len(forms_col), len(dates_col), len(accessions_col), len(docs_col))):
+            form, filing_date = forms_col[i], dates_col[i]
             if form not in forms or filing_date < since_date:
                 continue
-            events.append(FilingEvent(symbol, cik10, form, filing_date, accession, primary_doc))
+            events.append(FilingEvent(
+                symbol, cik10, form, filing_date, accessions_col[i], docs_col[i],
+                items=items_col[i] if i < len(items_col) else "",
+            ))
         return events
 
     async def latest_filing(self, symbol: str, form: str) -> FilingEvent | None:
@@ -380,11 +462,67 @@ class EdgarClient:
                 return FilingEvent(symbol, cik10, filing_form, filing_date, accession, primary_doc)
         return None
 
+    async def evidence_exhibits(self, filing: FilingEvent, limit: int = 3) -> list[str]:
+        """Filenames of the substantive exhibits attached to this filing --
+        the press releases (EX-99.x) and material agreements (EX-10.x) whose
+        content is the actual news. See _EVIDENCE_EXHIBIT_PREFIXES.
+
+        Read from the accession's `index.json` directory listing, which costs
+        one small request and is available for every filing. Resolution is
+        deliberately belt-and-braces: EDGAR's listing carries a `type` field
+        holding the EDGAR document type ("EX-99.1", "8-K", "GRAPHIC"), but
+        it is not guaranteed present on every historical accession, so a
+        filename pattern (ex991.htm, ex-99_1.htm, abc-ex991_6.htm) is used as
+        a fallback. Both paths require a textual extension, so the logos and
+        XBRL sidecars in the same folder are never fetched.
+
+        Bounded by `limit` because an 8-K can attach a dozen exhibits and the
+        per-evidence path truncates to a few thousand characters anyway --
+        past the first few there is nothing left to spend on them. Never
+        raises: an unavailable index degrades to "no exhibits", i.e. exactly
+        the primary-document-only behaviour this replaced."""
+        try:
+            response = await self._throttled_get(f"{filing.index_url}index.json")
+            items = response.json().get("directory", {}).get("item", [])
+        except (httpx.HTTPError, ValueError, AttributeError) as exc:
+            log.warning("%s: could not list exhibits for %s: %s",
+                        filing.symbol, filing.accession_number, exc)
+            return []
+
+        primary = filing.primary_document.rsplit("/", 1)[-1].lower()
+        found: list[str] = []
+        for item in items:
+            name = (item.get("name") or "") if isinstance(item, dict) else ""
+            if not name.lower().endswith(_TEXTUAL_EXTENSIONS) or name.lower() == primary:
+                continue
+            doc_type = str(item.get("type") or "").upper()
+            typed = doc_type.startswith(_EVIDENCE_EXHIBIT_PREFIXES)
+            # The filename fallback only applies when `type` gave no opinion
+            # at all -- when EDGAR HAS typed the document and typed it as
+            # something else, that is authoritative and a coincidental
+            # filename match must not override it.
+            named = not doc_type and bool(_EXHIBIT_NAME_RE.search(name))
+            if typed or named:
+                found.append(name)
+            if len(found) >= limit:
+                break
+        return found
+
     async def fetch_evidence_text(self, filing: FilingEvent) -> str:
-        """Evidence-ready text for a filing. Form 4s get a structured
-        summary of the insider transactions (the raw filing is XML --
-        useless noise as LLM 'evidence'); everything else gets plain-text
-        extraction of the primary document (see fetch_text)."""
+        """Evidence-ready text for a filing.
+
+        Form 4s get a structured summary of the insider transactions (the raw
+        filing is XML -- useless noise as LLM 'evidence').
+
+        Everything else gets the primary document PLUS its substantive
+        exhibits, and for an 8-K a plain-English expansion of its item codes
+        on top (see EIGHT_K_ITEMS / describe_8k_items). For an 8-K the
+        exhibit is put FIRST, because it is the news and the primary document
+        is a cover page: _process_filing re-truncates this to a few thousand
+        head-weighted characters, so anything behind the boilerplate would be
+        cut off exactly as it is now. This is the difference between the
+        dossier engine reading "the Company issued a press release, attached
+        as Exhibit 99.1" and reading the press release."""
         if filing.form == "4":
             try:
                 response = await self._throttled_get(filing.raw_document_url)
@@ -395,7 +533,26 @@ class EdgarClient:
             if summary:
                 return summary
             log.warning("%s: Form 4 %s did not parse -- falling back to plain text.", filing.symbol, filing.accession_number)
-        return await self.fetch_text(filing)
+            return await self.fetch_text(filing)
+
+        primary_text = await self.fetch_text(filing)
+        sections: list[str] = []
+
+        item_description = describe_8k_items(filing.items) if filing.form.startswith("8-K") else ""
+        if item_description:
+            sections.append(f"This 8-K reports: {item_description}")
+
+        for name in await self.evidence_exhibits(filing):
+            exhibit_text = await self.fetch_document_text(filing.document_url_for(name))
+            if exhibit_text:
+                sections.append(f"--- Attached exhibit ({name}) ---\n{exhibit_text}")
+
+        # No exhibits resolved -> unchanged behaviour, primary document only.
+        if not sections:
+            return primary_text
+        if primary_text:
+            sections.append(f"--- Filing cover document ---\n{primary_text}")
+        return "\n\n".join(sections)
 
     async def fetch_text(self, filing: FilingEvent, max_chars: int = 150_000) -> str:
         """Plain-text extraction of a filing's primary document, truncated --
@@ -418,13 +575,21 @@ class EdgarClient:
         chars regardless of what this returns, so raising this does NOT
         increase the high-frequency per-article cost the daily LLM call
         budget is guarding against."""
+        return await self.fetch_document_text(filing.document_url, max_chars=max_chars)
+
+    async def fetch_document_text(self, url: str, max_chars: int = 150_000) -> str:
+        """Plain-text extraction of ONE document in a filing's folder, by
+        URL. Split out from fetch_text so exhibits (see evidence_exhibits)
+        go through exactly the same HTML-stripping and truncation as the
+        primary document, rather than a parallel implementation that could
+        drift from it."""
         try:
-            response = await self._throttled_get(filing.document_url)
+            response = await self._throttled_get(url)
         except httpx.HTTPError as exc:
-            log.warning("%s: could not fetch filing document %s: %s", filing.symbol, filing.document_url, exc)
+            log.warning("Could not fetch filing document %s: %s", url, exc)
             return ""
         content_type = response.headers.get("content-type", "")
-        if "html" in content_type or filing.primary_document.endswith((".htm", ".html")):
+        if "html" in content_type or url.lower().endswith((".htm", ".html")):
             soup = BeautifulSoup(response.text, "html.parser")
             text = soup.get_text(separator=" ")
         else:
