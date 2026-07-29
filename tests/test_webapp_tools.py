@@ -128,3 +128,39 @@ async def test_diagnostics_endpoint_returns_a_bundle(engine):
         response = await client.post("/api/tools/diagnostics", json={})
         assert response.status == 200
         assert "=== SmartBoi diagnostics ===" in (await response.json())["report"]
+
+
+# --- Rebuild relationship graph: the recovery path for edges lost because
+# their counterparty was accepted into the universe only AFTER the
+# discovering filing had been extracted. ---
+
+async def test_rebuild_graph_queues_every_tradeable(engine):
+    engine.backfill_state.set("DCO", {"backfilled_at": "2026-07-01T00:00:00+00:00", "accession": "x"})
+    async with TestClient(TestServer(create_app(engine))) as client:
+        body = await (await client.post("/api/universe/rebuild-graph", json={})).json()
+
+    assert body["ok"] is True
+    assert "DCO" in body["symbols"]
+    # The once-ever marker is cleared, so _run_relationship_backfill picks it
+    # up on the next tick.
+    assert engine.backfill_state.get("DCO") is None
+
+
+async def test_rebuild_graph_never_removes_an_edge(engine):
+    from smartboi.graph import Relationship
+
+    engine.graph.add(Relationship("DCO", "RTX", "customer", "d", "s", 0.9, "2026-07-29"))
+    async with TestClient(TestServer(create_app(engine))) as client:
+        await client.post("/api/universe/rebuild-graph", json={})
+
+    assert len(engine.graph.relationships) == 1
+
+
+async def test_rebuild_graph_leaves_anchors_alone(engine):
+    """Backfill extracts from the SMALL companies' filings -- a giant's 10-K
+    never names its tier-2 suppliers, which is the whole reason the graph is
+    discovered bottom-up."""
+    async with TestClient(TestServer(create_app(engine))) as client:
+        body = await (await client.post("/api/universe/rebuild-graph", json={})).json()
+
+    assert "RTX" not in body["symbols"]

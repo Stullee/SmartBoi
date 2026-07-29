@@ -1,6 +1,6 @@
 ---
 name: SmartBoi (Evidence Synthesis, Paper-Only)
-version: "0.23.0"
+version: "0.24.0"
 slug: smartboi
 description: >-
   LLM-driven cross-company evidence synthesis for equity research: ingests
@@ -65,7 +65,7 @@ options:
   auto_accept_anchors: true
   auto_accept_tradeables: true
   auto_accept_min_seen_count: 2
-  auto_accept_max_per_day: 5
+  auto_accept_max_per_day: 20
   log_level: "info"
   alert_webhook_url: ""
   enable_dashboard: true

@@ -139,6 +139,24 @@ _LENDER_PHRASES = (
 # small-cap dossier, and the thesis built on it is pure noise. Phrases are
 # deliberately narrow (unambiguous CV markers only) so a genuine commercial
 # disclosure that happens to use "served" is not dropped with them.
+# A candidate's stashed pending edges (see _record_universe_candidate) are
+# persisted JSON, so they are bounded: enough to keep every distinct filer
+# that disclosed a counterparty, without letting a widely-named company grow
+# an unbounded record.
+_MAX_PENDING_EDGES = 12
+_MAX_REL_DESCRIPTION = 500
+
+
+def _clamped_confidence(value, default: float = 0.5) -> float:
+    """The extractor's confidence, coerced into [0, 1]. Anthropic tool use
+    does not hard-enforce the declared schema, so this must survive a
+    missing or non-numeric field rather than raising."""
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
 _BIOGRAPHY_PHRASES = (
     "prior to joining", "before joining", "prior to his", "prior to her",
     "previously served", "previously held", "previously was", "most recently served",
@@ -325,9 +343,58 @@ class Engine:
         # human chose -- _apply_accepted_candidates reads both shapes, so
         # existing files written before this keep working untouched.
         self.accepted_candidates.set(symbol, {"as": as_type, "source": source})
-        log.info("[CANDIDATE] %s accepted (%s) into the universe as %s -- polled starting next cycle.",
-                 symbol, source, as_type)
+        promoted = self._promote_pending_edges(symbol)
+        log.info("[CANDIDATE] %s accepted (%s) into the universe as %s -- polled starting next cycle, "
+                 "%d disclosed relationship(s) written into the graph.", symbol, source, as_type, promoted)
         return spec
+
+    def _promote_pending_edges(self, symbol: str) -> int:
+        """Writes the relationships that DISCOVERED this candidate into the
+        graph, now that both ends are in the universe.
+
+        Without this a newly accepted symbol arrives unconnected, and an
+        anchor with no edge to a tradeable is inert by construction: it is
+        never its own analysis target, so an article about it resolves to
+        zero targets and is fingerprinted and discarded without a single
+        LLM call. It could only ever gain an edge by the discovering filer
+        filing again -- annually, for a 10-K -- because that filer is
+        already marked backfilled and backfill skips anchors anyway.
+
+        Costs nothing: the relationship was already extracted and paid for
+        when the candidate was recorded (see _record_universe_candidate),
+        so this is a deterministic replay, not a re-extraction. graph.add
+        dedupes on (from, to, rel_type), so promoting twice is harmless."""
+        entry = self.candidates.get(symbol) or {}
+        pending = entry.get("pending_edges") or []
+        if not pending:
+            return 0
+        known = set(self.symbol_list)
+        now = datetime.now(timezone.utc).isoformat()
+        added = 0
+        for p in pending:
+            from_symbol = p.get("from_symbol") or ""
+            rel_type = p.get("rel_type") or ""
+            # The discovering filer can itself have left the universe since
+            # (pruned, demoted, reset) -- an edge to a non-member is dead
+            # weight the graph should not carry.
+            if from_symbol not in known or from_symbol == symbol or rel_type not in REL_TYPES:
+                continue
+            if self.graph.add(
+                Relationship(
+                    from_symbol=from_symbol,
+                    to_symbol=symbol,
+                    rel_type=rel_type,
+                    description=str(p.get("description") or ""),
+                    source=str(p.get("source") or ""),
+                    confidence=_clamped_confidence(p.get("confidence")),
+                    extracted_at=now,
+                )
+            ):
+                added += 1
+                log.info("[GRAPH] %s -> %s (%s, confidence=%.2f) promoted from a discovered candidate: %s",
+                         from_symbol, symbol, rel_type, _clamped_confidence(p.get("confidence")),
+                         str(p.get("description") or "")[:70])
+        return added
 
     def _warn_once(self, key: str, message: str) -> None:
         if key in self._warned:
@@ -959,6 +1026,31 @@ class Engine:
             entry["rel_types"].append(rel_type)
         if filing.document_url not in entry["sources"]:
             entry["sources"] = (entry["sources"] + [filing.document_url])[-5:]
+        # The relationship itself, kept whole so it can be written into the
+        # graph the moment this ticker joins the universe (see
+        # _promote_pending_edges). Without this the disclosure was simply
+        # DISCARDED: _extract_relationships records the candidate and moves
+        # on without adding an edge, the filer is then marked backfilled and
+        # never re-extracted, and backfill skips anchors entirely -- so a
+        # candidate accepted AFTER its discovering filing was processed
+        # became a symbol that gets polled hourly and can never connect to
+        # anything, until the filer's next annual 10-K a year later.
+        # Confirmed live: 40 accepted candidates, 237 discovered, and a
+        # graph of only 61 edges, with accepted anchors like ENTG, GEHC,
+        # DUK, LDOS, STM, SEDG and NVMI carrying no edge at all.
+        if rel_type:
+            pending = [
+                p for p in entry.get("pending_edges", [])
+                if not (p.get("from_symbol") == symbol and p.get("rel_type") == rel_type)
+            ]
+            pending.append({
+                "from_symbol": symbol,
+                "rel_type": rel_type,
+                "description": (rel.get("description") or "")[:_MAX_REL_DESCRIPTION],
+                "confidence": _clamped_confidence(rel.get("confidence")),
+                "source": filing.document_url,
+            })
+            entry["pending_edges"] = pending[-_MAX_PENDING_EDGES:]
         self.candidates.set(key, entry)
         if is_new:
             log.info("[CANDIDATE] %s (%s) is a %s of %s -- proposed as a universe candidate (never auto-added).",
@@ -1236,10 +1328,39 @@ class Engine:
 
     # --- News ingestion ---
 
+    def _can_produce_evidence(self, symbol: str) -> bool:
+        """Whether news about this symbol can reach ANY dossier.
+
+        A tradeable always can -- it is its own analysis target. An anchor
+        never is (that is what signal_source_only means), so its news is
+        only worth fetching if it has a graph edge to a tradeable. With no
+        such edge, _process_evidence resolves zero targets and the article
+        is fingerprinted and dropped without a single LLM call.
+
+        Measured live 2026-07-29: 104 of 130 anchors had no edge to any
+        tradeable -- including every loud name in the universe (NVDA, MSFT,
+        AMZN, GOOGL, META, TSLA, INTC, AMAT, LRCX, TSM, UPS, CSX...). They
+        accounted for ~2,500 wasted Finnhub calls a day and the bulk of
+        10,373 dedup fingerprints, against 52 LLM calls actually spent.
+        Skipping them changes no behaviour by construction, and reverses
+        itself the moment an edge appears."""
+        spec = self.spec_by_symbol.get(symbol)
+        if spec is None or not spec.signal_source_only:
+            return True
+        universe = set(self.symbol_list)
+        return any(
+            not (self.spec_by_symbol.get(linked) or spec).signal_source_only
+            for linked, _ in self.graph.linked_symbols(symbol, universe)
+        )
+
     async def _poll_news(self) -> None:
         to_date = date.today().isoformat()
         from_date = (date.today() - timedelta(days=self.settings.news_lookback_days)).isoformat()
+        skipped: list[str] = []
         for symbol in self.symbol_list:
+            if not self._can_produce_evidence(symbol):
+                skipped.append(symbol)
+                continue
             try:
                 articles = await self.finnhub.recent_news(symbol, from_date, to_date)
             except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
@@ -1299,6 +1420,14 @@ class Engine:
                     continue
                 if scored:
                     self.dedup.register(fp, publisher)
+        if skipped:
+            self._warn_once(
+                "anchors-unconnected",
+                f"Skipping news for {len(skipped)} anchor(s) with no graph edge to any tradeable: "
+                f"{', '.join(skipped)}. Their news cannot reach a dossier, so fetching it was pure "
+                "cost. They start being polled the moment an edge to a tradeable appears -- accept "
+                "their pending universe candidates, or drop them from ANCHOR_SYMBOLS.",
+            )
 
     # --- Shared evidence -> dossier pipeline ---
 
@@ -1970,6 +2099,34 @@ class Engine:
                 symbol, as_type, recommended,
                 (self.candidates.get(symbol) or {}).get("recommendation_reason", ""),
             )
+
+    def rebuild_relationship_graph(self) -> dict:
+        """Queues every tradeable's most recent 10-K for relationship
+        re-extraction, by clearing the once-ever backfill marker. The next
+        tick picks it up (see _run_relationship_backfill); graph.add dedupes
+        on (from, to, rel_type), so this can only ever ADD edges.
+
+        Exists because extraction only writes an edge when the counterparty
+        is ALREADY in the universe -- otherwise it records a watchlist
+        candidate and moves on. Every candidate accepted after its
+        discovering filing was processed therefore left a permanent hole:
+        the filer is marked backfilled and never re-read, and backfill skips
+        anchors, so the relationship that justified the acceptance could
+        only reappear with next year's 10-K. _promote_pending_edges closes
+        this going forward; this closes it for everything already
+        discovered.
+
+        Costs one extraction call per tradeable -- 48 against a 3000/day
+        budget running at under 2% -- and no price or trade state is
+        touched."""
+        pending = [s.symbol for s in self.universe if not s.signal_source_only]
+        for symbol in pending:
+            self.backfill_state.delete(symbol)
+        self._backfill_retry_after = 0.0
+        log.warning("[GRAPH] Queued %d tradeable symbol(s) for relationship re-extraction against the "
+                    "current %d-symbol universe. Edges are only ever added, never removed.",
+                    len(pending), len(self.universe))
+        return {"queued": len(pending), "symbols": pending, "edges_before": len(self.graph.relationships)}
 
     def reset_accepted_candidates(self) -> dict:
         """Drops every runtime-accepted symbol, returning the universe to the
