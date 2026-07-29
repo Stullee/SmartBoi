@@ -62,8 +62,19 @@ class FakeFinnhub:
     async def search_ticker_by_name(self, company_name):
         return self.ticker_by_name.get(company_name)
 
+    async def quote_bar(self, symbol):
+        """Values may be a plain float (high=low=close, the common case) or a
+        (close, high, low) tuple for tests that exercise intraday stop/target
+        evaluation off the Finnhub fallback -- same convention as
+        FakePriceFeed."""
+        value = self.quotes_by_symbol.get(symbol)
+        if value is None:
+            return None
+        return value if isinstance(value, tuple) else (value, value, value)
+
     async def quote(self, symbol):
-        return self.quotes_by_symbol.get(symbol)
+        bar = await self.quote_bar(symbol)
+        return bar[0] if bar is not None else None
 
     async def aclose(self):
         pass
@@ -89,11 +100,12 @@ class _ScriptedCallable:
 
 
 class FakeUpdater(_ScriptedCallable):
-    async def propose_update(self, dossier, evidence_text, origin_symbol, relationship_note, relationship_confidence=None):
+    async def propose_update(self, dossier, evidence_text, origin_symbol, relationship_note,
+                             relationship_confidence=None, ecosystem=""):
         self.calls.append({
             "symbol": dossier.symbol, "evidence_text": evidence_text,
             "origin_symbol": origin_symbol, "relationship_note": relationship_note,
-            "relationship_confidence": relationship_confidence,
+            "relationship_confidence": relationship_confidence, "ecosystem": ecosystem,
         })
         return self._next()
 
@@ -111,6 +123,27 @@ class FakeSkeptic(_ScriptedCallable):
 
     async def aclose(self):
         pass
+
+
+class FakeSynthesizer(_ScriptedCallable):
+    async def synthesize(self, dossier, ecosystem="", now=None):
+        self.calls.append({"symbol": dossier.symbol, "ecosystem": ecosystem})
+        return self._next()
+
+    async def aclose(self):
+        pass
+
+
+def synthesis(direction="LONG", confidence=0.9, magnitude=0.9, distinct_fact_count=5,
+              already_priced_in=False, strongest_catalyst="a contract award",
+              thesis="the evidence coheres"):
+    """A well-formed DossierSynthesizer.synthesize() response."""
+    return {
+        "direction": direction, "confidence": confidence, "magnitude": magnitude,
+        "distinct_fact_count": distinct_fact_count, "horizon_days": 20,
+        "already_priced_in": already_priced_in,
+        "strongest_catalyst": strongest_catalyst, "thesis": thesis,
+    }
 
 
 class FakeExtractor(_ScriptedCallable):

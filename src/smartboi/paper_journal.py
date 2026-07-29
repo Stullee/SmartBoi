@@ -286,6 +286,42 @@ class PaperTradeJournal:
         else:
             self._write_open_state()
 
+    def expire_past_horizon(self, now: datetime | None = None) -> list[PaperTrade]:
+        """Closes any open trade that has passed its horizon, WITHOUT needing
+        a fresh price -- it exits at the last price this journal ever saw.
+
+        `update` is the only other thing that can close a trade, and it can
+        only run when a price is available. A symbol no price source can
+        price (delisted, halted, unqualifiable at IB, absent from Finnhub's
+        free tier) therefore produced a trade that never stopped out, never
+        took profit and never timed out: it sat open forever, its dossier
+        pinned at SIGNALED so no fresh signal could ever replace it, and its
+        unrealized P&L quietly excluded from every closed-trade statistic.
+        An open position that cannot be marked is exactly the case a
+        horizon exists for, so the horizon is enforced unconditionally.
+
+        Returns the trades it closed so the caller can alert on them."""
+        now = now or datetime.now(timezone.utc)
+        expired: list[PaperTrade] = []
+        for symbol in list(self.open_trades):
+            trade = self.open_trades[symbol]
+            opened_at = datetime.fromisoformat(trade.opened_at)
+            if (now - opened_at).days < trade.horizon_days:
+                continue
+            # No mark ever landed: exit at entry, i.e. record a flat trade
+            # rather than inventing a price. A flat row is honest about
+            # having learned nothing; a fabricated one is not.
+            exit_price = trade.last_price if trade.last_price is not None else trade.entry_price
+            log.warning(
+                "[PAPER] %s: closing at the horizon on a stale mark (last price %s) -- no price "
+                "source could refresh it. The position could not be marked, so its stop and target "
+                "were never evaluated after that mark.",
+                symbol, "none" if trade.last_price is None else f"{trade.last_price:.2f}",
+            )
+            self._close(trade, "TIMEOUT", exit_price, now)
+            expired.append(trade)
+        return expired
+
     def _close(self, trade: PaperTrade, status: str, exit_price: float, now: datetime) -> None:
         risk = abs(trade.entry_price - trade.stop_price)
         gross = (

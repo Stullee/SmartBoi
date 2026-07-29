@@ -13,6 +13,7 @@ import pytest
 
 from smartboi.config import Settings
 from smartboi.engine import Engine
+from smartboi.universe import spec_by_symbol
 
 from tests.fakes import FakeEdgarClient, FakeFinnhub
 
@@ -58,11 +59,16 @@ async def test_tradeable_recommendation_is_auto_accepted_when_verified(engine):
 
 
 async def test_auto_accept_is_recorded_with_its_source(engine):
-    """Persisted as {"as", "source"} so an auto-add is distinguishable from
-    one a human chose -- that's what makes it auditable and undoable."""
+    """Persisted as {"as", "source", "ecosystem"} so an auto-add is
+    distinguishable from one a human chose (auditable and undoable), and so
+    the ecosystem accept_candidate classified it into survives a restart --
+    it used not to, and _apply_accepted_candidates rebuilt every accepted
+    symbol into the inert "accepted" bucket on startup."""
     engine.candidates.set("ZZZZ", _candidate())
     await engine._auto_accept_candidates()
-    assert engine.accepted_candidates.get("ZZZZ") == {"as": "tradeable", "source": "auto"}
+    assert engine.accepted_candidates.get("ZZZZ") == {
+        "as": "tradeable", "source": "auto", "ecosystem": "custom",
+    }
 
 
 # --- The guards ---
@@ -568,3 +574,53 @@ def test_an_already_accepted_candidate_is_not_retro_blocked(engine):
 
     assert engine._block_junk_candidates() == 0
     assert engine.candidates.get("DHR").get("auto_accept_blocked") is None
+
+
+# --- Ecosystem survives a restart.
+#
+# accept_candidate has always classified an acceptance into the ecosystem of
+# whoever disclosed it, but only persisted {"as", "source"} -- so the
+# classification lived in memory and died at every restart, and
+# _apply_accepted_candidates rebuilt each symbol into the literal "accepted"
+# bucket. That bucket is in _UNCLASSIFIED_ECOSYSTEMS, so _ecosystem_targets
+# returns [] and _can_produce_evidence returns False: every restart quietly
+# re-converted the accepted anchors into symbols whose news is never fetched.
+# Live, that was 64 anchors, with auto-accept adding up to 20 more a day. ---
+
+async def test_accepted_ecosystem_survives_a_restart(engine):
+    engine.candidates.set("ZZZZ", _candidate())
+    await engine._auto_accept_candidates()
+    assert engine.spec_by_symbol["ZZZZ"].ecosystem == "custom"
+
+    restarted = Engine(engine.settings)  # re-reads accepted_candidates.json
+
+    assert restarted.spec_by_symbol["ZZZZ"].ecosystem == "custom"
+
+
+async def test_a_legacy_entry_is_reclassified_from_its_discovery_record(engine):
+    """Persisting the field only helps acceptances made from here on. The
+    live deployment has a 69-symbol backlog written before it, and a
+    candidate is only ever accepted once -- so nothing would revisit them."""
+    engine.candidates.set("ZZZZ", _candidate())
+    # The pre-fix on-disk shape: no ecosystem at all.
+    engine.accepted_candidates.set("ZZZZ", {"as": "anchor", "source": "auto"})
+    engine._apply_accepted_candidates()
+    engine.spec_by_symbol = spec_by_symbol(engine.universe)
+    assert engine.spec_by_symbol["ZZZZ"].ecosystem == "accepted"  # inert
+
+    assert engine._reclassify_accepted_ecosystems() == 1
+
+    assert engine.spec_by_symbol["ZZZZ"].ecosystem == "custom"
+    assert engine.accepted_candidates.get("ZZZZ")["ecosystem"] == "custom"
+    # ...and the type/source it was accepted under are not clobbered.
+    assert engine.accepted_candidates.get("ZZZZ")["as"] == "anchor"
+    assert engine.accepted_candidates.get("ZZZZ")["source"] == "auto"
+
+
+async def test_reclassification_leaves_an_unresolvable_entry_alone(engine):
+    engine.accepted_candidates.set("QQQQ", {"as": "anchor", "source": "auto"})
+    engine._apply_accepted_candidates()
+    engine.spec_by_symbol = spec_by_symbol(engine.universe)
+
+    assert engine._reclassify_accepted_ecosystems() == 0
+    assert engine.accepted_candidates.get("QQQQ") == {"as": "anchor", "source": "auto"}

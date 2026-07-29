@@ -193,7 +193,7 @@ _DIAGNOSTIC_SETTINGS = (
     "min_independent_sources_news_only", "max_horizon_days",
     "max_favorable_drift_pct", "signal_entry_deadline_days",
     "stop_loss_pct", "take_profit_pct", "transaction_cost_bps_per_side",
-    "max_daily_llm_calls", "max_propagated_evidence_per_link",
+    "max_daily_llm_calls", "max_daily_usd", "max_propagated_evidence_per_link",
     "propagated_evidence_cooldown_hours",
     "enable_ecosystem_propagation", "max_ecosystem_evidence_per_link",
     "extraction_model", "dossier_model", "skeptic_model",
@@ -311,7 +311,9 @@ def run_diagnostics(engine) -> str:
 
     u = engine.usage.snapshot()
     add("\n--- LLM usage today ---")
+    budget = f"/${u.daily_usd_budget:.2f}" if u.daily_usd_budget else " (no cap)"
     add(f"  {u.date}: {u.calls}/{u.daily_call_budget} calls, {u.input_tokens:,} in / {u.output_tokens:,} out tokens")
+    add(f"  {' ' * len(u.date)}  ${u.usd_spent:.2f}{budget} estimated spend")
 
     log_dir = Path(s.log_dir)
     signals = read_jsonl(log_dir / "signals.jsonl")

@@ -6,10 +6,14 @@ implements point-by-point.
 Every optional integration degrades gracefully instead of failing to
 start -- see config.py's docstring. Add EDGAR_USER_AGENT and/or
 FINNHUB_API_KEY to start collecting evidence; add ANTHROPIC_API_KEY to
-start scoring it into dossiers; add IB (ENABLE_IB_PRICE_FEED=true) to start
-actually opening/marking hypothetical positions. Signals are detected and
-logged (signals.jsonl) the moment ANTHROPIC_API_KEY is present, regardless
-of whether IB is configured yet.
+start scoring it into dossiers. Signals are detected and logged
+(signals.jsonl) the moment ANTHROPIC_API_KEY is present. Opening and
+marking hypothetical positions needs a price source -- IB
+(ENABLE_IB_PRICE_FEED=true) when available, otherwise Finnhub's /quote,
+which the same FINNHUB_API_KEY already covers (see _price_bar). IB is
+preferred, never required: it was the sole entry price source for a while,
+which meant an unreachable Gateway silently blocked the system's only
+output.
 
 Evidence is only marked as seen (dedup-registered) once it has been
 handled DEFINITIVELY -- scored into dossiers, judged not-new, or refuted
@@ -35,11 +39,12 @@ from pathlib import Path
 from smartboi.alerts import AlertSender
 from smartboi.config import Settings
 from smartboi.dedup import DedupIndex, fingerprint, source_domain
-from smartboi.edgar import _truncate_head_tail
+from smartboi.edgar import _truncate_head_tail, describe_8k_items
 from smartboi.dossier import (
     DIRECTIONS,
     Dossier,
     DossierStore,
+    DossierSynthesizer,
     DossierUpdater,
     EvidenceRecord,
     has_evidence,
@@ -50,7 +55,7 @@ from smartboi.edgar import EdgarClient, FilingEvent
 from smartboi.graph import REL_TYPES, RelationshipExtractor, RelationshipGraph, Relationship
 from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal, cost_bps_per_side_for_cap
-from smartboi.prices import ReadOnlyPriceFeed
+from smartboi.prices import PriceBar, ReadOnlyPriceFeed
 from smartboi.ratelimit import SlidingWindowLimiter
 from smartboi.signals import evaluate, favorable_drift_pct, log_decision, log_signal, signal_expired
 from smartboi.skeptic import Skeptic
@@ -96,6 +101,22 @@ HEARTBEAT_INTERVAL_SEC = 600
 # and rarely restate customer/supplier relationships, so extraction time is
 # spent on the two disclosure-heavy forms.
 RELATIONSHIP_EXTRACTION_FORMS = ("10-K", "10-Q")
+# How much of a filing's text reaches the dossier updater as one evidence
+# item. Raised from 4,000: with 8-K exhibits now included (see
+# edgar.fetch_evidence_text), the highest-value content in the whole system
+# -- the company's own press release announcing a contract award, product
+# launch or guidance revision -- arrives in this string, and 4,000 chars
+# (~1,000 tokens) truncated a typical release mid-way through the paragraph
+# carrying the actual numbers. ~3,000 tokens per filing item is affordable:
+# filings are a small minority of evidence volume, and the live deployment
+# runs at ~6% of its daily LLM call budget.
+FILING_EVIDENCE_CHARS = 12_000
+# How far below the signal threshold a SIGNALED-but-unopened dossier must
+# fall before a NON-entry-gate path (freshly merged evidence, the daily decay
+# pass) is allowed to expire it, expressed as a fraction of the threshold --
+# but only until the entry gate has evaluated the episode once. See
+# Engine._should_expire_unopened for why the grace period exists at all.
+SIGNAL_EXPIRY_HYSTERESIS = 0.8
 # Best-effort filter on universe candidates that never resolve to a real
 # ticker (see _record_universe_candidate): government bodies, regulators,
 # generic customer-class descriptions ("public utilities"), and lenders are
@@ -191,6 +212,16 @@ def _non_common_reason(symbol: str) -> str:
     return ""
 
 
+def _clamp_unit(value, default: float = 0.0) -> float:
+    """A model-supplied 0-1 number, clamped. Tool schemas declare min/max but
+    Anthropic tool use does not hard-enforce them, so an out-of-range value
+    can arrive -- and here it would flow straight into a trade decision."""
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _clamped_confidence(value, default: float = 0.5) -> float:
     """The extractor's confidence, coerced into [0, 1]. Anthropic tool use
     does not hard-enforce the declared schema, so this must survive a
@@ -261,7 +292,8 @@ class Engine:
         # _check_model_provenance for why a change to these matters.
         self.model_state = JsonState(DATA_DIR / "model_provenance.json")
         self.alerts = AlertSender(settings.alert_webhook_url)
-        self.usage = UsageTracker(DATA_DIR / "llm_usage.json", settings.max_daily_llm_calls)
+        self.usage = UsageTracker(DATA_DIR / "llm_usage.json", settings.max_daily_llm_calls,
+                                  daily_usd_budget=settings.max_daily_usd)
 
         self.universe: list[CompanySpec] = list(settings.universe)
         self._apply_accepted_candidates()
@@ -308,6 +340,7 @@ class Engine:
         self.extractor: RelationshipExtractor | None = None
         self.updater: DossierUpdater | None = None
         self.skeptic: Skeptic | None = None
+        self.synthesizer: DossierSynthesizer | None = None
         self.price_feed: ReadOnlyPriceFeed | None = None
 
         self._warned: set[str] = set()
@@ -350,27 +383,95 @@ class Engine:
         return [c.symbol for c in self.universe]
 
     @staticmethod
-    def _accepted_entry(value) -> tuple[str, str]:
-        """(as_type, source) from an accepted_candidates.json entry. Entries
-        were originally a bare "tradeable"/"anchor" string and are now a
-        {"as", "source"} dict recording whether a human or the engine
-        accepted it (see accept_candidate) -- both shapes are read so an
-        existing file keeps working untouched across the upgrade."""
+    def _accepted_entry(value) -> tuple[str, str, str]:
+        """(as_type, source, ecosystem) from an accepted_candidates.json
+        entry. Entries were originally a bare "tradeable"/"anchor" string,
+        then a {"as", "source"} dict recording whether a human or the engine
+        accepted it, and now additionally carry the ecosystem accept_candidate
+        classified them into -- every shape is read, so an existing file keeps
+        working untouched across the upgrade."""
         if isinstance(value, dict):
-            return value.get("as", "tradeable"), value.get("source", "manual")
-        return value, "manual"
+            return (
+                value.get("as", "tradeable"),
+                value.get("source", "manual"),
+                value.get("ecosystem") or "accepted",
+            )
+        return value, "manual", "accepted"
 
     def _apply_accepted_candidates(self) -> None:
+        """Rebuilds runtime-accepted symbols into the live universe at
+        startup.
+
+        The ecosystem comes from the persisted entry, not a hardcoded
+        "accepted". accept_candidate has always classified an acceptance into
+        the ecosystem of whoever disclosed it (guess_ecosystem), but only
+        stored {"as", "source"} -- so the classification lived in memory and
+        died at every restart, and this function rebuilt all of them into the
+        literal "accepted" bucket. That bucket is in _UNCLASSIFIED_ECOSYSTEMS,
+        which makes _ecosystem_targets return [] and _can_produce_evidence
+        return False, so every restart quietly re-converted the accepted
+        anchors into inert symbols whose news is never fetched. Live, that was
+        64 anchors -- and auto-accept keeps manufacturing more at up to 20 a
+        day. See _reclassify_accepted_ecosystems for the repair of entries
+        written before the ecosystem was persisted."""
         known = {c.symbol for c in self.universe}
         for symbol, value in self.accepted_candidates.data.items():
             if symbol in known:
                 continue
-            as_type, source = self._accepted_entry(value)
+            as_type, source, ecosystem = self._accepted_entry(value)
             self.universe.append(
-                CompanySpec(symbol, symbol, "accepted", signal_source_only=(as_type == "anchor"),
+                CompanySpec(symbol, symbol, ecosystem, signal_source_only=(as_type == "anchor"),
                             notes=f"Accepted ({source}) from a discovered universe candidate")
             )
             known.add(symbol)
+
+    def _reclassify_accepted_ecosystems(self) -> int:
+        """One-shot repair for acceptances written before the ecosystem was
+        persisted: re-run guess_ecosystem over each unclassified accepted
+        symbol's own discovery record and write the answer back.
+
+        Without this, every already-accepted symbol stays in the
+        "accepted" bucket forever -- persisting the field only helps symbols
+        accepted from here on, and the live deployment has a 69-symbol
+        backlog that would never be revisited (a candidate is only accepted
+        once). Runs after the universe is built so guess_ecosystem resolves
+        against curated AND already-classified accepted specs, and iterates
+        until it stops making progress, so a chain (accepted symbol
+        discovered via another accepted symbol) resolves rather than
+        depending on dict order."""
+        repaired = 0
+        for _ in range(len(self.accepted_candidates.data) or 1):
+            progressed = 0
+            for symbol, value in list(self.accepted_candidates.data.items()):
+                as_type, source, ecosystem = self._accepted_entry(value)
+                if ecosystem not in _UNCLASSIFIED_ECOSYSTEMS:
+                    continue
+                related = (self.candidates.get(symbol) or {}).get("related_to") or []
+                guessed = guess_ecosystem(related, self.spec_by_symbol)
+                if guessed in _UNCLASSIFIED_ECOSYSTEMS:
+                    continue
+                self.accepted_candidates.set(
+                    symbol, {"as": as_type, "source": source, "ecosystem": guessed}
+                )
+                spec = self.spec_by_symbol.get(symbol)
+                if spec is not None:
+                    updated = CompanySpec(
+                        spec.symbol, spec.name, guessed,
+                        signal_source_only=spec.signal_source_only, notes=spec.notes,
+                    )
+                    self.universe = [updated if c.symbol == symbol else c for c in self.universe]
+                    self.spec_by_symbol[symbol] = updated
+                progressed += 1
+            repaired += progressed
+            if not progressed:
+                break
+        if repaired:
+            log.info(
+                "[UNIVERSE] Reclassified %d previously-unclassified accepted symbol(s) into a real "
+                "ecosystem. Their news can now reach a tradeable via ecosystem-fallback propagation; "
+                "before this they were inert on every restart.", repaired,
+            )
+        return repaired
 
     def accept_candidate(self, symbol: str, as_type: str, source: str = "manual") -> CompanySpec:
         """Adds a discovered universe candidate (see
@@ -428,7 +529,15 @@ class Engine:
         # recorded, so an auto-accepted symbol is distinguishable from one a
         # human chose -- _apply_accepted_candidates reads both shapes, so
         # existing files written before this keep working untouched.
-        self.accepted_candidates.set(symbol, {"as": as_type, "source": source})
+        #
+        # The ECOSYSTEM is persisted alongside. It used not to be, so this
+        # classification existed only in memory: the very next restart
+        # rebuilt the symbol into the flat "accepted" bucket, which
+        # _ecosystem_targets treats as unclassified and refuses to propagate
+        # from. Every acceptance was silently undone within hours.
+        self.accepted_candidates.set(
+            symbol, {"as": as_type, "source": source, "ecosystem": ecosystem}
+        )
         promoted = self._promote_pending_edges(symbol)
         log.info("[CANDIDATE] %s accepted (%s) into the universe as %s -- polled starting next cycle, "
                  "%d disclosed relationship(s) written into the graph.", symbol, source, as_type, promoted)
@@ -541,6 +650,10 @@ class Engine:
     async def start(self) -> None:
         self._check_model_provenance()
         self._seed_graph()
+        # Repairs acceptances written before the ecosystem was persisted (see
+        # _apply_accepted_candidates). Runs here rather than in __init__ so it
+        # resolves against the seeded graph and the fully-built universe.
+        self._reclassify_accepted_ecosystems()
 
         if self.settings.enable_edgar_ingestion and self.settings.edgar_user_agent.strip():
             self.edgar_client = EdgarClient(self.settings.edgar_user_agent, DATA_DIR / "edgar_cik_cache.json")
@@ -565,6 +678,13 @@ class Engine:
             self.extractor = RelationshipExtractor(self.settings.anthropic_api_key, self.settings.extraction_model, self.usage)
             self.updater = DossierUpdater(self.settings.anthropic_api_key, self.settings.dossier_model, self.usage)
             self.skeptic = Skeptic(self.settings.anthropic_api_key, self.settings.skeptic_model, self.usage)
+            # Same model as the skeptic: synthesis is the hardest judgement
+            # in the system (is this N facts or one fact N times?) and it
+            # runs at most once a day per tradeable, so it is the cheapest
+            # place in the pipeline to spend on reasoning quality.
+            self.synthesizer = DossierSynthesizer(
+                self.settings.anthropic_api_key, self.settings.skeptic_model, self.usage
+            )
             log.info(
                 "Dossier engine (Claude): ENABLED (daily LLM call budget: %d, see MAX_DAILY_LLM_CALLS)",
                 self.settings.max_daily_llm_calls,
@@ -595,9 +715,15 @@ class Engine:
                 log.warning(
                     "Read-only IB price feed: could not connect to %s:%s at startup -- will keep retrying "
                     "every %d min in the background. Signals are still detected and logged "
-                    "(logs/signals.jsonl) while unreachable.",
+                    "(logs/signals.jsonl), and entries/marks fall back to Finnhub quotes, while unreachable.",
                     self.settings.ib_host, self.settings.ib_port, IB_RETRY_GAP_SEC // 60,
                 )
+        if not self._has_price_source():
+            log.warning(
+                "No price source configured (ENABLE_IB_PRICE_FEED is off and there is no FINNHUB_API_KEY) "
+                "-- signals will be detected and logged, but no paper trade can ever be OPENED or marked. "
+                "A Finnhub free-tier key alone is enough for the full paper-trade loop.",
+            )
         else:
             self._warn_once(
                 "ib",
@@ -652,6 +778,8 @@ class Engine:
                 await self.updater.aclose()
             if self.skeptic is not None:
                 await self.skeptic.aclose()
+            if self.synthesizer is not None:
+                await self.synthesizer.aclose()
             if self.price_feed is not None:
                 self.price_feed.disconnect()
             await self.alerts.aclose()
@@ -677,6 +805,42 @@ class Engine:
             return min(self.settings.signal_entry_poll_interval_sec, self.settings.price_poll_interval_sec)
         return self.settings.price_poll_interval_sec
 
+    async def _run_entry_and_marking_poll(self) -> None:
+        """The price poll: evaluate pending entries and mark open trades.
+
+        Reads the clock ITSELF rather than taking the tick's opening
+        timestamp. It used to be tested against a `now` captured before a
+        full EDGAR + news sweep ran, so on a slow tick the due-check compared
+        against a clock that was already minutes stale and judged the poll
+        not-due when it was. That systematically under-ran the one pass that
+        produces this system's only output."""
+        now = time.monotonic()
+        price_interval = self._price_poll_interval()
+        if not self._has_price_source() or not self._due(self._last_price_poll, price_interval, now):
+            return
+        # IB is opportunistic here, not required. It used to gate the whole
+        # pass: an unreachable Gateway meant _mark_and_execute never ran, so
+        # no signal could become a paper trade and no open trade could be
+        # marked -- even with a perfectly good Finnhub quote available and
+        # already being used for the daily price marks. Now the connection
+        # attempt only decides which SOURCE serves the pass (see _price_bar),
+        # never whether it happens.
+        ib_up = self.price_feed is not None and await self.price_feed.ensure_connected()
+        if self.price_feed is not None and not ib_up:
+            self._warn_once(
+                "ib-unreachable",
+                f"IB Gateway unreachable -- the price feed keeps retrying every {IB_RETRY_GAP_SEC // 60} min "
+                "in the background. Entries and trade marks fall back to Finnhub quotes meanwhile. "
+                "Set ENABLE_IB_PRICE_FEED=false if you don't want it at all.",
+            )
+        if ib_up or self.finnhub is not None:
+            self._last_price_poll = now
+            await self._mark_and_execute()
+        else:
+            # IB down and no Finnhub key: nothing can price anything.
+            # Leave the poll pending but back off the connection attempt.
+            self._last_price_poll = now - price_interval + IB_RETRY_GAP_SEC
+
     def _log_heartbeat(self) -> None:
         signaled = sum(1 for s in self.dossiers.all_symbols() if self.dossiers.load(s).status == "SIGNALED")
         log.info(
@@ -688,6 +852,36 @@ class Engine:
 
     async def _tick(self) -> None:
         now = time.monotonic()
+        # ORDER MATTERS, and it used to be wrong in three compounding ways.
+        #
+        # The two passes that can FIRE a signal (the daily decay pass) and the
+        # one that can ACT on it (the price/entry poll) both ran at the BOTTOM
+        # of the tick, behind a full EDGAR sweep of 209 symbols and a news
+        # sweep that spends two LLM calls per article. Three consequences,
+        # all of which cost trades:
+        #
+        #  1. `now` was captured once at the top and then reused to decide
+        #     whether the price poll was due -- after ingestion had already
+        #     burned minutes of wall clock. The entry poll was therefore
+        #     tested against a stale clock and judged not-due more often than
+        #     it should have been.
+        #  2. A signal fired by the decay pass could not get an entry
+        #     evaluation in the same tick, because the price poll had already
+        #     stamped _last_price_poll and would not be due again for a full
+        #     entry interval.
+        #  3. A signal fired mid-news-poll could be EXPIRED by a later article
+        #     in the very same poll (see _update_dossier) without the entry
+        #     gate ever having seen it once.
+        #
+        # So both now run FIRST, in the order fire-then-act, and the price
+        # poll re-reads the clock. Ingestion is the slow, latency-tolerant
+        # part of the tick and belongs behind them.
+        if self._daily_pass_due("decay_pass"):
+            self._archive_orphaned_dossiers()
+            await self._run_decay_pass()
+            self._mark_daily_pass_done("decay_pass")
+        await self._run_entry_and_marking_poll()
+
         if (
             self.settings.enable_relationship_backfill
             and self.edgar_client is not None
@@ -706,36 +900,27 @@ class Engine:
         if self.finnhub is not None and self._due(self._last_news_poll, self.settings.news_poll_interval_sec, now):
             self._last_news_poll = now
             await self._poll_news()
-        price_interval = self._price_poll_interval()
-        if self.price_feed is not None and self._due(self._last_price_poll, price_interval, now):
-            if await self.price_feed.ensure_connected():
-                self._last_price_poll = now
-                await self._mark_and_execute()
-            else:
-                self._warn_once(
-                    "ib-unreachable",
-                    f"IB Gateway unreachable -- the price feed keeps retrying every {IB_RETRY_GAP_SEC // 60} min "
-                    "in the background. Set ENABLE_IB_PRICE_FEED=false if you don't want it yet.",
-                )
-                # Leave the poll pending but back off the connection attempt.
-                self._last_price_poll = now - price_interval + IB_RETRY_GAP_SEC
+        # Ingestion above may have fired a signal. Run the entry poll again so
+        # it gets its evaluation inside THIS tick rather than waiting out a
+        # full entry interval -- _fire_signal clears _last_price_poll on a
+        # fresh episode, so this second call is a cheap no-op (one _due check)
+        # unless something actually became SIGNALED.
+        await self._run_entry_and_marking_poll()
+
         if (
             self.finnhub is not None
             and self.settings.enable_universe_autoscreen
             and self._universe_screen_due()
         ):
             await self._run_universe_screen()
-        # Scheduled off persisted wall-clock, not a process-local marker: a
-        # monotonic marker resets to "due immediately" on every restart, and
-        # this pass is no longer the harmless idempotent re-score it was when
-        # that was written -- it EXPIRES a SIGNALED dossier that has slipped
-        # below the bar. With a restart-triggered decay pass and a 6-hourly
-        # price poll, a marginal signal could be killed several times a day
-        # before the entry gate ever looked at it.
-        if self._daily_pass_due("decay_pass"):
-            self._archive_orphaned_dossiers()
-            await self._run_decay_pass()
-            self._mark_daily_pass_done("decay_pass")
+        # (The decay pass runs at the TOP of the tick -- see the ordering
+        # note there. It is scheduled off persisted wall-clock rather than a
+        # process-local marker: a monotonic marker resets to "due
+        # immediately" on every restart, and this pass is not the harmless
+        # idempotent re-score it once was -- it both FIRES and EXPIRES
+        # signals, so a restart-triggered pass is an extra chance to kill a
+        # pending signal before the entry gate has looked at it.)
+        #
         # Both daily passes are marked done AFTER a successful run, not
         # before: forward data can't be backfilled, so a pass that raised
         # (disk error, feed dropping mid-fetch) must stay due and be
@@ -901,12 +1086,21 @@ class Engine:
 
         # Head + tail rather than a flat prefix: the first few thousand
         # characters of a filing are mostly the SEC cover page and checkbox
-        # boilerplate, so a flat text[:4000] often fed the dossier engine
+        # boilerplate, so a flat text[:N] often fed the dossier engine
         # near-zero actual content -- the disclosed items sit further in.
         evidence_text = (
             f"SEC {filing.form} filed {filing.filing_date} for {symbol}:\n"
-            f"{_truncate_head_tail(text, 4000)}"
+            f"{_truncate_head_tail(text, FILING_EVIDENCE_CHARS)}"
         )
+        # The item codes go in the HEADLINE, not only the body: the headline
+        # is what survives into the evidence record and into a paper trade's
+        # citations, so "DCO 8-K (Item 1.01: Entry into a Material Definitive
+        # Agreement)" is a readable audit trail where "DCO 8-K filed
+        # 2026-07-28" was not.
+        item_description = describe_8k_items(filing.items) if filing.form.startswith("8-K") else ""
+        headline = f"{symbol} {filing.form} filed {filing.filing_date}"
+        if item_description:
+            headline = f"{headline} -- {item_description}"
         scored = await self._process_evidence(
             origin_symbol=symbol,
             evidence_text=evidence_text,
@@ -922,7 +1116,7 @@ class Engine:
             # story than two truly independent confirmations.
             source_name=f"SEC EDGAR ({filing.form})",
             url=filing.document_url,
-            headline=f"{symbol} {filing.form} filed {filing.filing_date}",
+            headline=headline,
             published_at=filing.filing_date,
         )
         if scored:
@@ -1836,8 +2030,10 @@ class Engine:
         cached = self._pending_proposals.get(proposal_key)
         proposed = cached[0] if cached is not None else None
         if proposed is None:
+            target_spec = self.spec_by_symbol.get(target_symbol)
             raw = await self.updater.propose_update(
-                dossier, evidence_text, origin_symbol, relationship_note, relationship_confidence
+                dossier, evidence_text, origin_symbol, relationship_note, relationship_confidence,
+                ecosystem=target_spec.ecosystem if target_spec is not None else "",
             )
             if raw is None:
                 return "deferred"  # transient LLM failure or budget exhausted -- retry later
@@ -1902,17 +2098,93 @@ class Engine:
                           self.settings.min_independent_sources_news_only)
         if signal is not None:
             await self._fire_signal(dossier, signal)
-        elif dossier.status == "SIGNALED" and not self.journal.has_open(target_symbol):
+        elif (
+            dossier.status == "SIGNALED"
+            and not self.journal.has_open(target_symbol)
+            and self._should_expire_unopened(dossier)
+        ):
             # Newly merged evidence dropped the thesis below the signal bar
             # (or flipped it) while it sat SIGNALED-but-unopened. Left
             # as-is, the next price poll would still open a paper trade on
             # a thesis that no longer qualifies -- possibly in the OPPOSITE
             # direction from the one that signaled, against a baseline
-            # snapped for the old thesis.
+            # snapped for the old thesis. _should_expire_unopened is what
+            # keeps a MARGINAL dip from killing an episode the entry gate
+            # has not evaluated even once.
             self._expire_signal(dossier, self._below_bar_reason(dossier, "when fresh evidence merged"))
         return "handled"
 
     # --- Price marking / hypothetical execution ---
+
+    def _has_price_source(self) -> bool:
+        """Whether ANY price source exists -- IB or Finnhub's /quote.
+
+        The entry gate used to be reachable only through IB: _tick called
+        _mark_and_execute exclusively under `self.price_feed is not None`, so
+        a deployment without ENABLE_IB_PRICE_FEED could accumulate evidence,
+        cross the bar, fire a signal and log it -- and then never, under any
+        circumstances, open the paper trade that is the entire point of the
+        system. Finnhub's /quote was already trusted enough to set the
+        signal-time drift BASELINE (_snapshot_signal_price) and to write the
+        daily forward-validation price marks (_run_daily_price_marks); there
+        was never a reason it couldn't also price an entry."""
+        return self.price_feed is not None or self.finnhub is not None
+
+    async def _price_bar(self, symbol: str) -> PriceBar | None:
+        """One symbol's latest bar, IB first and Finnhub second.
+
+        IB is preferred where it works: it is a real historical daily bar
+        with true session extremes. But it fails in ways that are invisible
+        from here and routine in practice -- a Gateway whose market-data
+        farms are down (live: "farms not connected: eufarm; euhmds"), a
+        symbol with no market-data subscription on the account, a share
+        class SMART won't route. Every one of those returns None, and a None
+        at the entry gate used to mean no trade, ever, with no fallback and
+        no diagnostic. Finnhub's /quote covers US common stock on the free
+        tier and carries the session high/low, so it is a genuine substitute
+        rather than a degraded one."""
+        if self.price_feed is not None:
+            try:
+                bar = await self.price_feed.last_bar(symbol)
+            except Exception:  # noqa: BLE001 - fall through to Finnhub, never propagate
+                log.exception("%s: IB price lookup failed -- trying Finnhub.", symbol)
+            else:
+                if bar is not None:
+                    return bar
+        if self.finnhub is not None:
+            try:
+                quote = await self.finnhub.quote_bar(symbol)
+            except Exception:  # noqa: BLE001 - a missing price is a no-op, never a crash
+                log.exception("%s: Finnhub quote lookup failed.", symbol)
+                return None
+            if quote is not None:
+                return PriceBar(close=quote[0], high=quote[1], low=quote[2])
+        return None
+
+    async def _price_bars(self, symbols: list[str]) -> dict[str, PriceBar]:
+        """Same IB-then-Finnhub resolution as _price_bar, batched. IB is
+        asked for the whole list at once (it paces its own requests), then
+        Finnhub fills in whatever IB could not price -- the same shape
+        _run_daily_price_marks already used, so an open paper trade is
+        marked to market on exactly the days the forward-validation record
+        has a price for it, not fewer."""
+        bars: dict[str, PriceBar] = {}
+        if self.price_feed is not None:
+            try:
+                bars = dict(await self.price_feed.last_bars(symbols))
+            except Exception:  # noqa: BLE001 - fall through to Finnhub
+                log.exception("IB batch price lookup failed -- trying Finnhub.")
+        missing = [s for s in symbols if s not in bars]
+        if missing and self.finnhub is not None:
+            for symbol in missing:
+                try:
+                    quote = await self.finnhub.quote_bar(symbol)
+                except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
+                    log.exception("%s: Finnhub quote lookup failed.", symbol)
+                    continue
+                if quote is not None:
+                    bars[symbol] = PriceBar(close=quote[0], high=quote[1], low=quote[2])
+        return bars
 
     async def _fire_signal(self, dossier: Dossier, signal) -> None:
         """Logs a signal and, for a fresh episode, flips the dossier to
@@ -1941,6 +2213,15 @@ class Engine:
             # than letting this wait up to price_poll_interval_sec (6h) for
             # its first entry evaluation.
             self._entry_pending = True
+            # ...and make that first evaluation happen on the NEXT TICK (30s)
+            # rather than a full entry interval (15 min) from now. Clearing
+            # the marker is what makes the difference between a fresh episode
+            # being offered to the entry gate promptly and it spending its
+            # first quarter-hour exposed to every expiry path in the system
+            # -- newly merged evidence dipping it below the bar, or the decay
+            # pass -- without the gate ever having seen it once. The first
+            # signal this system ever fired died exactly that way.
+            self._last_price_poll = None
         log_signal(Path(self.settings.log_dir) / "signals.jsonl", signal, episode=dossier.signaled_at)
         await self.alerts.send(
             "signal",
@@ -1963,13 +2244,13 @@ class Engine:
         dossier.drift_alert_sent = False
         dossier.signaled_price = None
         try:
-            if self.price_feed is not None and await self.price_feed.ensure_connected():
-                dossier.signaled_price = await self.price_feed.last_price(dossier.symbol)
-            if dossier.signaled_price is None and self.finnhub is not None:
-                # Finnhub's /quote keeps the drift baseline usable when IB
-                # is down or not configured -- a missing baseline silently
-                # disables the "are we too late" check for this signal.
-                dossier.signaled_price = await self.finnhub.quote(dossier.symbol)
+            if self.price_feed is not None:
+                await self.price_feed.ensure_connected()
+            # _price_bar is IB-then-Finnhub: Finnhub's /quote keeps the drift
+            # baseline usable when IB is down or not configured -- a missing
+            # baseline silently disables the "are we too late" check.
+            bar = await self._price_bar(dossier.symbol)
+            dossier.signaled_price = bar.close if bar is not None else None
         except Exception:  # noqa: BLE001 - a missing baseline just disables the drift check for this signal
             log.exception("%s: could not snapshot signal-time price.", dossier.symbol)
 
@@ -1979,6 +2260,37 @@ class Engine:
         dossier.signaled_price = None
         dossier.signaled_direction = ""
         dossier.drift_alert_sent = False
+        dossier.entry_attempts = 0
+
+    def _should_expire_unopened(self, dossier: Dossier) -> bool:
+        """Whether a SIGNALED-but-unopened dossier that no longer clears the
+        bar should be expired NOW, by a path that is not the entry gate
+        (newly merged evidence, or the daily decay pass).
+
+        Both of those paths used to expire unconditionally, with no dwell
+        time and no requirement that the entry gate had ever run. That is a
+        real trade-killer at this system's cadences: the news poll walks 209
+        symbols spending two LLM calls per article, so an episode fired
+        early in a poll is exposed for the whole rest of that poll, and ONE
+        skeptic-approved contrary item is enough to end it -- confidence is
+        multiplied by `1 - mass_opposing/mass_agree` (dossier._aggregate), so
+        first opposing evidence moves the score sharply. The episode dies,
+        its price baseline is wiped, and the entry gate never saw it.
+
+        Two carve-outs, and only two:
+        - A direction FLIP always expires immediately. A stale SIGNALED
+          status pointing the wrong way is worse than no signal at all.
+        - Before the gate has evaluated this episode even once, a dip has to
+          be MATERIAL (below `SIGNAL_EXPIRY_HYSTERESIS` of the bar), not
+          marginal. Once entry_attempts > 0 the gate has had its look and
+          the normal, strict bar applies again -- this is a grace period for
+          the first evaluation, not a permanently softer threshold."""
+        if dossier.direction != dossier.signaled_direction:
+            return True
+        if dossier.entry_attempts > 0:
+            return True
+        score = dossier.confidence * dossier.magnitude
+        return score < self.settings.signal_confidence_threshold * SIGNAL_EXPIRY_HYSTERESIS
 
     def _record_decision(self, event: str, symbol: str, direction: str, episode: str,
                          price: float | None = None, reason: str = "") -> None:
@@ -2049,6 +2361,19 @@ class Engine:
         stayed SIGNALED. Opening from the stale status alone would take a
         position the current evidence no longer justifies -- possibly in
         the opposite direction from the thesis that actually signaled."""
+        # Recorded BEFORE any early return: reaching this function at all is
+        # what "the entry gate has looked at this episode" means, and the
+        # pre-gate expiry grace period (see _should_expire_unopened) keys off
+        # it. Persisted below alongside whatever this evaluation decides; an
+        # expiry resets it with the rest of the episode state. Persisted
+        # immediately rather than left to whichever branch happens to save:
+        # most of the paths out of this function (drift skip on a repeat
+        # poll, no price yet, a successful open) do not write the dossier at
+        # all, and a counter that only survives on the expiry paths would be
+        # exactly backwards.
+        dossier.entry_attempts += 1
+        self.dossiers.save(dossier)
+
         # Each failure mode gets its own reason string, with the numbers that
         # caused it: "no longer qualifies" told a reader nothing about WHY a
         # signal died, and the decisions ledger exists precisely so that
@@ -2065,12 +2390,29 @@ class Engine:
                 "before an entry was confirmed",
             )
             return
-        try:
-            price = await self.price_feed.last_price(symbol)
-        except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
-            log.exception("%s: could not fetch entry price.", symbol)
-            return
+        # IB first, Finnhub second (see _price_bar). Entry used to be the one
+        # place in the system with NO fallback -- _snapshot_signal_price and
+        # _run_daily_price_marks both already fell back to Finnhub, but the
+        # gate that actually opens the trade did not, so an IB outage was a
+        # total block on the system's only output.
+        bar = await self._price_bar(symbol)
+        price = bar.close if bar is not None else None
         if price is None:
+            # No price from ANY source. Deliberately still deadline-checked
+            # rather than a bare return: the deadline check used to sit below
+            # this early return, so a signal on an unpriceable symbol never
+            # opened AND never expired -- it stayed SIGNALED forever, holding
+            # the tightened entry poll cadence open and blocking the dossier
+            # from ever producing a fresh, cleanly-baselined signal later.
+            if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
+                self._expire_signal(dossier, "no price available from any source within the entry deadline")
+            else:
+                self._warn_once(
+                    f"no-entry-price:{symbol}",
+                    f"{symbol}: signal is waiting on the entry gate but no price source could price it "
+                    "(IB unreachable/unsubscribed and no Finnhub quote). It will expire at the entry "
+                    f"deadline ({self.settings.signal_entry_deadline_days}d) if nothing can price it.",
+                )
             return
 
         if dossier.signaled_price is not None:
@@ -2172,10 +2514,26 @@ class Engine:
                 pending = True
         self._entry_pending = pending
 
+        # Enforced BEFORE the price fetch and independent of it: a trade on a
+        # symbol nothing can price would otherwise stay open forever, pinning
+        # its dossier at SIGNALED so no fresh signal could replace it.
+        for trade in self.journal.expire_past_horizon():
+            await self.alerts.send(
+                "paper_trade_closed",
+                f"Paper trade closed: {trade.symbol} {trade.status} (stale mark)",
+                f"{trade.direction} entry={trade.entry_price:.2f} exit={trade.exit_price:.2f} "
+                f"R={trade.r_multiple:.2f}. Closed at its horizon without a fresh price -- no "
+                "source could mark it.",
+                asdict(trade),
+            )
+            dossier = self.dossiers.load(trade.symbol)
+            self._reset_to_active(dossier)
+            self.dossiers.save(dossier)
+
         open_symbols = list(self.journal.open_trades.keys())
         if not open_symbols:
             return
-        bars = await self.price_feed.last_bars(open_symbols)
+        bars = await self._price_bars(open_symbols)
         for symbol, bar in bars.items():
             trade = self.journal.open_trades.get(symbol)
             if trade is None:
@@ -2269,17 +2627,81 @@ class Engine:
             # unconditionally costs nothing.
             if self.journal.has_open(symbol):
                 continue
+            # Synthesis runs here and nowhere else: once a day, only for a
+            # dossier that has resolved a direction, so this is a few dozen
+            # calls against a budget the deployment runs at a few percent of.
+            await self._apply_synthesis(dossier, now)
             signal = evaluate(dossier, self.settings.signal_confidence_threshold,
                               self.settings.min_independent_sources,
                               self.settings.min_independent_sources_news_only)
             if signal is None:
-                if dossier.status == "SIGNALED":
+                if dossier.status == "SIGNALED" and self._should_expire_unopened(dossier):
                     self._expire_signal(dossier, self._below_bar_reason(dossier, "on the daily decay pass"))
             elif dossier.status == "ACTIVE":
                 log.info("[SIGNAL] %s: qualifies on the daily decay pass with no new evidence "
                          "(score=%.3f, sources=%d).", symbol,
                          dossier.confidence * dossier.magnitude, dossier.independent_source_count)
                 await self._fire_signal(dossier, signal)
+
+    async def _apply_synthesis(self, dossier: Dossier, now: datetime) -> None:
+        """Runs the whole-evidence-body pass and folds its verdict into the
+        dossier as a CAP on the arithmetic aggregate.
+
+        A cap, never a lift. The arithmetic aggregate is a mechanical sum
+        over independently-scored items and has no way to notice that ten of
+        them are one story restated, that the facts do not cohere, or that
+        the market already made the connection -- so synthesis is given the
+        power to veto and to trim, which is exactly the set of errors it can
+        see and the aggregate cannot. It is deliberately NOT given the power
+        to raise a score into a trade: that would make one model call a
+        single point of failure for committing capital, and this system's
+        whole premise is that a thesis has to survive accumulation and an
+        adversarial pass rather than one confident opinion.
+
+        Failure is a no-op, not a block: a transient error or an exhausted
+        budget leaves the arithmetic aggregate exactly as it was."""
+        if self.synthesizer is None or dossier.direction not in ("LONG", "SHORT"):
+            return
+        spec = self.spec_by_symbol.get(dossier.symbol)
+        verdict = await self.synthesizer.synthesize(
+            dossier, ecosystem=spec.ecosystem if spec is not None else "", now=now,
+        )
+        if verdict is None:
+            return
+
+        dossier.synthesis_at = now.isoformat()
+        dossier.synthesis_note = str(verdict.get("thesis") or "")[:600]
+        dossier.synthesis_catalyst = str(verdict.get("strongest_catalyst") or "")[:300]
+        dossier.distinct_fact_count = int(verdict.get("distinct_fact_count") or 0)
+        dossier.already_priced_in = bool(verdict.get("already_priced_in"))
+
+        if verdict.get("direction") != dossier.direction or dossier.already_priced_in:
+            # Synthesis disagrees with the resolved direction, or says the
+            # move is over. Either way this is not a thesis to enter on --
+            # zero the score rather than trading against the only pass that
+            # looked at the evidence as a whole.
+            reason = "already priced in" if dossier.already_priced_in else "direction disagrees"
+            log.info("[SYNTHESIS] %s: vetoed (%s) -- %s", dossier.symbol, reason,
+                     dossier.synthesis_note[:160])
+            dossier.synthesis_confidence = 0.0
+            dossier.synthesis_magnitude = 0.0
+            dossier.confidence = 0.0
+            dossier.magnitude = 0.0
+            return
+
+        dossier.synthesis_confidence = _clamp_unit(verdict.get("confidence"))
+        dossier.synthesis_magnitude = _clamp_unit(verdict.get("magnitude"))
+        before = dossier.confidence * dossier.magnitude
+        dossier.confidence = min(dossier.confidence, dossier.synthesis_confidence)
+        dossier.magnitude = min(dossier.magnitude, dossier.synthesis_magnitude)
+        after = dossier.confidence * dossier.magnitude
+        if after < before:
+            log.info(
+                "[SYNTHESIS] %s: score trimmed %.3f -> %.3f (%d distinct fact(s) behind %d counted "
+                "source(s)) -- %s", dossier.symbol, before, after,
+                dossier.distinct_fact_count, dossier.independent_source_count,
+                dossier.synthesis_catalyst[:120],
+            )
 
     # --- Forward-validation capture (Phase A): daily dossier score
     # snapshots and daily price marks, the raw material for eventually
@@ -2312,21 +2734,29 @@ class Engine:
         benchmark beyond the handful of tradeables, which is what makes the
         alpha-vs-sector-beta split in the forward-return report meaningful.
 
-        Deliberately NOT dependent on IB: forward data can't be backfilled,
-        so a day with the Gateway down (or IB never configured) must not be
-        a permanently lost sample. IB is preferred when reachable; whatever
-        it misses is filled from Finnhub's /quote. Returns False when no
-        price source produced anything -- the caller leaves the pass due so
-        the next tick retries instead of marking a lost day done."""
+        FINNHUB FIRST, IB only for the remainder -- the reverse of every
+        other price path here, and deliberately so. IB caps historical-data
+        requests at roughly 60 per rolling 10 minutes per connection; this
+        pass covers the WHOLE universe (209 symbols live), so routing it
+        through IB blows that budget by several times over and the pacing
+        violation lands on the shared connection that also has to price
+        entries. IB's request budget is worth reserving for the two jobs
+        that need a broker-quality bar: confirming an entry, and marking
+        the handful of open paper trades. A forward-validation mark only
+        needs a close, which Finnhub's /quote gives for one cheap HTTP
+        request per symbol with no pacing coupling at all.
+
+        Still not dependent on either source individually: forward data
+        can't be backfilled, so a day with one source down must not be a
+        permanently lost sample. Returns False when NO source produced
+        anything -- the caller leaves the pass due so the next tick retries
+        instead of marking a lost day done."""
         symbols = [c.symbol for c in self.universe]
         if not symbols:
             return True
         prices: dict[str, float] = {}
-        if self.price_feed is not None and await self.price_feed.ensure_connected():
-            prices = await self.price_feed.last_prices(symbols)
-        missing = [s for s in symbols if s not in prices]
-        if missing and self.finnhub is not None:
-            for symbol in missing:
+        if self.finnhub is not None:
+            for symbol in symbols:
                 try:
                     quote = await self.finnhub.quote(symbol)
                 except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
@@ -2334,6 +2764,9 @@ class Engine:
                     continue
                 if quote is not None:
                     prices[symbol] = quote
+        missing = [s for s in symbols if s not in prices]
+        if missing and self.price_feed is not None and await self.price_feed.ensure_connected():
+            prices.update(await self.price_feed.last_prices(missing))
         if not prices:
             return False
         marked_at = datetime.now(timezone.utc).isoformat()
@@ -2369,11 +2802,18 @@ class Engine:
         A demoted symbol's dossier is archived by the same pass that
         handles any other orphan."""
         for symbol, value in list(self.accepted_candidates.data.items()):
-            as_type, source = self._accepted_entry(value)
+            as_type, source, ecosystem = self._accepted_entry(value)
             recommended = (self.candidates.get(symbol) or {}).get("recommended_as")
             if recommended != "anchor" or recommended == as_type:
                 continue
-            self.accepted_candidates.set(symbol, {"as": recommended, "source": source})
+            # The ecosystem is carried through, not dropped: this pass
+            # rewrites the entry wholesale, so omitting it would silently
+            # demote a classified symbol back into the inert "accepted"
+            # bucket -- the exact failure _apply_accepted_candidates was
+            # just fixed for.
+            self.accepted_candidates.set(
+                symbol, {"as": recommended, "source": source, "ecosystem": ecosystem}
+            )
             spec = self.spec_by_symbol.get(symbol)
             if spec is not None:
                 corrected = CompanySpec(spec.symbol, spec.name, spec.ecosystem,

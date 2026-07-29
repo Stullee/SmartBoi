@@ -16,6 +16,7 @@ from pathlib import Path
 
 from anthropic import AsyncAnthropic
 
+from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
 from smartboi.usage import UsageTracker
 
 log = logging.getLogger(__name__)
@@ -182,11 +183,14 @@ class RelationshipExtractor:
         try:
             response = await self._client.messages.create(
                 model=self._model,
-                max_tokens=2000,
-                # Pinned to 0: extraction wants the same relationships out
-                # of the same filing text every run, not a fresh sample.
-                temperature=0,
-                system=_SYSTEM_PROMPT,
+                # Model-appropriate thinking/effort/temperature (see llm.py).
+                # Effort is "medium" rather than "high" here: extraction is
+                # by far the largest input-token consumer in the system (a
+                # 150k-char filing per call) and is a reading task, not a
+                # judgement one -- it does not gate a trade the way the
+                # dossier and skeptic passes do.
+                **request_kwargs(self._model, max_tokens=8000, effort="medium"),
+                system=cacheable_system(_SYSTEM_PROMPT),
                 tools=[_EXTRACTION_TOOL],
                 tool_choice={"type": "tool", "name": "report_relationships"},
                 messages=[{"role": "user", "content": prompt}],
@@ -194,11 +198,9 @@ class RelationshipExtractor:
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the ingestion loop
             log.warning("%s: relationship extraction failed: %s", filing_symbol, exc)
             return None
-        self._usage.record(response.usage.input_tokens, response.usage.output_tokens)
-        for block in response.content:
-            if block.type == "tool_use":
-                return block.input.get("relationships", [])
-        return []
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens, model=self._model)
+        payload = first_tool_use(response)
+        return [] if payload is None else payload.get("relationships", [])
 
     async def aclose(self) -> None:
         await self._client.close()

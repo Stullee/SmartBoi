@@ -240,4 +240,10 @@ def gather_usage(snapshot) -> dict:
         "input_tokens": snapshot.input_tokens,
         "output_tokens": snapshot.output_tokens,
         "daily_call_budget": snapshot.daily_call_budget,
+        # Estimated spend, not just call volume: per-call cost now spans
+        # more than an order of magnitude across the configurable models,
+        # so a call count on its own no longer tells an operator what the
+        # day is costing (see usage.py).
+        "usd_spent": round(snapshot.usd_spent, 2),
+        "daily_usd_budget": snapshot.daily_usd_budget,
     }

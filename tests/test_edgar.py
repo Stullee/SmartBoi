@@ -1,4 +1,12 @@
-from smartboi.edgar import FilingEvent, summarize_form4
+import httpx
+
+from smartboi.edgar import (
+    EIGHT_K_ITEMS,
+    EdgarClient,
+    FilingEvent,
+    describe_8k_items,
+    summarize_form4,
+)
 
 _FORM4_XML = """<?xml version="1.0"?>
 <ownershipDocument>
@@ -208,3 +216,156 @@ async def test_name_matches_ticker_rejects_an_unknown_ticker():
 async def test_name_matches_ticker_rejects_an_empty_name():
     client = _StubbedNameMap({"astronics": "ATRO"})
     assert await client.name_matches_ticker("", "ATRO") is False
+
+
+# --- 8-K item codes: the cheapest high-signal metadata EDGAR offers, and it
+# was being discarded. "Item 1.01 Entry into a Material Definitive
+# Agreement" is a contract win; "Item 5.02 Departure of Directors" is
+# usually noise. Telling the dossier engine which it is costs nothing --
+# the submissions endpoint already returns it. ---
+
+def test_describe_8k_items_expands_known_codes():
+    described = describe_8k_items("1.01,9.01")
+    assert "Material Definitive Agreement" in described
+    assert "Item 9.01" in described
+
+
+def test_describe_8k_items_passes_unknown_codes_through():
+    assert describe_8k_items("1.01,6.66") == (
+        f"Item 1.01: {EIGHT_K_ITEMS['1.01']}; Item 6.66"
+    )
+
+
+def test_describe_8k_items_is_empty_for_no_items():
+    assert describe_8k_items("") == ""
+    assert describe_8k_items(None) == ""
+
+
+def test_filing_event_items_default_to_empty():
+    filing = FilingEvent("DCO", "0000029669", "8-K", "2026-07-28", "0000029669-26-000012", "d8k.htm")
+    assert filing.items == ""
+
+
+# --- Evidence exhibits: an 8-K's PRIMARY document is a cover page reading
+# "a press release is attached as Exhibit 99.1". Fetching only that handed
+# the dossier engine a filing that says news exists and not one word of what
+# it said. These tests pin the exhibit resolution that fixes it. ---
+
+class _FakeResponse:
+    def __init__(self, payload=None, text="", headers=None):
+        self._payload = payload
+        self.text = text
+        self.headers = headers or {}
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
+
+
+class _FakeEdgar(EdgarClient):
+    """EdgarClient with the network replaced by a url -> response dict."""
+
+    def __init__(self, responses, tmp_path):
+        super().__init__("SmartBoi test test@example.com", tmp_path / "cik.json")
+        self.responses = responses
+        self.requested = []
+
+    async def _throttled_get(self, url):
+        self.requested.append(url)
+        if url not in self.responses:
+            raise httpx.HTTPError(f"no canned response for {url}")
+        return self.responses[url]
+
+
+def _index(items):
+    return _FakeResponse(payload={"directory": {"item": items}})
+
+
+_FILING = FilingEvent(
+    "DCO", "0000029669", "8-K", "2026-07-28", "0000029669-26-000012", "d8k.htm", items="1.01,9.01",
+)
+_BASE = _FILING.index_url
+
+
+async def test_evidence_exhibits_finds_press_release_by_type(tmp_path):
+    client = _FakeEdgar({
+        f"{_BASE}index.json": _index([
+            {"name": "d8k.htm", "type": "8-K"},
+            {"name": "logo.jpg", "type": "GRAPHIC"},
+            {"name": "d919283dex991.htm", "type": "EX-99.1"},
+        ]),
+    }, tmp_path)
+    assert await client.evidence_exhibits(_FILING) == ["d919283dex991.htm"]
+
+
+async def test_evidence_exhibits_falls_back_to_the_filename_when_untyped(tmp_path):
+    client = _FakeEdgar({
+        f"{_BASE}index.json": _index([
+            {"name": "d8k.htm"},
+            {"name": "ex-99_1.htm"},
+        ]),
+    }, tmp_path)
+    assert await client.evidence_exhibits(_FILING) == ["ex-99_1.htm"]
+
+
+async def test_a_declared_type_beats_a_coincidental_filename_match(tmp_path):
+    """An EDGAR-typed document is authoritative -- a filename that happens to
+    contain "ex99" must not smuggle in something typed as an XBRL sidecar."""
+    client = _FakeEdgar({
+        f"{_BASE}index.json": _index([
+            {"name": "dco-ex991_htm.xml", "type": "XML"},
+            {"name": "R99.htm", "type": "GRAPHIC"},
+        ]),
+    }, tmp_path)
+    assert await client.evidence_exhibits(_FILING) == []
+
+
+async def test_evidence_exhibits_skips_the_primary_document_and_binaries(tmp_path):
+    client = _FakeEdgar({
+        f"{_BASE}index.json": _index([
+            {"name": "d8k.htm", "type": "EX-99.1"},   # same file as primaryDocument
+            {"name": "ex991.pdf", "type": "EX-99.1"},  # not textual
+        ]),
+    }, tmp_path)
+    assert await client.evidence_exhibits(_FILING) == []
+
+
+async def test_evidence_exhibits_degrade_to_empty_when_the_index_is_unavailable(tmp_path):
+    client = _FakeEdgar({}, tmp_path)  # index.json raises
+    assert await client.evidence_exhibits(_FILING) == []
+
+
+async def test_fetch_evidence_text_leads_with_the_press_release(tmp_path):
+    client = _FakeEdgar({
+        f"{_BASE}d8k.htm": _FakeResponse(
+            text="<html>Item 1.01. On July 28 2026 the Company issued a press release, "
+                 "attached as Exhibit 99.1 and incorporated by reference.</html>",
+            headers={"content-type": "text/html"},
+        ),
+        f"{_BASE}index.json": _index([{"name": "dex991.htm", "type": "EX-99.1"}]),
+        f"{_BASE}dex991.htm": _FakeResponse(
+            text="<html>Ducommun awarded $150 million contract by Raytheon for missile "
+                 "guidance assemblies, deliveries beginning Q1 2027.</html>",
+            headers={"content-type": "text/html"},
+        ),
+    }, tmp_path)
+
+    text = await client.fetch_evidence_text(_FILING)
+
+    # The item codes are spelled out for the model...
+    assert "Material Definitive Agreement" in text
+    # ...the press release is present at all (it never used to be)...
+    assert "$150 million contract" in text
+    # ...and it comes BEFORE the cover page, because _process_filing
+    # truncates this head-weighted.
+    assert text.index("$150 million contract") < text.index("incorporated by reference")
+
+
+async def test_fetch_evidence_text_is_unchanged_when_there_are_no_exhibits(tmp_path):
+    client = _FakeEdgar({
+        f"{_BASE}d8k.htm": _FakeResponse(text="cover page only", headers={"content-type": "text/plain"}),
+        f"{_BASE}index.json": _index([{"name": "d8k.htm", "type": "8-K"}]),
+    }, tmp_path)
+    filing = FilingEvent("DCO", "0000029669", "10-Q", "2026-07-28", "0000029669-26-000012", "d8k.htm")
+    assert await client.fetch_evidence_text(filing) == "cover page only"

@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from anthropic import AsyncAnthropic
 
+from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
 from smartboi.usage import UsageTracker
 
 log = logging.getLogger(__name__)
@@ -85,6 +87,14 @@ class Dossier:
     signaled_price: float | None = None
     signaled_direction: str = ""
     drift_alert_sent: bool = False
+    # How many times the entry gate has actually evaluated THIS episode (see
+    # engine._try_open_from_signal). Reset with the rest of the episode
+    # state. Exists so the pre-gate expiry paths -- newly merged evidence and
+    # the daily decay pass -- can tell "this thesis degraded after it had its
+    # chance to enter" from "this thesis was killed before the gate ever saw
+    # it", and only apply the strict bar to the former. See
+    # engine._should_expire_unopened.
+    entry_attempts: int = 0
     # Decay-weighted evidence mass for/against the resolved direction, as
     # of the last _aggregate call (see dossier.py's _side_mass) -- exposed
     # so the dashboard can show WHY a confidence is low: a small agreeing
@@ -115,6 +125,23 @@ class Dossier:
     # mass 8.88, zero opposing, over 0.85-0.95 confidence disclosed links
     # to RTX/LMT/NOC, and could not act for want of a third publisher.
     has_disclosed_link_evidence: bool = False
+    # --- Whole-evidence-body synthesis (see DossierSynthesizer), refreshed
+    # once a day by the decay pass. These are recorded even when the verdict
+    # changes nothing, so the pass's actual effect on outcomes is measurable
+    # from the forward record rather than being invisible.
+    synthesis_at: str = ""
+    synthesis_confidence: float = 0.0
+    synthesis_magnitude: float = 0.0
+    # How many genuinely DISTINCT underlying facts the evidence represents,
+    # as opposed to how many items were scored. Ten articles about one
+    # contract award are one fact; the arithmetic aggregate cannot tell the
+    # difference and this is the number that says so.
+    distinct_fact_count: int = 0
+    # Whether the market has plainly already made this connection. The whole
+    # strategy is trading the lag BEFORE it does, so this is a veto.
+    already_priced_in: bool = False
+    synthesis_note: str = ""
+    synthesis_catalyst: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -177,19 +204,85 @@ _MIN_STALE_DAYS = 14
 # an indirect JV competitor) sit at 0.30-0.65.
 DISCLOSED_LINK_CONFIDENCE = 0.85
 
-# Per-extra-independent-source multiplier on magnitude (see _aggregate).
-# Deliberately larger than confidence's +0.1 additive step: confidence is a
-# probability and saturates at 1.0 by the third source anyway, whereas
-# magnitude is the size of the expected move and is where accumulated
-# corroboration actually has somewhere to go.
+def independence_key(record: EvidenceRecord) -> str:
+    """What makes two evidence items INDEPENDENT corroboration of each other
+    -- the unit `independent_source_count` counts (see _aggregate).
+
+    For DIRECT evidence it is the publisher/form, unchanged: dedup.py already
+    collapses syndicated republishes of one wire story onto a single
+    publisher name, and an 8-K, a Form 4 and a 10-Q are separate primary
+    disclosures rather than restatements of each other.
+
+    For PROPAGATED evidence the origin symbol is part of the key, and this is
+    the correction. A story about Lockheed and a story about Raytheon are two
+    different facts about Ducommun; they are not one story counted twice, and
+    which outlet happened to publish each is irrelevant to whether they
+    corroborate each other. Keying on publisher alone collapsed them anyway,
+    and that quietly capped the entire strategy: the live feed yields six
+    publisher names for the whole universe with one aggregator ("Yahoo")
+    accounting for ~69% of items, so a thesis built the way this system is
+    designed to build one -- accumulating second-order evidence across
+    several disclosed counterparties -- could hardly ever exceed two
+    "independent sources". DCO carried 17 agreeing items across RTX, LMT and
+    NOC, over 0.85-0.95 disclosed links, with zero opposing mass, and counted
+    2. Items 3 through 17 contributed nothing to confidence and nothing to
+    magnitude.
+
+    The anti-syndication defence is fully preserved, because the publisher is
+    still in the key: two Yahoo articles about the same counterparty on the
+    same day remain one source (and dedup drops the second before it ever
+    gets here). What changes is only that facts about DIFFERENT companies
+    stop being counted as one fact."""
+    if record.is_propagated and record.origin_symbol:
+        return f"{record.origin_symbol}|{record.source_name}"
+    return record.source_name
+
+
+# The decay-scaled confidence an evidence item must carry before it counts
+# as an INDEPENDENT SOURCE (as opposed to merely contributing to mass). The
+# skeptic can accept an item while scaling its confidence toward zero, and
+# such an item was still buying a full source slot -- worth both a
+# confidence bonus and a magnitude multiplier. Corroboration from evidence
+# the adversarial pass judged worthless is not corroboration.
+MIN_SOURCE_CONTRIBUTION = 0.15
+
+# Corroboration bonuses, applied per DOUBLING of the independent-source
+# count rather than per additional source (see _aggregate).
+#
+# Both were linear in (S - 1), which was defensible only while S could not
+# realistically exceed 2 or 3 -- and it could not, because the independence
+# key was the publisher name and the live feed yields six of those for the
+# whole universe. Fixing that key (see independence_key) makes S=7 ordinary
+# for a well-corroborated thesis, and under the linear form a DCO-shaped
+# dossier came out at confidence 1.00 and magnitude 1.00: certainty, and the
+# largest re-rating the scale can express, from eighteen individually modest
+# second-order items. That is not a stricter system, it is a differently
+# broken one, and it would fire trades on everything.
+#
+# Logarithmic is both the honest shape and the standard one for combining N
+# noisy independent estimates: the second source is worth far more than the
+# eighth, and these items are not fully independent anyway (they share a
+# sector factor). Calibrated so S=1 and S=2 are IDENTICAL to the old linear
+# values -- that is where every live dossier currently sits, so this changes
+# nothing at today's operating point and only governs the range that was
+# previously unreachable.
+#
+#   S:              1      2      3      4      8     16
+#   magnitude x  1.00   1.25   1.40   1.50   1.75   2.00
+#   confidence + 0.00   0.10   0.16   0.20   0.25   0.25 (capped)
 MAGNITUDE_CORROBORATION_STEP = 0.25
+CONFIDENCE_CORROBORATION_STEP = 0.10
+# Corroboration must never be able to manufacture near-certainty out of a
+# pile of individually weak items -- past this the strongest single agreeing
+# item's own confidence is what has to carry the thesis.
+MAX_CONFIDENCE_CORROBORATION_BONUS = 0.25
 
 # Bumped whenever a change alters how confidence/magnitude are computed from
 # the same evidence. Stamped onto every daily dossier snapshot so the
 # forward-validation record can be split at the boundary instead of silently
 # mixing scores that mean different things -- forward data cannot be
 # backfilled, and re-scoring old rows with new logic would be look-ahead.
-SCORING_VERSION = 2
+SCORING_VERSION = 3
 # Weight an evidence item keeps right at its stale cutoff, before being
 # excluded entirely -- never fully zero a moment before exclusion, since
 # aged corroboration is still weak signal that a persistent theme existed.
@@ -240,6 +333,16 @@ def evidence_weight(record: EvidenceRecord, now: datetime) -> float:
         return _DECAY_FLOOR
     fraction = (age - horizon) / (cutoff - horizon)
     return 1.0 - fraction * (1.0 - _DECAY_FLOOR)
+
+
+def _corroboration_doublings(independent_source_count: int) -> float:
+    """log2 of the independent-source count, floored at 0 -- how many times
+    the corroboration has DOUBLED. This is the multiplier both bonuses are
+    applied per, so that the second independent source is worth much more
+    than the eighth. See MAGNITUDE_CORROBORATION_STEP."""
+    if independent_source_count < 2:
+        return 0.0
+    return math.log2(independent_source_count)
 
 
 def _side_mass(dossier: Dossier, direction: str, now: datetime) -> float:
@@ -333,13 +436,44 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
         if e.direction == dossier.direction and not evidence_is_stale(e, now)
     ]
     weighted = [(e, evidence_weight(e, now)) for e in agreeing]
-    dossier.independent_source_count = len({e.source_name for e in agreeing})
-    dossier.has_filing_evidence = any(e.source_type != "news" for e in agreeing)
+    # An item the skeptic scaled to (near) zero still counted as a full
+    # independent source, and a source slot is worth a lot: it lifts
+    # confidence AND multiplies magnitude. So evidence the adversarial pass
+    # judged worthless was buying the corroboration that fires the trade.
+    # It still contributes to mass and decay for exactly what it is worth --
+    # it just stops claiming a slot it did not earn.
+    contributing = [e for e, w in weighted if e.confidence * w >= MIN_SOURCE_CONTRIBUTION]
+    dossier.independent_source_count = len({independence_key(e) for e in contributing})
+    # Gated on LINK quality as well as source type. Any filing set this flag,
+    # including one propagated over an ECOSYSTEM edge -- an industry-level
+    # association at 0.25 confidence, not a disclosed relationship. That
+    # silently relaxed the news-only corroboration bar from three sources to
+    # two on the weakest link type in the system, which is the opposite of
+    # what the bar is for. Direct filings carry relationship_confidence=None
+    # and still qualify; so does propagation over a strongly disclosed edge.
+    dossier.has_filing_evidence = any(
+        e.source_type != "news"
+        and (e.relationship_confidence is None
+             or e.relationship_confidence >= DISCLOSED_LINK_CONFIDENCE)
+        for e in agreeing
+    )
     dossier.has_disclosed_link_evidence = any(
         (e.relationship_confidence or 0.0) >= DISCLOSED_LINK_CONFIDENCE for e in agreeing
     )
-    base_confidence = max(e.confidence * w for e, w in weighted)
-    corroboration_bonus = 0.1 * max(0, dossier.independent_source_count - 1)
+    # The base thesis is ONE item's decay-scaled confidence and magnitude,
+    # chosen jointly. These used to be independent maxima over the whole
+    # agreeing set, so a dossier could report the confidence of a certain-
+    # but-tiny item alongside the magnitude of a speculative-but-large one
+    # -- a combined score no single piece of evidence had ever proposed,
+    # and higher than any of them. The strongest item is the one with the
+    # largest confidence*magnitude product; corroboration bonuses then
+    # build on top of it exactly as before.
+    best, best_weight = max(weighted, key=lambda ew: ew[0].confidence * ew[0].magnitude * ew[1] * ew[1])
+    base_confidence = best.confidence * best_weight
+    doublings = _corroboration_doublings(dossier.independent_source_count)
+    corroboration_bonus = min(
+        MAX_CONFIDENCE_CORROBORATION_BONUS, CONFIDENCE_CORROBORATION_STEP * doublings
+    )
     raw_confidence = min(1.0, base_confidence + corroboration_bonus)
 
     w_agree = w_long if dossier.direction == "LONG" else w_short
@@ -370,8 +504,8 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     # Keyed to independent_source_count (distinct source_name), not raw item
     # count: dedup already collapses syndicated republishes onto one name,
     # so N restatements of a single wire story cannot inflate this.
-    base_magnitude = max(e.magnitude * w for e, w in weighted)
-    magnitude_bonus = 1.0 + MAGNITUDE_CORROBORATION_STEP * max(0, dossier.independent_source_count - 1)
+    base_magnitude = best.magnitude * best_weight
+    magnitude_bonus = 1.0 + MAGNITUDE_CORROBORATION_STEP * doublings
     dossier.magnitude = min(1.0, base_magnitude * magnitude_bonus)
     dossier.horizon_days = round(sum(e.horizon_days for e in agreeing) / len(agreeing))
     # The last few agreeing items' reasoning, not just the single latest --
@@ -436,6 +570,103 @@ _UPDATE_TOOL = {
     },
 }
 
+# What a genuinely tradeable catalyst looks like, with worked magnitude
+# anchors. Without this the model was asked to size a price impact with no
+# frame of reference at all, and it did what an unanchored scorer always
+# does: clustered everything into a narrow, timid band. The live board ran
+# magnitudes of 0.10-0.40 across every kind of evidence -- a $150M contract
+# award and a conference appearance landed in the same range.
+#
+# Tiered by what the evidence IS, not by how excited the language is. The
+# distinguishing feature of tier 1 is a primary-source commitment with a
+# number attached; of tier 3, that it is somebody's opinion about a
+# company rather than something that happened to it.
+_CATALYST_RUBRIC = (
+    "CATALYST TIERS -- anchor `magnitude` to these rather than to how strongly the "
+    "source is worded:\n"
+    "  TIER 1 (magnitude 0.50-0.90): a committed, quantified change to future revenue "
+    "or cost. A signed or awarded contract with a stated value or ceiling; an FDA "
+    "510(k)/PMA clearance or CE mark; a named multi-year supply agreement or qualified "
+    "design win at a named OEM; an official guidance revision; a plant/fab/line "
+    "announcement with a stated site and timeline; a major customer loss or program "
+    "cancellation (negative).\n"
+    "  TIER 2 (magnitude 0.20-0.50): a concrete operational fact that changes the "
+    "outlook without a number attached to THIS company. A disclosed customer's capex "
+    "guide-up or guide-down where this company is a named supplier; a competitor's "
+    "disclosed capacity loss or exit; a product launch entering an existing market; a "
+    "capacity expansion; a regulatory decision affecting the addressable market; an "
+    "insider OPEN-MARKET purchase of size (not an award or a tax-withholding sale).\n"
+    "  TIER 3 (magnitude 0.00-0.10): commentary rather than event. Analyst notes and "
+    "price-target changes, sector sentiment, conference and trade-show appearances, "
+    "promotional press releases with no committed counterparty, index/screen mentions, "
+    "routine governance changes, and pre-planned 10b5-1 insider sales.\n"
+    "A tier-1 fact reaching this company through a LINKED company still deserves a "
+    "tier-2-or-better magnitude: the fact is real and quantified, and only the share "
+    "of it that lands here is uncertain -- that uncertainty belongs in `confidence`, "
+    "not in a magnitude collapsed to zero."
+)
+
+# What "a catalyst" concretely means in each of this universe's ecosystems.
+# Generic prompting made the model reason about a defense-supplier contract
+# award and a data-center power purchase agreement identically, when what
+# actually moves each name is domain-specific and well known.
+ECOSYSTEM_CATALYSTS = {
+    "semi_equipment": (
+        "Semiconductor equipment/materials. What moves these names: wafer-fab-equipment "
+        "capex revisions at TSMC/Intel/Samsung/Micron, tool orders and shipment "
+        "deferrals, new fab announcements and groundbreakings, node transitions, export "
+        "controls and license decisions, and photomask/test/inspection demand following "
+        "a customer's utilization commentary."
+    ),
+    "defense_tier2": (
+        "Defense and aerospace tier-2 suppliers. What moves these names: DoD contract "
+        "awards and IDIQ task orders (the daily defense.gov contract announcements are "
+        "the primary source), program-of-record milestones and production-rate "
+        "decisions, foreign military sales approvals, prime-contractor backlog and book-"
+        "to-bill commentary, and build-rate changes at Boeing/Airbus for the commercial "
+        "aerostructures side."
+    ),
+    "grid_datacenter": (
+        "Grid, electrification and data-center buildout. What moves these names: "
+        "hyperscaler capex guidance, named data-center site announcements, power "
+        "purchase agreements and interconnection-queue decisions, utility rate cases "
+        "and capital plans, transformer/switchgear lead times, and transmission "
+        "project approvals."
+    ),
+    "battery_storage": (
+        "Battery and energy storage. What moves these names: offtake and supply "
+        "agreements with named cell or vehicle makers, DOE grants and loan-programme "
+        "decisions, gigafactory milestones, qualification/homologation wins, lithium "
+        "and cathode input pricing, and EV production-schedule changes at the OEMs."
+    ),
+    "medtech_supply": (
+        "Medical-device supply chain. What moves these names: FDA 510(k) and PMA "
+        "clearances and their timing, recalls and warning letters, reimbursement "
+        "(CMS) decisions, procedure-volume commentary from the large device makers, "
+        "and single-use component demand tied to a named customer's launch."
+    ),
+    "auto_supply": (
+        "Automotive supply. What moves these names: OEM production schedules and "
+        "shutdowns, platform/program wins and losses, content-per-vehicle changes, "
+        "recalls, and the EV-vs-ICE mix at a disclosed customer."
+    ),
+    "energy_services": (
+        "Oilfield services and equipment. What moves these names: E&P capex budgets, "
+        "rig and frac-spread counts, completion activity, day rates, and a named "
+        "customer's drilling programme changes."
+    ),
+    "industrial_machinery": (
+        "Industrial machinery. What moves these names: order intake and book-to-bill, "
+        "machine-tool and capital-equipment demand cycles, tariffs on inputs, and "
+        "reshoring/capex announcements by disclosed customers."
+    ),
+    "transport_logistics": (
+        "Trucking and logistics. What moves these names: contract rate renewals, spot-"
+        "rate direction, freight volumes at a disclosed shipper, fuel surcharges, "
+        "driver availability, and a large customer's inventory cycle."
+    ),
+}
+
 _SYSTEM_PROMPT = (
     "You maintain a trading thesis for one company, built up from many small pieces of "
     "evidence over time rather than reacting to any single headline. You will be given "
@@ -446,9 +677,14 @@ _SYSTEM_PROMPT = (
     "company's news within minutes but rarely connects it to this one for days or weeks "
     "-- that lag is the opportunity this thesis exists to capture. Weigh how directly the "
     "evidence bears on THIS company: direct news usually implies a shorter horizon and "
-    "higher confidence than propagated news. Be conservative -- most news is noise, most "
-    "single articles should not flip an established thesis, and vague or promotional "
-    "language deserves low confidence."
+    "higher confidence than propagated news.\n\n"
+    + _CATALYST_RUBRIC +
+    "\n\nMost news is noise and most single articles should not flip an established "
+    "thesis. But 'be conservative' is a rule about VAGUE evidence, not a discount "
+    "applied to everything: a concrete tier-1 fact deserves the magnitude it implies, "
+    "and scoring a real contract award like a promotional press release is as wrong as "
+    "the reverse. Reserve low confidence for evidence that is genuinely vague, "
+    "promotional, already priced in, or not specific to this company."
 )
 
 
@@ -460,7 +696,7 @@ class DossierUpdater:
 
     async def propose_update(
         self, dossier: Dossier, evidence_text: str, origin_symbol: str, relationship_note: str,
-        relationship_confidence: float | None = None,
+        relationship_confidence: float | None = None, ecosystem: str = "",
     ) -> dict | None:
         if not self._usage.budget_remaining():
             log.info("%s: daily LLM call budget reached -- deferring dossier update.", dossier.symbol)
@@ -483,22 +719,28 @@ class DossierUpdater:
             if relationship_note
             else f"This evidence is about {dossier.symbol} directly."
         )
+        # What counts as a catalyst is domain-specific, and the model was
+        # previously left to infer it. A defense supplier's contract award
+        # and a data-center operator's power purchase agreement are not the
+        # same kind of event, and naming the ecosystem's actual drivers is
+        # free -- it is already on the CompanySpec.
+        sector = ECOSYSTEM_CATALYSTS.get(ecosystem, "")
+        sector_note = f"\n\nSector context for {dossier.symbol}: {sector}" if sector else ""
         prompt = (
             f"Company: {dossier.symbol}\n"
             f"Current thesis: {current}\n"
-            f"{propagation}\n\n"
+            f"{propagation}{sector_note}\n\n"
             f"New evidence:\n{evidence_text}"
         )
         try:
             response = await self._client.messages.create(
                 model=self._model,
-                max_tokens=500,
-                # Pinned to 0: this call's confidence/magnitude directly
-                # gate trades at a hard threshold, and the API default of
-                # 1.0 made every score a single high-temperature sample --
-                # some threshold crossings were sampling noise, not evidence.
-                temperature=0,
-                system=_SYSTEM_PROMPT,
+                # Model-appropriate thinking/effort/temperature -- see llm.py.
+                # max_tokens is a ceiling over thinking AND the tool call on
+                # every thinking-capable model, so 500 (the old value) would
+                # truncate before the tool_use block was ever emitted.
+                **request_kwargs(self._model, max_tokens=4000, effort="high"),
+                system=cacheable_system(_SYSTEM_PROMPT),
                 tools=[_UPDATE_TOOL],
                 tool_choice={"type": "tool", "name": "update_thesis"},
                 messages=[{"role": "user", "content": prompt}],
@@ -506,11 +748,183 @@ class DossierUpdater:
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the ingestion loop
             log.warning("%s: dossier update proposal failed: %s", dossier.symbol, exc)
             return None
-        self._usage.record(response.usage.input_tokens, response.usage.output_tokens)
-        for block in response.content:
-            if block.type == "tool_use":
-                return block.input
-        return None
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens, model=self._model)
+        return first_tool_use(response)
+
+    async def aclose(self) -> None:
+        await self._client.close()
+
+
+# --- Synthesis: reasoning across the accumulated evidence as a body ---
+
+_SYNTHESIS_TOOL = {
+    "name": "synthesize_thesis",
+    "description": "Judge a company's accumulated evidence as a whole and state the resulting thesis.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "direction": {"type": "string", "enum": list(DIRECTIONS)},
+            "distinct_fact_count": {
+                "type": "integer", "minimum": 0,
+                "description": (
+                    "How many genuinely DISTINCT underlying facts this evidence represents -- not "
+                    "how many items there are. Three articles about one contract award are ONE "
+                    "fact. A contract award, an insider purchase and a customer's guidance raise "
+                    "are THREE. This is the number that should decide how corroborated the thesis "
+                    "actually is."
+                ),
+            },
+            "confidence": {
+                "type": "number", "minimum": 0, "maximum": 1,
+                "description": "Confidence in the direction, judging the body of evidence as a whole.",
+            },
+            "magnitude": {
+                "type": "number", "minimum": 0, "maximum": 1,
+                "description": (
+                    "Size of the move the COMBINED evidence implies (0=negligible, 1=major "
+                    "re-rating). Overlapping items do not add; genuinely independent ones do."
+                ),
+            },
+            "horizon_days": {"type": "integer", "minimum": 1, "maximum": 60},
+            "already_priced_in": {
+                "type": "boolean",
+                "description": (
+                    "True if the market has plainly already absorbed this -- the evidence is old, "
+                    "the story was widely covered when it broke, or it merely confirms what was "
+                    "already known. The whole strategy is trading the lag BEFORE the market "
+                    "connects the dots, so a thesis the market has already connected is not one."
+                ),
+            },
+            "strongest_catalyst": {
+                "type": "string",
+                "description": "The single fact carrying the thesis, in one line.",
+            },
+            "thesis": {"type": "string", "description": "Two or three sentences."},
+        },
+        "required": [
+            "direction", "distinct_fact_count", "confidence", "magnitude",
+            "horizon_days", "already_priced_in", "strongest_catalyst", "thesis",
+        ],
+    },
+}
+
+_SYNTHESIS_SYSTEM_PROMPT = (
+    "You are an equity analyst reviewing the COMPLETE accumulated evidence file on one company "
+    "and stating what it adds up to. Everything here already survived an adversarial review "
+    "individually; your job is the question no per-item review can answer: what does this body "
+    "of evidence mean TOGETHER?\n\n"
+    "Three things only you can see:\n"
+    "1. OVERLAP. Items were scored one at a time, so the same underlying fact scored several "
+    "times looks like several corroborating facts. Count DISTINCT facts, not items. This is "
+    "the most important judgement you make -- an accumulation of one story restated is not a "
+    "corroborated thesis, and treating it as one is how a system talks itself into a trade.\n"
+    "2. COHERENCE. Do these facts describe one consistent story, or unrelated fragments that "
+    "happen to point the same way? A supplier winning a contract, that supplier's customer "
+    "guiding capex up, and an insider buying is a coherent thesis. Three unrelated mild "
+    "positives is a coincidence, and deserves far less confidence than their sum suggests.\n"
+    "3. STALENESS. Given the dates and how widely covered these facts were, has the market "
+    "already made this connection? The entire strategy is trading the lag before it does. Say "
+    "so plainly via already_priced_in -- it costs nothing to skip a move that is over, and a "
+    "great deal to enter one.\n\n"
+    + _CATALYST_RUBRIC +
+    "\n\nBe willing to conclude the evidence does NOT support a position: direction NONE, or a "
+    "confidence well below the individual items'. That is a real and useful answer. Be equally "
+    "willing to conclude it supports a LARGER move than any single item implied, when several "
+    "genuinely distinct facts reinforce each other."
+)
+
+
+class DossierSynthesizer:
+    """The pass that reasons across a dossier's evidence as a whole.
+
+    Everything else in this system is incremental: each evidence item is
+    scored alone against a one-line summary of the current thesis, and the
+    aggregate is then pure arithmetic over those independent scores
+    (see _aggregate). Nothing ever read the evidence file as a body, which
+    left three questions structurally unanswerable and all three of them
+    decide whether a trade is justified:
+
+      - are these N items N facts, or one fact counted N times?
+      - do they tell one coherent story, or are they unrelated coincidences
+        that happen to point the same way?
+      - has the market already connected these dots, making the lag this
+        strategy trades already gone?
+
+    Arithmetic over per-item scores cannot answer any of them, and the
+    per-item pass cannot either -- it sees one item. So this runs once a day
+    per tradeable with a live thesis: at most a few dozen calls, against a
+    budget the deployment runs at a few percent of.
+
+    Its output does not replace the arithmetic aggregate. It CAPS it (see
+    engine.py's decay pass): a thesis may fire on the lower of the two.
+    Synthesis can veto and it can trim, but it cannot inflate a score into a
+    trade on its own -- that keeps one model call from becoming a single
+    point of failure for committing capital."""
+
+    def __init__(self, api_key: str, model: str, usage: UsageTracker):
+        self._client = AsyncAnthropic(api_key=api_key)
+        self._model = model
+        self._usage = usage
+
+    @staticmethod
+    def _evidence_digest(dossier: Dossier, now: datetime, limit: int = 40) -> str:
+        """The evidence file as the analyst sees it: one line per non-stale
+        agreeing-or-opposing item, newest last, with the date, source, what
+        it was about and how it reached this company. Dates and sources are
+        included precisely so overlap and staleness are VISIBLE -- they are
+        what the two hardest judgements here are made from."""
+        live = [e for e in dossier.evidence if not evidence_is_stale(e, now)]
+        lines = []
+        for e in live[-limit:]:
+            route = (
+                f"via {e.origin_symbol} ({e.relationship_note[:110]})"
+                if e.is_propagated else "direct"
+            )
+            lines.append(
+                f"- [{(e.published_at or e.merged_at or '')[:10]}] {e.source_name} | {route}\n"
+                f"    {e.headline[:180]}\n"
+                f"    scored {e.direction} magnitude={e.magnitude:.2f} confidence={e.confidence:.2f}: "
+                f"{e.reasoning[:220]}"
+            )
+        return "\n".join(lines)
+
+    async def synthesize(self, dossier: Dossier, ecosystem: str = "",
+                         now: datetime | None = None) -> dict | None:
+        """None on a transient failure or an exhausted budget -- the caller
+        keeps the arithmetic aggregate unchanged rather than acting on a
+        synthesis it does not have."""
+        if not self._usage.budget_remaining():
+            log.info("%s: daily LLM budget reached -- deferring synthesis.", dossier.symbol)
+            return None
+        now = now or datetime.now(timezone.utc)
+        digest = self._evidence_digest(dossier, now)
+        if not digest:
+            return None
+        sector = ECOSYSTEM_CATALYSTS.get(ecosystem, "")
+        prompt = (
+            f"Company: {dossier.symbol}\n"
+            f"Today: {now.date().isoformat()}\n"
+            + (f"Sector: {sector}\n" if sector else "")
+            + f"\nArithmetic aggregate of the items below (for reference, not a constraint): "
+            f"direction={dossier.direction} confidence={dossier.confidence:.2f} "
+            f"magnitude={dossier.magnitude:.2f} over {dossier.independent_source_count} "
+            f"counted sources.\n\n"
+            f"ACCUMULATED EVIDENCE ({len(dossier.evidence)} items, non-stale shown):\n{digest}"
+        )
+        try:
+            response = await self._client.messages.create(
+                model=self._model,
+                **request_kwargs(self._model, max_tokens=8000, effort="high"),
+                system=cacheable_system(_SYNTHESIS_SYSTEM_PROMPT),
+                tools=[_SYNTHESIS_TOOL],
+                tool_choice={"type": "tool", "name": "synthesize_thesis"},
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the decay pass
+            log.warning("%s: synthesis failed: %s", dossier.symbol, exc)
+            return None
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens, model=self._model)
+        return first_tool_use(response)
 
     async def aclose(self) -> None:
         await self._client.close()
