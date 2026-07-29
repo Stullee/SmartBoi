@@ -46,10 +46,22 @@ that specific inefficiency, not to race anyone on speed:
    story are deduped to one data point, and evidence itself decays over
    time so an old, unconfirmed claim can't prop up confidence forever --
    see `dossier.py` and `dedup.py`.
-4. **Reads what nobody parses** -- SEC EDGAR full-text filings (8-Ks,
-   10-K/10-Q customer/supplier disclosures, Form 4 insider transactions,
-   parsed into readable transaction summaries) as a first-class evidence
-   source, not an afterthought. See `edgar.py`.
+4. **Reads what nobody parses, including the parts most readers skip** --
+   SEC EDGAR is treated as a LIVE catalyst feed, not a quarterly one, and
+   is polled every 15 minutes. An 8-K is filed within four business days
+   of a material event (usually the same day), and its *primary document*
+   is a cover page saying "a press release is attached as Exhibit 99.1" --
+   so `edgar.py` fetches the EXHIBITS too. The product launch, the contract
+   award, the guidance revision: they are all in EX-99.1, and reading only
+   the cover page meant they reached the dossier engine as a filing that
+   says news exists and not one word of what it said. The 8-K item codes
+   (1.01 material agreement, 2.02 results, 3.02 dilution...) are expanded
+   into plain English so a contract win is distinguishable from a director
+   departure before a single token is spent. Alongside: 10-K/10-Q
+   customer/supplier disclosures, Form 4 insider transactions parsed into
+   readable summaries, SC 13D activist stakes, and 424B5 shelf takedowns
+   (dilution -- the cleanest SHORT catalyst this universe offers; a system
+   that only reads good news is not a research system). See `edgar.py`.
 5. **Adversarial to itself, calibrated by directness** -- every proposed
    dossier update is reviewed by a second, skeptical LLM pass trying to
    refute it before it counts, but the bar differs deliberately for direct
@@ -66,15 +78,28 @@ that specific inefficiency, not to race anyone on speed:
    -- a real fact through a weak relationship is still worth something,
    just less than proposed, and refusing it outright would throw away
    exactly the small, accumulating corroboration point 3 depends on.
-6. **Prune-only universe auto-screen** -- a monthly market-cap/analyst-
+6. **Judged as a body, not just item by item** -- every score above is
+   assigned to ONE piece of evidence in isolation, and the aggregate is
+   arithmetic over those independent scores. That leaves three questions
+   structurally unanswerable, and each decides whether a trade is
+   justified: are these N items N facts or one fact counted N times; do
+   they tell one coherent story or are they unrelated coincidences pointing
+   the same way; and has the market already made this connection, which is
+   the lag the whole strategy exists to trade. A daily synthesis pass
+   (`dossier.DossierSynthesizer`) reads the complete evidence file and
+   answers them. Its verdict CAPS the arithmetic score -- it can veto and
+   it can trim, never lift -- so it catches exactly the errors the
+   aggregate is blind to without letting one model call manufacture a
+   trade on its own.
+7. **Prune-only universe auto-screen** -- a monthly market-cap/analyst-
    coverage recheck flags tickers that no longer fit (acquired, delisted,
    graduated to broad coverage) instead of trusting a hardcoded list to
    stay accurate forever. See `universe_screen.py`.
-7. **Forward-tested, not backtested** -- an LLM-driven strategy backtested
+8. **Forward-tested, not backtested** -- an LLM-driven strategy backtested
    on news it was trained after already "knows" how the story ended. This
    system only ever runs forward, logging every hypothetical trade it
    would make as it happens, so its track record means something.
-8. **Checks whether it's already too late** -- a signal firing doesn't mean
+9. **Checks whether it's already too late** -- a signal firing doesn't mean
    entering blind. At entry time, if the price already moved past
    `MAX_FAVORABLE_DRIFT_PCT` in the signal's favorable direction since it
    fired, the correction likely already happened between signal and entry
@@ -102,14 +127,18 @@ src/smartboi/
                         seeded relationships (see below)
   dedup.py               source fingerprinting: collapses syndicated
                         republishes to one data point
-  edgar.py                SEC EDGAR ingestion: CIK lookup, filing search, text fetch
-  news.py                  Finnhub company-news ingestion + market-cap/analyst-count lookups
+  edgar.py                SEC EDGAR ingestion: CIK lookup, filing search, text +
+                           EX-99 press-release exhibits, 8-K item codes
+  news.py                  Finnhub company-news ingestion + quotes + market-cap/analyst lookups
+  llm.py                    per-model request shape (thinking/effort/temperature differ by
+                             model generation) + pricing table -- see its docstring
   graph.py                  relationship graph store + LLM-based extraction from filings
-  dossier.py                 per-company evidence dossier: model, store, LLM update proposal
+  dossier.py                 per-company evidence dossier: model, store, LLM update proposal,
+                              and DossierSynthesizer (reasons across the WHOLE evidence body)
   skeptic.py                  adversarial second pass that tries to refute proposed updates
   signals.py                    evidence-threshold crossing -> SignalEvent (always logged)
   alerts.py                      optional webhook POST on signals / paper trade opens & closes
-  usage.py                        daily Claude API call/token budget tracker (cost control)
+  usage.py                        daily Claude API call + USD budget tracker (cost control)
   ratelimit.py                     sliding-window limiter (propagated-evidence cooldown)
   paper_journal.py                hypothetical trade open/mark/close -- NO order-placement code
   prices.py                        read-only IB price feed -- NO order-placement code, optional
@@ -300,9 +329,15 @@ the daily decay pass expired it before an entry was ever attempted. The
 tight cadence applies only while something is actually pending, so the
 steady-state request rate is unchanged.
 
-Two guards then decide whether the entry happens (both require
-`ENABLE_IB_PRICE_FEED=true` -- without a price feed there's no price to
-check a signal against, and signals just log as before):
+Entry needs a price, but NOT specifically IB. Prices resolve IB-first and
+Finnhub-second (`engine._price_bar`), so a free Finnhub key alone runs the
+full paper-trade loop. This matters more than it sounds: for a long time
+the entry gate was the one code path with no fallback -- the drift baseline
+and the daily forward-validation marks both already fell back to Finnhub,
+while the gate that actually opens the trade did not, so an unreachable
+Gateway silently blocked the system's only output.
+
+Two guards then decide whether the entry happens:
 
 - **Favorable drift** (`MAX_FAVORABLE_DRIFT_PCT`, default 5%): the price
   the moment a dossier flips to SIGNALED is snapshotted
@@ -350,14 +385,19 @@ second (skeptic) if it's judged new -- and propagation multiplies that by
 however many linked targets an origin has, so a heavily-covered anchor with
 several links can generate real spend fast. Two guards, both in `config.py`:
 
-- **Daily LLM call budget** (`MAX_DAILY_LLM_CALLS`, default 3000): a hard
-  ceiling across extraction/dossier-update/skeptic calls combined. Once hit,
-  further evidence is deferred (not discarded) until the budget resets at
-  UTC midnight -- exactly the same "retry later" path as a transient API
-  failure. Call-count-based rather than a dollar figure on purpose: this
-  codebase's own prompt construction keeps each call's token size roughly
-  bounded, so a call cap is a robust proxy for spend that won't rot when
-  Anthropic's pricing changes. See the dashboard for actual calls/tokens
+- **Daily spend budget** (`MAX_DAILY_USD`, default $25) and **daily call
+  budget** (`MAX_DAILY_LLM_CALLS`, default 3000), both checked before every
+  call. Either one exhausted defers further evidence (never discards it)
+  until UTC midnight -- exactly the same "retry later" path as a transient
+  API failure. The call cap alone used to be the whole budget, on the
+  reasoning that per-call token sizes are bounded by this codebase's own
+  prompts; that stopped being true once per-call cost spanned an order of
+  magnitude across configurable models and adaptive thinking unbounded
+  output tokens, so spend is now metered directly (`usage.py`, priced from
+  `llm.MODEL_PRICES_PER_MTOK`, with an unknown model priced at the most
+  expensive entry so a model-string typo never looks free). The call cap is
+  kept because it bounds request VOLUME, which dollars do not. See the
+  dashboard for actual calls/tokens/spend
   used today.
 - **Propagated-evidence cooldown** (`MAX_PROPAGATED_EVIDENCE_PER_LINK`,
   default 3 per `PROPAGATED_EVIDENCE_COOLDOWN_HOURS`, default 6h): caps how
@@ -596,7 +636,7 @@ Recommended order to bring integrations online:
 3. `ANTHROPIC_API_KEY`. This turns on the actual dossier engine
    (relationship extraction, dossier updates, the skeptic pass) --
    without it, evidence is collected but never scored.
-4. Only once you want real hypothetical P&L: `ENABLE_IB_PRICE_FEED=true`
+4. Optional, for broker-quality bars: `ENABLE_IB_PRICE_FEED=true`
    plus `IB_HOST`/`IB_PORT` pointed at a running IB Gateway/TWS. Read-only,
    never places an order. The connection is checked right at startup and
    logged clearly either way (`CONNECTED`, or a warning with the retry

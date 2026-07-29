@@ -1705,3 +1705,65 @@ async def test_the_decay_pass_runs_synthesis(engine):
     await engine._run_decay_pass()
 
     assert [c["symbol"] for c in engine.synthesizer.calls] == ["FORM"]
+
+
+# --- The loop closes: cold start -> evidence -> signal -> open paper trade.
+#
+# Every other test here exercises one stage. This one runs the actual tick
+# loop from an empty data directory and asserts a position exists at the end,
+# because the live system's defining symptom was that each stage worked in
+# isolation while the whole never produced its one output: 209 symbols, 17
+# dossiers, 10,705 ingested items, one signal ever, and zero paper trades. ---
+
+async def test_a_cold_start_reaches_an_open_paper_trade(engine):
+    """No IB, no dossiers, no prior state -- just news arriving."""
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol["FORM"] = 10.0
+    engine.finnhub.articles_by_symbol["FORM"] = [
+        NewsArticle(symbol="FORM", headline="FORM wins $40M photomask supply award",
+                    summary="multi-year", source="Reuters", url="https://finnhub.io/1",
+                    published_at="2026-07-29T12:00:00+00:00"),
+        NewsArticle(symbol="FORM", headline="Intel raises capex guidance for 2027",
+                    summary="fab expansion", source="Bloomberg", url="https://finnhub.io/2",
+                    published_at="2026-07-29T13:00:00+00:00"),
+    ]
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+
+    # Two ticks: the first ingests and fires, the second is the entry poll
+    # that _fire_signal pulled forward by clearing _last_price_poll.
+    await engine._tick()
+    await engine._tick()
+
+    assert engine.journal.has_open("FORM"), "cold start did not reach an open paper trade"
+    trade = engine.journal.open_trades["FORM"]
+    assert trade.direction == "LONG"
+    assert trade.entry_price == 10.0
+    assert trade.stop_price < trade.entry_price < trade.target_price
+    # ...and the record needed to judge it later exists.
+    log_dir = Path(engine.settings.log_dir)
+    assert (log_dir / "signals.jsonl").exists()
+    opened = [json.loads(line) for line in (log_dir / "decisions.jsonl").read_text().splitlines()]
+    assert any(r["event"] == "trade_opened" and r["symbol"] == "FORM" for r in opened)
+
+
+async def test_the_same_cold_start_closes_the_trade_when_the_target_trades(engine):
+    """The other half of the loop: a position that reaches its target closes,
+    banks a WIN, and hands the symbol back so fresh evidence can re-signal."""
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol["FORM"] = 10.0
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    await _signal_form(engine)
+    await engine._mark_and_execute()
+    trade = engine.journal.open_trades["FORM"]
+
+    engine.finnhub.quotes_by_symbol["FORM"] = trade.target_price + 0.05
+    await engine._mark_and_execute()
+
+    assert not engine.journal.has_open("FORM")
+    closed = [json.loads(line) for line in engine.journal.log_path.read_text().splitlines()]
+    assert closed[-1]["status"] == "WIN"
+    assert closed[-1]["r_multiple"] is not None       # net of the cost model
+    assert closed[-1]["cost_bps_round_trip"] > 0      # ...and costs were charged
+    assert engine.dossiers.load("FORM").status == "ACTIVE"
