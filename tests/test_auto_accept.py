@@ -420,3 +420,92 @@ def test_unsearchable_names_are_skipped():
 def test_real_company_names_are_still_searched():
     for name in ("Advantest", "SolarEdge Technologies Inc.", "Eastman Kodak Company"):
         assert Engine._is_unsearchable(name) is False
+
+
+# --- Edge promotion: accepting a candidate must write the relationship that
+# DISCOVERED it into the graph. Without this the disclosure was discarded --
+# _extract_relationships records the candidate without adding an edge, the
+# filer is marked backfilled and never re-extracted, and backfill skips
+# anchors entirely. Confirmed live: 237 candidates discovered, 40 accepted,
+# and a graph of only 61 edges, with accepted anchors (ENTG, GEHC, DUK,
+# LDOS, STM, SEDG, NVMI) carrying no edge at all. ---
+
+def _pending(from_symbol="DCO", rel_type="customer", confidence=0.9):
+    return [{
+        "from_symbol": from_symbol, "rel_type": rel_type,
+        "description": f"{from_symbol} discloses this counterparty as a major customer",
+        "confidence": confidence, "source": "https://sec.gov/x",
+    }]
+
+
+def test_accepting_a_candidate_writes_its_discovered_relationship(engine):
+    entry = _candidate(ticker="ZZZZ", recommended_as="anchor")
+    entry["pending_edges"] = _pending()
+    engine.candidates.set("ZZZZ", entry)
+
+    engine.accept_candidate("ZZZZ", "anchor", source="auto")
+
+    edges = [(r.from_symbol, r.to_symbol, r.rel_type) for r in engine.graph.relationships]
+    assert ("DCO", "ZZZZ", "customer") in edges
+
+
+def test_a_promoted_anchor_can_actually_reach_a_dossier(engine):
+    """The point of the edge: an anchor is never its own analysis target, so
+    with no edge to a tradeable its news resolves to zero targets and is
+    discarded without an LLM call. This is the end-to-end assertion --
+    without the stashed relationship an accepted anchor is inert, with it
+    the anchor is immediately worth polling."""
+    engine.candidates.set("INRT", _candidate(ticker="INRT", recommended_as="anchor"))
+    engine.accept_candidate("INRT", "anchor", source="auto")
+    assert engine._can_produce_evidence("INRT") is False  # unconnected: inert
+
+    entry = _candidate(ticker="ZZZZ", recommended_as="anchor")
+    entry["pending_edges"] = _pending()
+    engine.candidates.set("ZZZZ", entry)
+    engine.accept_candidate("ZZZZ", "anchor", source="auto")
+    assert engine._can_produce_evidence("ZZZZ") is True   # connected: worth polling
+
+
+def test_promotion_skips_a_filer_no_longer_in_the_universe(engine):
+    entry = _candidate(ticker="ZZZZ", recommended_as="anchor")
+    entry["pending_edges"] = _pending(from_symbol="GONE")
+    engine.candidates.set("ZZZZ", entry)
+
+    engine.accept_candidate("ZZZZ", "anchor", source="auto")
+
+    assert engine.graph.relationships == []
+
+
+def test_promotion_is_idempotent(engine):
+    entry = _candidate(ticker="ZZZZ", recommended_as="anchor")
+    entry["pending_edges"] = _pending()
+    engine.candidates.set("ZZZZ", entry)
+
+    engine.accept_candidate("ZZZZ", "anchor", source="auto")
+    engine._promote_pending_edges("ZZZZ")
+
+    assert len(engine.graph.relationships) == 1
+
+
+def test_a_candidate_with_no_stashed_relationship_still_accepts(engine):
+    """Entries written before pending_edges existed must not break accept."""
+    engine.candidates.set("ZZZZ", _candidate(ticker="ZZZZ", recommended_as="anchor"))
+    spec = engine.accept_candidate("ZZZZ", "anchor", source="auto")
+    assert spec.symbol == "ZZZZ"
+    assert engine.graph.relationships == []
+
+
+# --- Not polling what cannot produce anything ---
+
+def test_a_tradeable_is_always_worth_polling(engine):
+    assert engine._can_produce_evidence("DCO") is True
+
+
+def test_an_anchor_linked_only_to_another_anchor_stays_inert(engine):
+    """An anchor is never its own target, so an anchor-to-anchor edge still
+    resolves to zero analysis targets."""
+    from smartboi.graph import Relationship
+
+    engine.accept_candidate("ZZZZ", "anchor", source="auto")
+    engine.graph.add(Relationship("RTX", "ZZZZ", "supplier", "d", "s", 0.9, "2026-07-29"))
+    assert engine._can_produce_evidence("ZZZZ") is False

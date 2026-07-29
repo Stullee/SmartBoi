@@ -120,6 +120,7 @@ _INDEX_HTML = """<!doctype html>
   <button id="btn-analyze">Forward-return report</button>
   <button id="btn-event-study">Signal event study</button>
   <button id="btn-diagnostics">Diagnostics bundle</button>
+  <button id="btn-rebuild-graph">Rebuild relationship graph</button>
   <button id="btn-reset" style="border-color:rgba(239,83,80,0.5)">Reset added symbols</button>
 </div>
 <div class="toolhint">The first three are read-only: screening does market-cap/analyst lookups, the other two
@@ -383,6 +384,24 @@ document.getElementById("btn-event-study").addEventListener("click", function() 
 document.getElementById("btn-diagnostics").addEventListener("click", function() {
   runTool("tools/diagnostics", {}, this);
 });
+document.getElementById("btn-rebuild-graph").addEventListener("click", function() {
+  if (!confirm("Re-extract relationships from every tradeable's latest 10-K?\\n\\n" +
+               "Additive only -- edges are deduped, so this can never remove an edge or touch a " +
+               "dossier, trade or log. Costs about one LLM call per tradeable symbol. Runs in the " +
+               "background over the next few polling ticks.")) return;
+  var out = document.getElementById("tool-output");
+  out.style.display = "block";
+  out.textContent = "Queueing…";
+  fetch(API_BASE + "universe/rebuild-graph", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  }).then(function(r) { return r.json(); }).then(function(res) {
+    out.textContent = res.error ? ("Error: " + res.error)
+      : ("Queued " + res.queued + " symbol(s) for relationship re-extraction (graph currently has " +
+         res.edges_before + " edges).\\nWatch the Relationships panel and the log -- new edges appear " +
+         "over the next few ticks as each 10-K is re-read.");
+    refresh();
+  }).catch(function(err) { out.textContent = "Failed: " + err; });
+});
 document.getElementById("btn-reset").addEventListener("click", function() {
   if (!confirm("Remove every symbol added at runtime and return to the curated universe?\\n\\n" +
                "Dossiers for the removed symbols are ARCHIVED, not deleted. Candidates, trades " +
@@ -621,6 +640,15 @@ def create_app(engine) -> web.Application:
         result = engine.reset_accepted_candidates()
         return web.json_response({"ok": True, **result})
 
+    async def handle_rebuild_graph(request: web.Request) -> web.Response:
+        """Re-extracts relationships from every tradeable's latest 10-K (see
+        engine.rebuild_relationship_graph). Additive only -- graph.add
+        dedupes, so this cannot remove an edge or touch a dossier, a trade,
+        or a captured log. Runs on the event loop for the same reason the
+        reset does: it mutates engine state the polling coroutines read."""
+        result = engine.rebuild_relationship_graph()
+        return web.json_response({"ok": True, **result})
+
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_status)
@@ -630,6 +658,7 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/tools/event-study", handle_tool_event_study)
     app.router.add_post("/api/tools/diagnostics", handle_tool_diagnostics)
     app.router.add_post("/api/universe/reset-accepted", handle_reset_accepted)
+    app.router.add_post("/api/universe/rebuild-graph", handle_rebuild_graph)
     return app
 
 

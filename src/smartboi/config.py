@@ -220,8 +220,15 @@ class Settings(BaseSettings):
     # a single filing isn't enough to start taking positions on a name.
     auto_accept_min_seen_count: int = 2
     # Ceiling on auto-accepts per day, so one filing that names a long list
-    # of counterparties can't flood the universe in a single pass.
-    auto_accept_max_per_day: int = 5
+    # of counterparties can't flood the universe in a single pass. Raised
+    # from 5 to 20 in the 2026-07 refresh: accepting a candidate now also
+    # writes the relationship that DISCOVERED it into the graph (see
+    # Engine._promote_pending_edges), so an acceptance went from "one more
+    # symbol to poll" to "one more propagation path" -- and a 73-candidate
+    # backlog draining at 5/day is two weeks of a mostly disconnected graph.
+    # An accepted ANCHOR can never become a trade target, so the risk this
+    # bounds is polling cost, and the daily LLM budget runs under 2% used.
+    auto_accept_max_per_day: int = 20
 
     log_level: str = "INFO"
     log_dir: str = "logs"
