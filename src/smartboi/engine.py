@@ -57,11 +57,62 @@ from smartboi.skeptic import Skeptic
 from smartboi.state import JsonState
 from smartboi.status import snapshot_dossier
 from smartboi.universe import SEED_RELATIONSHIPS, CompanySpec, spec_by_symbol
-from smartboi.universe_screen import recommend_candidate_type, screen_universe
+from smartboi.universe_screen import guess_ecosystem, recommend_candidate_type, screen_universe
 from smartboi.usage import UsageTracker
 from smartboi.webapp import run_dashboard
 
 log = logging.getLogger(__name__)
+
+try:
+    from zoneinfo import ZoneInfo
+
+    _ET = ZoneInfo("America/New_York")
+except Exception:  # noqa: BLE001 - tzdata missing: crude EST fallback beats crashing at import
+    _ET = timezone(timedelta(hours=-5))
+
+# US equities regular-trading-hours close, in exchange time. Used only to
+# decide whether a daily bar's session could contain any post-signal
+# trading -- half-days (~2/year) close earlier and are accepted as a small
+# known imprecision rather than carrying an exchange calendar.
+_RTH_CLOSE_HOUR_ET = 16
+
+
+def _parse_ts(iso_ts: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _et_session_date(iso_ts: str) -> str:
+    """The US-exchange session date (ET calendar date) a UTC timestamp falls
+    on -- an after-hours UTC timestamp is still 'during' that ET date for
+    the purpose of comparing against a daily bar's session date."""
+    dt = _parse_ts(iso_ts)
+    return dt.astimezone(_ET).date().isoformat() if dt is not None else ""
+
+
+def _bar_postdates_signal(bar_date: str, signaled_at: str) -> bool:
+    """Whether a daily bar's session contains any trading from AFTER the
+    signal fired -- i.e. the session's close (16:00 ET on the bar's session
+    date) is later than the signal timestamp. False means every price in
+    the bar predates the evidence that fired the signal, so filling a paper
+    trade from it would book the next session's reaction gap as P&L no real
+    order could have captured. Empty/unparseable inputs return True: a
+    price source that can't supply session dates degrades to the old
+    behavior instead of silently never opening a trade."""
+    sig = _parse_ts(signaled_at)
+    if not bar_date or sig is None:
+        return True
+    try:
+        session_close = datetime.fromisoformat(bar_date).replace(
+            hour=_RTH_CLOSE_HOUR_ET, minute=0, second=0, microsecond=0, tzinfo=_ET,
+        )
+    except ValueError:
+        return True
+    return session_close > sig
+
 
 TICK_INTERVAL_SEC = 30
 DATA_DIR = Path("data")
@@ -238,14 +289,27 @@ class Engine:
             return value.get("as", "tradeable"), value.get("source", "manual")
         return value, "manual"
 
+    def _accepted_ecosystem(self, symbol: str, specs: dict) -> str:
+        """The ecosystem an accepted candidate joins as -- guessed from the
+        companies whose filings disclosed it (guess_ecosystem), because the
+        literal placeholder \"accepted\" used to lump every runtime-accepted
+        symbol into one cross-sector pseudo-ecosystem, and the forward-return
+        report's benchmark-relative alpha then measured each one against the
+        mean move of the other unrelated accepted names."""
+        entry = self.candidates.get(symbol) or {}
+        eco = guess_ecosystem(entry.get("related_to") or [], specs)
+        return eco if eco != "?" else "accepted"
+
     def _apply_accepted_candidates(self) -> None:
         known = {c.symbol for c in self.universe}
+        specs = spec_by_symbol(self.universe)
         for symbol, value in self.accepted_candidates.data.items():
             if symbol in known:
                 continue
             as_type, source = self._accepted_entry(value)
             self.universe.append(
-                CompanySpec(symbol, symbol, "accepted", signal_source_only=(as_type == "anchor"),
+                CompanySpec(symbol, symbol, self._accepted_ecosystem(symbol, specs),
+                            signal_source_only=(as_type == "anchor"),
                             notes=f"Accepted ({source}) from a discovered universe candidate")
             )
             known.add(symbol)
@@ -282,7 +346,8 @@ class Engine:
                 "Add it as an anchor instead -- its news will still propagate. "
                 "If you really want it tradeable, put it in SYMBOLS."
             )
-        spec = CompanySpec(symbol, symbol, "accepted", signal_source_only=(as_type == "anchor"),
+        spec = CompanySpec(symbol, symbol, self._accepted_ecosystem(symbol, self.spec_by_symbol),
+                            signal_source_only=(as_type == "anchor"),
                             notes=f"Accepted ({source}) from a discovered universe candidate")
         self.universe.append(spec)
         self.spec_by_symbol[symbol] = spec
@@ -605,7 +670,11 @@ class Engine:
     # --- EDGAR ingestion ---
 
     async def _poll_edgar(self) -> None:
-        since_date = (date.today() - timedelta(days=self.settings.edgar_lookback_days)).isoformat()
+        # UTC, not date.today(): filing dates, dedup fingerprints, and the
+        # daily passes are all UTC-dated, and on a host west of UTC the
+        # local date lags the UTC date for the first hours of every UTC day
+        # -- exactly the overnight window in which 8-Ks land.
+        since_date = (datetime.now(timezone.utc).date() - timedelta(days=self.settings.edgar_lookback_days)).isoformat()
         for symbol in self.symbol_list:
             try:
                 filings = await self.edgar_client.recent_filings(symbol, self.settings.edgar_forms_set, since_date)
@@ -620,15 +689,32 @@ class Engine:
 
     async def _process_filing(self, symbol: str, filing: FilingEvent) -> None:
         fp = f"filing:{symbol}:{filing.accession_number}"
-        if self.dedup.is_duplicate(fp):
+        # Relationship extraction and dossier scoring are SEPARATE paid
+        # outcomes of the same filing, tracked separately: registering the
+        # filing on a scored dossier while the extraction call had failed
+        # transiently used to lose the 10-K/10-Q's relationship disclosures
+        # until the next annual/quarterly filing, and the reverse (scoring
+        # deferred after a successful extraction) used to re-pay the ~40k-
+        # token extraction call -- the largest call in the system -- on
+        # every retry poll. The per-accession marker is also what stops the
+        # backfill and the regular poll from each extracting the same young
+        # 10-K once apiece (double-incrementing every counterparty's
+        # candidate seen_count, halving the auto-accept disclosure bar).
+        ext_key = f"extracted:{symbol}:{filing.accession_number}"
+        extraction_wanted = filing.form in RELATIONSHIP_EXTRACTION_FORMS and self.extractor is not None
+        extraction_pending = extraction_wanted and not self.dedup.is_duplicate(ext_key)
+        if self.dedup.is_duplicate(fp) and not extraction_pending:
             return
 
         text = await self.edgar_client.fetch_evidence_text(filing)
         if not text:
             return  # fetch failed/empty -- unregistered, so the next poll retries it
 
-        if filing.form in RELATIONSHIP_EXTRACTION_FORMS and self.extractor is not None:
-            await self._extract_relationships(symbol, filing, text)
+        if extraction_pending and await self._extract_relationships(symbol, filing, text):
+            self.dedup.register(ext_key, "sec.gov")
+
+        if self.dedup.is_duplicate(fp):
+            return  # already scored on an earlier pass -- this one only retried extraction
 
         # Head + tail rather than a flat prefix: the first few thousand
         # characters of a filing are mostly the SEC cover page and checkbox
@@ -1082,6 +1168,11 @@ class Engine:
         done = 0
         for symbol in pending:
             try:
+                # latest_filing RAISES on a transient HTTP failure (leaving
+                # the symbol pending via the except below) and returns None
+                # only when the submissions list was actually inspected --
+                # a 503 at the wrong moment used to be recorded as "no 10-K
+                # exists", permanently skipping this symbol's extraction.
                 filing = await self.edgar_client.latest_filing(symbol, "10-K")
                 if filing is None:
                     # No 10-K on record (foreign issuer, fresh IPO) -- mark done,
@@ -1090,18 +1181,30 @@ class Engine:
                     self.backfill_state.set(symbol, {"backfilled_at": datetime.now(timezone.utc).isoformat(),
                                                      "accession": None})
                     continue
-                text = await self.edgar_client.fetch_text(filing)
-                if not text:
-                    continue  # fetch failed -- left pending, retried on the next tick
-                if not await self._extract_relationships(symbol, filing, text):
-                    # Extraction was deferred (budget exhausted or a
-                    # transient API failure) -- the symbol must NOT be
-                    # marked backfilled, or its 10-K would silently never
-                    # be extracted at all until next year's annual filing.
-                    # Back off before retrying so a spent daily budget
-                    # doesn't turn this into a 30-second fetch loop.
-                    self._backfill_retry_after = time.monotonic() + IB_RETRY_GAP_SEC
-                    continue
+                ext_key = f"extracted:{symbol}:{filing.accession_number}"
+                if not self.dedup.is_duplicate(ext_key):
+                    text = await self.edgar_client.fetch_text(filing)
+                    if not text:
+                        # Fetch failed -- left pending, but on a backoff: a
+                        # persistently 404ing document used to re-fetch
+                        # submissions + document every 30-second tick forever.
+                        self._backfill_retry_after = time.monotonic() + IB_RETRY_GAP_SEC
+                        continue
+                    if not await self._extract_relationships(symbol, filing, text):
+                        # Extraction was deferred (budget exhausted or a
+                        # transient API failure) -- the symbol must NOT be
+                        # marked backfilled, or its 10-K would silently never
+                        # be extracted at all until next year's annual filing.
+                        # Back off before retrying so a spent daily budget
+                        # doesn't turn this into a 30-second fetch loop.
+                        self._backfill_retry_after = time.monotonic() + IB_RETRY_GAP_SEC
+                        continue
+                    # Shared with _process_filing: whichever of the backfill
+                    # and the regular poll extracts a young 10-K first, the
+                    # other skips it -- extracting the same accession twice
+                    # double-counted every counterparty's candidate
+                    # seen_count, halving the auto-accept disclosure bar.
+                    self.dedup.register(ext_key, "sec.gov")
                 self.backfill_state.set(symbol, {"backfilled_at": datetime.now(timezone.utc).isoformat(),
                                                  "accession": filing.accession_number,
                                                  "filing_date": filing.filing_date})
@@ -1114,8 +1217,12 @@ class Engine:
     # --- News ingestion ---
 
     async def _poll_news(self) -> None:
-        to_date = date.today().isoformat()
-        from_date = (date.today() - timedelta(days=self.settings.news_lookback_days)).isoformat()
+        # UTC for the same reason as _poll_edgar: Finnhub stamps articles
+        # with UTC dates, so a local-time to_date hides brand-new overnight
+        # articles from every poll until the local calendar catches up.
+        today_utc = datetime.now(timezone.utc).date()
+        to_date = today_utc.isoformat()
+        from_date = (today_utc - timedelta(days=self.settings.news_lookback_days)).isoformat()
         for symbol in self.symbol_list:
             try:
                 articles = await self.finnhub.recent_news(symbol, from_date, to_date)
@@ -1286,7 +1393,7 @@ class Engine:
         return "handled"
 
     @staticmethod
-    def _validated_proposal(target_symbol: str, proposed: dict) -> dict | None:
+    def _validated_proposal(target_symbol: str, proposed: dict, max_horizon_days: int = 60) -> dict | None:
         """Clamped, type-checked copy of a propose_update tool response, or
         None when a required field is missing/invalid -- Anthropic tool use
         does not hard-enforce the declared schema, and indexing a missing
@@ -1300,7 +1407,13 @@ class Engine:
                 "direction": direction,
                 "magnitude": min(1.0, max(0.0, float(proposed["magnitude"]))),
                 "confidence": min(1.0, max(0.0, float(proposed["confidence"]))),
-                "horizon_days": max(1, int(proposed["horizon_days"])),
+                # Clamped ABOVE too: the tool schema declares a maximum, but
+                # schemas are not hard-enforced, and one accepted record with
+                # horizon_days=3650 would hold full decay weight for a
+                # decade -- the daily decay pass could never fade or expire
+                # that dossier, keeping a stale thesis at the signal bar
+                # indefinitely.
+                "horizon_days": min(max(1, int(proposed["horizon_days"])), max(1, int(max_horizon_days))),
                 "reasoning": str(proposed.get("reasoning") or ""),
             }
         except (KeyError, TypeError, ValueError) as exc:
@@ -1356,7 +1469,7 @@ class Engine:
             )
             if raw is None:
                 return "deferred"  # transient LLM failure or budget exhausted -- retry later
-            proposed = self._validated_proposal(target_symbol, raw)
+            proposed = self._validated_proposal(target_symbol, raw, self.settings.max_horizon_days)
             if proposed is None:
                 return self._mark_handled(proposal_key)  # malformed -- dropping is definitive
             if not proposed["is_new_information"]:
@@ -1525,12 +1638,38 @@ class Engine:
             self._expire_signal(dossier, "thesis no longer qualifies at entry time")
             return
         try:
-            price = await self.price_feed.last_price(symbol)
+            bar = await self.price_feed.last_bar(symbol)
         except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
             log.exception("%s: could not fetch entry price.", symbol)
             return
-        if price is None:
+        if bar is None:
             return
+
+        # No fills from a bar whose session ended before the signal fired.
+        # 8-Ks land predominantly after the bell and news polls run around
+        # the clock, so when the market is closed the "last price" is the
+        # last COMPLETED session's close -- from BEFORE the market could
+        # react to the very evidence that fired the signal. Filling there
+        # books the next session's reaction gap as P&L no real order could
+        # have captured, systematically inflating the record exactly when
+        # the thesis was right. Defer to the next session instead.
+        if not _bar_postdates_signal(bar.date, dossier.signaled_at):
+            if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
+                self._expire_signal(dossier, "no post-signal session bar within the deadline",
+                                    price=bar.close)
+                return
+            log.info("[SIGNAL] %s: last daily bar (%s) predates the signal -- deferring entry "
+                     "to the next session.", symbol, bar.date or "undated")
+            return
+
+        # Fill convention: a signal fired DURING the bar's session enters at
+        # the current/close price; a signal from an earlier date enters at
+        # this session's OPEN (the standard next-open convention -- the
+        # decision to enter was fixed before the session started).
+        if bar.date and _et_session_date(dossier.signaled_at) < bar.date and bar.open > 0:
+            price, entry_fill = bar.open, "open"
+        else:
+            price, entry_fill = bar.close, "close"
 
         if dossier.signaled_price is not None:
             drift = favorable_drift_pct(dossier.direction, dossier.signaled_price, price)
@@ -1594,6 +1733,7 @@ class Engine:
             dossier.independent_source_count, citations,
             cost_bps_round_trip=cost_per_side * 2,
             market_cap_musd=market_cap,
+            entry_fill=entry_fill,
         )
         self._record_decision("trade_opened", symbol, dossier.direction, dossier.signaled_at,
                               price=price)
@@ -1635,7 +1775,23 @@ class Engine:
             # the stop intraday and recovered by the close is a real stop-out
             # for any live position -- evaluating on close alone erased
             # exactly those losses and flattered the paper record.
-            self.journal.update(symbol, bar.close, high=bar.high, low=bar.low)
+            #
+            # EXCEPT on the entry session of a close-filled trade: that
+            # bar's extremes are mostly PRE-entry price action (the trade
+            # opened at/near the close), and evaluating them fabricated
+            # same-tick stop-outs from moves that happened hours before the
+            # position existed. Entry-day marks for those trades use the
+            # close only; an open-filled trade owns its whole entry session,
+            # and from the next session on the full bar is post-entry.
+            same_session_close_fill = (
+                bool(bar.date)
+                and getattr(trade, "entry_fill", "close") != "open"
+                and _et_session_date(trade.opened_at) == bar.date
+            )
+            if same_session_close_fill:
+                self.journal.update(symbol, bar.close)
+            else:
+                self.journal.update(symbol, bar.close, high=bar.high, low=bar.low)
             if trade.status != "OPEN":
                 # The paper trade just closed (WIN/LOSS/TIMEOUT) -- notify,
                 # then reset the dossier so future evidence can trigger a
@@ -1647,9 +1803,17 @@ class Engine:
                     f"R={trade.r_multiple:.2f}",
                     asdict(trade),
                 )
-                dossier = self.dossiers.load(symbol)
-                self._reset_to_active(dossier)
-                self.dossiers.save(dossier)
+                # A demoted/removed symbol's open trade still closes here
+                # (correctly), but its dossier file may already have been
+                # moved to the archive -- load() would return an empty
+                # shell, and saving that recreates a live file which the
+                # next archive pass then uses to OVERWRITE the archived
+                # evidence history with nothing. Only reset a dossier that
+                # still exists live.
+                if (self.dossiers.dir_path / f"{symbol}.json").exists():
+                    dossier = self.dossiers.load(symbol)
+                    self._reset_to_active(dossier)
+                    self.dossiers.save(dossier)
 
     # --- Evidence time-decay ---
 
@@ -1834,8 +1998,17 @@ class Engine:
                 continue
             archive.mkdir(parents=True, exist_ok=True)
             source = self.dossiers.dir_path / f"{symbol}.json"
+            target = archive / f"{symbol}.json"
+            if target.exists():
+                # Never overwrite an existing archive -- "the accumulated
+                # evidence is real history" only holds if a later (possibly
+                # emptier) live file can't replace it. Archive under a
+                # timestamped name instead; the plain name keeps the
+                # earliest history for any future re-promotion.
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                target = archive / f"{symbol}.{stamp}.json"
             try:
-                source.replace(archive / f"{symbol}.json")
+                source.replace(target)
             except OSError:
                 log.exception("%s: could not archive orphaned dossier.", symbol)
                 continue

@@ -146,7 +146,13 @@ def run_forward_returns(
         )
 
     price_marks = price_marks_by_symbol(marks)
-    ecosystem_by_symbol = {symbol: spec.ecosystem for symbol, spec in spec_by_symbol(universe).items()}
+    # Tradeables only: anchors are deliberately price-marked (cheap data),
+    # but a small-cap's "ecosystem benchmark" must be its tradeable PEERS --
+    # after the anchor expansion, anchors outnumber tradeables ~2:1, and an
+    # equal-weight mean dominated by mega-caps turns "benchmark-relative
+    # alpha" into a measurement of the small-cap-vs-mega-cap factor spread.
+    ecosystem_by_symbol = {symbol: spec.ecosystem for symbol, spec in spec_by_symbol(universe).items()
+                           if not spec.signal_source_only}
     directional = [s for s in snapshots if s.get("direction") in ("LONG", "SHORT")]
     for horizon_days in horizons:
         joined = [

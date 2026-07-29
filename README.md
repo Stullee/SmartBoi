@@ -305,8 +305,22 @@ check a signal against, and signals just log as before):
   with a clean baseline. A thesis that flips direction while still
   SIGNALED-but-unopened also gets a fresh baseline immediately, since the
   old one no longer means anything.
+- **Bar-session honesty** (no config -- always on): a paper trade is never
+  filled from a daily bar whose session ended before the signal fired.
+  8-Ks land predominantly after the bell and news polls run around the
+  clock, so when the market is closed the "last price" is the last
+  completed session's close -- from BEFORE the market could react to the
+  evidence that fired the signal, and filling there books the next
+  session's reaction gap as P&L no real order could have captured. An
+  after-hours/weekend signal defers and fills at the next session's OPEN
+  (recorded as `entry_fill: "open"` on the trade); an intra-session signal
+  fills at the current close (`entry_fill: "close"`). For the same reason,
+  on its entry session a close-filled trade is marked against the close
+  only -- the day's high/low happened mostly before the position existed --
+  while an open-filled trade owns its whole entry session; from the next
+  session on the full bar applies.
 
-Both are visible on the dashboard's Dossiers table (Signaled @ column).
+Both guards are visible on the dashboard's Dossiers table (Signaled @ column).
 
 ## Evidence time-decay
 
@@ -495,11 +509,15 @@ first; and a benchmark-relative variant -- each return minus its own
 ecosystem's mean RAW return over the same window, sign-matched to the
 row's own direction (a LONG compares against the ecosystem's raw return
 directly, a SHORT against its negation). The ecosystem benchmark is built
-from every symbol `price_marks.jsonl` tracks (ecosystem tags from
+from the TRADEABLE symbols `price_marks.jsonl` tracks (ecosystem tags from
 `universe.py`), not just symbols that happen to have a dossier -- using
 only dossier-having symbols made a single-dossier ecosystem's "benchmark"
 trivially equal to its own return, zeroing out alpha by construction
-rather than measuring anything. Separates alpha (the pick itself) from
+rather than measuring anything. Anchors are deliberately price-marked
+(cheap, useful data) but excluded from the benchmark mean: after the
+anchor expansion they outnumber tradeables ~2:1, and an equal-weight mean
+dominated by mega-caps turns "benchmark-relative alpha" into a measurement
+of the small-cap-vs-mega-cap factor spread, not stock picking. Separates alpha (the pick itself) from
 sector beta (the whole ecosystem moved). Forward return is always signed
 in the THESIS
 direction (LONG: price up is a win; SHORT: price down is a win), so a

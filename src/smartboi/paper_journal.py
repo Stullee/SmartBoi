@@ -95,6 +95,15 @@ class PaperTrade:
     # assumes_borrow(). Kept per trade so win-rate/avg-R statistics can be
     # split into "clean" vs "assumes a borrow existed".
     assumes_borrow: bool = False
+    # How the entry price was taken from the daily bar: "close" (entered
+    # intra-session at the then-current price) or "open" (next-session-open
+    # convention, for signals that fired after the bell). Recorded because
+    # the entry-day stop/target evaluation differs: a close-fill's entry-day
+    # bar extremes are mostly PRE-entry price action and must not trigger
+    # the stop, while an open-fill owns its whole entry session (see
+    # engine._mark_and_execute). Defaults to "close" so rows written before
+    # this field existed keep loading.
+    entry_fill: str = "close"
 
     def _net_pnl(self, exit_price: float) -> float:
         """P&L per share after the round-trip transaction cost.
@@ -202,6 +211,7 @@ class PaperTradeJournal:
         citations: list[dict],
         cost_bps_round_trip: float = 0.0,
         market_cap_musd: float | None = None,
+        entry_fill: str = "close",
     ) -> PaperTrade:
         if direction == "LONG":
             stop_price = entry_price * (1 - stop_loss_pct / 100)
@@ -224,6 +234,7 @@ class PaperTradeJournal:
             cost_bps_round_trip=cost_bps_round_trip,
             market_cap_musd=market_cap_musd,
             assumes_borrow=assumes_borrow(direction, market_cap_musd),
+            entry_fill=entry_fill,
         )
         self.open_trades[symbol] = trade
         self._write_open_state()

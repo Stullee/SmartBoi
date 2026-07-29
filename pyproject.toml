@@ -12,6 +12,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "python-dotenv>=1.0",
     "ib_async>=1.0.3",
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

@@ -358,16 +358,20 @@ class EdgarClient:
         (within the submissions endpoint's ~1000-filing recent block) --
         used by the one-time relationship backfill (engine.py), which needs
         last year's 10-K, not just whatever landed inside the rolling
-        poll lookback window."""
+        poll lookback window.
+
+        None means DEFINITIVELY none: the submissions list was actually
+        inspected and contained no such form (or the symbol has no CIK at
+        all -- a foreign issuer or fresh IPO that doesn't file). A transient
+        HTTP failure RAISES instead of returning None -- the backfill marks
+        a None-returning symbol done forever, so conflating "SEC returned a
+        503" with "this company has never filed a 10-K" permanently and
+        silently skipped that symbol's graph extraction."""
         cik10 = await self.cik_for(symbol)
         if cik10 is None:
             log.warning("%s: no CIK found in EDGAR's ticker map -- cannot backfill.", symbol)
             return None
-        try:
-            response = await self._throttled_get(_SUBMISSIONS_URL.format(cik10=cik10))
-        except httpx.HTTPError as exc:
-            log.warning("%s: EDGAR submissions fetch failed: %s", symbol, exc)
-            return None
+        response = await self._throttled_get(_SUBMISSIONS_URL.format(cik10=cik10))
         recent = response.json().get("filings", {}).get("recent", {})
         # The recent block is newest-first, so the first match is the latest.
         for filing_form, filing_date, accession, primary_doc in zip(

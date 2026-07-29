@@ -25,11 +25,22 @@ class PriceBar(NamedTuple):
     """The most recent daily bar's close plus its intraday extremes --
     high/low exist so paper-trade stop/target checks can see a level that
     traded intraday but recovered by the close (see paper_journal.update);
-    a close-only mark silently erased exactly those stop-outs."""
+    a close-only mark silently erased exactly those stop-outs.
+
+    `open` and `date` (the bar's SESSION date, ISO, exchange calendar) exist
+    so the engine can tell whether this bar's session actually postdates a
+    signal: when the market is closed, IB returns the last COMPLETED bar,
+    whose close predates any evidence that arrived after the bell -- filling
+    a paper trade from it books the next session's reaction gap as P&L no
+    real order could have captured (see engine._try_open_from_signal).
+    Both default empty/zero so price sources that can't supply them (tests,
+    fallbacks) degrade to the old close-only behavior instead of breaking."""
 
     close: float
     high: float
     low: float
+    open: float = 0.0
+    date: str = ""
 
 # Spaces out price lookups within one polling pass so a ~40-symbol universe
 # doesn't burst 40 historical-data requests at once against IB's pacing
@@ -81,7 +92,9 @@ class ReadOnlyPriceFeed:
         if not bars:
             return None
         bar = bars[-1]
-        return PriceBar(close=float(bar.close), high=float(bar.high), low=float(bar.low))
+        # bar.date is the bar's session date for daily bars (a datetime.date).
+        return PriceBar(close=float(bar.close), high=float(bar.high), low=float(bar.low),
+                        open=float(bar.open), date=str(bar.date))
 
     async def last_price(self, symbol: str) -> float | None:
         bar = await self.last_bar(symbol)

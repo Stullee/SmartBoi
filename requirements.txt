@@ -6,5 +6,9 @@ anthropic>=0.40
 beautifulsoup4>=4.12
 python-dotenv>=1.0
 ib_async>=1.0.3
+# IANA timezone data for zoneinfo("America/New_York") on slim images that
+# ship without /usr/share/zoneinfo -- bar-session honesty checks in
+# engine.py depend on correct US/Eastern conversion.
+tzdata>=2024.1
 pytest>=8.2
 pytest-asyncio>=0.23

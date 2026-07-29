@@ -80,7 +80,12 @@ def main() -> None:
     price_marks = price_marks_by_symbol(marks)
     settings = load_settings()
     specs = spec_by_symbol(settings.universe)
-    ecosystem_by_symbol = {symbol: spec.ecosystem for symbol, spec in specs.items()}
+    # Tradeables only (same rule as tools.run_forward_returns): anchors are
+    # price-marked for cheap data, but the ecosystem benchmark must be a
+    # name's tradeable PEERS -- an equal-weight mean dominated by mega-cap
+    # anchors measures the size-factor spread, not stock-picking alpha.
+    ecosystem_by_symbol = {symbol: spec.ecosystem for symbol, spec in specs.items()
+                           if not spec.signal_source_only}
 
     horizons = [int(h.strip()) for h in args.horizons.split(",") if h.strip()]
     directional = [s for s in snapshots if s.get("direction") in ("LONG", "SHORT")]
