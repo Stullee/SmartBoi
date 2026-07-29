@@ -52,8 +52,36 @@ class Settings(BaseSettings):
     # supplier changes and are run through the same relationship
     # extraction (see engine.py), keeping the graph fresher between annual
     # 10-Ks instead of only updating once a year.
-    edgar_forms: str = "8-K,10-K,10-Q,4"
-    edgar_poll_interval_sec: int = 3600
+    # Widened beyond the original 8-K/10-K/10-Q/4. The forms filter is
+    # applied CLIENT-SIDE to a submissions payload that is fetched whole
+    # regardless, so adding a form type costs zero extra HTTP requests --
+    # only the per-filing document fetch and scoring for filings that
+    # actually appear. What each addition buys, for a universe of thinly-
+    # covered small caps:
+    #   SC 13D / SC 13D/A -- an activist or strategic investor crossing 5%,
+    #     filed within 10 days. One of the largest single-day moves a
+    #     micro-cap experiences, and it appears in the ISSUER's filing
+    #     history, so it needs no separate feed.
+    #   424B5 / 424B3 -- a shelf takedown actually pricing: dilution, and
+    #     the cleanest SHORT catalyst this universe offers. A system that
+    #     only ever reads good news is not a research system.
+    #   8-K/A -- amended material events, which is where a restated
+    #     contract value or corrected figure lands.
+    edgar_forms: str = "8-K,8-K/A,10-K,10-Q,4,SC 13D,SC 13D/A,424B5,424B3"
+    # 15 minutes, not an hour. This is now the system's PRIMARY live
+    # catalyst feed, not a slow background sweep of periodic reports: an
+    # 8-K carries the company's own press release as an exhibit (see
+    # edgar.fetch_evidence_text) and is filed within four business days of
+    # a material event, usually the same day. An hourly poll threw away up
+    # to an hour of a drift window the strategy's own configuration says is
+    # concentrated in the first week.
+    #
+    # The cost is one cached submissions request per symbol per pass, at
+    # EDGAR's 0.3s spacing -- about a minute of wall clock for a 209-symbol
+    # universe, against SEC's published 10-requests-per-second allowance.
+    # No LLM cost changes: dedup means an already-seen filing is dropped
+    # before any scoring call.
+    edgar_poll_interval_sec: int = 900
     # Rolling lookback window checked on every poll (not just first-run
     # backfill) -- dedup.py's fingerprint index prevents reprocessing a
     # filing already seen, so widening this is cheap and just a safety

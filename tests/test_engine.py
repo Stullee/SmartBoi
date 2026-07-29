@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -25,8 +25,10 @@ from tests.fakes import (
     FakeFinnhub,
     FakePriceFeed,
     FakeSkeptic,
+    FakeSynthesizer,
     FakeUpdater,
     proposal,
+    synthesis,
     verdict,
 )
 
@@ -1587,3 +1589,119 @@ async def test_a_fresh_signal_pulls_the_entry_poll_to_the_next_tick(engine):
 
     assert engine._last_price_poll is None
     assert engine._entry_pending is True
+
+
+# --- Whole-evidence-body synthesis.
+#
+# Everything else here is incremental: each item is scored alone against a
+# one-line thesis summary, and the aggregate is arithmetic over those
+# independent scores. Nothing read the evidence as a BODY, which left three
+# questions structurally unanswerable -- are these N facts or one fact
+# counted N times, do they cohere, and has the market already connected them
+# -- and all three decide whether a trade is justified.
+#
+# Its verdict CAPS the arithmetic aggregate. It can veto and it can trim; it
+# cannot inflate a score into a trade, so one model call never becomes a
+# single point of failure for committing capital. ---
+
+async def _build_thesis(engine, symbol="FORM", confidence=0.8, magnitude=0.8):
+    engine.updater.default = proposal(direction="LONG", magnitude=magnitude,
+                                      confidence=confidence, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=confidence,
+                                     adjusted_magnitude=magnitude)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol=symbol, evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+        )
+    return engine.dossiers.load(symbol)
+
+
+async def test_synthesis_trims_a_score_it_judges_over_counted(engine):
+    engine.synthesizer = FakeSynthesizer(default=synthesis(confidence=0.4, magnitude=0.5,
+                                                           distinct_fact_count=1))
+    dossier = await _build_thesis(engine)
+    before = dossier.confidence * dossier.magnitude
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert dossier.confidence == 0.4
+    assert dossier.magnitude == 0.5
+    assert dossier.confidence * dossier.magnitude < before
+    assert dossier.distinct_fact_count == 1
+
+
+async def test_synthesis_cannot_inflate_a_score(engine):
+    """A cap, never a lift -- otherwise one confident model call could
+    manufacture a trade on evidence that never accumulated."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(confidence=1.0, magnitude=1.0))
+    dossier = await _build_thesis(engine, confidence=0.3, magnitude=0.3)
+    before_c, before_m = dossier.confidence, dossier.magnitude
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert dossier.confidence == before_c
+    assert dossier.magnitude == before_m
+
+
+async def test_already_priced_in_is_a_veto(engine):
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    dossier = await _build_thesis(engine)
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert dossier.confidence == 0.0
+    assert dossier.magnitude == 0.0
+    assert dossier.already_priced_in is True
+
+
+async def test_a_direction_disagreement_is_a_veto(engine):
+    engine.synthesizer = FakeSynthesizer(default=synthesis(direction="SHORT"))
+    dossier = await _build_thesis(engine)  # arithmetic says LONG
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert dossier.confidence == 0.0
+    assert dossier.magnitude == 0.0
+
+
+async def test_a_failed_synthesis_leaves_the_aggregate_untouched(engine):
+    """A transient error or an exhausted budget must be a no-op, not a block."""
+    engine.synthesizer = FakeSynthesizer(default=None)
+    dossier = await _build_thesis(engine)
+    before_c, before_m = dossier.confidence, dossier.magnitude
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert (dossier.confidence, dossier.magnitude) == (before_c, before_m)
+
+
+async def test_synthesis_is_skipped_for_a_directionless_dossier(engine):
+    engine.synthesizer = FakeSynthesizer(default=synthesis())
+    dossier = engine.dossiers.load("FORM")  # never had evidence -> direction NONE
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert engine.synthesizer.calls == []
+
+
+async def test_out_of_range_model_numbers_are_clamped(engine):
+    """Tool schemas declare min/max but tool use does not hard-enforce them,
+    and these flow straight into a trade decision."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(confidence=7.5, magnitude=-2.0))
+    dossier = await _build_thesis(engine)
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert 0.0 <= dossier.synthesis_confidence <= 1.0
+    assert 0.0 <= dossier.synthesis_magnitude <= 1.0
+    assert dossier.magnitude == 0.0
+
+
+async def test_the_decay_pass_runs_synthesis(engine):
+    engine.synthesizer = FakeSynthesizer(default=synthesis(confidence=0.3, magnitude=0.3))
+    await _build_thesis(engine)
+
+    await engine._run_decay_pass()
+
+    assert [c["symbol"] for c in engine.synthesizer.calls] == ["FORM"]

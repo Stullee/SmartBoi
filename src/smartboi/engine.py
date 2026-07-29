@@ -44,6 +44,7 @@ from smartboi.dossier import (
     DIRECTIONS,
     Dossier,
     DossierStore,
+    DossierSynthesizer,
     DossierUpdater,
     EvidenceRecord,
     has_evidence,
@@ -211,6 +212,16 @@ def _non_common_reason(symbol: str) -> str:
     return ""
 
 
+def _clamp_unit(value, default: float = 0.0) -> float:
+    """A model-supplied 0-1 number, clamped. Tool schemas declare min/max but
+    Anthropic tool use does not hard-enforce them, so an out-of-range value
+    can arrive -- and here it would flow straight into a trade decision."""
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _clamped_confidence(value, default: float = 0.5) -> float:
     """The extractor's confidence, coerced into [0, 1]. Anthropic tool use
     does not hard-enforce the declared schema, so this must survive a
@@ -329,6 +340,7 @@ class Engine:
         self.extractor: RelationshipExtractor | None = None
         self.updater: DossierUpdater | None = None
         self.skeptic: Skeptic | None = None
+        self.synthesizer: DossierSynthesizer | None = None
         self.price_feed: ReadOnlyPriceFeed | None = None
 
         self._warned: set[str] = set()
@@ -666,6 +678,13 @@ class Engine:
             self.extractor = RelationshipExtractor(self.settings.anthropic_api_key, self.settings.extraction_model, self.usage)
             self.updater = DossierUpdater(self.settings.anthropic_api_key, self.settings.dossier_model, self.usage)
             self.skeptic = Skeptic(self.settings.anthropic_api_key, self.settings.skeptic_model, self.usage)
+            # Same model as the skeptic: synthesis is the hardest judgement
+            # in the system (is this N facts or one fact N times?) and it
+            # runs at most once a day per tradeable, so it is the cheapest
+            # place in the pipeline to spend on reasoning quality.
+            self.synthesizer = DossierSynthesizer(
+                self.settings.anthropic_api_key, self.settings.skeptic_model, self.usage
+            )
             log.info(
                 "Dossier engine (Claude): ENABLED (daily LLM call budget: %d, see MAX_DAILY_LLM_CALLS)",
                 self.settings.max_daily_llm_calls,
@@ -759,6 +778,8 @@ class Engine:
                 await self.updater.aclose()
             if self.skeptic is not None:
                 await self.skeptic.aclose()
+            if self.synthesizer is not None:
+                await self.synthesizer.aclose()
             if self.price_feed is not None:
                 self.price_feed.disconnect()
             await self.alerts.aclose()
@@ -2606,6 +2627,10 @@ class Engine:
             # unconditionally costs nothing.
             if self.journal.has_open(symbol):
                 continue
+            # Synthesis runs here and nowhere else: once a day, only for a
+            # dossier that has resolved a direction, so this is a few dozen
+            # calls against a budget the deployment runs at a few percent of.
+            await self._apply_synthesis(dossier, now)
             signal = evaluate(dossier, self.settings.signal_confidence_threshold,
                               self.settings.min_independent_sources,
                               self.settings.min_independent_sources_news_only)
@@ -2617,6 +2642,66 @@ class Engine:
                          "(score=%.3f, sources=%d).", symbol,
                          dossier.confidence * dossier.magnitude, dossier.independent_source_count)
                 await self._fire_signal(dossier, signal)
+
+    async def _apply_synthesis(self, dossier: Dossier, now: datetime) -> None:
+        """Runs the whole-evidence-body pass and folds its verdict into the
+        dossier as a CAP on the arithmetic aggregate.
+
+        A cap, never a lift. The arithmetic aggregate is a mechanical sum
+        over independently-scored items and has no way to notice that ten of
+        them are one story restated, that the facts do not cohere, or that
+        the market already made the connection -- so synthesis is given the
+        power to veto and to trim, which is exactly the set of errors it can
+        see and the aggregate cannot. It is deliberately NOT given the power
+        to raise a score into a trade: that would make one model call a
+        single point of failure for committing capital, and this system's
+        whole premise is that a thesis has to survive accumulation and an
+        adversarial pass rather than one confident opinion.
+
+        Failure is a no-op, not a block: a transient error or an exhausted
+        budget leaves the arithmetic aggregate exactly as it was."""
+        if self.synthesizer is None or dossier.direction not in ("LONG", "SHORT"):
+            return
+        spec = self.spec_by_symbol.get(dossier.symbol)
+        verdict = await self.synthesizer.synthesize(
+            dossier, ecosystem=spec.ecosystem if spec is not None else "", now=now,
+        )
+        if verdict is None:
+            return
+
+        dossier.synthesis_at = now.isoformat()
+        dossier.synthesis_note = str(verdict.get("thesis") or "")[:600]
+        dossier.synthesis_catalyst = str(verdict.get("strongest_catalyst") or "")[:300]
+        dossier.distinct_fact_count = int(verdict.get("distinct_fact_count") or 0)
+        dossier.already_priced_in = bool(verdict.get("already_priced_in"))
+
+        if verdict.get("direction") != dossier.direction or dossier.already_priced_in:
+            # Synthesis disagrees with the resolved direction, or says the
+            # move is over. Either way this is not a thesis to enter on --
+            # zero the score rather than trading against the only pass that
+            # looked at the evidence as a whole.
+            reason = "already priced in" if dossier.already_priced_in else "direction disagrees"
+            log.info("[SYNTHESIS] %s: vetoed (%s) -- %s", dossier.symbol, reason,
+                     dossier.synthesis_note[:160])
+            dossier.synthesis_confidence = 0.0
+            dossier.synthesis_magnitude = 0.0
+            dossier.confidence = 0.0
+            dossier.magnitude = 0.0
+            return
+
+        dossier.synthesis_confidence = _clamp_unit(verdict.get("confidence"))
+        dossier.synthesis_magnitude = _clamp_unit(verdict.get("magnitude"))
+        before = dossier.confidence * dossier.magnitude
+        dossier.confidence = min(dossier.confidence, dossier.synthesis_confidence)
+        dossier.magnitude = min(dossier.magnitude, dossier.synthesis_magnitude)
+        after = dossier.confidence * dossier.magnitude
+        if after < before:
+            log.info(
+                "[SYNTHESIS] %s: score trimmed %.3f -> %.3f (%d distinct fact(s) behind %d counted "
+                "source(s)) -- %s", dossier.symbol, before, after,
+                dossier.distinct_fact_count, dossier.independent_source_count,
+                dossier.synthesis_catalyst[:120],
+            )
 
     # --- Forward-validation capture (Phase A): daily dossier score
     # snapshots and daily price marks, the raw material for eventually

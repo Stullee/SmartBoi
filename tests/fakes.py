@@ -125,6 +125,27 @@ class FakeSkeptic(_ScriptedCallable):
         pass
 
 
+class FakeSynthesizer(_ScriptedCallable):
+    async def synthesize(self, dossier, ecosystem="", now=None):
+        self.calls.append({"symbol": dossier.symbol, "ecosystem": ecosystem})
+        return self._next()
+
+    async def aclose(self):
+        pass
+
+
+def synthesis(direction="LONG", confidence=0.9, magnitude=0.9, distinct_fact_count=5,
+              already_priced_in=False, strongest_catalyst="a contract award",
+              thesis="the evidence coheres"):
+    """A well-formed DossierSynthesizer.synthesize() response."""
+    return {
+        "direction": direction, "confidence": confidence, "magnitude": magnitude,
+        "distinct_fact_count": distinct_fact_count, "horizon_days": 20,
+        "already_priced_in": already_priced_in,
+        "strongest_catalyst": strongest_catalyst, "thesis": thesis,
+    }
+
+
 class FakeExtractor(_ScriptedCallable):
     def __init__(self, default=None):
         super().__init__(default=default if default is not None else [])

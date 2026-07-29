@@ -125,6 +125,23 @@ class Dossier:
     # mass 8.88, zero opposing, over 0.85-0.95 confidence disclosed links
     # to RTX/LMT/NOC, and could not act for want of a third publisher.
     has_disclosed_link_evidence: bool = False
+    # --- Whole-evidence-body synthesis (see DossierSynthesizer), refreshed
+    # once a day by the decay pass. These are recorded even when the verdict
+    # changes nothing, so the pass's actual effect on outcomes is measurable
+    # from the forward record rather than being invisible.
+    synthesis_at: str = ""
+    synthesis_confidence: float = 0.0
+    synthesis_magnitude: float = 0.0
+    # How many genuinely DISTINCT underlying facts the evidence represents,
+    # as opposed to how many items were scored. Ten articles about one
+    # contract award are one fact; the arithmetic aggregate cannot tell the
+    # difference and this is the number that says so.
+    distinct_fact_count: int = 0
+    # Whether the market has plainly already made this connection. The whole
+    # strategy is trading the lag BEFORE it does, so this is a veto.
+    already_priced_in: bool = False
+    synthesis_note: str = ""
+    synthesis_catalyst: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -730,6 +747,181 @@ class DossierUpdater:
             )
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the ingestion loop
             log.warning("%s: dossier update proposal failed: %s", dossier.symbol, exc)
+            return None
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens, model=self._model)
+        return first_tool_use(response)
+
+    async def aclose(self) -> None:
+        await self._client.close()
+
+
+# --- Synthesis: reasoning across the accumulated evidence as a body ---
+
+_SYNTHESIS_TOOL = {
+    "name": "synthesize_thesis",
+    "description": "Judge a company's accumulated evidence as a whole and state the resulting thesis.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "direction": {"type": "string", "enum": list(DIRECTIONS)},
+            "distinct_fact_count": {
+                "type": "integer", "minimum": 0,
+                "description": (
+                    "How many genuinely DISTINCT underlying facts this evidence represents -- not "
+                    "how many items there are. Three articles about one contract award are ONE "
+                    "fact. A contract award, an insider purchase and a customer's guidance raise "
+                    "are THREE. This is the number that should decide how corroborated the thesis "
+                    "actually is."
+                ),
+            },
+            "confidence": {
+                "type": "number", "minimum": 0, "maximum": 1,
+                "description": "Confidence in the direction, judging the body of evidence as a whole.",
+            },
+            "magnitude": {
+                "type": "number", "minimum": 0, "maximum": 1,
+                "description": (
+                    "Size of the move the COMBINED evidence implies (0=negligible, 1=major "
+                    "re-rating). Overlapping items do not add; genuinely independent ones do."
+                ),
+            },
+            "horizon_days": {"type": "integer", "minimum": 1, "maximum": 60},
+            "already_priced_in": {
+                "type": "boolean",
+                "description": (
+                    "True if the market has plainly already absorbed this -- the evidence is old, "
+                    "the story was widely covered when it broke, or it merely confirms what was "
+                    "already known. The whole strategy is trading the lag BEFORE the market "
+                    "connects the dots, so a thesis the market has already connected is not one."
+                ),
+            },
+            "strongest_catalyst": {
+                "type": "string",
+                "description": "The single fact carrying the thesis, in one line.",
+            },
+            "thesis": {"type": "string", "description": "Two or three sentences."},
+        },
+        "required": [
+            "direction", "distinct_fact_count", "confidence", "magnitude",
+            "horizon_days", "already_priced_in", "strongest_catalyst", "thesis",
+        ],
+    },
+}
+
+_SYNTHESIS_SYSTEM_PROMPT = (
+    "You are an equity analyst reviewing the COMPLETE accumulated evidence file on one company "
+    "and stating what it adds up to. Everything here already survived an adversarial review "
+    "individually; your job is the question no per-item review can answer: what does this body "
+    "of evidence mean TOGETHER?\n\n"
+    "Three things only you can see:\n"
+    "1. OVERLAP. Items were scored one at a time, so the same underlying fact scored several "
+    "times looks like several corroborating facts. Count DISTINCT facts, not items. This is "
+    "the most important judgement you make -- an accumulation of one story restated is not a "
+    "corroborated thesis, and treating it as one is how a system talks itself into a trade.\n"
+    "2. COHERENCE. Do these facts describe one consistent story, or unrelated fragments that "
+    "happen to point the same way? A supplier winning a contract, that supplier's customer "
+    "guiding capex up, and an insider buying is a coherent thesis. Three unrelated mild "
+    "positives is a coincidence, and deserves far less confidence than their sum suggests.\n"
+    "3. STALENESS. Given the dates and how widely covered these facts were, has the market "
+    "already made this connection? The entire strategy is trading the lag before it does. Say "
+    "so plainly via already_priced_in -- it costs nothing to skip a move that is over, and a "
+    "great deal to enter one.\n\n"
+    + _CATALYST_RUBRIC +
+    "\n\nBe willing to conclude the evidence does NOT support a position: direction NONE, or a "
+    "confidence well below the individual items'. That is a real and useful answer. Be equally "
+    "willing to conclude it supports a LARGER move than any single item implied, when several "
+    "genuinely distinct facts reinforce each other."
+)
+
+
+class DossierSynthesizer:
+    """The pass that reasons across a dossier's evidence as a whole.
+
+    Everything else in this system is incremental: each evidence item is
+    scored alone against a one-line summary of the current thesis, and the
+    aggregate is then pure arithmetic over those independent scores
+    (see _aggregate). Nothing ever read the evidence file as a body, which
+    left three questions structurally unanswerable and all three of them
+    decide whether a trade is justified:
+
+      - are these N items N facts, or one fact counted N times?
+      - do they tell one coherent story, or are they unrelated coincidences
+        that happen to point the same way?
+      - has the market already connected these dots, making the lag this
+        strategy trades already gone?
+
+    Arithmetic over per-item scores cannot answer any of them, and the
+    per-item pass cannot either -- it sees one item. So this runs once a day
+    per tradeable with a live thesis: at most a few dozen calls, against a
+    budget the deployment runs at a few percent of.
+
+    Its output does not replace the arithmetic aggregate. It CAPS it (see
+    engine.py's decay pass): a thesis may fire on the lower of the two.
+    Synthesis can veto and it can trim, but it cannot inflate a score into a
+    trade on its own -- that keeps one model call from becoming a single
+    point of failure for committing capital."""
+
+    def __init__(self, api_key: str, model: str, usage: UsageTracker):
+        self._client = AsyncAnthropic(api_key=api_key)
+        self._model = model
+        self._usage = usage
+
+    @staticmethod
+    def _evidence_digest(dossier: Dossier, now: datetime, limit: int = 40) -> str:
+        """The evidence file as the analyst sees it: one line per non-stale
+        agreeing-or-opposing item, newest last, with the date, source, what
+        it was about and how it reached this company. Dates and sources are
+        included precisely so overlap and staleness are VISIBLE -- they are
+        what the two hardest judgements here are made from."""
+        live = [e for e in dossier.evidence if not evidence_is_stale(e, now)]
+        lines = []
+        for e in live[-limit:]:
+            route = (
+                f"via {e.origin_symbol} ({e.relationship_note[:110]})"
+                if e.is_propagated else "direct"
+            )
+            lines.append(
+                f"- [{(e.published_at or e.merged_at or '')[:10]}] {e.source_name} | {route}\n"
+                f"    {e.headline[:180]}\n"
+                f"    scored {e.direction} magnitude={e.magnitude:.2f} confidence={e.confidence:.2f}: "
+                f"{e.reasoning[:220]}"
+            )
+        return "\n".join(lines)
+
+    async def synthesize(self, dossier: Dossier, ecosystem: str = "",
+                         now: datetime | None = None) -> dict | None:
+        """None on a transient failure or an exhausted budget -- the caller
+        keeps the arithmetic aggregate unchanged rather than acting on a
+        synthesis it does not have."""
+        if not self._usage.budget_remaining():
+            log.info("%s: daily LLM budget reached -- deferring synthesis.", dossier.symbol)
+            return None
+        now = now or datetime.now(timezone.utc)
+        digest = self._evidence_digest(dossier, now)
+        if not digest:
+            return None
+        sector = ECOSYSTEM_CATALYSTS.get(ecosystem, "")
+        prompt = (
+            f"Company: {dossier.symbol}\n"
+            f"Today: {now.date().isoformat()}\n"
+            + (f"Sector: {sector}\n" if sector else "")
+            + f"\nArithmetic aggregate of the items below (for reference, not a constraint): "
+            f"direction={dossier.direction} confidence={dossier.confidence:.2f} "
+            f"magnitude={dossier.magnitude:.2f} over {dossier.independent_source_count} "
+            f"counted sources.\n\n"
+            f"ACCUMULATED EVIDENCE ({len(dossier.evidence)} items, non-stale shown):\n{digest}"
+        )
+        try:
+            response = await self._client.messages.create(
+                model=self._model,
+                **request_kwargs(self._model, max_tokens=8000, effort="high"),
+                system=cacheable_system(_SYNTHESIS_SYSTEM_PROMPT),
+                tools=[_SYNTHESIS_TOOL],
+                tool_choice={"type": "tool", "name": "synthesize_thesis"},
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the decay pass
+            log.warning("%s: synthesis failed: %s", dossier.symbol, exc)
             return None
         self._usage.record(response.usage.input_tokens, response.usage.output_tokens, model=self._model)
         return first_tool_use(response)
