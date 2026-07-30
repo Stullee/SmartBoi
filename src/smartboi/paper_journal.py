@@ -17,6 +17,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from smartboi.market_hours import is_regular_trading_hours
+
 log = logging.getLogger(__name__)
 
 # Per-side transaction-cost floors by market-cap bucket, in basis points of
@@ -378,7 +380,19 @@ class PaperTradeJournal:
         # to the next session's bar costs a genuine same-day stop-out one
         # day of delay -- unbiased noise -- and there is no intraday data
         # anywhere in this system that could tell the two cases apart.
-        if datetime.fromisoformat(trade.opened_at).date() == now.date():
+        #
+        # TWO conditions, because the UTC date alone is not the session.
+        # An earlier version of this guard checked only the date, and the
+        # date rolls at 00:00 UTC while the daily BAR does not roll until
+        # the next US open at ~13:30 UTC. So for the thirteen and a half
+        # hours in between, the guard saw a new day and resolved against a
+        # bar that was still the entry session's -- reintroducing the exact
+        # bug it was written to remove, every single night, for every
+        # trade, and for the whole weekend on a Friday entry. Requiring the
+        # regular session means the bar in hand is always one whose range
+        # postdates the entry.
+        opened_at = datetime.fromisoformat(trade.opened_at)
+        if opened_at.date() == now.date() or not is_regular_trading_hours(now):
             self._write_open_state()
             return
 
@@ -391,7 +405,6 @@ class PaperTradeJournal:
             hit_target = day_low <= trade.target_price
             stop_fill = max(trade.stop_price, current_price)
 
-        opened_at = datetime.fromisoformat(trade.opened_at)
         timed_out = (now - opened_at).days >= trade.horizon_days
 
         if hit_stop:

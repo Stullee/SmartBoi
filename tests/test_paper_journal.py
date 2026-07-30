@@ -3,18 +3,46 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import smartboi.market_hours
+import smartboi.paper_journal
+from smartboi.market_hours import MARKET_TZ
 from smartboi.paper_journal import PaperTrade, PaperTradeJournal
 
 
 def _next_session(days: int = 1) -> datetime:
-    """A mark timestamp on a session AFTER the entry.
+    """A mark timestamp on a later session, DURING regular trading hours.
 
-    update() deliberately refuses to resolve a stop or target on the entry
-    session, because high/low is the whole session's range and on the entry
-    day that includes prints from before the position existed. Every test
-    below that checks a stop/target outcome therefore has to mark on a later
-    day -- which is also the only case the real engine can now produce."""
-    return datetime.now(timezone.utc) + timedelta(days=days)
+    update() refuses to resolve a stop or target unless both hold: the entry
+    was on an earlier date, and the market is currently open. The second is
+    not belt-and-braces -- the daily bar does not roll to a new session until
+    the next US open, so a bar fetched at 02:00 UTC is still the entry
+    session's, including prints from before the position existed.
+
+    17:00 UTC is 13:00 ET in summer / 12:00 ET in winter, inside the session
+    either way, and the weekday walk keeps it off Saturday and Sunday. Pinned
+    rather than derived from the wall clock so the suite gives the same answer
+    at any hour.
+    """
+    stamp = (datetime.now(timezone.utc) + timedelta(days=days)).replace(
+        hour=17, minute=0, second=0, microsecond=0
+    )
+    while stamp.astimezone(MARKET_TZ).weekday() >= 5:
+        stamp += timedelta(days=1)
+    return stamp
+
+
+@pytest.fixture
+def real_session_clock(monkeypatch):
+    """Undo conftest's suite-wide "market is always open" pin.
+
+    That pin exists so the ~15 close-path tests don't depend on the hour the
+    suite runs at. The three tests below are the exception: they are ABOUT the
+    predicate, so they need the real one."""
+    monkeypatch.setattr(
+        smartboi.paper_journal,
+        "is_regular_trading_hours",
+        smartboi.market_hours.is_regular_trading_hours,
+    )
 
 
 def _journal(tmp_path):
@@ -493,3 +521,51 @@ def test_the_entry_session_mark_still_persists(tmp_path):
 
     reloaded = PaperTradeJournal(journal.log_path)
     assert reloaded.open_trades["UCTT"].last_price == 97.5
+
+
+def test_resolution_is_refused_overnight_even_on_a_later_calendar_date(tmp_path, real_session_clock):
+    """The bug in the first version of this guard: the UTC date rolls at
+    00:00, but the daily BAR does not roll until the next US open (~13:30
+    UTC). A date-only check therefore resolved against a bar that was still
+    the entry session's, for thirteen and a half hours every night."""
+    journal = _journal(tmp_path)
+    journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
+    opened = datetime.fromisoformat(journal.open_trades["UCTT"].opened_at)
+
+    # Next calendar day, 02:00 UTC = 22:00 ET the evening before. The date has
+    # advanced; the session has not.
+    overnight = (opened + timedelta(days=1)).replace(hour=2, minute=0, second=0, microsecond=0)
+    journal.update("UCTT", 99.0, high=101.0, low=90.0, now=overnight)
+
+    assert journal.has_open("UCTT")
+    assert journal.open_trades["UCTT"].last_price == 99.0
+
+
+def test_a_friday_entry_is_not_resolved_across_the_whole_weekend(tmp_path, real_session_clock):
+    """A Friday entry was exposed from Saturday 00:00 UTC until Monday 13:30
+    -- the longest window, against the stalest bar."""
+    journal = _journal(tmp_path)
+    journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
+    opened = datetime.fromisoformat(journal.open_trades["UCTT"].opened_at)
+    # Walk to the next Saturday, mid-day UTC.
+    saturday = opened + timedelta(days=1)
+    while saturday.astimezone(MARKET_TZ).weekday() != 5:
+        saturday += timedelta(days=1)
+    for day in (saturday, saturday + timedelta(days=1)):
+        journal.update("UCTT", 99.0, high=101.0, low=90.0,
+                       now=day.replace(hour=15, minute=0, second=0, microsecond=0))
+        assert journal.has_open("UCTT"), day
+
+
+def test_a_timeout_still_closes_outside_the_session(tmp_path):
+    """The guard must not make a position unclosable. A horizon timeout does
+    not depend on an intraday range, so it is not affected by the stale-bar
+    problem and must still fire -- otherwise a trade whose horizon lapses on a
+    Friday sits open all weekend for no reason."""
+    journal = _journal(tmp_path)
+    journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, horizon_days=5,
+                 thesis_summary="t", confidence=0.7, independent_source_count=2, citations=[])
+    past_horizon = datetime.now(timezone.utc) + timedelta(days=6)
+
+    assert journal.expire_past_horizon(now=past_horizon)
+    assert not journal.has_open("UCTT")

@@ -33,6 +33,15 @@ def _inside_regular_trading_hours(monkeypatch):
     call signals.is_regular_trading_hours / is_trading_day directly and get
     the truth -- which is exactly what test_signals.py does."""
     import smartboi.engine
+    import smartboi.paper_journal
 
     monkeypatch.setattr(smartboi.engine, "is_regular_trading_hours", lambda now=None: True)
     monkeypatch.setattr(smartboi.engine, "is_trading_day", lambda now=None: True)
+    # paper_journal holds its OWN reference (stop/target resolution also
+    # requires the session to be open -- the daily bar does not roll until
+    # the next US open, so a bar fetched overnight is still the entry
+    # session's). Patching only engine's name left every close-path test on
+    # the real wall clock: green in the afternoon, red after 16:00 ET.
+    monkeypatch.setattr(
+        smartboi.paper_journal, "is_regular_trading_hours", lambda now=None: True
+    )

@@ -2759,48 +2759,67 @@ class Engine:
         dossier -- the open trade has its own stop/target/horizon."""
         now = datetime.now(timezone.utc)
         for symbol in self.dossiers.all_symbols():
-            dossier = self.dossiers.load(symbol)
-            if not dossier.evidence:
-                continue
-            # Every field recompute_decay writes that can change a SIGNAL
-            # DECISION belongs in this comparison, not just the scores: an
-            # unchanged tuple skips the save entirely, so anything omitted
-            # is recomputed in memory and thrown away on a dormant dossier.
-            # The two backing flags gate which corroboration bar applies
-            # (see signals.evaluate), so leaving them out meant a dossier
-            # whose scores had settled could never persist them.
-            before = self._decay_fingerprint(dossier)
-            recompute_decay(dossier, now)
-            changed = before != self._decay_fingerprint(dossier)
-            if changed:
-                self.dossiers.save(dossier)
+            # Per-symbol isolation, matching _poll_edgar and _poll_news. This
+            # pass runs FIRST in the tick and the tick has no per-pass
+            # try/except, so one symbol raising here skipped the dossier
+            # snapshot, the daily price marks, the entry/marking poll and the
+            # heartbeat -- every capture file at once, silently, while the
+            # process stayed alive and looked healthy. Nothing here is
+            # transactional across symbols, so one bad dossier should cost
+            # that dossier and not the day's data.
+            try:
+                await self._decay_one(symbol, now)
+            except Exception:  # noqa: BLE001 - deliberately broad; see above
+                log.exception("%s: decay pass failed for this symbol -- continuing.", symbol)
 
-            # Evaluated on EVERY pass, not only when the score moved. A
-            # dossier can sit above the bar with perfectly stable numbers --
-            # nothing decaying, no new evidence -- and it still needs to
-            # signal. Gating this on `changed` (as an earlier version did)
-            # reproduced the original bug in a subtler form: the one dossier
-            # that most obviously qualified was the one whose score had
-            # settled, so it was skipped every single day. evaluate() is a
-            # pure function over fields already in hand, so running it
-            # unconditionally costs nothing.
-            if self.journal.has_open(symbol):
-                continue
-            # Synthesis runs here and nowhere else: once a day, only for a
-            # dossier that has resolved a direction, so this is a few dozen
-            # calls against a budget the deployment runs at a few percent of.
-            await self._apply_synthesis(dossier, now)
-            signal = evaluate(dossier, self.settings.signal_confidence_threshold,
-                              self.settings.min_independent_sources,
-                              self.settings.min_independent_sources_news_only)
-            if signal is None:
-                if dossier.status == "SIGNALED" and self._should_expire_unopened(dossier):
-                    self._expire_signal(dossier, self._below_bar_reason(dossier, "on the daily decay pass"))
-            elif dossier.status == "ACTIVE":
-                log.info("[SIGNAL] %s: qualifies on the daily decay pass with no new evidence "
-                         "(score=%.3f, sources=%d).", symbol,
-                         dossier.confidence * dossier.magnitude, dossier.independent_source_count)
-                await self._fire_signal(dossier, signal)
+    async def _decay_one(self, symbol: str, now: datetime) -> None:
+        """One symbol's decay, synthesis and re-evaluation.
+
+        Split out of _run_decay_pass only so a raise can be contained to one
+        symbol. `return` here means "done with this symbol", which is what
+        `continue` meant when this was inline."""
+        dossier = self.dossiers.load(symbol)
+        if not dossier.evidence:
+            return
+        # Every field recompute_decay writes that can change a SIGNAL
+        # DECISION belongs in this comparison, not just the scores: an
+        # unchanged tuple skips the save entirely, so anything omitted
+        # is recomputed in memory and thrown away on a dormant dossier.
+        # The two backing flags gate which corroboration bar applies
+        # (see signals.evaluate), so leaving them out meant a dossier
+        # whose scores had settled could never persist them.
+        before = self._decay_fingerprint(dossier)
+        recompute_decay(dossier, now)
+        changed = before != self._decay_fingerprint(dossier)
+        if changed:
+            self.dossiers.save(dossier)
+
+        # Evaluated on EVERY pass, not only when the score moved. A
+        # dossier can sit above the bar with perfectly stable numbers --
+        # nothing decaying, no new evidence -- and it still needs to
+        # signal. Gating this on `changed` (as an earlier version did)
+        # reproduced the original bug in a subtler form: the one dossier
+        # that most obviously qualified was the one whose score had
+        # settled, so it was skipped every single day. evaluate() is a
+        # pure function over fields already in hand, so running it
+        # unconditionally costs nothing.
+        if self.journal.has_open(symbol):
+            return
+        # Synthesis runs here and nowhere else: once a day, only for a
+        # dossier that has resolved a direction, so this is a few dozen
+        # calls against a budget the deployment runs at a few percent of.
+        await self._apply_synthesis(dossier, now)
+        signal = evaluate(dossier, self.settings.signal_confidence_threshold,
+                          self.settings.min_independent_sources,
+                          self.settings.min_independent_sources_news_only)
+        if signal is None:
+            if dossier.status == "SIGNALED" and self._should_expire_unopened(dossier):
+                self._expire_signal(dossier, self._below_bar_reason(dossier, "on the daily decay pass"))
+        elif dossier.status == "ACTIVE":
+            log.info("[SIGNAL] %s: qualifies on the daily decay pass with no new evidence "
+                     "(score=%.3f, sources=%d).", symbol,
+                     dossier.confidence * dossier.magnitude, dossier.independent_source_count)
+            await self._fire_signal(dossier, signal)
 
     async def _apply_synthesis(self, dossier: Dossier, now: datetime) -> None:
         """Runs the whole-evidence-body pass and folds its verdict into the
@@ -2840,7 +2859,20 @@ class Engine:
         dossier.synthesis_at = now.isoformat()
         dossier.synthesis_note = str(verdict.get("thesis") or "")[:600]
         dossier.synthesis_catalyst = str(verdict.get("strongest_catalyst") or "")[:300]
-        dossier.distinct_fact_count = int(verdict.get("distinct_fact_count") or 0)
+        # Coerced defensively, like every other read of raw tool output here
+        # (see _validated_proposal / _clamp_unit, which exist because
+        # Anthropic tool use does not hard-enforce the schema). This was the
+        # only unguarded int() in the file, and it sits inside the decay pass
+        # -- so before the isolation above, one malformed field would have
+        # silently stopped all five capture files on every tick.
+        try:
+            dossier.distinct_fact_count = int(verdict.get("distinct_fact_count") or 0)
+        except (TypeError, ValueError):
+            log.warning(
+                "%s: synthesis returned a non-numeric distinct_fact_count (%r) -- treating as 0.",
+                dossier.symbol, verdict.get("distinct_fact_count"),
+            )
+            dossier.distinct_fact_count = 0
         dossier.already_priced_in = bool(verdict.get("already_priced_in"))
 
         if verdict.get("direction") != dossier.direction or dossier.already_priced_in:

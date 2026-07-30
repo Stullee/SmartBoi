@@ -17,23 +17,15 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, dataclass
-from datetime import datetime, time as dt_time, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from smartboi.dossier import SCORING_VERSION, Dossier
+# Re-exported: these lived here before market_hours.py existed, and both
+# engine.py and the test suite import them from this module.
+from smartboi.market_hours import is_regular_trading_hours, is_trading_day  # noqa: F401
 
 log = logging.getLogger(__name__)
-
-# US equity regular trading hours, in exchange-local time. Entries are
-# gated on these (see is_regular_trading_hours) because a paper trade
-# booked at a price no order could have been filled at is not a paper
-# trade, it is a fabricated fill -- and the live record contains two of
-# them, opened at 09:18 ET, twelve minutes before the open.
-_MARKET_TZ = ZoneInfo("America/New_York")
-_MARKET_OPEN = dt_time(9, 30)
-_MARKET_CLOSE = dt_time(16, 0)
-
 
 @dataclass(frozen=True)
 class SignalEvent:
@@ -121,51 +113,6 @@ def evaluate(
         min_sources_in_force=required_sources,
         scoring_version=SCORING_VERSION,
     )
-
-
-def is_trading_day(now: datetime | None = None) -> bool:
-    """Whether this is a weekday in exchange-local time.
-
-    Weaker than is_regular_trading_hours on purpose: the daily
-    forward-validation marks want "is there a session today", not "is it
-    open right now" -- they run once a day at whatever hour the tick lands
-    on, and a mark taken after the close is the session's real close.
-
-    Same holiday gap as is_regular_trading_hours, and the same reasoning: a
-    hand-maintained calendar that stops being maintained fails silently and
-    is worse than the problem. A holiday mark duplicates the prior close
-    under a new date, which is the weekend failure at 1/25th the frequency."""
-    now = now or datetime.now(timezone.utc)
-    return now.astimezone(_MARKET_TZ).weekday() < 5
-
-
-def is_regular_trading_hours(now: datetime | None = None) -> bool:
-    """Whether US equities are in their regular session right now.
-
-    An entry booked outside this window is not a fill anybody could have
-    got. The price sources do not refuse to answer out of hours -- IB and
-    Finnhub both return the last session's close -- so without this check
-    the engine happily opens a position at a stale price and stamps it with
-    the current timestamp. The live record has two: ESOA and PUMP, both
-    booked 13:18Z, which is 09:18 ET, twelve minutes before the open. Every
-    subsequent statistic about those trades inherits an entry price that
-    was never available.
-
-    Exchange-local rather than a fixed UTC offset, so this stays correct
-    across DST: the ET session is 13:30-20:00 UTC in summer and 14:30-21:00
-    in winter, and a hard-coded UTC window is wrong for half the year.
-
-    KNOWN GAP: market holidays. They are all weekdays, so a holiday still
-    passes this check and the same stale-close problem applies to that one
-    day. A holiday calendar needs annual maintenance and silently rots when
-    it stops getting it, which is a worse failure than the one it fixes --
-    so this covers nights and weekends (where the observed damage was) and
-    the residual is documented rather than half-solved."""
-    now = now or datetime.now(timezone.utc)
-    local = now.astimezone(_MARKET_TZ)
-    if local.weekday() >= 5:  # Saturday/Sunday
-        return False
-    return _MARKET_OPEN <= local.time() < _MARKET_CLOSE
 
 
 def favorable_drift_pct(direction: str, signaled_price: float, current_price: float) -> float:
