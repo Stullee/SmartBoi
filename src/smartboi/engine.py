@@ -62,6 +62,7 @@ from smartboi.signals import (
     evaluate,
     favorable_drift_pct,
     is_regular_trading_hours,
+    is_trading_day,
     log_decision,
     log_signal,
     signal_expired,
@@ -291,6 +292,12 @@ class Engine:
         self.periodic_state = JsonState(DATA_DIR / "periodic_pass_state.json")
         self.backfill_state = JsonState(DATA_DIR / "relationship_backfill.json")
         self.candidates = JsonState(DATA_DIR / "universe_candidates.json")
+        # Which anchors have HAD a supplier-research call, as opposed to
+        # which ones produced a candidate -- see research.researched_anchors.
+        # Separate file rather than a sentinel row in universe_candidates so
+        # a bookkeeping marker can never be mistaken for a candidate by
+        # ticker resolution, the screen, auto-accept or the dashboard count.
+        self.research_state = JsonState(DATA_DIR / "anchor_research.json")
         self.accepted_candidates = JsonState(DATA_DIR / "accepted_candidates.json")
         # {date, count} -- the UTC-daily auto-accept budget (see
         # _auto_accept_candidates). Persisted so a restart cannot reset the
@@ -512,10 +519,23 @@ class Engine:
                 "Add it as an anchor instead -- the underlying company's news still propagates, "
                 "and the thesis this system builds is about operating-company equity."
             )
-        if as_type == "tradeable" and recommended == "anchor":
+        # DEFAULT-DENY, not default-allow. This used to reject only an
+        # explicit "anchor", which meant recommended_as = None sailed
+        # through -- and None is the normal state for a freshly discovered
+        # candidate, or for any candidate at all when the market-cap/analyst
+        # lookup hasn't run. So the one path this guard exists to block
+        # (adding a name with zero vetting, which is the incident the
+        # comment above describes) was reachable by clicking "+ Tradeable"
+        # on anything new. Unvetted and screens-as-anchor now get the same
+        # answer, with the same escape hatch.
+        if as_type == "tradeable" and recommended != "tradeable":
+            reason = (
+                entry.get("recommendation_reason")
+                or ("no market-cap/analyst screen has run for it yet -- run the universe screen, "
+                    "or the 'Screen candidates' tool, and accept it once it has a recommendation")
+            )
             raise ValueError(
-                f"{symbol} screens as an ANCHOR, not a trade target "
-                f"({entry.get('recommendation_reason', 'past the tradeable bounds')}). "
+                f"{symbol} does not screen as a trade target ({reason}). "
                 "Add it as an anchor instead -- its news will still propagate. "
                 "If you really want it tradeable, put it in SYMBOLS."
             )
@@ -983,9 +1003,24 @@ class Engine:
         # or reachable -- they are the raw material for the forward-return
         # validation, and a missed day is permanently unbackfillable. IB is
         # preferred when available; Finnhub's /quote fills in otherwise.
+        # Weekends are SKIPPED, not merely tolerated. Both price sources
+        # answer on a Saturday -- with Friday's close, a real-looking number
+        # -- so the pass wrote a duplicate mark under a weekend date key.
+        # forward_returns._price_on_or_after takes the first date at or after
+        # its target, so a snapshot whose entry_date + horizon lands on a
+        # weekend joins to that stale row instead of walking on to Monday,
+        # truncating the realized window by a day or two. It never extends
+        # it, so the error is one-directional: it attenuates every measured
+        # return, hit rate and correlation toward zero, and occasionally
+        # manufactures an exact 0.00% row out of nothing. Neither default
+        # horizon (5, 20) is a multiple of 7, so a meaningful share of rows
+        # are affected rather than a rare few -- and none of it is
+        # repairable afterwards, because a weekend row is indistinguishable
+        # from a genuine one once written.
         if (
             (self.price_feed is not None or self.finnhub is not None)
             and now >= self._price_marks_retry_after
+            and is_trading_day()
             and self._daily_pass_due("price_marks")
         ):
             if await self._run_daily_price_marks():

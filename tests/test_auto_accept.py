@@ -230,7 +230,7 @@ async def test_accepting_an_anchor_recommendation_as_tradeable_is_refused(engine
     entry["recommendation_reason"] = "market cap $322954M exceeds the tradeable ceiling"
     engine.candidates.set("MRK", entry)
 
-    with pytest.raises(ValueError, match="screens as an ANCHOR"):
+    with pytest.raises(ValueError, match="does not screen as a trade target"):
         engine.accept_candidate("MRK", "tradeable")
     assert "MRK" not in engine.spec_by_symbol
 
@@ -624,3 +624,31 @@ async def test_reclassification_leaves_an_unresolvable_entry_alone(engine):
 
     assert engine._reclassify_accepted_ecosystems() == 0
     assert engine.accepted_candidates.get("QQQQ") == {"as": "anchor", "source": "auto"}
+
+
+def test_accepting_an_unvetted_candidate_as_tradeable_is_refused(engine):
+    """Default-DENY. The guard used to reject only an explicit "anchor"
+    recommendation, so recommended_as=None passed -- and None is the normal
+    state for a freshly discovered candidate, or for any candidate when the
+    market-cap lookup hasn't run. That is precisely the "added with zero
+    vetting" incident the guard exists to prevent, reachable by clicking
+    "+ Tradeable" on anything new."""
+    engine.candidates.set("NEWCO", {"ticker": "NEWCO", "related_to": ["FORM"], "seen_count": 1})
+
+    with pytest.raises(ValueError, match="no market-cap/analyst screen has run"):
+        engine.accept_candidate("NEWCO", "tradeable")
+
+    # As an ANCHOR it is fine -- anchors never trade, so there is nothing to vet.
+    engine.accept_candidate("NEWCO", "anchor")
+    assert "NEWCO" in engine.accepted_candidates.data
+
+
+def test_a_screened_tradeable_recommendation_is_still_accepted(engine):
+    """The guard must not block the path it exists to serve."""
+    engine.candidates.set("SMALLCO", {
+        "ticker": "SMALLCO", "related_to": ["FORM"], "seen_count": 1,
+        "recommended_as": "tradeable", "recommendation_reason": "market cap $180M, 3 analysts",
+    })
+
+    engine.accept_candidate("SMALLCO", "tradeable")
+    assert "SMALLCO" in engine.accepted_candidates.data

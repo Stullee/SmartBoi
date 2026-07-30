@@ -361,6 +361,27 @@ class PaperTradeJournal:
         day_high = high if high is not None else current_price
         day_low = low if low is not None else current_price
 
+        # ENTRY SESSION: mark, but never resolve. high/low is the WHOLE
+        # session's range, from the open -- it has no concept of "since
+        # entry". On the entry day that range includes prints from before
+        # the position existed, so a stock that had already swung through
+        # the stop distance earlier that morning closed the trade the
+        # instant it opened, on price action that predates it. Worse, the
+        # engine's own poll does exactly this: _mark_and_execute opens the
+        # trade in its first loop and then marks every open trade -- the
+        # new one included -- a few lines later in the same call.
+        #
+        # The bias is not symmetric, which is what makes it damaging rather
+        # than merely noisy: the stop is nearer than the target, so a wide
+        # entry-day range hits the stop first far more often, and it fires
+        # precisely on the volatile days where it does most harm. Deferring
+        # to the next session's bar costs a genuine same-day stop-out one
+        # day of delay -- unbiased noise -- and there is no intraday data
+        # anywhere in this system that could tell the two cases apart.
+        if datetime.fromisoformat(trade.opened_at).date() == now.date():
+            self._write_open_state()
+            return
+
         if trade.direction == "LONG":
             hit_stop = day_low <= trade.stop_price
             hit_target = day_high >= trade.target_price

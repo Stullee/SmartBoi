@@ -176,3 +176,39 @@ def test_runs_on_a_completely_fresh_deployment(engine):
     report = run_diagnostics(engine)
     assert "=== SmartBoi diagnostics ===" in report
     assert "none yet" in report
+
+
+# --- Audit round 2: the diagnostics bundle promised "credentials omitted"
+# and leaked the alert webhook URL. The webhook id IS the credential -- and
+# the bundle is what an operator pastes into a chat or an issue. ---
+
+
+def test_a_failed_webhook_post_never_logs_the_url():
+    from smartboi.news import redact_url
+
+    secret = "http://homeassistant.local:8123/api/webhook/abc-SECRET-id"
+    # What httpx's HTTPStatusError actually stringifies to after
+    # raise_for_status(), which is the path AlertSender takes.
+    exc = f"Client error '404 Not Found' for url '{secret}'\nFor more information check: ..."
+
+    scrubbed = redact_url(secret, exc)
+    assert "abc-SECRET-id" not in scrubbed
+    assert "<webhook-url-redacted>" in scrubbed
+    assert "404 Not Found" in scrubbed  # the diagnostic value survives
+
+
+def test_the_finnhub_token_scrub_still_applies():
+    from smartboi.news import redact_url
+
+    line = "quote fetch failed: GET https://finnhub.io/api/v1/quote?symbol=X&token=SECRETKEY"
+    scrubbed = redact_url("", line)
+    assert "SECRETKEY" not in scrubbed
+    assert "token=REDACTED" in scrubbed
+
+
+def test_an_unconfigured_webhook_does_not_scrub_the_empty_string():
+    from smartboi.news import redact_url
+
+    line = "some ordinary warning line"
+    assert redact_url("", line) == line
+    assert redact_url("   ", line) == line

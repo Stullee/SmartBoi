@@ -6,6 +6,17 @@ import pytest
 from smartboi.paper_journal import PaperTrade, PaperTradeJournal
 
 
+def _next_session(days: int = 1) -> datetime:
+    """A mark timestamp on a session AFTER the entry.
+
+    update() deliberately refuses to resolve a stop or target on the entry
+    session, because high/low is the whole session's range and on the entry
+    day that includes prints from before the position existed. Every test
+    below that checks a stop/target outcome therefore has to mark on a later
+    day -- which is also the only case the real engine can now produce."""
+    return datetime.now(timezone.utc) + timedelta(days=days)
+
+
 def _journal(tmp_path):
     return PaperTradeJournal(tmp_path / "logs" / "paper_trades.jsonl")
 
@@ -34,7 +45,7 @@ def test_open_short_computes_stop_and_target(tmp_path):
 def test_target_hit_closes_as_win(tmp_path):
     journal = _journal(tmp_path)
     journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
-    journal.update("UCTT", 116.0)
+    journal.update("UCTT", 116.0, now=_next_session())
 
     assert not journal.has_open("UCTT")
     lines = journal.log_path.read_text().strip().splitlines()
@@ -48,7 +59,7 @@ def test_target_hit_closes_as_win(tmp_path):
 def test_stop_hit_closes_as_loss(tmp_path):
     journal = _journal(tmp_path)
     journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
-    journal.update("UCTT", 92.0)
+    journal.update("UCTT", 92.0, now=_next_session())
 
     assert not journal.has_open("UCTT")
 
@@ -90,7 +101,7 @@ def test_costs_are_charged_on_both_sides(tmp_path):
     journal = PaperTradeJournal(tmp_path / "t.jsonl")
     trade = journal.open("AAA", "LONG", 100.0, 10.0, 20.0, 21, "t", 0.8, 2, [],
                          cost_bps_round_trip=50.0)
-    journal.update("AAA", 120.0)                      # take-profit
+    journal.update("AAA", 120.0, now=_next_session())                      # take-profit
 
     # Gross: +20 on 10 of risk = 2.0R. Cost: 50bp over (100+120)/2 notional
     # per side => 0.25% * 220 = 0.55 -> 0.055R of drag.
@@ -104,7 +115,7 @@ def test_costs_apply_to_shorts_in_the_same_direction(tmp_path):
     journal = PaperTradeJournal(tmp_path / "t.jsonl")
     trade = journal.open("AAA", "SHORT", 100.0, 10.0, 20.0, 21, "t", 0.8, 2, [],
                          cost_bps_round_trip=50.0)
-    journal.update("AAA", 80.0)                       # take-profit for a short
+    journal.update("AAA", 80.0, now=_next_session())                       # take-profit for a short
     assert trade.r_multiple < trade.r_multiple_gross
 
 
@@ -115,7 +126,7 @@ def test_a_marginal_winner_can_be_a_net_loser(tmp_path):
     # Wide stop => small R per unit move, so cost drag dominates a small win.
     trade = journal.open("AAA", "LONG", 100.0, 50.0, 0.05, 21, "t", 0.8, 2, [],
                          cost_bps_round_trip=200.0)
-    journal.update("AAA", 100.05)
+    journal.update("AAA", 100.05, now=_next_session())
     assert trade.r_multiple_gross > 0
     assert trade.r_multiple < 0
 
@@ -125,7 +136,7 @@ def test_unrealized_is_also_quoted_net(tmp_path):
     journal = PaperTradeJournal(tmp_path / "t.jsonl")
     trade = journal.open("AAA", "LONG", 100.0, 10.0, 50.0, 21, "t", 0.8, 2, [],
                          cost_bps_round_trip=100.0)
-    journal.update("AAA", 105.0)
+    journal.update("AAA", 105.0, now=_next_session())
     assert trade.status == "OPEN"
     assert trade.unrealized_r_multiple() < 0.5        # gross would be exactly 0.5
 
@@ -133,7 +144,7 @@ def test_unrealized_is_also_quoted_net(tmp_path):
 def test_zero_cost_reproduces_the_old_gross_behaviour(tmp_path):
     journal = PaperTradeJournal(tmp_path / "t.jsonl")
     trade = journal.open("AAA", "LONG", 100.0, 10.0, 20.0, 21, "t", 0.8, 2, [])
-    journal.update("AAA", 120.0)
+    journal.update("AAA", 120.0, now=_next_session())
     assert trade.r_multiple == trade.r_multiple_gross == 2.0
 
 
@@ -146,7 +157,7 @@ def test_intraday_stop_breach_closes_as_loss_even_if_close_recovered(tmp_path):
     journal = _journal(tmp_path)
     journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
     # Day: low 90 (through the 92 stop), close back at 99.
-    journal.update("UCTT", 99.0, high=101.0, low=90.0)
+    journal.update("UCTT", 99.0, high=101.0, low=90.0, now=_next_session())
 
     assert not journal.has_open("UCTT")
     import json
@@ -160,7 +171,7 @@ def test_intraday_stop_fill_is_never_better_than_the_close(tmp_path):
     journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
     # Gap down: closes at 85, below the 92 stop -- a resting stop can't
     # have filled at 92 on a gap through it; the close is the honest fill.
-    journal.update("UCTT", 85.0, high=88.0, low=84.0)
+    journal.update("UCTT", 85.0, high=88.0, low=84.0, now=_next_session())
 
     import json
     closed = json.loads(journal.log_path.read_text().strip().splitlines()[0])
@@ -171,7 +182,7 @@ def test_intraday_stop_fill_is_never_better_than_the_close(tmp_path):
 def test_intraday_target_touch_closes_as_win_at_target_price(tmp_path):
     journal = _journal(tmp_path)
     journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
-    journal.update("UCTT", 110.0, high=117.0, low=105.0)  # touched 116 target intraday
+    journal.update("UCTT", 110.0, high=117.0, low=105.0, now=_next_session())  # touched 116 target intraday
 
     import json
     closed = json.loads(journal.log_path.read_text().strip().splitlines()[0])
@@ -184,7 +195,7 @@ def test_stop_wins_when_both_levels_traded_in_one_bar(tmp_path):
     journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
     # Wild bar: both the 92 stop and 116 target traded. With no intraday
     # sequencing available, assuming the loss is the conservative choice.
-    journal.update("UCTT", 100.0, high=118.0, low=91.0)
+    journal.update("UCTT", 100.0, high=118.0, low=91.0, now=_next_session())
 
     import json
     closed = json.loads(journal.log_path.read_text().strip().splitlines()[0])
@@ -195,7 +206,7 @@ def test_short_intraday_stop_breach(tmp_path):
     journal = _journal(tmp_path)
     journal.open("UCTT", "SHORT", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
     # SHORT stop at 108: high spiked to 109 intraday, closed back at 101.
-    journal.update("UCTT", 101.0, high=109.0, low=99.0)
+    journal.update("UCTT", 101.0, high=109.0, low=99.0, now=_next_session())
 
     import json
     closed = json.loads(journal.log_path.read_text().strip().splitlines()[0])
@@ -206,7 +217,7 @@ def test_short_intraday_stop_breach(tmp_path):
 def test_close_only_update_behaves_as_before(tmp_path):
     journal = _journal(tmp_path)
     journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
-    journal.update("UCTT", 100.5)  # no high/low -- old behavior, stays open
+    journal.update("UCTT", 100.5, now=_next_session())  # no high/low -- old behavior, stays open
     assert journal.has_open("UCTT")
 
 
@@ -217,7 +228,7 @@ def test_close_only_update_behaves_as_before(tmp_path):
 def test_restart_drops_open_trade_already_present_in_closed_log(tmp_path):
     journal = _journal(tmp_path)
     trade = journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
-    journal.update("UCTT", 116.0)  # closes as WIN
+    journal.update("UCTT", 116.0, now=_next_session())  # closes as WIN
     assert not journal.has_open("UCTT")
 
     # Simulate the crash window: re-inject the closed trade into the
@@ -401,7 +412,7 @@ def test_a_trade_past_its_horizon_closes_without_a_price(tmp_path):
 def test_it_exits_at_the_last_mark_when_one_exists(tmp_path):
     journal = PaperTradeJournal(tmp_path / "paper_trades.jsonl")
     trade = _open_trade(journal)
-    journal.update("FORM", 10.5)  # a mark landed, then the feed went dark
+    journal.update("FORM", 10.5, now=_next_session())  # a mark landed, then the feed went dark
     opened = datetime.fromisoformat(trade.opened_at)
 
     journal.expire_past_horizon(now=opened + timedelta(days=21))
@@ -430,3 +441,55 @@ def test_a_trade_inside_its_horizon_is_left_alone(tmp_path):
 
     assert journal.expire_past_horizon(now=opened + timedelta(days=19)) == []
     assert journal.has_open("FORM")
+
+
+# --- Audit round 2, finding #1: a trade could be opened and spuriously
+# resolved on the SAME poll, against price action from before it existed.
+# engine._mark_and_execute opens in its first loop and then marks every open
+# trade -- the new one included -- a few lines later in the same call. ---
+
+
+def test_a_stop_inside_the_entry_session_range_does_not_close_the_trade(tmp_path):
+    """The exact shape of the bug: the entry-day bar's low is through the
+    stop because the stock swung that far BEFORE the entry. Resolving it
+    books a loss on a position that did not exist at that price."""
+    journal = _journal(tmp_path)
+    journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
+    journal.update("UCTT", 99.0, high=101.0, low=90.0)  # entry session, no now=
+
+    assert journal.has_open("UCTT")
+    assert journal.open_trades["UCTT"].last_price == 99.0  # still marked for display
+
+
+def test_a_target_inside_the_entry_session_range_does_not_close_it_either(tmp_path):
+    """Symmetric, and it matters: silently taking the free wins would bias
+    the ledger the other way and be much harder to notice."""
+    journal = _journal(tmp_path)
+    journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
+    journal.update("UCTT", 110.0, high=120.0, low=105.0)
+
+    assert journal.has_open("UCTT")
+
+
+def test_the_same_breach_resolves_normally_on_the_next_session(tmp_path):
+    """Deferred, not discarded -- the guard must not make a trade unclosable."""
+    journal = _journal(tmp_path)
+    journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
+    journal.update("UCTT", 99.0, high=101.0, low=90.0)
+    assert journal.has_open("UCTT")
+
+    journal.update("UCTT", 99.0, high=101.0, low=90.0, now=_next_session())
+    assert not journal.has_open("UCTT")
+    closed = json.loads(journal.log_path.read_text().strip().splitlines()[-1])
+    assert closed["status"] == "LOSS"
+
+
+def test_the_entry_session_mark_still_persists(tmp_path):
+    """last_price has to survive a restart even on the entry day, or the
+    dashboard shows an open position with no mark until the next session."""
+    journal = _journal(tmp_path)
+    journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
+    journal.update("UCTT", 97.5, high=101.0, low=90.0)
+
+    reloaded = PaperTradeJournal(journal.log_path)
+    assert reloaded.open_trades["UCTT"].last_price == 97.5

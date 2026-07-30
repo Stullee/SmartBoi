@@ -190,3 +190,27 @@ def test_a_naive_or_non_utc_stamp_is_still_converted_correctly():
     aware_utc = _utc("2026-07-29T13:18:20+00:00")
     # Same instant, expressed in another zone -- must give the same answer.
     assert is_regular_trading_hours(aware_utc.astimezone(ZoneInfo("Asia/Tokyo"))) is False
+
+
+def test_trading_day_is_weekday_only_in_exchange_local_time():
+    from smartboi.signals import is_trading_day
+
+    assert is_trading_day(_utc("2026-07-29T18:00:00+00:00"))       # Wed
+    assert not is_trading_day(_utc("2026-07-25T15:00:00+00:00"))   # Sat
+    assert not is_trading_day(_utc("2026-07-26T15:00:00+00:00"))   # Sun
+    # Local, not UTC: Friday 23:00 ET is Saturday 03:00 UTC. The session that
+    # just closed was Friday's, so this is still a trading day.
+    assert is_trading_day(_utc("2026-07-25T03:00:00+00:00"))
+    # And the mirror: Sunday 20:00 ET is Monday 00:00 UTC -- not a trading day.
+    assert not is_trading_day(_utc("2026-07-27T00:00:00+00:00"))
+
+
+def test_a_trading_day_is_weaker_than_being_open():
+    """The daily marks pass wants "is there a session today", not "is it open
+    right now" -- it runs once at whatever hour the tick lands on, and a mark
+    taken after the close is that session's real close."""
+    from smartboi.signals import is_trading_day
+
+    after_close = _utc("2026-07-29T21:00:00+00:00")  # 17:00 ET, Wed
+    assert is_trading_day(after_close)
+    assert not is_regular_trading_hours(after_close)

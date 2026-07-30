@@ -123,6 +123,22 @@ def evaluate(
     )
 
 
+def is_trading_day(now: datetime | None = None) -> bool:
+    """Whether this is a weekday in exchange-local time.
+
+    Weaker than is_regular_trading_hours on purpose: the daily
+    forward-validation marks want "is there a session today", not "is it
+    open right now" -- they run once a day at whatever hour the tick lands
+    on, and a mark taken after the close is the session's real close.
+
+    Same holiday gap as is_regular_trading_hours, and the same reasoning: a
+    hand-maintained calendar that stops being maintained fails silently and
+    is worse than the problem. A holiday mark duplicates the prior close
+    under a new date, which is the weekend failure at 1/25th the frequency."""
+    now = now or datetime.now(timezone.utc)
+    return now.astimezone(_MARKET_TZ).weekday() < 5
+
+
 def is_regular_trading_hours(now: datetime | None = None) -> bool:
     """Whether US equities are in their regular session right now.
 

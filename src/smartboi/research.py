@@ -358,13 +358,27 @@ def format_research_report(anchor_results: list[tuple[str, list[ResearchedSuppli
     return "\n".join(lines)
 
 
-def researched_anchors(candidates) -> set[str]:
+def researched_anchors(candidates, research_state=None) -> set[str]:
     """Anchors already covered by a previous run, so re-running continues
-    through the list instead of redoing the first ten."""
+    through the list instead of redoing the first ten.
+
+    Reads BOTH sources. Derived-from-candidates was the original mechanism
+    and is kept so existing markers keep counting, but it can only ever see
+    an anchor that produced at least one candidate: `last_researched_at` is
+    written onto the SUPPLIER entries, so "searched, found nothing" -- which
+    research.py's own prompt explicitly encourages as an answer -- left no
+    trace anywhere. That anchor was reselected and re-billed for a paid
+    web-search call on every future run, and since selection is deterministic
+    (sorted by inertness, then ecosystem, then symbol) a batch of
+    unproductive anchors could sit at the front of the queue forever,
+    permanently starving the rest of the list. research_state records the
+    attempt itself, which is the thing that actually cost money."""
     seen: set[str] = set()
     for entry in candidates.data.values():
         if entry.get("last_researched_at"):
             seen.update(entry.get("related_to") or [])
+    if research_state is not None:
+        seen.update(research_state.data.keys())
     return seen
 
 

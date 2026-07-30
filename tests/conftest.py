@@ -19,11 +19,20 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _inside_regular_trading_hours(monkeypatch):
-    """Pin the market open for every test that doesn't say otherwise.
+    """Pin the market open, and the day to a weekday, for every test that
+    doesn't say otherwise.
 
-    Patched at the point of USE (engine's imported name) rather than in
-    signals, so a test that wants the real predicate can still import and
-    call signals.is_regular_trading_hours directly and get the truth."""
+    Both matter. is_regular_trading_hours gates entries, and is_trading_day
+    gates the daily price-marks pass (weekend marks duplicate Friday's close
+    under a weekend date key and silently truncate every forward-return
+    window that lands on one). Left unpinned, tests covering either would
+    pass Monday to Friday and fail at the weekend.
+
+    Patched at the point of USE (engine's imported names) rather than in
+    signals, so a test that wants the real predicates can still import and
+    call signals.is_regular_trading_hours / is_trading_day directly and get
+    the truth -- which is exactly what test_signals.py does."""
     import smartboi.engine
 
     monkeypatch.setattr(smartboi.engine, "is_regular_trading_hours", lambda now=None: True)
+    monkeypatch.setattr(smartboi.engine, "is_trading_day", lambda now=None: True)

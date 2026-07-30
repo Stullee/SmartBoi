@@ -22,7 +22,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from smartboi.news import redact_token
+from smartboi.news import redact_token, redact_url
 from smartboi.paper_journal import cost_buckets, trade_economics
 from smartboi.status import gather_dossiers, gather_paper_trade_stats
 from smartboi.event_study import (
@@ -146,7 +146,7 @@ async def run_supplier_research(engine) -> str:
 
     universe = set(engine.symbol_list)
     tradeables = {c.symbol for c in engine.universe if not c.signal_source_only}
-    already = researched_anchors(engine.candidates)
+    already = researched_anchors(engine.candidates, engine.research_state)
 
     def is_inert(symbol: str) -> bool:
         return not any(linked in tradeables
@@ -172,6 +172,14 @@ async def run_supplier_research(engine) -> str:
                 engine.settings.universe_max_market_cap_musd,
             )
             results.append((spec.symbol, found))
+            # Marked BEFORE the merge and regardless of what came back: the
+            # call is what costs money, so the call is what has to be
+            # recorded. Gating this on `found` meant a legitimate empty
+            # result was re-billed on every subsequent run, forever.
+            engine.research_state.set(
+                spec.symbol,
+                {"researched_at": datetime.now(timezone.utc).isoformat(), "found": len(found)},
+            )
             if found:
                 added, touched = merge_into_candidates(engine.candidates, found)
                 new += added
@@ -276,7 +284,7 @@ def _jsonl_span(rows: list[dict], key: str) -> str:
     return f"{len(rows)} row(s), {stamps[0]} .. {stamps[-1]}" if stamps else f"{len(rows)} row(s)"
 
 
-def _recent_log_problems(log_dir: Path) -> list[str]:
+def _recent_log_problems(log_dir: Path, webhook_url: str = "") -> list[str]:
     """The tail of WARNING/ERROR lines from smartboi.log. Run through
     redact_token because a logged exception can carry a Finnhub request URL,
     which has the API key in its query string -- this bundle is meant to be
@@ -289,7 +297,15 @@ def _recent_log_problems(log_dir: Path) -> list[str]:
     except OSError:
         return []
     problems = [ln for ln in lines if "| WARNING" in ln or "| ERROR" in ln]
-    return [redact_token(ln) for ln in problems[-MAX_LOG_LINES:]]
+    # Scrubbed a SECOND time here, on top of the scrub at each logging site.
+    # Not redundancy for its own sake: this function's output is copied
+    # verbatim into a bundle whose own heading promises credentials are
+    # omitted, and pasted into chats and issue trackers. Every future
+    # log.warning that happens to interpolate a URL would otherwise be one
+    # edit away from leaking, in a file nobody thinks of as security-
+    # sensitive. The boundary that makes the promise is the right place to
+    # enforce it.
+    return [redact_url(webhook_url, ln) for ln in problems[-MAX_LOG_LINES:]]
 
 
 def run_diagnostics(engine) -> str:
@@ -492,7 +508,7 @@ def run_diagnostics(engine) -> str:
     add(f"  price_marks.jsonl       : {_jsonl_span(read_jsonl(log_dir / 'price_marks.jsonl'), 'marked_at')}")
     add(f"  decisions.jsonl         : {_jsonl_span(read_jsonl(log_dir / 'decisions.jsonl'), 'at')}")
 
-    problems = _recent_log_problems(log_dir)
+    problems = _recent_log_problems(log_dir, s.alert_webhook_url)
     add(f"\n--- Recent warnings/errors (last {MAX_LOG_LINES}) ---")
     for line in problems:
         add(f"  {line}")

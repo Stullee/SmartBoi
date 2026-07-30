@@ -35,6 +35,24 @@ from tests.fakes import (
 )
 
 
+def _backdate_entry(engine, symbol: str, days: int = 1) -> None:
+    """Move an open trade's opened_at back, so the next mark lands on a
+    later session than the entry.
+
+    paper_journal.update() only records last_price on the entry session --
+    the bar it is handed carries the WHOLE session's high/low, which on the
+    entry day includes price action from before the position existed, and
+    resolving a stop against that fabricated stop-outs out of pre-entry
+    prints. Every test that drives a trade to a WIN/LOSS therefore has to
+    put the entry on an earlier day, which is also the only shape the real
+    engine can produce."""
+    trade = engine.journal.open_trades[symbol]
+    trade.opened_at = (
+        datetime.fromisoformat(trade.opened_at) - timedelta(days=days)
+    ).isoformat()
+    engine.journal._write_open_state()
+
+
 @pytest.fixture
 def engine(tmp_path, monkeypatch):
     """A fully-constructed Engine with every optional integration wired to
@@ -483,6 +501,12 @@ async def test_full_lifecycle_signal_open_close_reset(engine):
 
     # Close: move price to the take-profit target and mark again.
     engine.price_feed.prices["FORM"] = trade.target_price + 0.01
+    # Backdated one day: the journal deliberately refuses to resolve a
+    # stop or target on the ENTRY session, because the bar's high/low is the
+    # whole session's range and on the entry day it includes prints from
+    # before the position existed. A close therefore always happens on a
+    # later session, and this is what that looks like.
+    _backdate_entry(engine, "FORM")
     await engine._mark_and_execute()
     assert not engine.journal.has_open("FORM")
 
@@ -1444,6 +1468,7 @@ async def test_open_trade_is_marked_from_finnhub_intraday_band(engine):
 
     # Closed above the stop, but the session low traded through it.
     engine.finnhub.quotes_by_symbol["FORM"] = (10.0, 10.2, trade.stop_price - 0.05)
+    _backdate_entry(engine, "FORM")  # a stop/target never resolves on the entry session
     await engine._mark_and_execute()
 
     assert not engine.journal.has_open("FORM")
@@ -1763,6 +1788,7 @@ async def test_the_same_cold_start_closes_the_trade_when_the_target_trades(engin
     trade = engine.journal.open_trades["FORM"]
 
     engine.finnhub.quotes_by_symbol["FORM"] = trade.target_price + 0.05
+    _backdate_entry(engine, "FORM")  # a stop/target never resolves on the entry session
     await engine._mark_and_execute()
 
     assert not engine.journal.has_open("FORM")
@@ -1943,3 +1969,30 @@ async def test_a_non_object_relationship_does_not_kill_the_paid_for_extraction(e
     # The call is not wasted: it ran, and the well-formed edge survived.
     assert ran is True
     assert any(r.to_symbol == "UCTT" for r in engine.graph.relationships)
+
+
+async def test_the_daily_price_marks_pass_is_skipped_at_the_weekend(engine, monkeypatch):
+    """Both price sources answer on a Saturday, with Friday's close -- a
+    real-looking number under a weekend date key. forward_returns walks
+    FORWARD to the first date at or after its target, so a horizon landing on
+    a weekend joins that stale row instead of Monday's, truncating the window
+    by a day or two. It never extends it, so the bias is one-directional:
+    every measured return, hit rate and correlation is attenuated."""
+    monkeypatch.setattr(smartboi.engine, "is_trading_day", lambda now=None: False)
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol["FORM"] = 10.0
+
+    await engine._tick()
+
+    assert not (Path(engine.settings.log_dir) / "price_marks.jsonl").exists()
+    assert engine._daily_pass_due("price_marks")  # still due, picked up on Monday
+
+
+async def test_the_daily_price_marks_pass_runs_on_a_weekday(engine):
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol["FORM"] = 10.0
+
+    await engine._tick()
+
+    assert (Path(engine.settings.log_dir) / "price_marks.jsonl").exists()
+    assert not engine._daily_pass_due("price_marks")

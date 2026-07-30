@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 
 import httpx
 
+from smartboi.news import redact_url
+
 log = logging.getLogger(__name__)
 
 
@@ -41,7 +43,17 @@ class AlertSender:
             response = await self._client.post(self._url, json=payload)
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            log.warning("Alert webhook POST failed (%s): %s", event, exc)
+            # The URL is scrubbed at the point of LOGGING, not left to the
+            # reader downstream. raise_for_status() above produces
+            # HTTPStatusError, whose str() is "Client error '404 Not Found'
+            # for url 'http://.../api/webhook/<secret-id>'" -- and a webhook
+            # id IS the credential: anyone holding it can fire the trigger.
+            # That line went into logs/smartboi.log, and run_diagnostics
+            # copies the last WARNING/ERROR lines verbatim into the bundle
+            # an operator pastes into chat or an issue, under a heading that
+            # promises credentials are omitted. HA restarting returns 404,
+            # so this was the common case, not a corner one.
+            log.warning("Alert webhook POST failed (%s): %s", event, redact_url(self._url, exc))
 
     async def aclose(self) -> None:
         if self._client is not None:

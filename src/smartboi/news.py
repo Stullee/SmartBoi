@@ -53,6 +53,26 @@ def redact_token(text: object) -> str:
     return _TOKEN_RE.sub("token=REDACTED", str(text))
 
 
+def redact_url(secret_url: str, text: object) -> str:
+    """`text` with `secret_url` (and the query-string token pattern) removed.
+
+    For credentials that live in the PATH rather than a named parameter, so
+    no pattern can find them -- an alert webhook URL is
+    http://host:8123/api/webhook/<id> where the id itself is the only thing
+    authenticating the caller. Matching on the configured value is the only
+    way to catch that, which means the caller has to pass it in.
+
+    Substring rather than exact match: httpx wraps the URL in quotes and
+    appends its own text, so the URL arrives embedded in a longer message.
+    Empty/whitespace `secret_url` is a no-op, so an unconfigured webhook
+    doesn't turn every log line into a scrub for the empty string."""
+    scrubbed = redact_token(text)
+    secret_url = (secret_url or "").strip()
+    if secret_url:
+        scrubbed = scrubbed.replace(secret_url, "<webhook-url-redacted>")
+    return scrubbed
+
+
 @dataclass(frozen=True)
 class NewsArticle:
     symbol: str
