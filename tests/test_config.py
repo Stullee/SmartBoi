@@ -105,6 +105,7 @@ def test_the_addon_default_matches_the_code_default():
     options = _addon_config()["options"]
     defaults = Settings(_env_file=None)
     for key in ("edgar_poll_interval_sec", "edgar_forms", "max_daily_usd",
+                "budget_share_extraction", "budget_share_synthesis", "budget_share_research",
                 "extraction_model", "dossier_model", "skeptic_model",
                 "synthesis_model", "backfill_anchors", "transaction_cost_profile"):
         assert options[key] == getattr(defaults, key), (
@@ -130,3 +131,20 @@ def test_the_dockerfile_version_mirrors_the_addon_version():
         f"Dockerfile ships {match.group(1).strip()!r}, config.yaml says "
         f"{_addon_config()['version']!r}"
     )
+
+
+def test_every_budget_and_threshold_setting_is_tunable_from_the_addon():
+    """The existing guards check options -> Settings (no stray keys) but never
+    Settings -> options, so a new setting could ship unreachable from the HA
+    UI with every test green. That happened: the three budget shares were
+    added to Settings and silently omitted here.
+
+    Scoped to the settings an operator actually has to reach without a
+    rebuild -- budgets, thresholds and the switches that cost money."""
+    options = set(_addon_config()["options"])
+    must_be_tunable = {
+        name for name in Settings.model_fields
+        if name.startswith(("budget_share_", "max_daily_", "signal_", "min_independent_"))
+    }
+    missing = must_be_tunable - options
+    assert not missing, f"Settings unreachable from the add-on UI: {sorted(missing)}"

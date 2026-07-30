@@ -203,6 +203,28 @@ class Settings(BaseSettings):
     # over several days instead of consuming a month of budget in an
     # afternoon.
     max_daily_usd: float = 3.30
+    # --- Per-category shares of the daily budget (see usage.py) ---
+    # One shared pool is first-come-first-served, and arrival order has
+    # nothing to do with value. The budget resets at UTC midnight = 20:00 ET,
+    # just after the US close, which hands relationship extraction thirteen
+    # and a half hours of night to spend the whole day before the market ever
+    # opens. Measured live: exhausted before 09:30 ET, so the dossier pass --
+    # the only thing that can turn news into a position, and the one whose
+    # input decays -- got nothing on the day it mattered.
+    #
+    # Each value is the MAXIMUM FRACTION of both daily caps that category may
+    # consume. 1.0 is uncapped; 0.0 switches the category off entirely (useful
+    # for anything you don't want running unsupervised).
+    #
+    # The DOSSIER category (updater + skeptic) is deliberately absent and
+    # therefore uncapped: it is guaranteed whatever the three below cannot
+    # reach (>=30% at these values) and can use the entire day when they are
+    # idle. Caps rather than fixed partitions for exactly that reason -- this
+    # system's inputs are bursty, and a partition would idle a third of the
+    # budget on a day with no filings while the pass that matters starves.
+    budget_share_extraction: float = 0.35
+    budget_share_synthesis: float = 0.25
+    budget_share_research: float = 0.10
     # Caps how many pieces of PROPAGATED evidence (about a linked company,
     # never the dossier's own direct evidence) get forwarded to one target
     # from one origin within a rolling window -- without this, a heavily-

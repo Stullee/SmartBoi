@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from anthropic import AsyncAnthropic
 
 from smartboi.llm import cacheable_system, request_kwargs
-from smartboi.usage import UsageTracker
+from smartboi.usage import CAT_RESEARCH, UsageTracker
 
 log = logging.getLogger(__name__)
 
@@ -184,7 +184,7 @@ class SupplierResearcher:
 
     async def research(self, anchor: str, anchor_name: str, ecosystem: str,
                        min_cap_musd: float, max_cap_musd: float) -> list[ResearchedSupplier]:
-        if not self._usage.budget_remaining():
+        if not self._usage.budget_remaining(CAT_RESEARCH):
             log.info("%s: daily LLM budget reached -- skipping supplier research.", anchor)
             return []
         messages = [{
@@ -217,7 +217,7 @@ class SupplierResearcher:
                 log.warning("%s: supplier research call failed: %s", anchor, exc)
                 return []
             self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
-                               model=self._model)
+                               model=self._model, category=CAT_RESEARCH)
             payload = _report_payload(response)
             if payload is not None:
                 return _to_suppliers(anchor, payload)

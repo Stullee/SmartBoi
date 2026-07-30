@@ -100,3 +100,111 @@ def test_recording_without_a_model_still_counts_the_call(tmp_path):
     snapshot = tracker.snapshot()
     assert snapshot.calls == 1
     assert snapshot.usd_spent == 0.0
+
+
+# --- Per-category budget shares. One shared pool is first-come-first-served,
+# and the reset at UTC midnight (= 20:00 ET) hands extraction thirteen and a
+# half hours of night to spend the whole day before the market opens. ---
+
+from smartboi.usage import CAT_DOSSIER, CAT_EXTRACTION, CAT_RESEARCH, CAT_SYNTHESIS
+
+
+def _tracker(tmp_path, **kw):
+    return UsageTracker(
+        tmp_path / "u.json", daily_call_budget=1000, daily_usd_budget=10.0,
+        category_shares={CAT_EXTRACTION: 0.35, CAT_SYNTHESIS: 0.25, CAT_RESEARCH: 0.10},
+        **kw,
+    )
+
+
+def test_extraction_cannot_spend_the_whole_day(tmp_path):
+    """The live failure: budget exhausted before the US market opened, by the
+    one pass whose output is not time-sensitive."""
+    u = _tracker(tmp_path)
+    # $3.50 = 35% of $10. Haiku at $1/$5 per MTok: 3.5M input tokens.
+    u.record(3_500_000, 0, model="claude-haiku-4-5", category=CAT_EXTRACTION)
+
+    assert not u.budget_remaining(CAT_EXTRACTION)
+    # ...and the pass that turns news into a position is untouched.
+    assert u.budget_remaining(CAT_DOSSIER)
+
+
+def test_the_dossier_bucket_is_uncapped_and_can_use_the_whole_day(tmp_path):
+    """Uncapped is the point: on a quiet day for filings it should be able to
+    spend everything, which a fixed partition would forbid."""
+    u = _tracker(tmp_path)
+    u.record(6_000_000, 0, model="claude-haiku-4-5", category=CAT_DOSSIER)  # $6, past every share
+    assert u.budget_remaining(CAT_DOSSIER)
+
+    u.record(4_000_000, 0, model="claude-haiku-4-5", category=CAT_DOSSIER)  # $10 total
+    assert not u.budget_remaining(CAT_DOSSIER)  # the TOTAL cap still binds
+
+
+def test_one_category_exhausting_itself_does_not_block_the_others(tmp_path):
+    u = _tracker(tmp_path)
+    u.record(1_000_000, 0, model="claude-haiku-4-5", category=CAT_RESEARCH)  # $1 = 10%
+    assert not u.budget_remaining(CAT_RESEARCH)
+    for cat in (CAT_DOSSIER, CAT_SYNTHESIS, CAT_EXTRACTION):
+        assert u.budget_remaining(cat), cat
+
+
+def test_the_total_cap_still_overrides_an_unspent_share(tmp_path):
+    """A category with room left must still be refused once the day is gone
+    -- shares are caps, not reservations against the total."""
+    u = _tracker(tmp_path)
+    u.record(10_000_000, 0, model="claude-haiku-4-5", category=CAT_DOSSIER)
+    assert not u.budget_remaining(CAT_EXTRACTION)  # its own 35% is untouched
+    assert not u.budget_remaining(CAT_SYNTHESIS)
+
+
+def test_a_zero_share_switches_a_category_off(tmp_path):
+    """Useful for anything you don't want running unsupervised."""
+    u = UsageTracker(tmp_path / "u.json", 1000, 10.0, category_shares={CAT_RESEARCH: 0.0})
+    assert not u.budget_remaining(CAT_RESEARCH)
+    assert u.budget_remaining(CAT_DOSSIER)
+
+
+def test_a_share_of_one_is_uncapped(tmp_path):
+    u = UsageTracker(tmp_path / "u.json", 1000, 10.0, category_shares={CAT_EXTRACTION: 1.0})
+    u.record(9_000_000, 0, model="claude-haiku-4-5", category=CAT_EXTRACTION)
+    assert u.budget_remaining(CAT_EXTRACTION)
+
+
+def test_call_shares_bind_even_when_the_model_is_unpriced(tmp_path):
+    """A mispriced/unknown model must not let a category consume the day with
+    its dollar counter frozen at zero -- the call share is the backstop."""
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=100, daily_usd_budget=0.0,
+                     category_shares={CAT_EXTRACTION: 0.10})
+    for _ in range(10):  # 10% of 100 calls
+        u.record(1000, 100, category=CAT_EXTRACTION)  # no model -> no cost recorded
+
+    assert not u.budget_remaining(CAT_EXTRACTION)
+    assert u.budget_remaining(CAT_DOSSIER)
+
+
+def test_categories_roll_over_at_utc_midnight_with_the_totals(tmp_path):
+    u = _tracker(tmp_path)
+    u.record(3_500_000, 0, today="2026-07-31", model="claude-haiku-4-5", category=CAT_EXTRACTION)
+    assert not u.budget_remaining(CAT_EXTRACTION, today="2026-07-31")
+    # Across a month boundary, which the 10-day window actually spans.
+    assert u.budget_remaining(CAT_EXTRACTION, today="2026-08-01")
+    assert u.snapshot(today="2026-08-01").by_category == {}
+
+
+def test_the_snapshot_attributes_spend_per_category(tmp_path):
+    u = _tracker(tmp_path)
+    u.record(1_000_000, 0, model="claude-haiku-4-5", category=CAT_EXTRACTION)
+    u.record(200_000, 0, model="claude-opus-5", category=CAT_SYNTHESIS)
+
+    by_cat = u.snapshot().by_category
+    assert by_cat[CAT_EXTRACTION] == (1.0, 1)
+    assert by_cat[CAT_SYNTHESIS] == (1.0, 1)  # 0.2M input at $5/MTok
+    assert u.snapshot().usd_spent == pytest.approx(2.0)
+
+
+def test_an_uncategorised_call_still_counts_against_the_totals(tmp_path):
+    """Back-compat: a call site that hasn't been given a category must not
+    become invisible to the budget."""
+    u = _tracker(tmp_path)
+    u.record(10_000_000, 0, model="claude-haiku-4-5")
+    assert not u.budget_remaining(CAT_DOSSIER)

@@ -16,7 +16,7 @@ from pathlib import Path
 from anthropic import AsyncAnthropic
 
 from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
-from smartboi.usage import UsageTracker
+from smartboi.usage import CAT_DOSSIER, CAT_SYNTHESIS, UsageTracker
 
 log = logging.getLogger(__name__)
 
@@ -698,7 +698,7 @@ class DossierUpdater:
         self, dossier: Dossier, evidence_text: str, origin_symbol: str, relationship_note: str,
         relationship_confidence: float | None = None, ecosystem: str = "",
     ) -> dict | None:
-        if not self._usage.budget_remaining():
+        if not self._usage.budget_remaining(CAT_DOSSIER):
             log.info("%s: daily LLM call budget reached -- deferring dossier update.", dossier.symbol)
             return None
         current = (
@@ -748,7 +748,8 @@ class DossierUpdater:
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the ingestion loop
             log.warning("%s: dossier update proposal failed: %s", dossier.symbol, exc)
             return None
-        self._usage.record(response.usage.input_tokens, response.usage.output_tokens, model=self._model)
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
+                           model=self._model, category=CAT_DOSSIER)
         return first_tool_use(response)
 
     async def aclose(self) -> None:
@@ -893,7 +894,7 @@ class DossierSynthesizer:
         """None on a transient failure or an exhausted budget -- the caller
         keeps the arithmetic aggregate unchanged rather than acting on a
         synthesis it does not have."""
-        if not self._usage.budget_remaining():
+        if not self._usage.budget_remaining(CAT_SYNTHESIS):
             log.info("%s: daily LLM budget reached -- deferring synthesis.", dossier.symbol)
             return None
         now = now or datetime.now(timezone.utc)
@@ -923,7 +924,8 @@ class DossierSynthesizer:
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the decay pass
             log.warning("%s: synthesis failed: %s", dossier.symbol, exc)
             return None
-        self._usage.record(response.usage.input_tokens, response.usage.output_tokens, model=self._model)
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
+                           model=self._model, category=CAT_SYNTHESIS)
         return first_tool_use(response)
 
     async def aclose(self) -> None:

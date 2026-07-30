@@ -17,7 +17,7 @@ from pathlib import Path
 from anthropic import AsyncAnthropic
 
 from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
-from smartboi.usage import UsageTracker
+from smartboi.usage import CAT_EXTRACTION, UsageTracker
 
 log = logging.getLogger(__name__)
 
@@ -172,7 +172,7 @@ class RelationshipExtractor:
         retry."""
         if not filing_text.strip():
             return []
-        if not self._usage.budget_remaining():
+        if not self._usage.budget_remaining(CAT_EXTRACTION):
             log.info("%s: daily LLM call budget reached -- deferring relationship extraction.", filing_symbol)
             return None
         prompt = (
@@ -198,7 +198,8 @@ class RelationshipExtractor:
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the ingestion loop
             log.warning("%s: relationship extraction failed: %s", filing_symbol, exc)
             return None
-        self._usage.record(response.usage.input_tokens, response.usage.output_tokens, model=self._model)
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
+                           model=self._model, category=CAT_EXTRACTION)
         payload = first_tool_use(response)
         return [] if payload is None else payload.get("relationships", [])
 

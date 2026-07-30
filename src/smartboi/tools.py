@@ -24,6 +24,7 @@ from pathlib import Path
 
 from smartboi.news import redact_token, redact_url
 from smartboi.paper_journal import cost_buckets, trade_economics
+from smartboi.usage import CATEGORIES
 from smartboi.status import gather_dossiers, gather_paper_trade_stats
 from smartboi.event_study import (
     OUTCOME_LABELS,
@@ -260,7 +261,9 @@ _DIAGNOSTIC_SETTINGS = (
     "max_favorable_drift_pct", "signal_entry_deadline_days",
     "stop_loss_pct", "take_profit_pct", "transaction_cost_bps_per_side",
     "transaction_cost_profile",
-    "max_daily_llm_calls", "max_daily_usd", "max_propagated_evidence_per_link",
+    "max_daily_llm_calls", "max_daily_usd",
+    "budget_share_extraction", "budget_share_synthesis", "budget_share_research",
+    "max_propagated_evidence_per_link",
     "propagated_evidence_cooldown_hours",
     "enable_ecosystem_propagation", "max_ecosystem_evidence_per_link",
     "extraction_model", "dossier_model", "skeptic_model", "synthesis_model",
@@ -390,6 +393,26 @@ def run_diagnostics(engine) -> str:
     budget = f"/${u.daily_usd_budget:.2f}" if u.daily_usd_budget else " (no cap)"
     add(f"  {u.date}: {u.calls}/{u.daily_call_budget} calls, {u.input_tokens:,} in / {u.output_tokens:,} out tokens")
     add(f"  {' ' * len(u.date)}  ${u.usd_spent:.2f}{budget} estimated spend")
+    # Per category, because the total alone hid the failure that mattered:
+    # the budget was being consumed before the US market opened, by the one
+    # pass whose output is not time-sensitive, leaving nothing for the pass
+    # that turns news into a position. A single number cannot show that.
+    shares = engine.usage.category_shares
+    for cat in CATEGORIES:
+        spent_usd, spent_calls = u.by_category.get(cat, (0.0, 0))
+        share = shares.get(cat)
+        if share is None or share >= 1.0:
+            cap = "uncapped"
+        elif share <= 0:
+            cap = "OFF"
+        elif u.daily_usd_budget:
+            cap = f"cap ${u.daily_usd_budget * share:.2f} ({share * 100:.0f}%)"
+        else:
+            cap = f"cap {share * 100:.0f}%"
+        exhausted = "" if engine.usage.budget_remaining(cat) else "  <-- EXHAUSTED, deferred to UTC midnight"
+        add(f"    {cat:<11} ${spent_usd:>6.2f}  {spent_calls:>5} calls  {cap}{exhausted}")
+    add("  ^^ 'dossier' (updater+skeptic) is uncapped by design: it gets whatever the others")
+    add("     cannot reach, and the whole day when they are idle. See usage.py.")
 
     log_dir = Path(s.log_dir)
     signals = read_jsonl(log_dir / "signals.jsonl")

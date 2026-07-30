@@ -29,7 +29,7 @@ import logging
 from anthropic import AsyncAnthropic
 
 from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
-from smartboi.usage import UsageTracker
+from smartboi.usage import CAT_DOSSIER, UsageTracker
 
 log = logging.getLogger(__name__)
 
@@ -170,7 +170,7 @@ class Skeptic:
         (extraction time), given directly rather than left for the skeptic
         to re-infer proportionality purely from the wording of the note
         every time."""
-        if not self._usage.budget_remaining():
+        if not self._usage.budget_remaining(CAT_DOSSIER):
             log.info("Daily LLM call budget reached -- deferring skeptic review.")
             return None
         confidence_suffix = (
@@ -205,7 +205,8 @@ class Skeptic:
         except Exception as exc:  # noqa: BLE001 - fail safe: nothing merges without a real verdict
             log.warning("Skeptic review failed (%s) -- will retry this evidence on a later poll.", exc)
             return None
-        self._usage.record(response.usage.input_tokens, response.usage.output_tokens, model=self._model)
+        self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
+                           model=self._model, category=CAT_DOSSIER)
         verdict = first_tool_use(response)
         if verdict is not None:
             return verdict

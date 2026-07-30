@@ -72,7 +72,7 @@ from smartboi.state import JsonState
 from smartboi.status import snapshot_dossier
 from smartboi.universe import SEED_RELATIONSHIPS, CompanySpec, spec_by_symbol
 from smartboi.universe_screen import guess_ecosystem, recommend_candidate_type, screen_universe
-from smartboi.usage import UsageTracker
+from smartboi.usage import CAT_EXTRACTION, CAT_RESEARCH, CAT_SYNTHESIS, UsageTracker
 from smartboi.webapp import run_dashboard
 
 log = logging.getLogger(__name__)
@@ -307,8 +307,18 @@ class Engine:
         # _check_model_provenance for why a change to these matters.
         self.model_state = JsonState(DATA_DIR / "model_provenance.json")
         self.alerts = AlertSender(settings.alert_webhook_url)
-        self.usage = UsageTracker(DATA_DIR / "llm_usage.json", settings.max_daily_llm_calls,
-                                  daily_usd_budget=settings.max_daily_usd)
+        self.usage = UsageTracker(
+            DATA_DIR / "llm_usage.json", settings.max_daily_llm_calls,
+            daily_usd_budget=settings.max_daily_usd,
+            # DOSSIER is absent on purpose -- see usage.py. It is guaranteed
+            # whatever these three cannot reach, and can use the whole day
+            # when they are idle.
+            category_shares={
+                CAT_EXTRACTION: settings.budget_share_extraction,
+                CAT_SYNTHESIS: settings.budget_share_synthesis,
+                CAT_RESEARCH: settings.budget_share_research,
+            },
+        )
 
         self.universe: list[CompanySpec] = list(settings.universe)
         self._apply_accepted_candidates()
