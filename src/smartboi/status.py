@@ -5,6 +5,7 @@ upstream API."""
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,13 @@ class PaperTradeStats:
     losses: int = 0
     timeouts: int = 0
     win_rate: float = 0.0
+    # 95% Wilson interval around win_rate. A bare rate on a dozen trades
+    # reads as fact when it is noise: at 13 closed the honest interval is
+    # wide enough to still straddle the ~59% break-even, i.e. the record
+    # cannot yet be called winning OR losing. Surfaced so the point estimate
+    # is never presented alone (see _wilson_interval, and the dashboard card).
+    win_rate_ci_low: float = 0.0
+    win_rate_ci_high: float = 0.0
     avg_r: float = 0.0
     # Reported alongside net so the cost drag is visible rather than
     # implicit -- the gap between these two is the whole question of whether
@@ -150,6 +158,23 @@ def _read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def _wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """95% Wilson score interval for a binomial proportion (default z=1.96).
+
+    Chosen over the textbook Wald (p +/- z*sqrt(p(1-p)/n)) interval because
+    Wald degenerates exactly where this record lives: it collapses to zero
+    width at 0 or 100% wins and can run past [0, 1] at small n. Wilson stays
+    inside [0, 1] and stays honest at the dozen-trade counts the paper
+    journal actually has. n <= 0 -> (0, 0)."""
+    if n <= 0:
+        return (0.0, 0.0)
+    p = successes / n
+    denom = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    margin = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return (max(0.0, center - margin), min(1.0, center + margin))
+
+
 def gather_paper_trade_stats(log_path: Path) -> tuple[PaperTradeStats, list[dict]]:
     rows = _read_jsonl(log_path)
     stats = PaperTradeStats(closed=len(rows))
@@ -160,6 +185,11 @@ def gather_paper_trade_stats(log_path: Path) -> tuple[PaperTradeStats, list[dict
         gross = [r.get("r_multiple_gross") for r in rows if r.get("r_multiple_gross") is not None]
         stats.avg_r_gross = round(sum(gross) / len(gross), 3) if gross else 0.0
         stats.win_rate = stats.wins / stats.closed
+        # A win is a WIN against every closed trade (timeouts included, as in
+        # win_rate above), so the interval is over the same successes/trials.
+        low, high = _wilson_interval(stats.wins, stats.closed)
+        stats.win_rate_ci_low = round(low, 4)
+        stats.win_rate_ci_high = round(high, 4)
         stats.avg_r = sum(r.get("r_multiple") or 0.0 for r in rows) / stats.closed
         stats.borrow_assumed = sum(1 for r in rows if r.get("assumes_borrow"))
         clean = [r.get("r_multiple") or 0.0 for r in rows if not r.get("assumes_borrow")]

@@ -14,9 +14,16 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from smartboi.config import Settings
 from smartboi.engine import Engine
-from smartboi.webapp import _parse_tickers, create_app
+from smartboi.webapp import _CSRF_HEADER, _parse_tickers, create_app
 
 from tests.fakes import FakeFinnhub
+
+
+def _client(engine) -> TestClient:
+    """A dashboard client that carries the CSRF header on every request, like
+    the real page's JS does on every POST (see _INDEX_HTML). The rejection of
+    a POST that omits it is covered on its own below."""
+    return TestClient(TestServer(create_app(engine)), headers={_CSRF_HEADER: "1"})
 
 
 @pytest.fixture
@@ -58,7 +65,7 @@ def test_parse_tickers_ignores_non_strings():
 # --- Endpoints ---
 
 async def test_screen_endpoint_returns_a_report(engine):
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         response = await client.post("/api/tools/screen", json={"tickers": "intt asys"})
         assert response.status == 200
         report = (await response.json())["report"]
@@ -67,22 +74,56 @@ async def test_screen_endpoint_returns_a_report(engine):
 
 async def test_screen_endpoint_without_finnhub_explains_instead_of_failing(engine):
     engine.finnhub = None
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         response = await client.post("/api/tools/screen", json={"tickers": "INTT"})
         assert response.status == 200
         assert "FINNHUB_API_KEY" in (await response.json())["report"]
 
 
 async def test_malformed_body_is_a_400_not_a_500(engine):
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         response = await client.post("/api/tools/screen", data="{not json")
         assert response.status == 400
+
+
+# --- CSRF: the whole write surface requires a custom header. The dashboard
+# binds 0.0.0.0 with no auth, and the destructive endpoints don't even read
+# their body, so a plain cross-origin form POST would otherwise reach them. ---
+
+async def test_state_changing_post_without_the_csrf_header_is_rejected(engine):
+    """reset-accepted is the sharpest case: it takes no body, so nothing but
+    the required header stands between a cross-origin page and wiping every
+    runtime-added symbol. Missing header -> 403, before the handler runs."""
+    # A bare client (NOT _client) sends no CSRF header, exactly like a
+    # cross-origin attacker's fetch/form would.
+    async with TestClient(TestServer(create_app(engine))) as client:
+        for path in ("universe/reset-accepted", "universe/rebuild-graph",
+                     "tools/screen", "candidates/accept"):
+            response = await client.post(f"/api/{path}", json={})
+            assert response.status == 403, f"/api/{path} answered {response.status}, not 403"
+
+
+async def test_reads_do_not_require_the_csrf_header(engine):
+    """GET is a pure read here, and the page's own 10s auto-refresh sends no
+    such header -- gating it would break the dashboard on load."""
+    async with TestClient(TestServer(create_app(engine))) as client:
+        assert (await client.get("/api/status")).status == 200
+        assert (await client.get("/")).status == 200
+
+
+async def test_the_csrf_header_lets_the_same_request_through(engine):
+    """The guard rejects on the ABSENCE of the header, not its value -- a
+    same-origin client that sets it (as the dashboard JS does) is unaffected.
+    Pairs with the rejection test so a guard that blocked everything couldn't
+    pass both."""
+    async with _client(engine) as client:
+        assert (await client.post("/api/universe/rebuild-graph", json={})).status == 200
 
 
 async def test_forward_returns_endpoint_reports_no_data_gracefully(engine):
     """Nothing captured yet is the normal state of a fresh deployment --
     it must read as an explanation, not an error."""
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         response = await client.post("/api/tools/forward-returns", json={})
         assert response.status == 200
         assert "No dossier snapshots" in (await response.json())["report"]
@@ -101,7 +142,7 @@ async def test_concurrent_tool_runs_are_rejected(engine):
 
     engine.finnhub.market_cap_musd = slow_market_cap
 
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         first = asyncio.create_task(client.post("/api/tools/screen", json={"tickers": "INTT"}))
         await asyncio.wait_for(started.wait(), timeout=5)
 
@@ -117,14 +158,14 @@ async def test_tool_failure_returns_an_error_not_a_dead_dashboard(engine):
         raise RuntimeError("finnhub exploded")
 
     engine.finnhub.market_cap_musd = boom
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         response = await client.post("/api/tools/screen", json={"tickers": "INTT"})
         assert response.status == 500
         assert "error" in await response.json()
 
 
 async def test_diagnostics_endpoint_returns_a_bundle(engine):
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         response = await client.post("/api/tools/diagnostics", json={})
         assert response.status == 200
         assert "=== SmartBoi diagnostics ===" in (await response.json())["report"]
@@ -134,7 +175,7 @@ async def test_diagnostics_state_the_after_cost_break_even_win_rate(engine):
     """The 8%/16% grid reads as 2:1 and isn't -- the sub-$300M bucket needs
     59% to net zero. That number decides whether the whole record can ever
     be profitable, so it has to appear without anyone asking for it."""
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         report = (await (await client.post("/api/tools/diagnostics", json={})).json())["report"]
 
     assert "Cost drag on the 8%/16% grid" in report
@@ -151,7 +192,7 @@ async def test_diagnostics_price_each_open_trade_at_its_own_cost_bucket(engine):
         "ESOA", "LONG", 15.05, 8.0, 16.0, 20, "t", 0.9, 3, [],
         cost_bps_round_trip=600.0, market_cap_musd=180.0,
     )
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         report = (await (await client.post("/api/tools/diagnostics", json={})).json())["report"]
 
     # An open trade showing worse than -1.00R while still ABOVE its stop is
@@ -167,7 +208,7 @@ async def test_diagnostics_price_each_open_trade_at_its_own_cost_bucket(engine):
 
 async def test_rebuild_graph_queues_every_tradeable(engine):
     engine.backfill_state.set("DCO", {"backfilled_at": "2026-07-01T00:00:00+00:00", "accession": "x"})
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         body = await (await client.post("/api/universe/rebuild-graph", json={})).json()
 
     assert body["ok"] is True
@@ -181,7 +222,7 @@ async def test_rebuild_graph_never_removes_an_edge(engine):
     from smartboi.graph import Relationship
 
     engine.graph.add(Relationship("DCO", "RTX", "customer", "d", "s", 0.9, "2026-07-29"))
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         await client.post("/api/universe/rebuild-graph", json={})
 
     assert len(engine.graph.relationships) == 1
@@ -191,7 +232,7 @@ async def test_rebuild_graph_leaves_anchors_alone(engine):
     """Backfill extracts from the SMALL companies' filings -- a giant's 10-K
     never names its tier-2 suppliers, which is the whole reason the graph is
     discovered bottom-up."""
-    async with TestClient(TestServer(create_app(engine))) as client:
+    async with _client(engine) as client:
         body = await (await client.post("/api/universe/rebuild-graph", json={})).json()
 
     assert "RTX" not in body["symbols"]

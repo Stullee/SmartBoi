@@ -459,8 +459,14 @@ def run_diagnostics(engine) -> str:
     stats, closed = gather_paper_trade_stats(log_dir / "paper_trades.jsonl")
     add("\n--- Paper trades ---")
     add(f"  open: {len(engine.journal.open_trades)} ({', '.join(engine.journal.open_trades) or '-'})")
+    # The win rate carries its 95% Wilson interval: at a dozen-odd closed
+    # trades the point estimate alone reads as fact when it is noise, and the
+    # interval width is exactly what says whether the record can be told apart
+    # from the break-even hit rate below.
     add(f"  closed: {stats.closed} (W{stats.wins}/L{stats.losses}/T{stats.timeouts}), "
-        f"win rate {stats.win_rate * 100:.0f}%, avg R {stats.avg_r:.2f}")
+        f"win rate {stats.win_rate * 100:.0f}% "
+        f"(95% CI {stats.win_rate_ci_low * 100:.0f}-{stats.win_rate_ci_high * 100:.0f}%), "
+        f"avg R {stats.avg_r:.2f}")
     for symbol, trade in engine.journal.open_trades.items():
         econ = trade_economics(
             s.stop_loss_pct, s.take_profit_pct, trade.cost_bps_round_trip, trade.direction

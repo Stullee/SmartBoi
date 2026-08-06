@@ -1,6 +1,65 @@
+import json
+
 from smartboi.dossier import Dossier
 from smartboi.graph import Relationship, RelationshipGraph
-from smartboi.status import gather_graph_stats, gather_universe_candidates, snapshot_dossier
+from smartboi.status import (
+    gather_graph_stats,
+    gather_paper_trade_stats,
+    gather_universe_candidates,
+    snapshot_dossier,
+)
+
+
+def _write_trades(path, statuses):
+    """A paper_trades.jsonl of closed trades with the given WIN/LOSS/TIMEOUT
+    statuses (r_multiple filled in only so avg_r has something to read)."""
+    lines = [json.dumps({"status": s, "r_multiple": 1.0 if s == "WIN" else -1.0})
+             for s in statuses]
+    path.write_text("\n".join(lines) + "\n")
+
+
+# --- Win rate carries a confidence interval. A bare rate on a dozen trades
+# reads as fact when it is noise; the interval width is the honest signal. ---
+
+def test_win_rate_reports_a_wilson_confidence_interval(tmp_path):
+    """5 wins in 13 closed is a 38% point estimate whose 95% interval is wide
+    enough to still contain the ~59% break-even -- i.e. the record cannot yet
+    be called losing. The interval brackets the point estimate and stays in
+    [0, 1]."""
+    path = tmp_path / "paper_trades.jsonl"
+    _write_trades(path, ["WIN"] * 5 + ["LOSS"] * 8)
+
+    stats, _ = gather_paper_trade_stats(path)
+
+    assert stats.closed == 13 and stats.wins == 5
+    assert round(stats.win_rate, 2) == 0.38
+    assert 0.0 <= stats.win_rate_ci_low < stats.win_rate < stats.win_rate_ci_high <= 1.0
+    # Wide at n=13: the upper bound clears break-even, which is the point of
+    # showing the interval rather than the bare 38%.
+    assert stats.win_rate_ci_high > 0.59
+
+
+def test_win_rate_interval_stays_inside_zero_one_at_the_extremes(tmp_path):
+    """The reason for Wilson over Wald: an all-wins (or all-losses) record
+    would give Wald a zero-width interval or one that runs past [0, 1].
+    Wilson stays strictly inside and non-degenerate."""
+    path = tmp_path / "paper_trades.jsonl"
+    _write_trades(path, ["WIN"] * 4)
+
+    stats, _ = gather_paper_trade_stats(path)
+
+    assert stats.win_rate == 1.0
+    assert stats.win_rate_ci_low > 0.0        # not the degenerate (1, 1)
+    assert stats.win_rate_ci_high <= 1.0
+
+
+def test_win_rate_interval_is_zero_with_no_closed_trades(tmp_path):
+    """Nothing closed yet is the normal fresh-deploy state -- no division, no
+    NaN, just a (0, 0) interval the dashboard renders as absent."""
+    stats, _ = gather_paper_trade_stats(tmp_path / "does_not_exist.jsonl")
+
+    assert stats.closed == 0
+    assert stats.win_rate_ci_low == 0.0 and stats.win_rate_ci_high == 0.0
 
 
 def test_snapshot_dossier_includes_computed_score():

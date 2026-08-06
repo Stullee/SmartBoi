@@ -729,6 +729,17 @@ pipeline itself already surfaced, never an arbitrary ticker, and it can
 only widen what's watched, never place an order or directly create a
 trade. See "Bring your own universe" above.
 
+Every state-changing endpoint (that one, the reset/rebuild controls, and
+the read-only tool runs) requires a custom `X-SmartBoi-Request` header that
+the dashboard's own JS attaches to every POST. A browser won't add a
+non-safelisted header to a cross-origin request without a CORS preflight,
+which the server answers for no origin, so a page the operator merely
+visits can't drive these endpoints -- even the ones (reset, rebuild) that
+take no body and would otherwise accept a plain cross-origin form POST. The
+dashboard binds all interfaces with no auth of its own, which is exactly
+what makes that guard matter. `GET` is left open: those are pure reads, and
+the page's own 10-second auto-refresh sends no such header.
+
 ## Observability
 
 A `heartbeat: universe=N dossiers=N signaled=N graph_edges=N ...` INFO line
