@@ -167,6 +167,10 @@ _INDEX_HTML = """<!doctype html>
   safe to paste &mdash; credentials and personal data are omitted and log lines are scrubbed.
   <b>Reset added symbols</b> is the one that changes things: it removes every symbol added at runtime, returning the
   universe to the curated list, and archives (never deletes) the dossiers that orphans. It asks first.</div>
+<div id="tool-output-actions" style="display:none; justify-content:flex-end; margin-top:0.7rem">
+  <button id="btn-copy-output" title="Copy the whole report to the clipboard"
+          style="font-size:0.8rem; padding:0.25rem 0.7rem">Copy report</button>
+</div>
 <pre id="tool-output"></pre>
 
 <div id="app">Loading&hellip;</div>
@@ -428,13 +432,59 @@ document.addEventListener("click", function(ev) {
 // hence its own much longer budget.
 var TOOL_TIMEOUT_MS = 300000;
 
+// Reveal the shared tool-output panel and its Copy button together. Several
+// tools write into #tool-output, and all of them want the Copy button shown.
+function showToolOutput() {
+  document.getElementById("tool-output").style.display = "block";
+  document.getElementById("tool-output-actions").style.display = "flex";
+}
+
+// One-click copy of whatever report is currently shown -- the diagnostics
+// bundle is long and drag-selecting it is miserable. navigator.clipboard
+// needs a secure context, which a plain-HTTP LAN Home Assistant install is
+// not, so fall back to a hidden-textarea execCommand (works over HTTP) and,
+// if even that is blocked, select the block so Ctrl-C still copies it.
+function copyToolOutput(btn) {
+  var text = document.getElementById("tool-output").textContent || "";
+  if (!text) return;
+  function flash(msg) { btn.textContent = msg; setTimeout(function() { btn.textContent = "Copy report"; }, 1500); }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function() { flash("Copied!"); },
+                                          function() { fallbackCopyToolOutput(text, flash); });
+  } else {
+    fallbackCopyToolOutput(text, flash);
+  }
+}
+
+function fallbackCopyToolOutput(text, flash) {
+  var ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.top = "-1000px";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  var ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+  document.body.removeChild(ta);
+  if (ok) { flash("Copied!"); return; }
+  // Even execCommand refused -- leave the report selected so the keyboard
+  // shortcut still works.
+  var range = document.createRange();
+  range.selectNodeContents(document.getElementById("tool-output"));
+  var sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  flash("Press Ctrl-C");
+}
+
 function runTool(path, body, button) {
   var out = document.getElementById("tool-output");
   var buttons = [document.getElementById("btn-screen"), document.getElementById("btn-analyze"),
                  document.getElementById("btn-event-study"), document.getElementById("btn-diagnostics"),
                  document.getElementById("btn-research")];
   buttons.forEach(function(b) { b.disabled = true; });
-  out.style.display = "block";
+  showToolOutput();
   out.textContent = "Running… (this can take a few minutes for a long ticker list)";
 
   var controller = new AbortController();
@@ -493,7 +543,7 @@ document.getElementById("btn-rebuild-graph").addEventListener("click", function(
                "dossier, trade or log. Costs about one LLM call per tradeable symbol. Runs in the " +
                "background over the next few polling ticks.")) return;
   var out = document.getElementById("tool-output");
-  out.style.display = "block";
+  showToolOutput();
   out.textContent = "Queueing…";
   fetch(API_BASE + "universe/rebuild-graph", {
     method: "POST", headers: POST_HEADERS, body: "{}",
@@ -510,7 +560,7 @@ document.getElementById("btn-reset").addEventListener("click", function() {
                "Dossiers for the removed symbols are ARCHIVED, not deleted. Candidates, trades " +
                "and captured logs are untouched.")) return;
   var out = document.getElementById("tool-output");
-  out.style.display = "block";
+  showToolOutput();
   out.textContent = "Resetting…";
   fetch(API_BASE + "universe/reset-accepted", {
     method: "POST", headers: POST_HEADERS, body: "{}",
@@ -520,6 +570,9 @@ document.getElementById("btn-reset").addEventListener("click", function() {
          "\\nUniverse is now " + res.universe_size + " symbols.");
     refresh();
   }).catch(function(err) { out.textContent = "Failed: " + err; });
+});
+document.getElementById("btn-copy-output").addEventListener("click", function() {
+  copyToolOutput(this);
 });
 
 function refresh() {
