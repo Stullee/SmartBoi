@@ -48,6 +48,30 @@ from smartboi.status import (
 
 log = logging.getLogger(__name__)
 
+# Every state-changing request must carry this header, and the dashboard's
+# own JS sets it on every POST (see _INDEX_HTML). It is the standard custom-
+# header CSRF defense, and here it is the ONLY thing guarding the write
+# surface: the dashboard binds 0.0.0.0 with no auth, and reset-accepted /
+# rebuild-graph don't even read their body -- so without it a plain
+# cross-origin <form> POST from any page the operator happened to open could
+# reset the universe on their host. A browser will not attach a non-safelisted
+# header to a cross-origin request without a CORS preflight, which this server
+# answers for no origin, so only same-origin dashboard JS gets through. GET is
+# left open on purpose: every GET here is a pure read with no side effect, and
+# the page's own 10s auto-refresh sends no such header. (Keep this string in
+# sync with the POST_HEADERS constant in the dashboard JS.)
+_CSRF_HEADER = "X-SmartBoi-Request"
+
+
+@web.middleware
+async def _require_csrf_header(request: web.Request, handler):
+    if request.method == "POST" and _CSRF_HEADER not in request.headers:
+        return web.json_response(
+            {"error": f"missing required {_CSRF_HEADER} header"}, status=403
+        )
+    return await handler(request)
+
+
 _STATUS_TIMEOUT_SEC = 8.0
 # A ticker as the screener will accept it: letters, digits, and the dot/dash
 # real symbols use (BRK.B, RDS-A). Anything else in the free-text box is
@@ -372,6 +396,10 @@ function render(data) {
 var API_BASE = location.pathname.replace(/\\/?$/, "/") + "api/";
 var API_STATUS_URL = API_BASE + "status";
 var REFRESH_TIMEOUT_MS = 12000;
+// Sent on every state-changing POST. The custom header is what the server's
+// CSRF guard requires (see _CSRF_HEADER in webapp.py) -- keep the name in
+// sync with it. GET (the auto-refresh) deliberately sends nothing.
+var POST_HEADERS = { "Content-Type": "application/json", "X-SmartBoi-Request": "1" };
 
 document.addEventListener("click", function(ev) {
   var btn = ev.target.closest(".accept-btn");
@@ -379,7 +407,7 @@ document.addEventListener("click", function(ev) {
   btn.disabled = true;
   fetch(API_BASE + "candidates/accept", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: POST_HEADERS,
     body: JSON.stringify({ symbol: btn.dataset.symbol, as: btn.dataset.as }),
   }).then(function(r) { return r.json(); }).then(function(result) {
     if (result.error) {
@@ -414,7 +442,7 @@ function runTool(path, body, button) {
   var timer = setTimeout(function() { timedOut = true; controller.abort(); }, TOOL_TIMEOUT_MS);
   fetch(API_BASE + path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: POST_HEADERS,
     body: JSON.stringify(body || {}),
     signal: controller.signal,
   }).then(function(r) {
@@ -468,7 +496,7 @@ document.getElementById("btn-rebuild-graph").addEventListener("click", function(
   out.style.display = "block";
   out.textContent = "Queueing…";
   fetch(API_BASE + "universe/rebuild-graph", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    method: "POST", headers: POST_HEADERS, body: "{}",
   }).then(function(r) { return r.json(); }).then(function(res) {
     out.textContent = res.error ? ("Error: " + res.error)
       : ("Queued " + res.queued + " symbol(s) for relationship re-extraction (graph currently has " +
@@ -485,7 +513,7 @@ document.getElementById("btn-reset").addEventListener("click", function() {
   out.style.display = "block";
   out.textContent = "Resetting…";
   fetch(API_BASE + "universe/reset-accepted", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    method: "POST", headers: POST_HEADERS, body: "{}",
   }).then(function(r) { return r.json(); }).then(function(res) {
     out.textContent = res.error ? ("Error: " + res.error)
       : ("Removed " + res.removed.length + " added symbol(s): " + (res.removed.join(", ") || "none") +
@@ -739,7 +767,7 @@ def create_app(engine) -> web.Application:
         result = engine.rebuild_relationship_graph()
         return web.json_response({"ok": True, **result})
 
-    app = web.Application()
+    app = web.Application(middlewares=[_require_csrf_header])
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_status)
     app.router.add_post("/api/candidates/accept", handle_accept_candidate)
