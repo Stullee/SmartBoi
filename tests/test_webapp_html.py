@@ -99,6 +99,18 @@ def test_javascript_parses():
     assert result.returncode == 0, f"dashboard JS does not parse:\n{result.stderr}"
 
 
+def test_copy_button_degrades_to_execcommand_for_plain_http():
+    """The Copy-report button must work on a plain-HTTP LAN Home Assistant
+    install -- which is most of them. navigator.clipboard is undefined in a
+    non-secure context, so relying on it alone would make the button silently
+    do nothing for exactly this add-on's users. Lock in the execCommand
+    fallback so a refactor can't quietly drop it."""
+    body = _script_body()
+    assert 'getElementById("btn-copy-output")' in body      # the button is wired up
+    assert "navigator.clipboard" in body                    # modern API when it's there
+    assert 'execCommand("copy")' in body                    # ...but HTTP still copies
+
+
 def test_every_button_the_script_binds_actually_exists_in_the_html():
     """A renamed or removed element id leaves addEventListener throwing on a
     null at load time, which kills the rest of the script exactly like a
