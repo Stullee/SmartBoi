@@ -86,7 +86,8 @@ class UsageSnapshot:
 
 class UsageTracker:
     def __init__(self, path: Path, daily_call_budget: int, daily_usd_budget: float = 0.0,
-                 category_shares: dict[str, float] | None = None):
+                 category_shares: dict[str, float] | None = None,
+                 category_reserved: dict[str, float] | None = None):
         self._state = JsonState(path)
         self.daily_call_budget = daily_call_budget
         # 0 disables the dollar cap (call cap only) -- the pre-existing
@@ -94,13 +95,31 @@ class UsageTracker:
         # semantics can have them.
         self.daily_usd_budget = daily_usd_budget
         # {category: max fraction of the day it may spend}. A category absent
-        # from this dict is UNCAPPED, which is how the trading-critical
-        # bucket gets both a guaranteed floor (whatever the capped ones
-        # cannot reach) and the freedom to use the whole day when they are
-        # idle. 1.0 is also uncapped, stated explicitly; 0.0 genuinely means
-        # "make no calls at all", which is a useful thing to be able to set
-        # for a category you don't want running unsupervised.
+        # from this dict is UNCAPPED. 1.0 is also uncapped, stated
+        # explicitly; 0.0 genuinely means "make no calls at all", which is a
+        # useful thing to set for a category you don't want running
+        # unsupervised.
         self.category_shares = dict(category_shares or {})
+        # {category: fraction of the day RESERVED for it}, which is a
+        # different and stronger thing than a ceiling.
+        #
+        # A ceiling protects nothing. The total-budget check runs first, so
+        # once another category has spent the day, every remaining category
+        # is refused no matter how much of its own share is untouched.
+        # Measured live after a week on a $10 day: dossier $6.47, extraction
+        # $3.54, synthesis $0.00 against a $2.50 ceiling -- and synthesis had
+        # therefore never run at all, in the entire life of the system. It is
+        # the one pass that asks whether N pieces of evidence are N facts or
+        # one fact N times, and it was being starved by the pass whose output
+        # it exists to judge.
+        #
+        # Timing is what makes a ceiling useless here rather than merely
+        # imperfect. The daily decay pass is the only caller of synthesis and
+        # is scheduled off a persisted wall clock, so whichever hour it first
+        # ran at is its slot forever; land that slot late in the UTC day and
+        # the budget is reliably already gone. A reservation does not care
+        # when the pass runs.
+        self.category_reserved = dict(category_reserved or {})
 
     @staticmethod
     def _today() -> str:
@@ -115,6 +134,23 @@ class UsageTracker:
             self._state.set("usd_spent", 0.0)
             self._state.set("usd_by_category", {})
             self._state.set("calls_by_category", {})
+
+    def _reserved_elsewhere(self, category: str) -> float:
+        """Dollars reserved by OTHER categories that they have not spent yet.
+
+        Unspent only: a reservation that has been used is no longer set
+        aside, so it stops shrinking everyone else's pool. That is what keeps
+        this from wasting the budget -- the protection costs the other
+        categories nothing once the reserved pass has actually run."""
+        if self.daily_usd_budget <= 0:
+            return 0.0
+        total = 0.0
+        for cat, share in self.category_reserved.items():
+            if cat == category or share <= 0:
+                continue
+            spent, _ = self._category_spent(cat)
+            total += max(0.0, self.daily_usd_budget * share - spent)
+        return total
 
     def _category_spent(self, category: str) -> tuple[float, int]:
         usd = (self._state.get("usd_by_category") or {}).get(category, 0.0)
@@ -138,8 +174,16 @@ class UsageTracker:
         self._roll_if_new_day(today)
         if self._state.get("calls", 0) >= self.daily_call_budget:
             return False
-        if self.daily_usd_budget > 0 and self._state.get("usd_spent", 0.0) >= self.daily_usd_budget:
-            return False
+        # The total this category may draw against is the day MINUS whatever
+        # other categories have reserved and not yet spent. Their reservation
+        # is not this category's to consume, which is the whole point -- a
+        # bare `usd_spent >= daily_usd_budget` let the first spender of the
+        # day take money that had been explicitly set aside for a pass that
+        # had not run yet.
+        if self.daily_usd_budget > 0:
+            available = self.daily_usd_budget - self._reserved_elsewhere(category)
+            if self._state.get("usd_spent", 0.0) >= available:
+                return False
 
         share = self.category_shares.get(category)
         if share is None or share >= 1.0:

@@ -208,3 +208,74 @@ def test_an_uncategorised_call_still_counts_against_the_totals(tmp_path):
     u = _tracker(tmp_path)
     u.record(10_000_000, 0, model="claude-haiku-4-5")
     assert not u.budget_remaining(CAT_DOSSIER)
+
+
+# --- Reservations. A ceiling protected nothing: the total-budget check runs
+# first, so once dossier had spent the day every other category was refused
+# however much of its own share was untouched. Measured live after a week:
+# dossier $6.47, extraction $3.54, synthesis $0.00 of a $2.50 ceiling -- and
+# synthesis had therefore never run once in the system's entire life. ---
+
+
+def _reserved(tmp_path):
+    return UsageTracker(
+        tmp_path / "u.json", daily_call_budget=5000, daily_usd_budget=10.0,
+        category_shares={CAT_EXTRACTION: 0.35, CAT_SYNTHESIS: 0.25, CAT_RESEARCH: 0.0},
+        category_reserved={CAT_SYNTHESIS: 0.15},
+    )
+
+
+def test_the_live_starvation_no_longer_happens(tmp_path):
+    """The observed week, replayed through the GATE rather than forced past
+    it -- record() only meters, budget_remaining() is what refuses."""
+    u = _reserved(tmp_path)
+    u.record(6_470_000, 0, model="claude-haiku-4-5", category=CAT_DOSSIER)   # $6.47
+
+    # Extraction's own 35% ceiling ($3.50) is what stops it here, and even
+    # without that the pool would run out at $8.50, not $10.
+    assert u.budget_remaining(CAT_EXTRACTION)
+    u.record(2_100_000, 0, model="claude-haiku-4-5", category=CAT_EXTRACTION)  # $2.10 -> $8.57
+
+    assert not u.budget_remaining(CAT_DOSSIER)     # $8.50 pool is gone
+    assert not u.budget_remaining(CAT_EXTRACTION)
+    assert u.budget_remaining(CAT_SYNTHESIS)       # the reserved $1.50 survives
+
+
+def test_an_uncapped_category_cannot_spend_a_reservation(tmp_path):
+    u = _reserved(tmp_path)
+    # $8.50 is the whole day minus synthesis's reserved $1.50.
+    u.record(8_500_000, 0, model="claude-haiku-4-5", category=CAT_DOSSIER)
+
+    assert not u.budget_remaining(CAT_DOSSIER)
+    assert not u.budget_remaining(CAT_EXTRACTION)
+    assert u.budget_remaining(CAT_SYNTHESIS)  # its own money, untouched
+
+
+def test_a_spent_reservation_stops_shrinking_everyone_elses_pool(tmp_path):
+    """The reservation must not waste budget: once synthesis has actually
+    used it, the money is no longer set aside and dossier can have the rest."""
+    u = _reserved(tmp_path)
+    u.record(300_000, 0, model="claude-opus-5", category=CAT_SYNTHESIS)  # $1.50, its full reserve
+    u.record(8_000_000, 0, model="claude-haiku-4-5", category=CAT_DOSSIER)  # $8.00
+
+    # Nothing is set aside any more, so the last $0.50 is dossier's to take
+    # -- the protection costs the other categories nothing once it is used.
+    assert u.budget_remaining(CAT_DOSSIER)
+    assert u.snapshot().usd_spent == pytest.approx(9.5)
+
+    u.record(500_000, 0, model="claude-haiku-4-5", category=CAT_DOSSIER)  # $10.00
+    assert not u.budget_remaining(CAT_DOSSIER)
+    assert not u.budget_remaining(CAT_SYNTHESIS)        # reserve used, no special claim
+
+
+def test_a_reservation_does_not_exempt_a_category_from_its_own_ceiling(tmp_path):
+    u = _reserved(tmp_path)
+    u.record(500_000, 0, model="claude-opus-5", category=CAT_SYNTHESIS)  # $2.50 = its 25% ceiling
+    assert not u.budget_remaining(CAT_SYNTHESIS)
+
+
+def test_no_reservation_configured_reproduces_the_old_behaviour(tmp_path):
+    u = UsageTracker(tmp_path / "u.json", 5000, 10.0,
+                     category_shares={CAT_SYNTHESIS: 0.25})
+    u.record(10_000_000, 0, model="claude-haiku-4-5", category=CAT_DOSSIER)
+    assert not u.budget_remaining(CAT_SYNTHESIS)

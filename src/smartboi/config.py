@@ -225,6 +225,23 @@ class Settings(BaseSettings):
     budget_share_extraction: float = 0.35
     budget_share_synthesis: float = 0.25
     budget_share_research: float = 0.10
+    # A RESERVATION, not a ceiling -- the fraction of the day no other
+    # category may consume until synthesis has had its chance at it.
+    #
+    # The ceilings above turned out to protect nothing: the total-budget
+    # check runs first, so once dossier had spent the day every other
+    # category was refused however much of its own share was untouched.
+    # Measured live after a week on a $10 day: dossier $6.47, extraction
+    # $3.54, synthesis $0.00 against a $2.50 ceiling -- and the one pass that
+    # judges whether N pieces of evidence are N facts or one fact N times had
+    # therefore never run, ever.
+    #
+    # Timing is why a ceiling could never have worked. The daily decay pass
+    # is synthesis's only caller and is scheduled off a persisted wall clock,
+    # so whichever hour it first ran at becomes its slot permanently; land
+    # late in the UTC day and the budget is always already gone. Set to 0 to
+    # go back to a pure ceiling.
+    budget_reserve_synthesis: float = 0.15
     # Caps how many pieces of PROPAGATED evidence (about a linked company,
     # never the dossier's own direct evidence) get forwarded to one target
     # from one origin within a rolling window -- without this, a heavily-

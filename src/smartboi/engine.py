@@ -318,6 +318,10 @@ class Engine:
                 CAT_SYNTHESIS: settings.budget_share_synthesis,
                 CAT_RESEARCH: settings.budget_share_research,
             },
+            # Reserved, not merely capped -- see usage.py. Synthesis runs on
+            # the daily decay pass, whose slot drifts to whatever hour it
+            # first ran at, so it cannot rely on being early in the day.
+            category_reserved={CAT_SYNTHESIS: settings.budget_reserve_synthesis},
         )
 
         self.universe: list[CompanySpec] = list(settings.universe)

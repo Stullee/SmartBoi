@@ -263,6 +263,7 @@ _DIAGNOSTIC_SETTINGS = (
     "transaction_cost_profile",
     "max_daily_llm_calls", "max_daily_usd",
     "budget_share_extraction", "budget_share_synthesis", "budget_share_research",
+    "budget_reserve_synthesis",
     "max_propagated_evidence_per_link",
     "propagated_evidence_cooldown_hours",
     "enable_ecosystem_propagation", "max_ecosystem_evidence_per_link",
