@@ -87,6 +87,7 @@ _INDEX_HTML = """<!doctype html>
   .card { background: rgba(128,128,128,0.12); border-radius: 8px; padding: 0.9rem 1.2rem; min-width: 140px; }
   .card .label { font-size: 0.75rem; opacity: 0.65; text-transform: uppercase; letter-spacing: 0.03em; }
   .card .value { font-size: 1.4rem; font-weight: 600; margin-top: 0.2rem; }
+  .card .ci { font-size: 0.7rem; opacity: 0.55; margin-top: 0.15rem; }
   .pos { color: #3ecf6e; } .neg { color: #ef5350; } .warn { color: #e6b800; }
   table { border-collapse: collapse; width: 100%; margin-top: 0.4rem; font-size: 0.9rem; }
   th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid rgba(128,128,128,0.2); }
@@ -331,7 +332,13 @@ function render(data) {
   html += '<div class="card"><div class="label">Active dossiers</div><div class="value">' + data.dossiers.length + '</div></div>';
   html += '<div class="card"><div class="label">Paper trades open</div><div class="value">' + data.open_paper_trades.length + '</div></div>';
   html += '<div class="card"><div class="label">Paper win rate</div><div class="value">' +
-    (data.paper_stats.closed ? Math.round(data.paper_stats.win_rate * 100) + "%" : "-") + '</div></div>';
+    (data.paper_stats.closed ? Math.round(data.paper_stats.win_rate * 100) + "%" : "-") + '</div>' +
+    // The interval, not just the point: a dozen trades cannot distinguish a
+    // winning record from a losing one, and a bare "38%" hides that.
+    (data.paper_stats.closed ? '<div class="ci" title="95% Wilson interval on ' +
+      data.paper_stats.closed + ' closed trade(s) -- the point estimate is not yet reliable">95% CI ' +
+      Math.round(data.paper_stats.win_rate_ci_low * 100) + '-' +
+      Math.round(data.paper_stats.win_rate_ci_high * 100) + '%</div>' : "") + '</div>';
   html += '<div class="card"><div class="label">Paper avg R</div><div class="value ' + cls(data.paper_stats.avg_r) + '">' +
     (data.paper_stats.closed ? fmt(data.paper_stats.avg_r) : "-") + '</div></div>';
   if (data.paper_stats.borrow_assumed) {
