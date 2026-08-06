@@ -83,7 +83,9 @@ A dashboard runs alongside ingestion (same process), reachable directly or
 as this add-on's Ingress tab. Shows: which integrations are enabled, the
 relationship graph, every company's dossier (direction, confidence,
 magnitude, evidence count, thesis, signal-time price), open/closed
-hypothetical trades with win rate and average R, recent signals, today's
+hypothetical trades with win rate (shown with its 95% confidence interval,
+because a rate over a dozen-odd trades is mostly noise) and average R,
+recent signals, today's
 LLM call/token usage against the daily budget, and discovered **universe
 candidates** -- companies outside your universe that a filing disclosed a
 relationship to. Auto-refreshes every 10 seconds. Never places orders.
