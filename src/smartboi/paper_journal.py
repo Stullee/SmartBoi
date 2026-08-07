@@ -174,6 +174,29 @@ class PaperTrade:
     confidence: float
     independent_source_count: int
     citations: list[dict] = field(default_factory=list)  # [{source_name, url, headline, published_at}, ...]
+    # The signal EPISODE this trade came from -- the dossier's signaled_at,
+    # the same key signals.jsonl and decisions.jsonl carry (see
+    # signals.log_signal / log_decision).
+    #
+    # Without it a closed trade could not be joined back to the signal that
+    # produced it at all: the only link was "same symbol, opened_at near a
+    # trade_opened row's timestamp", which is a reconstruction rather than a
+    # key, and it degrades exactly where a post-mortem needs it most -- a
+    # symbol that signals repeatedly (BWEN opened twice in three days on the
+    # live board) offers several episodes to guess between. With this, the
+    # whole chain joins: closed trade -> episode -> every signal re-log ->
+    # the decisions ledger -> the dossier snapshot series.
+    #
+    # Empty on a record written before episode stamping existed; those can
+    # never be backfilled, since nothing remembers which episode they came
+    # from.
+    episode: str = ""
+    # The dossier's magnitude at open. confidence is stored above, but the
+    # bar a signal clears is confidence * MAGNITUDE (see signals.evaluate),
+    # so without this the score that actually admitted the trade is not
+    # recoverable from the trade record -- only from signals.jsonl, which
+    # needed the join key above to reach.
+    magnitude: float = 0.0
     status: str = "OPEN"  # OPEN | WIN | LOSS | TIMEOUT
     closed_at: str | None = None
     exit_price: float | None = None
@@ -214,6 +237,26 @@ class PaperTrade:
     # form a single "legacy" bucket instead of contaminating the current
     # numbers (see status.gather_strategy_generations).
     strategy: dict | None = None
+    # The whole-evidence-body synthesis verdict as it stood on the dossier at
+    # open (see dossier.DossierSynthesizer). Copied rather than looked up
+    # later because the dossier is LIVE: its aggregate is recomputed on every
+    # merge and every decay pass, so by the time a trade closes, the file no
+    # longer says what was believed at entry.
+    #
+    # `synthesis_at` is the load-bearing one, and it is deliberately a
+    # TIMESTAMP rather than a flag: it makes staleness measurable. The daily
+    # synthesis cap is currently applied on the decay path only and is not
+    # consulted when fresh evidence merges (see docs/AUDIT-2026-08.md 2.1 and
+    # A1), so a dossier vetoed to 0.000 overnight can re-fire and open hours
+    # later on the uncapped arithmetic score. Stamping the verdict here is
+    # what turns that from an inference about the logs into a per-trade fact:
+    # a trade whose synthesis said already_priced_in shortly before it opened
+    # is the bypass, on the record, in the row.
+    synthesis_at: str = ""
+    synthesis_confidence: float = 0.0
+    synthesis_magnitude: float = 0.0
+    distinct_fact_count: int = 0
+    already_priced_in: bool = False
 
     def _net_return_fraction(self, exit_price: float) -> float:
         """Net-of-cost return as a fraction of the entry notional -- the
@@ -342,6 +385,9 @@ class PaperTradeJournal:
         market_cap_musd: float | None = None,
         position_value: float = 0.0,
         strategy: dict | None = None,
+        episode: str = "",
+        magnitude: float = 0.0,
+        synthesis: dict | None = None,
     ) -> PaperTrade:
         if direction == "LONG":
             stop_price = entry_price * (1 - stop_loss_pct / 100)
@@ -366,6 +412,17 @@ class PaperTradeJournal:
             assumes_borrow=assumes_borrow(direction, market_cap_musd),
             position_value=position_value,
             strategy=strategy,
+            episode=episode,
+            magnitude=magnitude,
+            # Defaulted per field rather than requiring the caller to pass a
+            # complete dict: a dossier that has never been synthesized (the
+            # pass is skipped below a score floor) has no verdict to copy,
+            # and that must record as "no synthesis" rather than raising.
+            synthesis_at=str((synthesis or {}).get("synthesis_at") or ""),
+            synthesis_confidence=float((synthesis or {}).get("synthesis_confidence") or 0.0),
+            synthesis_magnitude=float((synthesis or {}).get("synthesis_magnitude") or 0.0),
+            distinct_fact_count=int((synthesis or {}).get("distinct_fact_count") or 0),
+            already_priced_in=bool((synthesis or {}).get("already_priced_in")),
         )
         self.open_trades[symbol] = trade
         self._write_open_state()
