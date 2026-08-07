@@ -5,6 +5,7 @@ from smartboi.graph import Relationship, RelationshipGraph
 from smartboi.status import (
     gather_graph_stats,
     gather_paper_trade_stats,
+    gather_strategy_generations,
     gather_universe_candidates,
     snapshot_dossier,
 )
@@ -81,6 +82,98 @@ def test_currency_equity_is_capital_plus_realized(tmp_path):
 def test_currency_equity_with_no_trades_is_just_the_capital(tmp_path):
     stats, _ = gather_paper_trade_stats(tmp_path / "none.jsonl", initial_capital=5000.0, currency="EUR")
     assert stats.realized_pnl == 0.0 and stats.equity == 5000.0
+
+
+# --- Strategy generations: the closed record split by the config each trade
+# was opened under, so a new strategy's win rate is never pooled with the old
+# regime that produced the current headline 5W-8L. ---
+
+_HTH_SIG = {
+    "stop_loss_pct": 50.0, "take_profit_pct": 100.0, "signal_confidence_threshold": 0.5,
+    "transaction_cost_profile": "retail", "max_favorable_drift_pct": 12.0, "max_horizon_days": 21,
+    "label": "hold-to-horizon", "version": "0.43.0",
+}
+
+
+def _trade(status, r, strategy=None):
+    row = {"status": status, "r_multiple": r}
+    if strategy is not None:
+        row["strategy"] = strategy
+    return row
+
+
+def _write_rows(path, rows):
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+
+def test_strategy_generations_split_current_from_legacy(tmp_path):
+    """The whole point: the current strategy is measured on ONLY its own
+    trades, and the old unstamped record (the contaminating 5W-8L) is kept in
+    a separate, labelled legacy bucket -- not pooled into the headline."""
+    path = tmp_path / "paper_trades.jsonl"
+    _write_rows(path,
+                [_trade("WIN", 1.0) for _ in range(5)] + [_trade("LOSS", -1.0) for _ in range(8)]
+                + [_trade("WIN", 1.5, _HTH_SIG) for _ in range(2)] + [_trade("LOSS", -1.0, _HTH_SIG)])
+
+    gens = gather_strategy_generations(path, _HTH_SIG)
+
+    current = next(g for g in gens if g.is_current)
+    assert current.label == "hold-to-horizon"
+    assert (current.closed, current.wins, current.losses) == (3, 2, 1)  # NOT the legacy 13
+    legacy = next(g for g in gens if g.legacy)
+    assert (legacy.closed, legacy.wins, legacy.losses) == (13, 5, 8)
+    assert legacy.label.startswith("legacy")
+    # Current first, legacy last.
+    assert gens[0].is_current and gens[-1].legacy
+
+
+def test_current_generation_is_present_even_with_no_closed_trades(tmp_path):
+    """Right after a strategy change the current record is 0W-0L -- that empty
+    'still measuring' state is the honest headline and must appear, labelled
+    with the version it began at, rather than being absent."""
+    path = tmp_path / "paper_trades.jsonl"
+    _write_rows(path, [_trade("WIN", 1.0) for _ in range(3)])  # only legacy trades exist
+
+    gens = gather_strategy_generations(path, _HTH_SIG)
+
+    current = next(g for g in gens if g.is_current)
+    assert current.closed == 0
+    assert current.label == "hold-to-horizon"
+    assert current.version_from == "0.43.0"
+
+
+def test_generations_group_by_config_not_by_version(tmp_path):
+    """A cosmetic version bump must not fork a strategy's record; only a rule
+    change does. Two trades that differ solely in version pool together; a
+    third with a changed stop is its own generation."""
+    path = tmp_path / "paper_trades.jsonl"
+    v1 = dict(_HTH_SIG, version="0.43.0")
+    v2 = dict(_HTH_SIG, version="0.44.0")               # cosmetic bump, same rules
+    changed = dict(_HTH_SIG, stop_loss_pct=25.0, version="0.45.0")  # a real rule change
+    _write_rows(path, [_trade("WIN", 1.0, v1), _trade("LOSS", -1.0, v2), _trade("WIN", 1.0, changed)])
+
+    gens = gather_strategy_generations(path, _HTH_SIG)
+
+    non_legacy = [g for g in gens if not g.legacy]
+    assert len(non_legacy) == 2                          # v1+v2 collapsed, changed separate
+    current = next(g for g in gens if g.is_current)
+    assert current.closed == 2                           # v1 and v2 pooled into one generation
+    assert current.version_from == "0.43.0" and current.version_to == "0.44.0"
+
+
+def test_generation_carries_its_own_win_rate_and_interval(tmp_path):
+    """Each generation's win rate stands alone with its own Wilson interval,
+    so a young strategy's noise reads as noise rather than borrowing the
+    legacy record's larger n."""
+    path = tmp_path / "paper_trades.jsonl"
+    _write_rows(path, [_trade("WIN", 1.0, _HTH_SIG) for _ in range(5)]
+                + [_trade("LOSS", -1.0, _HTH_SIG) for _ in range(8)])
+
+    current = next(g for g in gather_strategy_generations(path, _HTH_SIG) if g.is_current)
+
+    assert (current.closed, current.wins) == (13, 5)
+    assert round(current.win_rate, 2) == 0.38
+    assert 0.0 <= current.win_rate_ci_low < current.win_rate < current.win_rate_ci_high <= 1.0
 
 
 def test_snapshot_dossier_includes_computed_score():

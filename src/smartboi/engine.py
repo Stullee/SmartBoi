@@ -2647,6 +2647,7 @@ class Engine:
             cost_bps_round_trip=cost_per_side * 2,
             market_cap_musd=market_cap,
             position_value=position_value,
+            strategy=self.settings.strategy_signature(),
         )
         self._record_decision("trade_opened", symbol, dossier.direction, dossier.signaled_at,
                               price=price)

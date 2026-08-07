@@ -1461,6 +1461,21 @@ async def test_ib_price_is_preferred_over_finnhub_when_both_have_one(engine):
     assert engine.journal.open_trades["FORM"].entry_price == 10.0
 
 
+async def test_opened_trade_is_stamped_with_the_current_strategy(engine):
+    """Each paper trade the engine opens carries the live strategy signature,
+    so the closed record can later be split by generation and a new strategy's
+    win rate is never pooled with an abandoned one (see status.py)."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+
+    await _signal_form(engine)
+    await engine._mark_and_execute()
+
+    trade = engine.journal.open_trades["FORM"]
+    assert trade.strategy == engine.settings.strategy_signature()
+    assert trade.strategy["stop_loss_pct"] == engine.settings.stop_loss_pct
+    assert trade.strategy["transaction_cost_profile"] == engine.settings.transaction_cost_profile
+
+
 async def test_open_trade_is_marked_from_finnhub_intraday_band(engine):
     """The Finnhub fallback carries the session high/low, so a stop that
     traded intraday still stops the trade out -- a close-only fallback would

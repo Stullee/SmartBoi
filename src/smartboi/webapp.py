@@ -42,6 +42,7 @@ from smartboi.status import (
     gather_dossiers,
     gather_graph_stats,
     gather_paper_trade_stats,
+    gather_strategy_generations,
     gather_recent_signals,
     gather_universe_candidates,
     gather_usage,
@@ -206,6 +207,22 @@ _INDEX_HTML = """<!doctype html>
              transform: translateX(-50%); border: 1.5px dashed #e6b800; }
   .fresh { font-size: 0.7rem; opacity: 0.55; }
   .fresh.stale { color: #e6b800; opacity: 0.9; }
+  /* Strategy record: win-loss split by generation. */
+  .gen-head, .gen-row { display: grid; grid-template-columns: 1fr 4.4rem 3rem 4rem; gap: 0.6rem; align-items: center; }
+  .gen-head { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.45;
+              padding: 0.4rem 0 0.3rem; border-bottom: 1px solid rgba(128,128,128,0.16); }
+  .gen-head span:not(:first-child) { text-align: right; }
+  .gen-row { padding: 0.45rem 0; border-bottom: 1px solid rgba(128,128,128,0.08); font-size: 0.86rem; }
+  .gen-row:last-child { border-bottom: none; }
+  .gen-row > div:not(.gen-name) { text-align: right; }
+  .gen-name { display: flex; align-items: center; gap: 0.45rem; min-width: 0; }
+  .gen-name b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .gen-dot { width: 8px; height: 8px; border-radius: 50%; background: #8a8a8a; flex: none; }
+  .gen-dot.on { background: #3ecf6e; box-shadow: 0 0 0 3px rgba(62,207,110,0.16); }
+  .gen-dot.off { background: #8a8a8a; opacity: 0.5; }
+  .gen-ver { font-size: 0.68rem; opacity: 0.5; }
+  .gen-tag { font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.04em; color: #3ecf6e;
+             border: 1px solid rgba(62,207,110,0.4); border-radius: 999px; padding: 0.03rem 0.36rem; }
 </style>
 </head>
 <body>
@@ -477,16 +494,33 @@ function renderAccount(data) {
       '<span>' + ps.closed + ' closed</span><span class="pos">' + ps.wins + 'W</span><span class="neg">' + ps.losses + 'L</span></div></div>';
 }
 
-function renderWinRate(ps) {
-  if (!ps.closed) return '<div class="ov-p"><div class="ov-k">Win rate</div><div class="ov-big">&ndash;</div><div class="ov-sub">no closed trades yet</div></div>';
-  var lo = ps.win_rate_ci_low * 100, hi = ps.win_rate_ci_high * 100, pt = ps.win_rate * 100;
-  return '<div class="ov-p"><div class="ov-k">Win rate</div>' +
+// The generation matching the live config -- the numbers that actually
+// describe what the bot is doing now, as opposed to the pooled all-time
+// record contaminated by trades taken under an old, abandoned strategy.
+function currentGen(data) {
+  var gs = (data.strategy_generations || []).filter(function(g) { return g.is_current; });
+  return gs.length ? gs[0] : null;
+}
+
+function renderWinRate(data) {
+  var cg = currentGen(data), ps = data.paper_stats;
+  var name = cg ? cg.label : "";
+  var allTime = '<div class="ov-sub" style="margin-top:0.35rem">all-time ' + ps.wins + "W&ndash;" + ps.losses + "L" +
+    (ps.closed ? " &middot; " + Math.round(ps.win_rate * 100) + "%" : "") + "</div>";
+  if (!cg || !cg.closed) {
+    return '<div class="ov-p"><div class="ov-k">Win rate &middot; current strategy</div>' +
+      '<div class="ov-big">&ndash;</div>' +
+      '<div class="ov-sub">no closed trades yet' + (name ? ' under <b>' + esc(name) + '</b>' : '') + '</div>' +
+      allTime + '</div>';
+  }
+  var lo = cg.win_rate_ci_low * 100, hi = cg.win_rate_ci_high * 100, pt = cg.win_rate * 100;
+  return '<div class="ov-p"><div class="ov-k">Win rate &middot; ' + esc(name) + '</div>' +
     '<div class="ov-big">' + Math.round(pt) + '<span style="font-size:1rem;opacity:0.5">%</span></div>' +
-    '<div class="ov-sub">95% CI ' + Math.round(lo) + "&ndash;" + Math.round(hi) + "% &middot; n=" + ps.closed + '</div>' +
+    '<div class="ov-sub">95% CI ' + Math.round(lo) + "&ndash;" + Math.round(hi) + "% &middot; n=" + cg.closed + '</div>' +
     '<div class="ci-wrap"><div class="ci-axis"></div>' +
       '<div class="ci-band" style="left:' + lo + "%;width:" + (hi - lo) + '%"></div>' +
       '<div class="ci-pt" style="left:' + pt + '%"></div></div>' +
-    '<div class="ci-lab"><span>0%</span><span>100%</span></div></div>';
+    '<div class="ci-lab"><span>0%</span><span>100%</span></div>' + allTime + '</div>';
 }
 
 function budgetMeter(u) {
@@ -499,13 +533,13 @@ function budgetMeter(u) {
 }
 
 function renderOverview(data) {
-  var ps = data.paper_stats;
+  var cg = currentGen(data), exp = (cg && cg.closed) ? cg : null;
   return '<div class="ov">' +
     renderAccount(data) +
-    renderWinRate(ps) +
-    '<div class="ov-p"><div class="ov-k">Expectancy / trade</div>' +
-      '<div class="ov-big ' + cls(ps.avg_r) + '">' + (ps.closed ? (ps.avg_r >= 0 ? "+" : "") + fmt(ps.avg_r) + "R" : "&ndash;") + '</div>' +
-      '<div class="ov-sub mono">gross ' + (ps.avg_r_gross >= 0 ? "+" : "") + fmt(ps.avg_r_gross) + 'R</div>' +
+    renderWinRate(data) +
+    '<div class="ov-p"><div class="ov-k">Expectancy / trade &middot; current</div>' +
+      '<div class="ov-big ' + (exp ? cls(exp.avg_r) : "") + '">' + (exp ? (exp.avg_r >= 0 ? "+" : "") + fmt(exp.avg_r) + "R" : "&ndash;") + '</div>' +
+      '<div class="ov-sub mono">' + (exp ? "gross " + (exp.avg_r_gross >= 0 ? "+" : "") + fmt(exp.avg_r_gross) + "R" : "awaiting first close") + '</div>' +
       '<div class="ov-sub">open exposure <b>' + data.open_paper_trades.length + '</b> pos</div></div>' +
     '<div class="ov-p"><div class="ov-k">LLM budget today</div>' +
       '<div class="ov-big mono">$' + (data.usage.usd_spent || 0).toFixed(2) +
@@ -552,6 +586,32 @@ function renderLadder(data) {
     '<div class="ov-sub" style="margin-top:0.4rem">&#9679; long &#9679; short &middot; <span style="color:#e6b800">&#9676;</span> contested. Right of 0.50 fires.</div>';
 }
 
+// The win-loss record split by strategy generation -- the current strategy
+// measured on its own trades, the old config's record kept separate and
+// labelled, so a new strategy's performance is never pooled with an
+// abandoned one (see status.gather_strategy_generations).
+function renderStrategyRecord(gens) {
+  if (!gens || !gens.length) return "";
+  var rows = gens.map(function(g) {
+    var wl = g.closed ? (g.wins + "W&ndash;" + g.losses + "L") : "&mdash;";
+    var wr = g.closed ? Math.round(g.win_rate * 100) + "%" : "&mdash;";
+    var avgr = g.closed ? ((g.avg_r >= 0 ? "+" : "") + fmt(g.avg_r) + "R") : "&mdash;";
+    var ver = "";
+    if (!g.legacy && g.version_from) {
+      ver = "v" + g.version_from + (g.version_to && g.version_to !== g.version_from ? "&ndash;v" + g.version_to : "");
+    }
+    var dotcls = g.is_current ? "gen-dot on" : (g.legacy ? "gen-dot off" : "gen-dot");
+    return '<div class="gen-row"><div class="gen-name"><span class="' + dotcls + '"></span><b>' + esc(g.label) + '</b>' +
+      (ver ? ' <span class="gen-ver">' + ver + '</span>' : "") +
+      (g.is_current ? ' <span class="gen-tag">live</span>' : "") + '</div>' +
+      '<div class="mono">' + wl + '</div><div class="mono">' + wr + '</div>' +
+      '<div class="mono ' + (g.closed ? cls(g.avg_r) : "") + '">' + avgr + '</div></div>';
+  }).join("");
+  return '<div class="ov-p" style="margin-top:0.8rem"><div class="ov-k">Strategy record &middot; win&ndash;loss by generation</div>' +
+    '<div class="gen-head"><span>strategy</span><span>W&ndash;L</span><span>win</span><span>avg R</span></div>' + rows +
+    '<div class="ov-sub" style="margin-top:0.5rem">A strategy change starts a fresh record &mdash; the current strategy is measured only on its own trades, never pooled with the old config. <b>Legacy</b> = trades taken before generation tracking began.</div></div>';
+}
+
 function render(data) {
   var html = "";
   html += renderCapabilities(data.capabilities);
@@ -559,6 +619,7 @@ function render(data) {
   html += '<div class="ov" style="grid-template-columns:1.4fr 1fr">' +
     '<div class="ov-p"><div class="ov-k">Universe activation</div>' + renderFunnel(data) + '</div>' +
     '<div class="ov-p"><div class="ov-k">Dossiers by conviction</div>' + renderLadder(data) + '</div></div>';
+  html += renderStrategyRecord(data.strategy_generations);
   html += "<h2>Dossiers</h2>" + renderDossiers(data.dossiers);
   html += renderPaperTrades(data.closed_paper_trades, data.open_paper_trades);
   html += "<h2>Recent Signals</h2>" + renderSignals(data.recent_signals);
@@ -795,6 +856,10 @@ async def _status_payload(engine) -> dict:
         log_dir / "paper_trades.jsonl",
         settings.initial_trading_capital, settings.trading_currency,
     )
+    current_strategy = settings.strategy_signature()
+    strategy_generations = gather_strategy_generations(
+        log_dir / "paper_trades.jsonl", current_strategy
+    )
     open_trades = []
     for t in engine.journal.open_trades.values():
         row = asdict(t)
@@ -816,6 +881,8 @@ async def _status_payload(engine) -> dict:
         "open_paper_trades": open_trades,
         "closed_paper_trades": closed_trades,
         "paper_stats": paper_stats.__dict__,
+        "strategy_generations": [asdict(g) for g in strategy_generations],
+        "current_strategy": current_strategy,
         "recent_signals": gather_recent_signals(log_dir / "signals.jsonl"),
         "universe_candidates": gather_universe_candidates(engine.candidates.data, engine.accepted_candidates.data),
         "usage": gather_usage(engine.usage.snapshot()),

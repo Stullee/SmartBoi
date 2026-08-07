@@ -205,6 +205,15 @@ class PaperTrade:
     # as "no currency data" rather than a real zero.
     position_value: float = 0.0
     currency_pnl: float | None = None
+    # The strategy "generation" this trade was opened under -- a snapshot of
+    # the trade-governing config at open (stops, target, conviction bar, cost
+    # profile, drift, horizon) plus a display label and the app version (see
+    # config.strategy_signature). Lets the closed record be segmented so a new
+    # strategy's forward performance is never pooled with an old, abandoned
+    # one. None on a record written before generation stamping existed -- those
+    # form a single "legacy" bucket instead of contaminating the current
+    # numbers (see status.gather_strategy_generations).
+    strategy: dict | None = None
 
     def _net_return_fraction(self, exit_price: float) -> float:
         """Net-of-cost return as a fraction of the entry notional -- the
@@ -332,6 +341,7 @@ class PaperTradeJournal:
         cost_bps_round_trip: float = 0.0,
         market_cap_musd: float | None = None,
         position_value: float = 0.0,
+        strategy: dict | None = None,
     ) -> PaperTrade:
         if direction == "LONG":
             stop_price = entry_price * (1 - stop_loss_pct / 100)
@@ -355,6 +365,7 @@ class PaperTradeJournal:
             market_cap_musd=market_cap_musd,
             assumes_borrow=assumes_borrow(direction, market_cap_musd),
             position_value=position_value,
+            strategy=strategy,
         )
         self.open_trades[symbol] = trade
         self._write_open_state()
