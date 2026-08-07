@@ -263,7 +263,9 @@ def test_gather_graph_stats_builds_typed_nodes_and_edges(tmp_path):
     nodes = {n["id"]: n for n in stats["nodes"]}
     assert nodes["UCTT"]["kind"] == "tradeable" and nodes["UCTT"]["dir"] == "LONG"
     assert nodes["UCTT"]["score"] == 0.4                 # confidence * magnitude
+    assert nodes["UCTT"]["name"] == "Ultra Clean"        # carried for the graph tooltip
     assert nodes["AMAT"]["kind"] == "anchor" and nodes["AMAT"]["dir"] is None
+    assert nodes["AMAT"]["name"] == "Applied Materials"
     assert stats["edges"] == [["UCTT", "AMAT", "customer", 0.85]]
 
 
