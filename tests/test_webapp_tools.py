@@ -32,6 +32,12 @@ def engine(tmp_path, monkeypatch):
     settings = Settings(
         _env_file=None, symbols="DCO", anchor_symbols="RTX",
         enable_dashboard=False, enable_universe_autoscreen=False,
+        # Pin the illustrative 8/16 institutional grid the cost-drag
+        # diagnostics tests below document (59% <$300M break-even, +1.19R/
+        # -1.72R at 600bp). The shipped default is now the wider
+        # hold-to-horizon grid, so these must set the example explicitly
+        # rather than inherit it.
+        stop_loss_pct=8.0, take_profit_pct=16.0, transaction_cost_profile="institutional",
     )
     e = Engine(settings)
     finnhub = FakeFinnhub()
