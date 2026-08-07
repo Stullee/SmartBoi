@@ -184,9 +184,11 @@ def gather_graph_stats(graph: RelationshipGraph, universe=None, store=None) -> d
     ]
 
     kind_by: dict[str, str] = {}
+    info_by: dict[str, tuple[str, str]] = {}
     if universe is not None:
         for c in universe:
             kind_by[c.symbol] = "anchor" if c.signal_source_only else "tradeable"
+            info_by[c.symbol] = (c.name, c.ecosystem)
     dossier_syms = set(store.all_symbols()) if store is not None else set()
 
     symbols: set[str] = set()
@@ -203,7 +205,9 @@ def gather_graph_stats(graph: RelationshipGraph, universe=None, store=None) -> d
             d = store.load(s)
             direction = d.direction
             score = round(d.confidence * d.magnitude, 3)
-        nodes.append({"id": s, "kind": kind_by.get(s, "external"), "dir": direction, "score": score})
+        name, sector = info_by.get(s, ("", ""))
+        nodes.append({"id": s, "kind": kind_by.get(s, "external"), "dir": direction, "score": score,
+                      "name": name, "sector": sector})
 
     return {
         "edge_count": len(graph.relationships),

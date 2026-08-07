@@ -801,16 +801,43 @@ function renderFeed(){
   Array.prototype.forEach.call(el("feed").querySelectorAll(".ev"),function(b){ b.addEventListener("click",function(){ WIRE.active=+b.dataset.i; WIRE.t0=performance.now(); renderFeed(); }); });
 }
 
+// The full graph is the whole universe (~200 names, hundreds of edges) -- a
+// hairball. Focus on what actually drives trades: tradeables carrying a thesis
+// (a dossier direction/score) or on the live wire, plus the anchors one hop out
+// that feed them. That is the "news -> supply chain" subgraph, ~30 nodes.
+function focusGraph(g){
+  var nodes=g.nodes||[], edges=g.edges||[], keep={};
+  nodes.forEach(function(n){ if(n.kind==="tradeable" && (n.dir || n.score!=null)) keep[n.id]="t"; });
+  (data.recent_signals||[]).forEach(function(s){ keep[s.symbol]="t"; });
+  edges.forEach(function(e){ if(keep[e[0]]==="t" && !keep[e[1]]) keep[e[1]]="a"; if(keep[e[1]]==="t" && !keep[e[0]]) keep[e[0]]="a"; });
+  var fnodes=nodes.filter(function(n){ return keep[n.id]; });
+  if(fnodes.length<6){
+    // nothing has a thesis yet (fresh deploy) -- show the most-connected slice so it isn't blank
+    var deg={}; edges.forEach(function(e){ deg[e[0]]=(deg[e[0]]||0)+1; deg[e[1]]=(deg[e[1]]||0)+1; });
+    fnodes=nodes.slice().sort(function(a,b){ return (deg[b.id]||0)-(deg[a.id]||0); }).slice(0,40);
+    fnodes.forEach(function(n){ keep[n.id]=keep[n.id]||"a"; });
+  } else if(fnodes.length>52){
+    // still dense -- keep every thesis name, trim anchors to the best-connected
+    var dk={}; edges.forEach(function(e){ if(keep[e[0]]&&keep[e[1]]){ dk[e[0]]=(dk[e[0]]||0)+1; dk[e[1]]=(dk[e[1]]||0)+1; } });
+    fnodes.sort(function(a,b){ var pa=keep[a.id]==="t"?0:1, pb=keep[b.id]==="t"?0:1; return pa!==pb?pa-pb:((dk[b.id]||0)-(dk[a.id]||0)); });
+    fnodes=fnodes.slice(0,52);
+  }
+  var ids={}; fnodes.forEach(function(n){ ids[n.id]=1; });
+  return { nodes:fnodes, edges:edges.filter(function(e){ return ids[e[0]]&&ids[e[1]]; }), total:nodes.length };
+}
+
 function updateWire(d){
-  var g=d.graph||{}, key=JSON.stringify([(g.edges||[]).length,(d.recent_signals||[]).map(function(s){return s.symbol;})]);
-  WIRE.nodes=(g.nodes||[]).slice(); WIRE.edges=(g.edges||[]).slice();
+  var f=focusGraph(d.graph||{});
+  var key=JSON.stringify(f.nodes.map(function(n){return n.id;}));
+  WIRE.nodes=f.nodes; WIRE.edges=f.edges;
   if(key!==WIRE.sigKey){ WIRE.sigKey=key; layoutWire(); }
   el("wireLeg").innerHTML='<span class="gl"><i class="gl-l" style="background:var(--gc-cust)"></i>customer</span>'+
     '<span class="gl"><i class="gl-l" style="background:var(--gc-comp)"></i>competitor</span>'+
     '<span class="gl"><i class="gl-l" style="background:var(--gc-eco)"></i>ecosystem</span>'+
     '<span class="gl"><i class="gl-d" style="background:var(--gn-anchor)"></i>anchor</span>'+
     '<span class="gl"><i class="gl-d" style="background:var(--pos)"></i>long</span>'+
-    '<span class="gl"><i class="gl-d" style="background:var(--neg)"></i>short</span>';
+    '<span class="gl"><i class="gl-d" style="background:var(--neg)"></i>short</span>'+
+    '<span class="gl" style="margin-left:auto;color:var(--faint)">'+f.nodes.length+' of '+f.total+' names &middot; thesis + the anchors feeding them</span>';
   renderFeed();
 }
 
@@ -823,7 +850,8 @@ function updateWire(d){
     var n=nodeAt(ev.clientX-rect.left,ev.clientY-rect.top);
     if(!n){ tip.style.opacity="0"; cv.style.cursor="default"; return; } cv.style.cursor="pointer";
     var thesis=n.kind==="anchor"?"anchor &middot; news source":(n.score!=null?((n.dir==="LONG"?"long":n.dir==="SHORT"?"short":"no")+" thesis, score "+n.score.toFixed(2)):"no thesis yet");
-    tip.innerHTML='<div class="h">'+n.id+'</div>'+(DESC[n.id]?'<div class="d">'+DESC[n.id]+"</div>":"")+'<div class="d">'+thesis+"</div>";
+    var name=n.name||"", info=DESC[n.id]||n.sector||"";
+    tip.innerHTML='<div class="h">'+n.id+(name?' &middot; '+esc(name):"")+"</div>"+(info?'<div class="d">'+esc(info)+"</div>":"")+'<div class="d">'+thesis+"</div>";
     tip.style.opacity="1"; tip.style.left=(ev.clientX+14)+"px"; tip.style.top=(ev.clientY+12)+"px";
   });
 })();
