@@ -25,7 +25,12 @@ from pathlib import Path
 from smartboi.news import redact_token, redact_url
 from smartboi.paper_journal import cost_buckets, trade_economics
 from smartboi.usage import CATEGORIES
-from smartboi.status import gather_dossiers, gather_paper_trade_stats, gather_strategy_generations
+from smartboi.status import (
+    gather_dossiers,
+    gather_graph_health,
+    gather_paper_trade_stats,
+    gather_strategy_generations,
+)
 from smartboi.event_study import (
     OUTCOME_LABELS,
     attach_outcomes,
@@ -293,7 +298,9 @@ _DIAGNOSTIC_SETTINGS = (
     "universe_max_analyst_count", "universe_screen_interval_days",
     "enable_auto_accept_candidates", "auto_accept_anchors", "auto_accept_tradeables",
     "auto_accept_min_seen_count", "auto_accept_max_per_day",
-    "enable_relationship_backfill", "backfill_anchors", "enable_ib_price_feed", "ib_host", "ib_port",
+    "enable_relationship_backfill", "backfill_anchors",
+    "enable_graph_refresh", "graph_refresh_symbols_per_day", "enable_auto_supplier_research",
+    "enable_ib_price_feed", "ib_host", "ib_port",
 )
 MAX_LOG_LINES = 40
 MAX_LISTED_ROWS = 60
@@ -475,6 +482,43 @@ def run_diagnostics(engine) -> str:
     stats, closed = gather_paper_trade_stats(
         log_dir / "paper_trades.jsonl", s.initial_trading_capital, s.trading_currency,
     )
+    # The graph IS the strategy -- an edge is the only path by which an
+    # anchor's news reaches a tradeable, so a missing edge is a trade that
+    # never happens. The two lines that matter most are the disconnected
+    # tradeables carrying a thesis (single-stock signals wearing this
+    # system's clothes) and how far behind the rolling re-extraction is.
+    gh = gather_graph_health(
+        engine.graph, engine.universe, engine.dossiers,
+        backfill_state=engine.backfill_state.data,
+        last_refresh=engine.periodic_state.get("graph_refresh", "") or "",
+        last_research=engine.periodic_state.get("supplier_research", "") or "",
+        researched_anchor_count=len(researched_anchors(engine.candidates, engine.research_state)),
+        refresh_per_day=(s.graph_refresh_symbols_per_day if s.enable_graph_refresh else 0),
+    )
+    add("\n--- Graph health (the mechanism the whole strategy runs on) ---")
+    add(f"  edges: {gh['edges']} ({', '.join(f'{k} {v}' for k, v in gh['edges_by_type'].items()) or '-'})")
+    add(f"  tradeables connected: {gh['tradeables_connected']}/{gh['tradeables']} "
+        f"({gh['tradeables_disconnected']} disconnected)")
+    if gh["disconnected_with_thesis"]:
+        add(f"  !! {gh['disconnected_with_thesis']} tradeable(s) carry a THESIS with no graph edge at all: "
+            f"{' '.join(gh['disconnected_with_thesis_symbols'])}")
+        add("     ^^ their dossier came only from their own filings -- the cross-company mechanism "
+            "never fired for them.")
+    add(f"  anchors linked to a tradeable: {gh['anchors_live']}/{gh['anchors']} "
+        f"({gh['anchors_inert']} inert -- their news reaches nothing)")
+    stalest = gh["stalest_days"]
+    add(f"  extraction age: median {gh['median_extraction_age_days']}d, stalest "
+        f"{'-' if stalest is None else f'{stalest:.0f}d'}, never extracted {gh['never_extracted']}")
+    refresh_age = gh["last_refresh_days"]
+    research_age = gh["last_research_days"]
+    if gh["refresh_per_day"]:
+        add(f"  rolling refresh: {gh['refresh_per_day']}/day -> full universe every ~{gh['cycle_days']:.0f}d; "
+            f"last run {'never' if refresh_age is None else f'{refresh_age:.1f}d ago'}")
+    else:
+        add("  rolling refresh: DISABLED -- the graph only grows from new filings and the manual button.")
+    add(f"  anchors researched for suppliers: {gh['researched_anchors']}/{gh['anchors']}, "
+        f"last run {'never' if research_age is None else f'{research_age:.1f}d ago'}")
+
     add("\n--- Paper trades ---")
     # Currency overlay: each trade is one slot of the account, so the record
     # reads in real money as well as R. Equity is realized only; open positions'

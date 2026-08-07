@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 
 from smartboi.dossier import Dossier
 from smartboi.graph import Relationship, RelationshipGraph
@@ -380,3 +381,92 @@ def test_snapshot_records_which_scoring_logic_produced_it():
                            "2026-07-29T00:00:00+00:00")
 
     assert row["scoring_version"] == SCORING_VERSION
+
+
+# --- Graph health: is the mechanism the strategy runs on being kept alive? ---
+
+def test_graph_health_flags_a_thesis_with_no_supply_chain_path(tmp_path):
+    """The headline number. A tradeable carrying a real thesis with NO graph
+    edge built that thesis entirely from its own filings -- it never used the
+    cross-company mechanism this system exists for, so it is a single-stock
+    news signal wearing the system's clothes. Seen live as green nodes
+    floating unconnected on the dashboard graph."""
+    from smartboi.dossier import Dossier, DossierStore
+    from smartboi.status import gather_graph_health
+    from smartboi.universe import CompanySpec
+
+    graph = RelationshipGraph(tmp_path / "g.json")
+    graph.add(Relationship("UCTT", "AMAT", "customer", "d", "s", 0.85, "2026-07-01"))
+    universe = [CompanySpec("UCTT", "Ultra Clean", "semi"),
+                CompanySpec("LONE", "Lonely Co", "semi"),          # thesis, no edge
+                CompanySpec("QUIET", "Quiet Co", "semi"),          # no edge, no thesis
+                CompanySpec("AMAT", "Applied Materials", "semi", signal_source_only=True)]
+    store = DossierStore(tmp_path / "d")
+    store.save(Dossier(symbol="UCTT", direction="LONG", confidence=0.8, magnitude=0.5))
+    store.save(Dossier(symbol="LONE", direction="LONG", confidence=0.9, magnitude=0.7))
+    store.save(Dossier(symbol="QUIET"))                            # no direction
+
+    h = gather_graph_health(graph, universe, store)
+
+    assert h["tradeables_connected"] == 1 and h["tradeables_disconnected"] == 2
+    # Only the disconnected name that actually carries a thesis is flagged.
+    assert h["disconnected_with_thesis"] == 1
+    assert h["disconnected_with_thesis_symbols"] == ["LONE"]
+
+
+def test_graph_health_counts_edges_by_type_and_anchor_liveness(tmp_path):
+    """An anchor is never its own analysis target, so 'live' means linked to
+    something TRADEABLE -- an anchor-to-anchor edge reaches nothing."""
+    from smartboi.dossier import DossierStore
+    from smartboi.status import gather_graph_health
+    from smartboi.universe import CompanySpec
+
+    graph = RelationshipGraph(tmp_path / "g.json")
+    graph.add(Relationship("UCTT", "AMAT", "customer", "d", "s", 0.85, "2026-07-01"))
+    graph.add(Relationship("UCTT", "LRCX", "competitor", "d", "s", 0.5, "2026-07-01"))
+    graph.add(Relationship("AMAT", "DEAD", "customer", "d", "s", 0.5, "2026-07-01"))  # anchor->anchor
+    universe = [CompanySpec("UCTT", "Ultra Clean", "semi"),
+                CompanySpec("AMAT", "Applied", "semi", signal_source_only=True),
+                CompanySpec("LRCX", "Lam", "semi", signal_source_only=True),
+                CompanySpec("DEAD", "Inert Co", "semi", signal_source_only=True)]
+
+    h = gather_graph_health(graph, universe, DossierStore(tmp_path / "d"))
+
+    assert h["edges"] == 3
+    assert h["edges_by_type"] == {"customer": 2, "competitor": 1}
+    assert h["anchors_live"] == 2 and h["anchors_inert"] == 1   # DEAD reaches no tradeable
+
+
+def test_graph_health_reports_extraction_staleness_and_cadence(tmp_path):
+    """How far behind the rolling re-extraction is. A symbol last read when
+    the universe was smaller carries holes a re-read would fill, and one never
+    read at all is the stalest case of the lot."""
+    from smartboi.dossier import DossierStore
+    from smartboi.status import gather_graph_health
+    from smartboi.universe import CompanySpec
+
+    graph = RelationshipGraph(tmp_path / "g.json")
+    universe = [CompanySpec("A", "A", "x"), CompanySpec("B", "B", "x"), CompanySpec("C", "C", "x")]
+    old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    state = {"A": {"backfilled_at": old}, "B": {"backfilled_at": recent}}   # C never read
+
+    h = gather_graph_health(graph, universe, DossierStore(tmp_path / "d"),
+                            backfill_state=state, refresh_per_day=10)
+
+    assert 39 < h["stalest_days"] < 41
+    assert h["never_extracted"] == 1
+    assert h["cycle_days"] == 0.3          # 3 symbols at 10/day
+    assert h["last_refresh_days"] is None  # never run
+
+
+def test_graph_health_works_with_no_engine_state(tmp_path):
+    """Callers without engine state (several tests, and any pre-upgrade
+    deploy) must still get the structural numbers rather than an exception."""
+    from smartboi.dossier import DossierStore
+    from smartboi.status import gather_graph_health
+
+    h = gather_graph_health(RelationshipGraph(tmp_path / "g.json"), [], DossierStore(tmp_path / "d"))
+
+    assert h["edges"] == 0 and h["tradeables"] == 0
+    assert h["stalest_days"] is None and h["cycle_days"] is None

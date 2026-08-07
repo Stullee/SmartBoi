@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from smartboi.config import strategy_key
@@ -214,6 +215,125 @@ def gather_graph_stats(graph: RelationshipGraph, universe=None, store=None) -> d
         "by_symbol": groups,
         "nodes": nodes,
         "edges": edges,
+    }
+
+
+def _days_since(stamp: str) -> float | None:
+    """Whole-ish days since an ISO-8601 UTC stamp; None if absent/unparseable."""
+    if not stamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+
+
+def gather_graph_health(
+    graph: RelationshipGraph,
+    universe,
+    store: DossierStore,
+    backfill_state: dict | None = None,
+    last_refresh: str = "",
+    last_research: str = "",
+    researched_anchor_count: int = 0,
+    refresh_per_day: int = 0,
+) -> dict:
+    """Health and maintenance state of the relationship graph -- the numbers
+    that say whether the mechanism the whole strategy runs on is actually
+    being kept alive.
+
+    The graph IS the strategy: an edge is the only path by which an anchor's
+    news reaches a tradeable, so a missing edge is a trade that never happens.
+    Two numbers here matter more than the totals:
+
+    - `disconnected_with_thesis`: tradeables carrying a real thesis while
+      having NO graph edge at all. Their dossier came entirely from their own
+      filings, so they never used the cross-company mechanism -- they are
+      effectively single-stock news signals wearing this system's clothes.
+      A non-zero count is the honest measure of how much of the edge map is
+      still missing.
+    - `stalest_days` / `never_extracted`: how far behind the rolling
+      re-extraction is. Extraction only writes an edge when the counterparty
+      is ALREADY in the universe, so a symbol last read when the universe was
+      smaller is carrying holes that a re-read would fill.
+
+    Every argument after `store` is optional so the tables still render on a
+    caller that has no engine state to hand (several tests do exactly that).
+    """
+    tradeables = [c.symbol for c in universe if not c.signal_source_only]
+    anchors = [c.symbol for c in universe if c.signal_source_only]
+    tradeable_set = set(tradeables)
+
+    linked: dict[str, set[str]] = {}
+    by_type: dict[str, int] = {}
+    edge_ages: list[float] = []
+    for r in graph.relationships:
+        linked.setdefault(r.from_symbol, set()).add(r.to_symbol)
+        linked.setdefault(r.to_symbol, set()).add(r.from_symbol)
+        by_type[r.rel_type] = by_type.get(r.rel_type, 0) + 1
+        age = _days_since(getattr(r, "extracted_at", ""))
+        if age is not None:
+            edge_ages.append(age)
+
+    connected = [s for s in tradeables if linked.get(s)]
+    disconnected = sorted(tradeable_set - set(connected))
+    # An anchor is never its own analysis target, so "live" means specifically
+    # linked to something TRADEABLE -- an anchor-to-anchor edge reaches nothing.
+    live_anchors = [a for a in anchors if linked.get(a, set()) & tradeable_set]
+
+    # The headline: a thesis with no supply-chain path behind it.
+    disconnected_set = set(disconnected)
+    with_thesis = []
+    for symbol in store.all_symbols():
+        if symbol not in disconnected_set:
+            continue
+        d = store.load(symbol)
+        if d.direction in ("LONG", "SHORT") and (d.confidence * d.magnitude) > 0:
+            with_thesis.append(symbol)
+
+    # Symbol-level extraction age: when each symbol's filing was last read.
+    state = backfill_state or {}
+    ages: list[float] = []
+    never = 0
+    for symbol in tradeables + anchors:
+        marker = state.get(symbol)
+        stamp = marker.get("backfilled_at", "") if isinstance(marker, dict) else ""
+        age = _days_since(stamp)
+        if age is None:
+            never += 1
+        else:
+            ages.append(age)
+    ages.sort()
+
+    universe_size = len(tradeables) + len(anchors)
+    return {
+        "edges": len(graph.relationships),
+        "edges_by_type": dict(sorted(by_type.items(), key=lambda kv: -kv[1])),
+        "edge_age_median_days": round(edge_ages[len(edge_ages) // 2], 1) if edge_ages else None,
+        "tradeables": len(tradeables),
+        "tradeables_connected": len(connected),
+        "tradeables_disconnected": len(disconnected),
+        "disconnected": disconnected[:40],
+        "disconnected_with_thesis": len(with_thesis),
+        "disconnected_with_thesis_symbols": sorted(with_thesis)[:40],
+        "anchors": len(anchors),
+        "anchors_live": len(live_anchors),
+        "anchors_inert": len(anchors) - len(live_anchors),
+        "stalest_days": round(ages[-1], 1) if ages else None,
+        "median_extraction_age_days": round(ages[len(ages) // 2], 1) if ages else None,
+        "never_extracted": never,
+        "last_refresh": last_refresh,
+        "last_refresh_days": _days_since(last_refresh),
+        "last_research": last_research,
+        "last_research_days": _days_since(last_research),
+        "researched_anchors": researched_anchor_count,
+        "refresh_per_day": refresh_per_day,
+        # How long a full pass over the universe takes at the current rate --
+        # the number that says whether "monthly" is really monthly.
+        "cycle_days": round(universe_size / refresh_per_day, 1) if refresh_per_day else None,
     }
 
 
