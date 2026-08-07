@@ -102,10 +102,16 @@ _INDEX_HTML = """<!doctype html>
 <meta charset="utf-8">
 <title>SmartBoi Status</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root { color-scheme: light dark;
+    --gc-cust:#3a86d4; --gc-supp:#2fa35a; --gc-comp:#ef5350; --gc-reg:#9a7fe0; --gc-eco:#8493a6;
+    --gn-long:#3ecf6e; --gn-short:#ef5350; --gn-none:#6b7885;
+    --gn-anchor:#8a97a8; --gn-stroke:#0f1115; --gn-txt:#e6e6e6; }
   body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 1.5rem;
          background: #0f1115; color: #e6e6e6; }
-  @media (prefers-color-scheme: light) { body { background: #f7f7f8; color: #1a1a1a; } }
+  @media (prefers-color-scheme: light) {
+    body { background: #f7f7f8; color: #1a1a1a; }
+    :root { --gn-anchor:#606c7b; --gn-stroke:#ffffff; --gn-txt:#1a1a1a; }
+  }
   h1 { font-size: 1.3rem; margin: 0 0 0.25rem; }
   .subtitle { opacity: 0.6; font-size: 0.85rem; margin-bottom: 1rem; }
   /* Section headers in the console idiom: a quiet uppercase eyebrow with a
@@ -223,6 +229,36 @@ _INDEX_HTML = """<!doctype html>
   .gen-ver { font-size: 0.68rem; opacity: 0.5; }
   .gen-tag { font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.04em; color: #3ecf6e;
              border: 1px solid rgba(62,207,110,0.4); border-radius: 999px; padding: 0.03rem 0.36rem; }
+  /* LLM spend-by-category: a segmented bar + a compact legend, so the panel
+     shows WHERE the day's budget went, not just the total. */
+  .catbar { display: flex; height: 7px; border-radius: 4px; overflow: hidden; margin-top: 0.55rem;
+            background: rgba(128,128,128,0.16); }
+  .catbar > div { height: 100%; }
+  .catleg { display: grid; grid-template-columns: 1fr 1fr; gap: 0.15rem 0.7rem; margin-top: 0.4rem; font-size: 0.66rem; opacity: 0.82; }
+  .lc { display: flex; align-items: center; gap: 0.32rem; }
+  .lc-dot { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+  .lc b { font-weight: 600; }
+  /* Interactive relationship graph -- the mockup, ported: the whole web on
+     one canvas, nodes coloured by live thesis, edges by relationship type. */
+  .gviz { border: 1px solid rgba(128,128,128,0.18); border-radius: 10px; background: rgba(128,128,128,0.04);
+          margin-top: 0.2rem; overflow: hidden; }
+  .gviz svg { display: block; width: 100%; height: 480px; }
+  .gnode { cursor: pointer; }
+  .gn-lbl { fill: var(--gn-txt); font-size: 11px; font-weight: 600; pointer-events: none; }
+  .gn-sc { fill: var(--gn-stroke); font-size: 8px; font-weight: 700; pointer-events: none; }
+  .gviz-note { font-size: 0.68rem; opacity: 0.5; margin-top: 0.35rem; }
+  .gviz-leg { display: flex; flex-wrap: wrap; gap: 0.45rem 1rem; margin-top: 0.5rem; font-size: 0.72rem; opacity: 0.82; }
+  .gl { display: inline-flex; align-items: center; gap: 0.35rem; }
+  .gl-l { width: 16px; height: 3px; border-radius: 2px; }
+  .gl-d { width: 10px; height: 10px; border-radius: 50%; }
+  .gtables { margin-top: 0.7rem; }
+  .gtables > summary { cursor: pointer; font-size: 0.78rem; opacity: 0.6; }
+  .gtip { position: fixed; pointer-events: none; z-index: 20; background: #111821; color: #e6e6e6;
+          border: 1px solid rgba(128,128,128,0.3); border-radius: 8px; padding: 0.45rem 0.6rem;
+          font-size: 0.74rem; max-width: 250px; opacity: 0; transition: opacity 0.1s;
+          box-shadow: 0 8px 26px -8px rgba(0,0,0,0.6); }
+  .gtip .gt-h { font-weight: 700; margin-bottom: 0.12rem; }
+  .gtip .gt-m { opacity: 0.85; line-height: 1.4; }
 </style>
 </head>
 <body>
@@ -264,6 +300,7 @@ _INDEX_HTML = """<!doctype html>
 </div>
 <pre id="tool-output"></pre>
 
+<div class="gtip" id="gtip"></div>
 <div id="app">Loading&hellip;</div>
 <div class="updated" id="updated"></div>
 <script>
@@ -402,6 +439,120 @@ function renderGraph(g) {
   }).join("");
 }
 
+// --- Interactive relationship graph (the approved mockup, ported) ----------
+// The whole web on one SVG: anchors (news sources) and the tradeables that
+// hang off them, nodes coloured by live dossier thesis, edges by relationship
+// type and thickened by disclosed confidence. Layout is a deterministic
+// force settle (seeded, no animation) so the 10s dashboard refresh redraws
+// the exact same picture -- no jitter, and hover survives via delegation.
+var GVIZ = {};
+
+function gvColor(type) {
+  if (type === "customer") return "--gc-cust";
+  if (type === "supplier") return "--gc-supp";
+  if (type === "competitor") return "--gc-comp";
+  if (type === "regulator") return "--gc-reg";
+  return "--gc-eco";
+}
+function gvNodeR(n) {
+  if (n.kind === "anchor") return 13;
+  if (n.score != null) return 6 + n.score * 10;
+  return 6;
+}
+function gvNodeFill(n) {
+  if (n.kind === "anchor") return "--gn-anchor";
+  if (n.dir === "LONG") return "--gn-long";
+  if (n.dir === "SHORT") return "--gn-short";
+  return "--gn-none";
+}
+function gvLegend() {
+  return '<div class="gviz-leg">' +
+    '<span class="gl"><i class="gl-l" style="background:var(--gc-cust)"></i>customer</span>' +
+    '<span class="gl"><i class="gl-l" style="background:var(--gc-comp)"></i>competitor</span>' +
+    '<span class="gl"><i class="gl-l" style="background:var(--gc-eco)"></i>ecosystem</span>' +
+    '<span class="gl"><i class="gl-d" style="background:var(--gn-anchor)"></i>anchor</span>' +
+    '<span class="gl"><i class="gl-d" style="background:var(--gn-long)"></i>long thesis</span>' +
+    '<span class="gl"><i class="gl-d" style="background:var(--gn-short)"></i>short thesis</span>' +
+    '<span class="gl"><i class="gl-d" style="background:var(--gn-none)"></i>no thesis</span></div>';
+}
+
+function renderGraphViz(g) {
+  var nodes = (g.nodes || []).slice(), edges = (g.edges || []).slice(), i, j;
+  if (!edges.length) return '<div class="empty">No relationships extracted yet.</div>';
+  var deg = {};
+  edges.forEach(function(e) { deg[e[0]] = (deg[e[0]] || 0) + 1; deg[e[1]] = (deg[e[1]] || 0) + 1; });
+  var note = "";
+  if (nodes.length > 70) {
+    nodes = nodes.slice().sort(function(a, b) { return (deg[b.id] || 0) - (deg[a.id] || 0); }).slice(0, 70);
+    var keep = {}; nodes.forEach(function(n) { keep[n.id] = 1; });
+    edges = edges.filter(function(e) { return keep[e[0]] && keep[e[1]]; });
+    note = '<div class="gviz-note">Showing the 70 most-connected of ' + (g.nodes || []).length + ' symbols.</div>';
+  }
+  var VW = 1000, VH = 560, pos = {};
+  var seed = 1234567;
+  function rnd() { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296; }
+  nodes.forEach(function(n, k) {
+    var a = k * 2 * Math.PI / nodes.length;
+    pos[n.id] = { x: VW / 2 + (170 + rnd() * 50) * Math.cos(a), y: VH / 2 + (140 + rnd() * 50) * Math.sin(a), vx: 0, vy: 0 };
+  });
+  for (var it = 0; it < 250; it++) {
+    for (i = 0; i < nodes.length; i++) {
+      for (j = i + 1; j < nodes.length; j++) {
+        var pa = pos[nodes[i].id], pb = pos[nodes[j].id];
+        var dx = pa.x - pb.x, dy = pa.y - pb.y, d2 = dx * dx + dy * dy + 0.01, d = Math.sqrt(d2);
+        var rep = 5200 / d2, ux = dx / d, uy = dy / d;
+        pa.vx += ux * rep; pa.vy += uy * rep; pb.vx -= ux * rep; pb.vy -= uy * rep;
+      }
+    }
+    edges.forEach(function(e) {
+      var qa = pos[e[0]], qb = pos[e[1]]; if (!qa || !qb) return;
+      var ex = qb.x - qa.x, ey = qb.y - qa.y, ed = Math.sqrt(ex * ex + ey * ey) + 0.01;
+      var f = (ed - 92) * 0.02 * (0.5 + e[3]), nx = ex / ed, ny = ey / ed;
+      qa.vx += nx * f; qa.vy += ny * f; qb.vx -= nx * f; qb.vy -= ny * f;
+    });
+    nodes.forEach(function(n) {
+      var p = pos[n.id];
+      p.vx += (VW / 2 - p.x) * 0.006; p.vy += (VH / 2 - p.y) * 0.006;
+      p.vx *= 0.85; p.vy *= 0.85; p.x += p.vx; p.y += p.vy;
+      p.x = Math.max(38, Math.min(VW - 38, p.x)); p.y = Math.max(32, Math.min(VH - 32, p.y));
+    });
+  }
+  for (var pass = 0; pass < 9; pass++) {
+    for (i = 0; i < nodes.length; i++) {
+      for (j = i + 1; j < nodes.length; j++) {
+        var ra = pos[nodes[i].id], rb = pos[nodes[j].id];
+        var sx = rb.x - ra.x, sy = rb.y - ra.y, sd = Math.sqrt(sx * sx + sy * sy) + 0.01;
+        var need = gvNodeR(nodes[i]) + gvNodeR(nodes[j]) + 13;
+        if (sd < need) { var push = (need - sd) / 2, mx = sx / sd, my = sy / sd; ra.x -= mx * push; ra.y -= my * push; rb.x += mx * push; rb.y += my * push; }
+      }
+    }
+  }
+  GVIZ = {};
+  nodes.forEach(function(n) { GVIZ[n.id] = { kind: n.kind, dir: n.dir, score: n.score, edges: [] }; });
+  edges.forEach(function(e) {
+    if (GVIZ[e[0]]) GVIZ[e[0]].edges.push([e[1], e[2], e[3]]);
+    if (GVIZ[e[1]]) GVIZ[e[1]].edges.push([e[0], e[2], e[3]]);
+  });
+  var svgE = edges.map(function(e) {
+    var pa = pos[e[0]], pb = pos[e[1]]; if (!pa || !pb) return "";
+    var dash = (e[2] === "ecosystem" || e[2] === "eco") ? ' stroke-dasharray="3 4"' : "";
+    return '<line x1="' + pa.x.toFixed(1) + '" y1="' + pa.y.toFixed(1) + '" x2="' + pb.x.toFixed(1) + '" y2="' + pb.y.toFixed(1) +
+      '" stroke="var(' + gvColor(e[2]) + ')" stroke-width="' + (0.6 + e[3] * 2.4).toFixed(1) +
+      '" stroke-opacity="' + (e[3] >= 0.6 ? 0.7 : 0.42) + '"' + dash + " />";
+  }).join("");
+  var svgN = nodes.map(function(n) {
+    var p = pos[n.id], r = gvNodeR(n);
+    var ly = n.kind === "anchor" ? (p.y + 3.5) : (p.y - r - 4);
+    var lbl = '<text x="' + p.x.toFixed(1) + '" y="' + ly.toFixed(1) + '" text-anchor="middle" class="gn-lbl">' + esc(n.id) + '</text>';
+    var sc = (n.kind !== "anchor" && n.score != null && r > 9)
+      ? '<text x="' + p.x.toFixed(1) + '" y="' + (p.y + 3).toFixed(1) + '" text-anchor="middle" class="gn-sc">' + n.score.toFixed(2) + '</text>' : "";
+    return '<g class="gnode" data-sym="' + esc(n.id) + '"><circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) +
+      '" r="' + r.toFixed(1) + '" fill="var(' + gvNodeFill(n) + ')" stroke="var(--gn-stroke)" stroke-width="1.5"/>' + lbl + sc + "</g>";
+  }).join("");
+  return '<div class="gviz"><svg viewBox="0 0 ' + VW + " " + VH + '" preserveAspectRatio="xMidYMid meet">' +
+    svgE + svgN + "</svg></div>" + note + gvLegend();
+}
+
 // Coverage: how much of the TRADEABLE universe is actually live, which is a
 // different question from how many symbols are configured. A dossier count
 // far below the tradeable count means most of the universe is dark, not that
@@ -532,6 +683,26 @@ function budgetMeter(u) {
     '<div class="ci-lab" style="margin-top:0.2rem"><span>' + u.calls + " / " + u.daily_call_budget + ' calls</span><span>| ' + Math.round(frac) + '% into UTC day</span></div>';
 }
 
+// Where the day's LLM spend actually went -- a segmented bar (scaled to the
+// daily budget so headroom shows) plus a compact per-category legend. The
+// split is what reveals one category starving another (see usage.py), which
+// the single total can't.
+function categoryBreakdown(u) {
+  var cats = [["extraction", "#3ea6cf"], ["dossier", "#7e6bd0"], ["synthesis", "#e6a03e"], ["research", "#4bb886"]];
+  var bc = u.by_category || {};
+  var scale = (u.daily_usd_budget || 0) > 0 ? u.daily_usd_budget : (u.usd_spent || 1);
+  var seg = cats.map(function(c) {
+    var v = (bc[c[0]] || {}).usd || 0;
+    return v > 0 ? '<div style="width:' + Math.min(100, v / scale * 100) + "%;background:" + c[1] + '"></div>' : "";
+  }).join("");
+  var leg = cats.map(function(c) {
+    var v = (bc[c[0]] || {}).usd || 0;
+    return '<span class="lc"><span class="lc-dot" style="background:' + c[1] + '"></span>' +
+      c[0] + ' <b class="mono">$' + v.toFixed(2) + '</b></span>';
+  }).join("");
+  return '<div class="catbar">' + seg + '</div><div class="catleg">' + leg + '</div>';
+}
+
 function renderOverview(data) {
   var cg = currentGen(data), exp = (cg && cg.closed) ? cg : null;
   return '<div class="ov">' +
@@ -544,7 +715,7 @@ function renderOverview(data) {
     '<div class="ov-p"><div class="ov-k">LLM budget today</div>' +
       '<div class="ov-big mono">$' + (data.usage.usd_spent || 0).toFixed(2) +
       '<span style="font-size:0.9rem;opacity:0.5"> / ' + (data.usage.daily_usd_budget || 0).toFixed(0) + '</span></div>' +
-      budgetMeter(data.usage) + '</div>' +
+      budgetMeter(data.usage) + categoryBreakdown(data.usage) + '</div>' +
     '</div>';
 }
 
@@ -623,7 +794,8 @@ function render(data) {
   html += "<h2>Dossiers</h2>" + renderDossiers(data.dossiers);
   html += renderPaperTrades(data.closed_paper_trades, data.open_paper_trades);
   html += "<h2>Recent Signals</h2>" + renderSignals(data.recent_signals);
-  html += "<h2>Relationship Graph</h2>" + renderGraph(data.graph);
+  html += "<h2>Relationship Graph</h2>" + renderGraphViz(data.graph) +
+    '<details class="gtables"><summary>Relationships as a table</summary>' + renderGraph(data.graph) + "</details>";
   html += "<h2>Universe Candidates (discovered, awaiting your review)</h2>" + renderCandidates(data.universe_candidates || []);
 
   document.getElementById("app").innerHTML = html;
@@ -815,6 +987,38 @@ document.getElementById("btn-copy-output").addEventListener("click", function() 
   copyToolOutput(this);
 });
 
+// Graph tooltip: delegated on document so it keeps working after the 10s
+// innerHTML refresh rebuilds the SVG. Reads GVIZ, which renderGraphViz
+// repopulates each render.
+(function() {
+  var gtip = document.getElementById("gtip");
+  document.addEventListener("mouseover", function(ev) {
+    var node = ev.target.closest ? ev.target.closest(".gnode") : null;
+    if (!node) return;
+    var sym = node.getAttribute("data-sym"), info = GVIZ[sym];
+    if (!info) return;
+    var kind = info.kind === "anchor" ? "anchor &middot; news source"
+      : (info.kind === "tradeable" ? "tradeable" : "external");
+    var thesis = info.kind === "anchor" ? ""
+      : (info.score != null
+          ? "<br>" + (info.dir === "LONG" ? "LONG" : info.dir === "SHORT" ? "SHORT" : "no") + " thesis, score " + info.score.toFixed(2)
+          : "<br>no thesis yet");
+    var links = info.edges.length
+      ? "<br>" + info.edges.length + " link(s): " + info.edges.slice(0, 6).map(function(x) { return x[0] + " (" + x[1] + ")"; }).join(", ")
+      : "";
+    gtip.innerHTML = '<div class="gt-h">' + sym + '</div><div class="gt-m">' + kind + thesis + links + "</div>";
+    gtip.style.opacity = "1";
+  });
+  document.addEventListener("mousemove", function(ev) {
+    if (gtip.style.opacity !== "1") return;
+    gtip.style.left = (ev.clientX + 14) + "px";
+    gtip.style.top = (ev.clientY + 12) + "px";
+  });
+  document.addEventListener("mouseout", function(ev) {
+    if (ev.target.closest && ev.target.closest(".gnode")) gtip.style.opacity = "0";
+  });
+})();
+
 function refresh() {
   var controller = new AbortController();
   var timedOut = false;
@@ -877,7 +1081,7 @@ async def _status_payload(engine) -> dict:
         "universe_size": len(engine.symbol_list),
         "coverage": gather_coverage(engine.universe, engine.graph, engine.dossiers),
         "dossiers": gather_dossiers(engine.dossiers),
-        "graph": gather_graph_stats(engine.graph),
+        "graph": gather_graph_stats(engine.graph, engine.universe, engine.dossiers),
         "open_paper_trades": open_trades,
         "closed_paper_trades": closed_trades,
         "paper_stats": paper_stats.__dict__,
