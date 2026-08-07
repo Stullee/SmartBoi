@@ -134,6 +134,51 @@ _INDEX_HTML = """<!doctype html>
   #tool-output { background: rgba(128,128,128,0.12); border-radius: 8px; padding: 0.8rem 1rem;
                  margin-top: 0.7rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.45;
                  white-space: pre; display: none; }
+  /* --- Overview (operations-console) components. Scoped with an ov- prefix so
+       they never collide with the legacy card/table styles below them. --- */
+  .mono { font-variant-numeric: tabular-nums;
+          font-family: ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace; }
+  .ov { display: grid; gap: 0.8rem; margin: 0.4rem 0 0.4rem;
+        grid-template-columns: 1.5fr 1fr 1fr 1fr; }
+  @media (max-width: 900px) { .ov { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 560px) { .ov { grid-template-columns: 1fr; } }
+  .ov-p { background: rgba(128,128,128,0.10); border: 1px solid rgba(128,128,128,0.20);
+          border-radius: 10px; padding: 0.85rem 1rem; }
+  .ov-k { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.6; }
+  .ov-big { font-size: 1.7rem; font-weight: 650; margin-top: 0.15rem; line-height: 1.05; letter-spacing: -0.01em; }
+  .ov-sub { font-size: 0.72rem; opacity: 0.6; margin-top: 0.3rem; }
+  .ov-spark { width: 100%; height: 46px; display: block; margin-top: 0.4rem; }
+  .ov-foot { display: flex; gap: 0.9rem; flex-wrap: wrap; font-size: 0.72rem; opacity: 0.7; margin-top: 0.5rem; }
+  .ov-flag { font-size: 0.7rem; color: #e6b800; background: rgba(230,184,0,0.12);
+             border-radius: 6px; padding: 0.35rem 0.5rem; margin-top: 0.55rem; }
+  .ci-wrap { position: relative; height: 22px; margin-top: 0.55rem; }
+  .ci-axis { position: absolute; left: 0; right: 0; top: 10px; height: 2px; background: rgba(128,128,128,0.25); border-radius: 2px; }
+  .ci-band { position: absolute; top: 6px; height: 10px; background: rgba(62,207,110,0.18);
+             border: 1px solid #3ecf6e; border-radius: 6px; }
+  .ci-pt { position: absolute; top: 3px; width: 2px; height: 16px; background: #3ecf6e; border-radius: 2px; }
+  .ci-lab { display: flex; justify-content: space-between; font-size: 0.62rem; opacity: 0.5; margin-top: 0.1rem; }
+  .funnel { display: flex; flex-direction: column; gap: 0.45rem; }
+  .fn-row { display: grid; grid-template-columns: 130px 1fr auto; align-items: center; gap: 0.6rem; }
+  .fn-lab { font-size: 0.78rem; opacity: 0.85; }
+  .fn-lab small { display: block; font-size: 0.62rem; opacity: 0.55; }
+  .fn-bar { height: 20px; border-radius: 5px; background: rgba(128,128,128,0.16); overflow: hidden; position: relative; }
+  .fn-bar > span { position: absolute; inset: 0 auto 0 0; border-radius: 5px;
+                   background: linear-gradient(90deg,#3ea6cf,rgba(62,166,207,0.45)); }
+  .fn-val { font-size: 0.8rem; min-width: 44px; text-align: right; }
+  .fn-val small { opacity: 0.5; }
+  .lad { display: flex; flex-direction: column; gap: 0.05rem; }
+  .lad-scale { position: relative; height: 12px; margin: 0 0 0.1rem 3.4rem; }
+  .lad-line { position: absolute; top: 6px; left: 0; right: 0; border-top: 1px dashed #e6b800; }
+  .lad-line-lab { position: absolute; top: -2px; font-size: 0.6rem; color: #e6b800; transform: translateX(-50%); white-space: nowrap; }
+  .lad-row { display: grid; grid-template-columns: 3.2rem 1fr; align-items: center; gap: 0.4rem; height: 1.25rem; }
+  .lad-sym { font-size: 0.72rem; text-align: right; }
+  .lad-trk { position: relative; height: 0.7rem; }
+  .lad-fill { position: absolute; top: 0.18rem; left: 0; height: 0.34rem; border-radius: 3px; }
+  .lad-dot { position: absolute; top: 0.05rem; width: 0.6rem; height: 0.6rem; border-radius: 50%; transform: translateX(-50%); }
+  .lad-con { position: absolute; top: -0.05rem; width: 0.8rem; height: 0.8rem; border-radius: 50%;
+             transform: translateX(-50%); border: 1.5px dashed #e6b800; }
+  .fresh { font-size: 0.7rem; opacity: 0.55; }
+  .fresh.stale { color: #e6b800; opacity: 0.9; }
 </style>
 </head>
 <body>
@@ -221,15 +266,16 @@ function renderPaperTrades(rows, openTrades) {
   var html = "";
   if (openTrades.length) {
     html += "<h2>Open Paper Trades</h2>";
-    html += "<table><tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>Current</th><th>Unrealized</th>" +
-      "<th>Stop</th><th>Target</th><th>Horizon</th><th>Opened</th></tr>" +
+    html += "<table><tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>Current</th><th>Unreal R</th><th>Unreal &euro;</th>" +
+      "<th>Stop</th><th>Target</th><th>Horizon</th><th>Opened</th><th>Marked</th></tr>" +
       openTrades.map(function(t) {
-        var r = t.unrealized_r;
+        var r = t.unrealized_r, uc = t.unrealized_currency, fr = timeAgo(t.last_marked_at);
         return "<tr><td>" + t.symbol + "</td><td>" + badge(t.direction) + "</td><td>" + fmt(t.entry_price) +
           "</td><td>" + (t.last_price !== null && t.last_price !== undefined ? fmt(t.last_price) : "-") + "</td><td class=\\"" +
-          cls(r) + "\\">" + (r === null || r === undefined ? "-" : (r >= 0 ? "+" : "") + fmt(r) + "R") + "</td><td>" +
+          cls(r) + "\\">" + (r === null || r === undefined ? "-" : (r >= 0 ? "+" : "") + fmt(r) + "R") + "</td><td class=\\"" +
+          cls(uc) + "\\">" + (uc === null || uc === undefined ? "-" : (uc >= 0 ? "+" : "") + fmt(uc, 0)) + "</td><td>" +
           fmt(t.stop_price) + "</td><td>" + fmt(t.target_price) + "</td><td>" + t.horizon_days + "d</td><td>" +
-          (t.opened_at || "").slice(0, 10) + "</td></tr>";
+          (t.opened_at || "").slice(0, 10) + "</td><td class=\\"fresh" + (fr.stale ? " stale" : "") + "\\">" + fr.t + "</td></tr>";
       }).join("") + "</table>";
   } else {
     html += "<h2>Open Paper Trades</h2><div class='empty'>None open.</div>";
@@ -352,39 +398,139 @@ function renderCoverage(c) {
   return html;
 }
 
+// ---- Operations-console overview: the bottom line before the detail. ----
+function timeAgo(iso) {
+  if (!iso) return { t: "never marked", stale: true };
+  var ms = Date.now() - Date.parse(iso);
+  if (isNaN(ms)) return { t: "", stale: false };
+  var m = Math.floor(ms / 60000);
+  var t = m < 1 ? "just now" : (m < 60 ? m + "m ago" : Math.floor(m / 60) + "h " + (m % 60) + "m ago");
+  return { t: t, stale: m >= 90 };
+}
+
+function cumR(closed) {
+  var s = 0, out = [0];
+  for (var i = 0; i < closed.length; i++) { s += (closed[i].r_multiple || 0); out.push(s); }
+  return out;
+}
+
+function sparkline(vals) {
+  if (!vals || vals.length < 2) return '<div class="ov-sub">no closed trades yet</div>';
+  var W = 280, H = 46, pad = 4, i;
+  var hi = Math.max.apply(null, vals.concat([0])), lo = Math.min.apply(null, vals.concat([0])), rng = (hi - lo) || 1;
+  function x(i) { return pad + i * (W - 2 * pad) / (vals.length - 1); }
+  function y(v) { return pad + (hi - v) * (H - 2 * pad) / rng; }
+  var zy = y(0), line = "";
+  for (i = 0; i < vals.length; i++) { line += (i ? "L" : "M") + x(i).toFixed(1) + " " + y(vals[i]).toFixed(1) + " "; }
+  var last = vals[vals.length - 1], col = last >= 0 ? "#3ecf6e" : "#ef5350";
+  var fillc = last >= 0 ? "rgba(62,207,110,0.15)" : "rgba(239,83,80,0.15)";
+  var area = line + "L" + x(vals.length - 1).toFixed(1) + " " + zy.toFixed(1) + " L" + x(0).toFixed(1) + " " + zy.toFixed(1) + " Z";
+  return '<svg class="ov-spark" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' +
+    '<path d="' + area + '" fill="' + fillc + '"/>' +
+    '<line x1="0" y1="' + zy.toFixed(1) + '" x2="' + W + '" y2="' + zy.toFixed(1) + '" stroke="rgba(128,128,128,0.3)" stroke-dasharray="3 3"/>' +
+    '<path d="' + line + '" fill="none" stroke="' + col + '" stroke-width="2" vector-effect="non-scaling-stroke"/>' +
+    '<circle cx="' + x(vals.length - 1).toFixed(1) + '" cy="' + y(last).toFixed(1) + '" r="3" fill="' + col + '"/></svg>';
+}
+
+function renderAccount(data) {
+  var ps = data.paper_stats, cur = ps.currency || "", closed = data.closed_paper_trades || [];
+  var cr = cumR(closed), lastR = cr[cr.length - 1];
+  var openUR = 0, hasUR = false;
+  (data.open_paper_trades || []).forEach(function(t) {
+    if (t.unrealized_currency !== null && t.unrealized_currency !== undefined) { openUR += t.unrealized_currency; hasUR = true; }
+  });
+  var realized = ps.realized_pnl || 0, equity = ps.equity || ps.initial_capital || 0;
+  return '<div class="ov-p"><div class="ov-k">Account &middot; ' + cur + " " + fmt(ps.initial_capital, 0) + ' start</div>' +
+    '<div class="ov-big ' + cls(realized) + '">' + cur + " " + fmt(equity, 0) + '</div>' +
+    '<div class="ov-sub">realized <b class="' + cls(realized) + '">' + (realized >= 0 ? "+" : "") + fmt(realized, 0) + '</b> ' + cur +
+      (hasUR ? ' &middot; open <b class="' + cls(openUR) + '">' + (openUR >= 0 ? "+" : "") + fmt(openUR, 0) + '</b> unreal.' : "") + '</div>' +
+    sparkline(cr) +
+    '<div class="ov-foot"><span>cum <b class="' + cls(lastR) + '">' + (lastR >= 0 ? "+" : "") + fmt(lastR) + 'R</b></span>' +
+      '<span>' + ps.closed + ' closed</span><span class="pos">' + ps.wins + 'W</span><span class="neg">' + ps.losses + 'L</span></div></div>';
+}
+
+function renderWinRate(ps) {
+  if (!ps.closed) return '<div class="ov-p"><div class="ov-k">Win rate</div><div class="ov-big">&ndash;</div><div class="ov-sub">no closed trades yet</div></div>';
+  var lo = ps.win_rate_ci_low * 100, hi = ps.win_rate_ci_high * 100, pt = ps.win_rate * 100;
+  return '<div class="ov-p"><div class="ov-k">Win rate</div>' +
+    '<div class="ov-big">' + Math.round(pt) + '<span style="font-size:1rem;opacity:0.5">%</span></div>' +
+    '<div class="ov-sub">95% CI ' + Math.round(lo) + "&ndash;" + Math.round(hi) + "% &middot; n=" + ps.closed + '</div>' +
+    '<div class="ci-wrap"><div class="ci-axis"></div>' +
+      '<div class="ci-band" style="left:' + lo + "%;width:" + (hi - lo) + '%"></div>' +
+      '<div class="ci-pt" style="left:' + pt + '%"></div></div>' +
+    '<div class="ci-lab"><span>0%</span><span>100%</span></div></div>';
+}
+
+function budgetMeter(u) {
+  var pct = u.daily_usd_budget ? Math.min(100, u.usd_spent / u.daily_usd_budget * 100) : 0;
+  var now = new Date(), frac = (now.getUTCHours() * 3600 + now.getUTCMinutes() * 60) / 86400 * 100;
+  return '<div style="height:6px;border-radius:4px;background:rgba(128,128,128,0.2);margin-top:0.5rem;position:relative;overflow:hidden">' +
+    '<div style="position:absolute;top:0;bottom:0;left:0;width:' + pct + "%;border-radius:4px;background:" + (pct > 85 ? "#e6b800" : "#3ea6cf") + '"></div>' +
+    '<div style="position:absolute;top:0;bottom:0;left:' + frac + '%;width:2px;background:currentColor;opacity:0.55"></div></div>' +
+    '<div class="ci-lab" style="margin-top:0.2rem"><span>' + u.calls + " / " + u.daily_call_budget + ' calls</span><span>| ' + Math.round(frac) + '% into UTC day</span></div>';
+}
+
+function renderOverview(data) {
+  var ps = data.paper_stats;
+  return '<div class="ov">' +
+    renderAccount(data) +
+    renderWinRate(ps) +
+    '<div class="ov-p"><div class="ov-k">Expectancy / trade</div>' +
+      '<div class="ov-big ' + cls(ps.avg_r) + '">' + (ps.closed ? (ps.avg_r >= 0 ? "+" : "") + fmt(ps.avg_r) + "R" : "&ndash;") + '</div>' +
+      '<div class="ov-sub mono">gross ' + (ps.avg_r_gross >= 0 ? "+" : "") + fmt(ps.avg_r_gross) + 'R</div>' +
+      '<div class="ov-sub">open exposure <b>' + data.open_paper_trades.length + '</b> pos</div></div>' +
+    '<div class="ov-p"><div class="ov-k">LLM budget today</div>' +
+      '<div class="ov-big mono">$' + (data.usage.usd_spent || 0).toFixed(2) +
+      '<span style="font-size:0.9rem;opacity:0.5"> / ' + (data.usage.daily_usd_budget || 0).toFixed(0) + '</span></div>' +
+      budgetMeter(data.usage) + '</div>' +
+    '</div>';
+}
+
+function renderFunnel(data) {
+  var c = data.coverage;
+  if (!c) return "";
+  var signaled = (data.dossiers || []).filter(function(d) { return d.status === "SIGNALED"; }).length;
+  var base = c.tradeables || 1;
+  var stages = [
+    ["Tradeables", "in the universe", c.tradeables],
+    ["Connected", "can receive anchor news", c.tradeables_connected],
+    ["Has a dossier", "thesis accumulating", c.tradeables_with_dossier],
+    ["Signaled now", "over the conviction bar", signaled]
+  ];
+  return '<div class="funnel">' + stages.map(function(s) {
+    var p = Math.min(100, s[2] / base * 100);
+    return '<div class="fn-row"><div class="fn-lab">' + s[0] + "<small>" + s[1] + '</small></div>' +
+      '<div class="fn-bar"><span style="width:' + p + '%"></span></div>' +
+      '<div class="fn-val mono">' + s[2] + ' <small>/' + c.tradeables + "</small></div></div>";
+  }).join("") + '</div><div class="ov-sub" style="margin-top:0.5rem">Only <b>' +
+    Math.round(c.tradeables_with_dossier / base * 100) + "%</b> of tradeables have a thesis &mdash; that gap, not market quiet, caps signal output.</div>";
+}
+
+function renderLadder(data) {
+  var ds = (data.dossiers || []).slice().sort(function(a, b) {
+    return (b.confidence * b.magnitude) - (a.confidence * a.magnitude);
+  }).slice(0, 14);
+  if (!ds.length) return '<div class="ov-sub">No dossiers yet.</div>';
+  var rows = ds.map(function(d) {
+    var sc = d.confidence * d.magnitude, pct = Math.min(100, sc * 100), isS = d.direction === "SHORT";
+    var col = isS ? "#ef5350" : "#3ecf6e", soft = isS ? "rgba(239,83,80,0.2)" : "rgba(62,207,110,0.2)";
+    var con = d.mass_opposing > 0.3 ? '<span class="lad-con" style="left:' + pct + '%"></span>' : "";
+    return '<div class="lad-row"><div class="lad-sym mono">' + esc(d.symbol) + '</div>' +
+      '<div class="lad-trk"><div class="lad-fill" style="width:' + pct + "%;background:" + soft + '"></div>' +
+      con + '<div class="lad-dot" style="left:' + pct + "%;background:" + col + '"></div></div></div>';
+  }).join("");
+  return '<div class="lad"><div class="lad-scale"><div class="lad-line"></div>' +
+    '<div class="lad-line-lab" style="left:50%">bar 0.50</div></div>' + rows + '</div>' +
+    '<div class="ov-sub" style="margin-top:0.4rem">&#9679; long &#9679; short &middot; <span style="color:#e6b800">&#9676;</span> contested. Right of 0.50 fires.</div>';
+}
+
 function render(data) {
   var html = "";
   html += renderCapabilities(data.capabilities);
-  html += '<div class="cards" style="margin-top:0.75rem">';
-  html += renderCoverage(data.coverage);
-  html += '<div class="card"><div class="label">Universe</div><div class="value">' + data.universe_size + '</div></div>';
-  html += '<div class="card"><div class="label">Graph edges</div><div class="value">' + data.graph.edge_count + '</div></div>';
-  html += '<div class="card"><div class="label">Active dossiers</div><div class="value">' + data.dossiers.length + '</div></div>';
-  html += '<div class="card"><div class="label">Paper trades open</div><div class="value">' + data.open_paper_trades.length + '</div></div>';
-  html += '<div class="card"><div class="label">Paper win rate</div><div class="value">' +
-    (data.paper_stats.closed ? Math.round(data.paper_stats.win_rate * 100) + "%" : "-") + '</div>' +
-    // The interval, not just the point: a dozen trades cannot distinguish a
-    // winning record from a losing one, and a bare "38%" hides that.
-    (data.paper_stats.closed ? '<div class="ci" title="95% Wilson interval on ' +
-      data.paper_stats.closed + ' closed trade(s) -- the point estimate is not yet reliable">95% CI ' +
-      Math.round(data.paper_stats.win_rate_ci_low * 100) + '-' +
-      Math.round(data.paper_stats.win_rate_ci_high * 100) + '%</div>' : "") + '</div>';
-  html += '<div class="card"><div class="label">Paper avg R</div><div class="value ' + cls(data.paper_stats.avg_r) + '">' +
-    (data.paper_stats.closed ? fmt(data.paper_stats.avg_r) : "-") + '</div></div>';
-  if (data.paper_stats.borrow_assumed) {
-    html += '<div class="card"><div class="label">Avg R excl. ' + data.paper_stats.borrow_assumed +
-      ' borrow-assumed short(s)</div><div class="value ' + cls(data.paper_stats.avg_r_clean) + '">' +
-      fmt(data.paper_stats.avg_r_clean) + '</div></div>';
-  }
-  html += '<div class="card"><div class="label">LLM calls today</div><div class="value">' +
-    data.usage.calls + ' / ' + data.usage.daily_call_budget + '</div></div>';
-  html += '<div class="card"><div class="label">LLM tokens today (in/out)</div><div class="value" style="font-size:1rem">' +
-    (data.usage.input_tokens / 1000).toFixed(1) + 'k / ' + (data.usage.output_tokens / 1000).toFixed(1) + 'k</div></div>';
-  html += '<div class="card"><div class="label">LLM spend today</div><div class="value">$' +
-    (data.usage.usd_spent || 0).toFixed(2) +
-    (data.usage.daily_usd_budget ? ' / $' + data.usage.daily_usd_budget.toFixed(0) : '') + '</div></div>';
-  html += "</div>";
-
+  html += renderOverview(data);
+  html += '<div class="ov" style="grid-template-columns:1.4fr 1fr">' +
+    '<div class="ov-p"><div class="ov-k">Universe activation</div>' + renderFunnel(data) + '</div>' +
+    '<div class="ov-p"><div class="ov-k">Dossiers by conviction</div>' + renderLadder(data) + '</div></div>';
   html += "<h2>Dossiers</h2>" + renderDossiers(data.dossiers);
   html += renderPaperTrades(data.closed_paper_trades, data.open_paper_trades);
   html += "<h2>Recent Signals</h2>" + renderSignals(data.recent_signals);
