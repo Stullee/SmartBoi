@@ -107,30 +107,57 @@ _INDEX_HTML = """<!doctype html>
   @media (prefers-color-scheme: light) { body { background: #f7f7f8; color: #1a1a1a; } }
   h1 { font-size: 1.3rem; margin: 0 0 0.25rem; }
   .subtitle { opacity: 0.6; font-size: 0.85rem; margin-bottom: 1rem; }
-  h2 { font-size: 1rem; margin: 1.5rem 0 0.5rem; opacity: 0.85; }
-  .cards { display: flex; flex-wrap: wrap; gap: 0.75rem; }
-  .card { background: rgba(128,128,128,0.12); border-radius: 8px; padding: 0.9rem 1.2rem; min-width: 140px; }
-  .card .label { font-size: 0.75rem; opacity: 0.65; text-transform: uppercase; letter-spacing: 0.03em; }
-  .card .value { font-size: 1.4rem; font-weight: 600; margin-top: 0.2rem; }
-  .card .ci { font-size: 0.7rem; opacity: 0.55; margin-top: 0.15rem; }
+  /* Section headers in the console idiom: a quiet uppercase eyebrow with a
+     hairline rule, so "Dossiers" / "Recent Signals" read as the same system
+     as the overview's ov-k micro-labels rather than as old bold headings. */
+  h2 { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
+       opacity: 0.55; margin: 1.7rem 0 0.55rem; padding-bottom: 0.4rem;
+       border-bottom: 1px solid rgba(128,128,128,0.16); }
   .pos { color: #3ecf6e; } .neg { color: #ef5350; } .warn { color: #e6b800; }
-  table { border-collapse: collapse; width: 100%; margin-top: 0.4rem; font-size: 0.9rem; }
-  th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid rgba(128,128,128,0.2); }
-  th { opacity: 0.65; font-weight: 500; font-size: 0.8rem; }
-  .empty { opacity: 0.5; padding: 0.4rem 0.6rem; font-size: 0.9rem; }
+  /* Capability rail -- a compact live/off status strip replacing the old big
+     value-cards, so the top of the page matches the overview panels below. */
+  .rail { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  .rail-item { display: flex; align-items: center; gap: 0.5rem; background: rgba(128,128,128,0.08);
+               border: 1px solid rgba(128,128,128,0.18); border-radius: 9px; padding: 0.5rem 0.75rem; }
+  .rail-dot { width: 8px; height: 8px; border-radius: 50%; background: #3ecf6e; flex: none;
+              box-shadow: 0 0 0 3px rgba(62,207,110,0.16); }
+  .rail-dot.off { background: #8a8a8a; box-shadow: none; }
+  .rail-lab { font-size: 0.8rem; opacity: 0.8; }
+  .rail-state { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.5; }
+  /* legacy card -- kept for renderCoverage; restyled to the panel look. */
+  .card { background: rgba(128,128,128,0.10); border: 1px solid rgba(128,128,128,0.20);
+          border-radius: 10px; padding: 0.85rem 1rem; }
+  .card .label { font-size: 0.7rem; opacity: 0.6; text-transform: uppercase; letter-spacing: 0.05em; }
+  .card .value { font-size: 1.4rem; font-weight: 600; margin-top: 0.2rem; }
+  /* Detail tables live in a bordered, horizontally-scrollable panel so an
+     11-column table can't shove the whole page sideways on a phone, and so
+     each section reads as a panel like the overview above it. */
+  .tbl { overflow-x: auto; border: 1px solid rgba(128,128,128,0.18); border-radius: 10px;
+         background: rgba(128,128,128,0.05); margin-top: 0.2rem; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.5rem 0.7rem; white-space: nowrap; }
+  th { font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
+       opacity: 0.5; border-bottom: 1px solid rgba(128,128,128,0.22); }
+  td { border-bottom: 1px solid rgba(128,128,128,0.10); font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(128,128,128,0.05); }
+  td[style*="max-width"] { white-space: normal; }
+  .empty { opacity: 0.6; padding: 0.7rem 0.9rem; font-size: 0.85rem; background: rgba(128,128,128,0.05);
+           border: 1px dashed rgba(128,128,128,0.22); border-radius: 10px; margin-top: 0.2rem; }
   .updated { opacity: 0.5; font-size: 0.75rem; margin-top: 1.5rem; }
   .err { color: #ef5350; }
-  .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.78rem; }
-  .badge.on { background: rgba(62,207,110,0.18); color: #3ecf6e; }
-  .badge.off { background: rgba(128,128,128,0.18); opacity: 0.7; }
-  button { font: inherit; padding: 0.35rem 0.8rem; border-radius: 6px; cursor: pointer;
-           border: 1px solid rgba(128,128,128,0.4); background: rgba(128,128,128,0.14); color: inherit; }
-  button:hover:not(:disabled) { background: rgba(128,128,128,0.26); }
+  .badge { display: inline-block; padding: 0.12rem 0.55rem; border-radius: 999px; font-size: 0.7rem;
+           font-weight: 600; letter-spacing: 0.02em; }
+  .badge.on { background: rgba(62,207,110,0.16); color: #3ecf6e; }
+  .badge.off { background: rgba(128,128,128,0.16); opacity: 0.7; }
+  button { font: inherit; padding: 0.4rem 0.85rem; border-radius: 8px; cursor: pointer;
+           border: 1px solid rgba(128,128,128,0.35); background: rgba(128,128,128,0.12); color: inherit; }
+  button:hover:not(:disabled) { background: rgba(128,128,128,0.24); }
   button:disabled { opacity: 0.5; cursor: default; }
-  input[type=text] { font: inherit; padding: 0.35rem 0.6rem; border-radius: 6px; min-width: 22rem;
-                     border: 1px solid rgba(128,128,128,0.4); background: rgba(128,128,128,0.1); color: inherit; }
+  input[type=text] { font: inherit; padding: 0.4rem 0.6rem; border-radius: 8px; min-width: 22rem;
+                     border: 1px solid rgba(128,128,128,0.35); background: rgba(128,128,128,0.08); color: inherit; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
-  .toolhint { opacity: 0.55; font-size: 0.8rem; margin: 0.4rem 0 0; }
+  .toolhint { opacity: 0.55; font-size: 0.8rem; margin: 0.4rem 0 0; line-height: 1.5; }
   #tool-output { background: rgba(128,128,128,0.12); border-radius: 8px; padding: 0.8rem 1rem;
                  margin-top: 0.7rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.45;
                  white-space: pre; display: none; }
@@ -238,12 +265,13 @@ function capBadge(on) {
 }
 
 function renderCapabilities(c) {
-  return '<div class="cards">' +
-    '<div class="card"><div class="label">EDGAR ingestion</div><div class="value">' + capBadge(c.edgar) + '</div></div>' +
-    '<div class="card"><div class="label">News ingestion</div><div class="value">' + capBadge(c.news) + '</div></div>' +
-    '<div class="card"><div class="label">Dossier engine (Claude)</div><div class="value">' + capBadge(c.anthropic) + '</div></div>' +
-    '<div class="card"><div class="label">IB price feed</div><div class="value">' + capBadge(c.ib) + '</div></div>' +
-    '</div>';
+  function item(label, on) {
+    return '<div class="rail-item"><span class="rail-dot ' + (on ? "" : "off") + '"></span>' +
+      '<span class="rail-lab">' + label + '</span>' +
+      '<span class="rail-state">' + (on ? "live" : "off") + '</span></div>';
+  }
+  return '<div class="rail">' + item("EDGAR ingestion", c.edgar) + item("News ingestion", c.news) +
+    item("Dossier engine (Claude)", c.anthropic) + item("IB price feed", c.ib) + '</div>';
 }
 
 function renderDossiers(rows) {
@@ -258,15 +286,15 @@ function renderDossiers(rows) {
       (d.signaled_price != null ? "$" + fmt(d.signaled_price) + " @ " + (d.signaled_at || "").slice(0, 10) : "-") +
       "</td><td style='max-width:32rem'>" + esc(d.thesis_summary) + "</td></tr>";
   }).join("");
-  return "<table><tr><th>Symbol</th><th>Dir</th><th>Confidence</th><th>Magnitude</th><th>Horizon</th>" +
-    "<th>Sources</th><th>Mass (agree vs oppose)</th><th>Evidence</th><th>Status</th><th>Signaled @</th><th>Thesis</th></tr>" + body + "</table>";
+  return "<div class='tbl'><table><tr><th>Symbol</th><th>Dir</th><th>Confidence</th><th>Magnitude</th><th>Horizon</th>" +
+    "<th>Sources</th><th>Mass (agree vs oppose)</th><th>Evidence</th><th>Status</th><th>Signaled @</th><th>Thesis</th></tr>" + body + "</table></div>";
 }
 
 function renderPaperTrades(rows, openTrades) {
   var html = "";
   if (openTrades.length) {
     html += "<h2>Open Paper Trades</h2>";
-    html += "<table><tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>Current</th><th>Unreal R</th><th>Unreal &euro;</th>" +
+    html += "<div class='tbl'><table><tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>Current</th><th>Unreal R</th><th>Unreal &euro;</th>" +
       "<th>Stop</th><th>Target</th><th>Horizon</th><th>Opened</th><th>Marked</th></tr>" +
       openTrades.map(function(t) {
         var r = t.unrealized_r, uc = t.unrealized_currency, fr = timeAgo(t.last_marked_at);
@@ -276,7 +304,7 @@ function renderPaperTrades(rows, openTrades) {
           cls(uc) + "\\">" + (uc === null || uc === undefined ? "-" : (uc >= 0 ? "+" : "") + fmt(uc, 0)) + "</td><td>" +
           fmt(t.stop_price) + "</td><td>" + fmt(t.target_price) + "</td><td>" + t.horizon_days + "d</td><td>" +
           (t.opened_at || "").slice(0, 10) + "</td><td class=\\"fresh" + (fr.stale ? " stale" : "") + "\\">" + fr.t + "</td></tr>";
-      }).join("") + "</table>";
+      }).join("") + "</table></div>";
   } else {
     html += "<h2>Open Paper Trades</h2><div class='empty'>None open.</div>";
   }
@@ -284,25 +312,25 @@ function renderPaperTrades(rows, openTrades) {
   if (!rows.length) {
     html += '<div class="empty">No paper trades closed yet.</div>';
   } else {
-    html += "<table><tr><th>Closed</th><th>Symbol</th><th>Dir</th><th>Status</th><th>Entry</th><th>Exit</th><th>R</th></tr>" +
+    html += "<div class='tbl'><table><tr><th>Closed</th><th>Symbol</th><th>Dir</th><th>Status</th><th>Entry</th><th>Exit</th><th>R</th></tr>" +
       rows.slice().reverse().map(function(t) {
         var r = t.r_multiple;
         return "<tr><td>" + (t.closed_at || "").slice(0, 10) + "</td><td>" + t.symbol + "</td><td>" + badge(t.direction) +
           "</td><td>" + esc(t.status) + "</td><td>" + fmt(t.entry_price) + "</td><td>" + fmt(t.exit_price) + "</td><td class=\\"" +
           cls(r || 0) + "\\">" + (r !== null && r !== undefined ? fmt(r) + "R" : "-") + "</td></tr>";
-      }).join("") + "</table>";
+      }).join("") + "</table></div>";
   }
   return html;
 }
 
 function renderSignals(rows) {
   if (!rows.length) return '<div class="empty">No signals yet.</div>';
-  return "<table><tr><th>When</th><th>Symbol</th><th>Dir</th><th>Confidence</th><th>Magnitude</th><th>Sources</th><th>Thesis</th></tr>" +
+  return "<div class='tbl'><table><tr><th>When</th><th>Symbol</th><th>Dir</th><th>Confidence</th><th>Magnitude</th><th>Sources</th><th>Thesis</th></tr>" +
     rows.slice().reverse().map(function(s) {
       return "<tr><td>" + (s.generated_at || "").slice(0, 16).replace("T", " ") + "</td><td>" + s.symbol + "</td><td>" +
         badge(s.direction) + "</td><td>" + fmt(s.confidence) + "</td><td>" + fmt(s.magnitude) + "</td><td>" +
         s.independent_source_count + "</td><td style='max-width:28rem'>" + esc(s.thesis_summary) + "</td></tr>";
-    }).join("") + "</table>";
+    }).join("") + "</table></div>";
 }
 
 function candidateAction(c) {
@@ -318,13 +346,13 @@ function candidateAction(c) {
 }
 
 function candidateTable(rows) {
-  return "<table><tr><th>Name</th><th>Ticker</th><th>Related to</th><th>Type</th><th>Mentions</th><th>Description</th><th>Action</th></tr>" +
+  return "<div class='tbl'><table><tr><th>Name</th><th>Ticker</th><th>Related to</th><th>Type</th><th>Mentions</th><th>Description</th><th>Action</th></tr>" +
     rows.map(function(c) {
       return "<tr><td>" + esc(c.name) + "</td><td>" + esc(c.ticker || "?") + "</td><td>" +
         esc((c.related_to || []).join(", ")) + "</td><td>" + esc((c.rel_types || []).join(", ")) + "</td><td>" +
         (c.seen_count || 0) + "</td><td style='max-width:28rem'>" + esc(c.description) + "</td><td>" +
         candidateAction(c) + "</td></tr>";
-    }).join("") + "</table>";
+    }).join("") + "</table></div>";
 }
 
 function renderCandidates(rows) {
@@ -353,7 +381,7 @@ function renderGraph(g) {
     }).join("");
     return "<div style='margin-top:0.6rem'><b>" + group.symbol + "</b> <span style='opacity:0.6'>(" +
       group.relationships.length + ")</span></div>" +
-      "<table><tr><th>Type</th><th>Counterparty</th><th>Confidence</th><th>Description</th></tr>" + rows + "</table>";
+      "<div class='tbl'><table><tr><th>Type</th><th>Counterparty</th><th>Confidence</th><th>Description</th></tr>" + rows + "</table></div>";
   }).join("");
 }
 
