@@ -1,6 +1,6 @@
 ---
 name: SmartBoi (Evidence Synthesis, Paper-Only)
-version: "0.38.0"
+version: "0.39.0"
 slug: smartboi
 description: >-
   LLM-driven cross-company evidence synthesis for equity research: ingests
@@ -51,16 +51,16 @@ options:
   propagated_evidence_cooldown_hours: 6
   enable_ecosystem_propagation: true
   max_ecosystem_evidence_per_link: 1
-  signal_confidence_threshold: 0.65
+  signal_confidence_threshold: 0.5
   min_independent_sources: 2
   min_independent_sources_news_only: 3
   max_horizon_days: 21
   transaction_cost_bps_per_side: 25.0
-  transaction_cost_profile: "institutional"
-  max_favorable_drift_pct: 5.0
+  transaction_cost_profile: "retail"
+  max_favorable_drift_pct: 12.0
   signal_entry_deadline_days: 5
-  stop_loss_pct: 8.0
-  take_profit_pct: 16.0
+  stop_loss_pct: 50.0
+  take_profit_pct: 100.0
   enable_ib_price_feed: false
   ib_host: "127.0.0.1"
   ib_port: 7497
