@@ -32,6 +32,7 @@ from smartboi.screen import (
 from smartboi.tools import (
     run_diagnostics,
     run_event_study,
+    run_exit_analysis,
     run_forward_returns,
     run_screen,
     run_supplier_research,
@@ -151,13 +152,14 @@ _INDEX_HTML = """<!doctype html>
   <button id="btn-screen">Screen candidates</button>
   <button id="btn-analyze">Forward-return report</button>
   <button id="btn-event-study">Signal event study</button>
+  <button id="btn-exit-analysis">Exit analysis</button>
   <button id="btn-research">Research anchor suppliers (web)</button>
   <button id="btn-diagnostics">Diagnostics bundle</button>
   <button id="btn-rebuild-graph">Rebuild relationship graph</button>
   <button id="btn-reset" style="border-color:rgba(239,83,80,0.5)">Reset added symbols</button>
 </div>
-<div class="toolhint">The first three are read-only: screening does market-cap/analyst lookups, the other two
-  read already-persisted state. <b>Research anchor suppliers</b> runs web searches to find small-cap counterparties
+<div class="toolhint">The first four are read-only: screening does market-cap/analyst lookups, the other three
+  read already-persisted state (forward returns, the signal event study, and the exit analysis of the closed trade ledger). <b>Research anchor suppliers</b> runs web searches to find small-cap counterparties
   of your anchors &mdash; the direction SEC filings structurally never disclose, since a giant's 10-K names its big
   customers, not its small suppliers. It writes universe <i>candidates</i> only and never a relationship edge: a
   web-sourced link is a lead, not a disclosure, and edges at disclosed confidence are what satisfy the corroboration
@@ -481,8 +483,8 @@ function fallbackCopyToolOutput(text, flash) {
 function runTool(path, body, button) {
   var out = document.getElementById("tool-output");
   var buttons = [document.getElementById("btn-screen"), document.getElementById("btn-analyze"),
-                 document.getElementById("btn-event-study"), document.getElementById("btn-diagnostics"),
-                 document.getElementById("btn-research")];
+                 document.getElementById("btn-event-study"), document.getElementById("btn-exit-analysis"),
+                 document.getElementById("btn-diagnostics"), document.getElementById("btn-research")];
   buttons.forEach(function(b) { b.disabled = true; });
   showToolOutput();
   out.textContent = "Running… (this can take a few minutes for a long ticker list)";
@@ -525,6 +527,9 @@ document.getElementById("btn-analyze").addEventListener("click", function() {
 });
 document.getElementById("btn-event-study").addEventListener("click", function() {
   runTool("tools/event-study", {}, this);
+});
+document.getElementById("btn-exit-analysis").addEventListener("click", function() {
+  runTool("tools/exit-analysis", {}, this);
 });
 document.getElementById("btn-diagnostics").addEventListener("click", function() {
   runTool("tools/diagnostics", {}, this);
@@ -779,6 +784,20 @@ def create_app(engine) -> web.Application:
 
         return await _run_tool(run)
 
+    async def handle_tool_exit_analysis(request: web.Request) -> web.Response:
+        """Runs the exit-quality analysis (smartboi.tools.run_exit_analysis)
+        over paper_trades.jsonl + price_marks.jsonl -- holding period vs
+        horizon, realized reward:risk, stop-gap integrity, cost drag, and the
+        hold-to-horizon counterfactual. Pure file reads -- no network, no LLM,
+        nothing mutated."""
+        async def run() -> str:
+            # Threaded like the other report tools: the ledger and price
+            # marks grow daily and parsing them on the event loop would
+            # stall the engine's polling.
+            return await asyncio.to_thread(run_exit_analysis, engine.settings.log_dir)
+
+        return await _run_tool(run)
+
     async def handle_tool_diagnostics(request: web.Request) -> web.Response:
         """One pasteable runtime-state bundle (smartboi.tools.run_diagnostics)
         -- integrations, universe, graph, dossiers, where evidence is coming
@@ -828,6 +847,7 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/tools/supplier-research", handle_tool_supplier_research)
     app.router.add_post("/api/tools/forward-returns", handle_tool_forward_returns)
     app.router.add_post("/api/tools/event-study", handle_tool_event_study)
+    app.router.add_post("/api/tools/exit-analysis", handle_tool_exit_analysis)
     app.router.add_post("/api/tools/diagnostics", handle_tool_diagnostics)
     app.router.add_post("/api/universe/reset-accepted", handle_reset_accepted)
     app.router.add_post("/api/universe/rebuild-graph", handle_rebuild_graph)

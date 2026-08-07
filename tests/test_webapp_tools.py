@@ -129,6 +129,15 @@ async def test_forward_returns_endpoint_reports_no_data_gracefully(engine):
         assert "No dossier snapshots" in (await response.json())["report"]
 
 
+async def test_exit_analysis_endpoint_reports_no_data_gracefully(engine):
+    """Same as the other read-only reports: an empty ledger on a fresh
+    deployment must read as an explanation, not an error."""
+    async with _client(engine) as client:
+        response = await client.post("/api/tools/exit-analysis", json={})
+        assert response.status == 200
+        assert "No paper trades" in (await response.json())["report"]
+
+
 async def test_concurrent_tool_runs_are_rejected(engine):
     """Two screening runs at once would interleave against the engine's
     single rate-limited Finnhub client and blow the free tier's 60/min."""
