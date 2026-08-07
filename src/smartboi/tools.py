@@ -276,6 +276,7 @@ _DIAGNOSTIC_SETTINGS = (
     "max_favorable_drift_pct", "signal_entry_deadline_days",
     "stop_loss_pct", "take_profit_pct", "transaction_cost_bps_per_side",
     "transaction_cost_profile",
+    "initial_trading_capital", "trading_currency", "max_concurrent_positions",
     "max_daily_llm_calls", "max_daily_usd",
     "budget_share_extraction", "budget_share_synthesis", "budget_share_research",
     "budget_reserve_synthesis",
@@ -471,8 +472,18 @@ def run_diagnostics(engine) -> str:
     add(f"  price poll (entry due)  : {s.signal_entry_poll_interval_sec}s")
     add(f"  entry deadline          : {s.signal_entry_deadline_days}d, max favorable drift {s.max_favorable_drift_pct}%")
 
-    stats, closed = gather_paper_trade_stats(log_dir / "paper_trades.jsonl")
+    stats, closed = gather_paper_trade_stats(
+        log_dir / "paper_trades.jsonl", s.initial_trading_capital, s.trading_currency,
+    )
     add("\n--- Paper trades ---")
+    # Currency overlay: each trade is one slot of the account, so the record
+    # reads in real money as well as R. Equity is realized only; open positions'
+    # unrealized P&L is marked live on the dashboard, not here.
+    open_unreal = sum(v for v in (t.unrealized_currency() for t in engine.journal.open_trades.values()) if v is not None)
+    add(f"  account: {stats.currency} {stats.initial_capital:.0f} start, "
+        f"realized {stats.realized_pnl:+.2f} -> equity {stats.equity:.2f} "
+        f"(open unreal. {open_unreal:+.2f}); "
+        f"{s.max_concurrent_positions} slots @ {stats.currency} {s.initial_trading_capital / max(1, s.max_concurrent_positions):.0f} each")
     add(f"  open: {len(engine.journal.open_trades)} ({', '.join(engine.journal.open_trades) or '-'})")
     # The win rate carries its 95% Wilson interval: at a dozen-odd closed
     # trades the point estimate alone reads as fact when it is noise, and the

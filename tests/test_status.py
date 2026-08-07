@@ -62,6 +62,27 @@ def test_win_rate_interval_is_zero_with_no_closed_trades(tmp_path):
     assert stats.win_rate_ci_low == 0.0 and stats.win_rate_ci_high == 0.0
 
 
+# --- Currency overlay: equity = starting capital + realized currency P&L. ---
+
+def test_currency_equity_is_capital_plus_realized(tmp_path):
+    path = tmp_path / "paper_trades.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in [
+        {"status": "WIN", "r_multiple": 1.0, "currency_pnl": 150.0},
+        {"status": "LOSS", "r_multiple": -1.0, "currency_pnl": -80.0},
+    ]) + "\n")
+
+    stats, _ = gather_paper_trade_stats(path, initial_capital=5000.0, currency="EUR")
+
+    assert stats.currency == "EUR"
+    assert stats.realized_pnl == 70.0
+    assert stats.equity == 5070.0
+
+
+def test_currency_equity_with_no_trades_is_just_the_capital(tmp_path):
+    stats, _ = gather_paper_trade_stats(tmp_path / "none.jsonl", initial_capital=5000.0, currency="EUR")
+    assert stats.realized_pnl == 0.0 and stats.equity == 5000.0
+
+
 def test_snapshot_dossier_includes_computed_score():
     dossier = Dossier(symbol="UCTT", direction="LONG", confidence=0.8, magnitude=0.5,
                        independent_source_count=2, status="SIGNALED")

@@ -354,6 +354,19 @@ class Settings(BaseSettings):
     stop_loss_pct: float = 50.0
     take_profit_pct: float = 100.0
 
+    # --- Account model: turns the abstract R-multiple record into an actual
+    # currency P&L. Each paper trade is sized at initial_trading_capital /
+    # max_concurrent_positions (equal weight), and its currency P&L is that
+    # notional times the net-of-cost return. This is a MEASUREMENT overlay on
+    # the paper journal, not a live account: the journal still records every
+    # signal's outcome (it never refuses a signal because "all slots are
+    # full"), and the slot count only sets the per-position size. A hard
+    # concurrency cap belongs with real order placement, not signal
+    # validation, so it is deliberately not enforced here. ---
+    initial_trading_capital: float = 5000.0
+    trading_currency: str = "EUR"
+    max_concurrent_positions: int = 15
+
     # --- Read-only IB price feed. NEVER places orders -- see prices.py,
     # which contains no order-placement code at all. Off by default; until
     # enabled, dossiers/signals still accumulate and log fully, they just

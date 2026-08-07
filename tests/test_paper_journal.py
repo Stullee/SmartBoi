@@ -70,6 +70,45 @@ def test_open_short_computes_stop_and_target(tmp_path):
     assert trade.target_price == pytest.approx(84.0)
 
 
+# --- Account model: a trade sized at a currency notional realises that
+# notional times its net-of-cost return, on top of the R record. ---
+
+def test_currency_pnl_is_notional_times_net_return(tmp_path):
+    journal = _journal(tmp_path)
+    # EUR 1000 slot, LONG 100 -> 116 target, 100bp round trip.
+    journal.open("AAA", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.9, 3, [],
+                 cost_bps_round_trip=100.0, position_value=1000.0)
+    journal.update("AAA", 116.0, now=_next_session())   # hits target -> WIN
+
+    row = json.loads((tmp_path / "logs" / "paper_trades.jsonl").read_text().strip().splitlines()[-1])
+    assert row["status"] == "WIN"
+    assert row["position_value"] == 1000.0
+    # net = (16 gross - 1.08 cost) / 100 = 14.92% -> EUR 149.20 on EUR 1000.
+    assert row["currency_pnl"] == pytest.approx(149.2, abs=0.05)
+
+
+def test_unsized_trade_carries_no_currency_pnl(tmp_path):
+    # A record with no notional (position_value 0) reports None, not a fake 0 --
+    # the stats treat that as "no currency data" (pre-account-model rows).
+    journal = _journal(tmp_path)
+    journal.open("AAA", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.9, 3, [])
+    journal.update("AAA", 116.0, now=_next_session())
+    row = json.loads((tmp_path / "logs" / "paper_trades.jsonl").read_text().strip().splitlines()[-1])
+    assert row["currency_pnl"] is None
+
+
+def test_mark_stamps_last_marked_at_and_unrealized_currency(tmp_path):
+    # The freshness stamp and the marked-to-market EUR figure are set even on a
+    # same-session mark that does not resolve the trade.
+    journal = _journal(tmp_path)
+    journal.open("AAA", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.9, 3, [], position_value=1000.0)
+    journal.update("AAA", 104.0)   # same session: marks but does not close
+    trade = journal.open_trades["AAA"]
+    assert trade.last_price == 104.0
+    assert trade.last_marked_at is not None
+    assert trade.unrealized_currency() == pytest.approx(40.0, abs=0.01)  # +4% of EUR 1000, no cost
+
+
 def test_target_hit_closes_as_win(tmp_path):
     journal = _journal(tmp_path)
     journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
