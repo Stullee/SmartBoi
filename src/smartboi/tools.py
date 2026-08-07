@@ -38,6 +38,7 @@ from smartboi.forward_returns import (
     format_report,
     price_marks_by_symbol,
 )
+from smartboi.exit_analysis import format_report as format_exit_report
 from smartboi.screen import candidates_from_file, resolve_candidates_path
 from smartboi.universe import CompanySpec, spec_by_symbol
 from smartboi.research import (
@@ -246,6 +247,20 @@ def run_event_study(
     decision_rows = read_jsonl(log_dir / "decisions.jsonl")
     marks = read_jsonl(log_dir / "price_marks.jsonl")
     return format_event_study(signal_rows, decision_rows, price_marks_by_symbol(marks), horizons)
+
+
+def run_exit_analysis(log_dir: str | Path) -> str:
+    """Exit-quality report over the closed paper-trade ledger (see
+    exit_analysis.py): how early trades closed vs their horizon, the realized
+    reward:risk, whether stops gapped, the cost drag, and the hold-to-horizon
+    counterfactual. Pure file reads of paper_trades.jsonl and price_marks.jsonl
+    -- no network, no LLM, nothing mutated."""
+    log_dir = Path(log_dir)
+    trades = read_jsonl(log_dir / "paper_trades.jsonl")
+    if not trades:
+        return "No paper trades recorded yet -- exit analysis starts meaning something once trades close."
+    marks = read_jsonl(log_dir / "price_marks.jsonl")
+    return format_exit_report(trades, price_marks_by_symbol(marks))
 
 
 # Settings safe to print in a diagnostics bundle. An explicit ALLOW-list, not
