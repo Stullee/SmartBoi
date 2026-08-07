@@ -154,13 +154,20 @@ def gather_coverage(universe, graph: RelationshipGraph, store: DossierStore) -> 
     }
 
 
-def gather_graph_stats(graph: RelationshipGraph) -> dict:
+def gather_graph_stats(graph: RelationshipGraph, universe=None, store=None) -> dict:
     """Relationships grouped by the filer (`from_symbol` -- "the company the
     evidence is about", see graph.py's Relationship) instead of one flat
     row per edge -- a company with several disclosed counterparties reads
     as one group ("FORM: customer of X, supplier to Y, ...") rather than
     being scattered across a table sorted by insertion order. Each group's
-    own relationships are strongest-confidence first."""
+    own relationships are strongest-confidence first.
+
+    Also returns flat `nodes`/`edges` for the interactive graph panel. A
+    node's `kind` comes from the universe (anchors are signal_source_only),
+    and its `dir`/`score` from any dossier it has -- so the viz can colour a
+    tradeable by its live thesis and size it by conviction, exactly like the
+    approved mockup. Both optional: called without them (as several tests do)
+    it still returns the tables, just with empty node/edge lists."""
     by_symbol: dict[str, list[dict]] = {}
     for r in graph.relationships:
         by_symbol.setdefault(r.from_symbol, []).append(
@@ -175,9 +182,34 @@ def gather_graph_stats(graph: RelationshipGraph) -> dict:
         {"symbol": symbol, "relationships": sorted(rels, key=lambda x: x["confidence"], reverse=True)}
         for symbol, rels in sorted(by_symbol.items())
     ]
+
+    kind_by: dict[str, str] = {}
+    if universe is not None:
+        for c in universe:
+            kind_by[c.symbol] = "anchor" if c.signal_source_only else "tradeable"
+    dossier_syms = set(store.all_symbols()) if store is not None else set()
+
+    symbols: set[str] = set()
+    edges: list[list] = []
+    for r in graph.relationships:
+        symbols.add(r.from_symbol)
+        symbols.add(r.to_symbol)
+        edges.append([r.from_symbol, r.to_symbol, r.rel_type, round(r.confidence, 3)])
+
+    nodes = []
+    for s in sorted(symbols):
+        direction = score = None
+        if s in dossier_syms:
+            d = store.load(s)
+            direction = d.direction
+            score = round(d.confidence * d.magnitude, 3)
+        nodes.append({"id": s, "kind": kind_by.get(s, "external"), "dir": direction, "score": score})
+
     return {
         "edge_count": len(graph.relationships),
         "by_symbol": groups,
+        "nodes": nodes,
+        "edges": edges,
     }
 
 
@@ -379,6 +411,18 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str) -> dict:
 
 
 def gather_usage(snapshot) -> dict:
+    # Per-category spend breakdown, so the dashboard can show WHERE the day's
+    # budget went (extraction / dossier / synthesis / research), not just the
+    # total -- the split is the thing that reveals a category starving another
+    # (the reason budget_reserve_synthesis exists; see config.py / usage.py).
+    # Every category is present, zeros included, so the bar segments stay
+    # stable across refreshes instead of appearing and disappearing.
+    from smartboi.usage import CATEGORIES
+
+    by_category = {}
+    for cat in CATEGORIES:
+        usd, calls = snapshot.by_category.get(cat, (0.0, 0))
+        by_category[cat] = {"usd": round(usd, 4), "calls": calls}
     return {
         "date": snapshot.date,
         "calls": snapshot.calls,
@@ -391,4 +435,5 @@ def gather_usage(snapshot) -> dict:
         # day is costing (see usage.py).
         "usd_spent": round(snapshot.usd_spent, 2),
         "daily_usd_budget": snapshot.daily_usd_budget,
+        "by_category": by_category,
     }

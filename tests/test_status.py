@@ -241,7 +241,30 @@ def test_gather_graph_stats_groups_by_filer_symbol(tmp_path):
 def test_gather_graph_stats_empty_graph(tmp_path):
     graph = RelationshipGraph(tmp_path / "graph.json")
     stats = gather_graph_stats(graph)
-    assert stats == {"edge_count": 0, "by_symbol": []}
+    assert stats == {"edge_count": 0, "by_symbol": [], "nodes": [], "edges": []}
+
+
+def test_gather_graph_stats_builds_typed_nodes_and_edges(tmp_path):
+    """The interactive graph panel needs typed nodes: kind from the universe
+    (anchor vs tradeable), direction/score from any dossier, plus a flat edge
+    list. Without a universe/store it degrades to empty node/edge lists."""
+    from smartboi.dossier import Dossier, DossierStore
+    from smartboi.universe import CompanySpec
+
+    graph = RelationshipGraph(tmp_path / "graph.json")
+    graph.add(Relationship("UCTT", "AMAT", "customer", "concentration", "manual", 0.85, "2026-07-01"))
+    universe = [CompanySpec("UCTT", "Ultra Clean", "semi"),
+                CompanySpec("AMAT", "Applied Materials", "semi", signal_source_only=True)]
+    store = DossierStore(tmp_path / "d")
+    store.save(Dossier(symbol="UCTT", direction="LONG", confidence=0.8, magnitude=0.5))
+
+    stats = gather_graph_stats(graph, universe, store)
+
+    nodes = {n["id"]: n for n in stats["nodes"]}
+    assert nodes["UCTT"]["kind"] == "tradeable" and nodes["UCTT"]["dir"] == "LONG"
+    assert nodes["UCTT"]["score"] == 0.4                 # confidence * magnitude
+    assert nodes["AMAT"]["kind"] == "anchor" and nodes["AMAT"]["dir"] is None
+    assert stats["edges"] == [["UCTT", "AMAT", "customer", 0.85]]
 
 
 # --- Coverage: how much of the TRADEABLE universe is actually live. A
