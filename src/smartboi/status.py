@@ -9,6 +9,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+from smartboi.config import strategy_key
 from smartboi.dossier import SCORING_VERSION, Dossier, DossierStore
 from smartboi.graph import RelationshipGraph
 
@@ -46,6 +47,35 @@ class PaperTradeStats:
     initial_capital: float = 0.0
     realized_pnl: float = 0.0
     equity: float = 0.0
+
+
+@dataclass
+class StrategyGeneration:
+    """One strategy "generation" in the closed record -- a set of trades that
+    share the same trade-governing config (see config.strategy_key). Kept
+    apart so a new strategy's win rate is never pooled with an old, abandoned
+    regime's, which would measure two strategies as one number. `legacy` marks
+    trades opened before generation stamping existed (config unknown), grouped
+    together rather than each masquerading as its own strategy; `is_current`
+    marks the generation matching the live config -- the number that actually
+    describes what the bot is doing now."""
+
+    key: str
+    label: str
+    version_from: str
+    version_to: str
+    is_current: bool
+    legacy: bool
+    closed: int
+    wins: int
+    losses: int
+    timeouts: int
+    win_rate: float
+    win_rate_ci_low: float
+    win_rate_ci_high: float
+    avg_r: float
+    avg_r_gross: float
+    realized_pnl: float
 
 
 def gather_dossiers(store: DossierStore) -> list[dict]:
@@ -208,6 +238,78 @@ def gather_paper_trade_stats(
         stats.realized_pnl = round(sum(pnls), 2) if pnls else 0.0
     stats.equity = round(initial_capital + stats.realized_pnl, 2)
     return stats, rows[-20:]
+
+
+def _generation_stats(
+    key: str, rows: list[dict], current_key: str | None, current_signature: dict | None
+) -> StrategyGeneration:
+    legacy = key == ""
+    is_current = bool(current_key) and key == current_key and not legacy
+    closed = len(rows)
+    wins = sum(1 for r in rows if r.get("status") == "WIN")
+    losses = sum(1 for r in rows if r.get("status") == "LOSS")
+    timeouts = sum(1 for r in rows if r.get("status") == "TIMEOUT")
+    win_rate = wins / closed if closed else 0.0
+    low, high = _wilson_interval(wins, closed)
+    avg_r = (sum(r.get("r_multiple") or 0.0 for r in rows) / closed) if closed else 0.0
+    gross_vals = [r.get("r_multiple_gross") for r in rows if r.get("r_multiple_gross") is not None]
+    avg_r_gross = round(sum(gross_vals) / len(gross_vals), 3) if gross_vals else 0.0
+    pnls = [r.get("currency_pnl") for r in rows if r.get("currency_pnl") is not None]
+    realized = round(sum(pnls), 2) if pnls else 0.0
+
+    # Label + version range: for the LIVE generation prefer the current
+    # signature, so it reads correctly ("hold-to-horizon, since v0.43") even
+    # with zero closed trades yet; otherwise read them off the stamped rows.
+    stamped = [r.get("strategy") for r in rows if r.get("strategy")]
+    versions = sorted(s.get("version", "") for s in stamped if s.get("version"))
+    if legacy:
+        label = "legacy (pre-tracking)"
+    elif is_current and current_signature:
+        label = current_signature.get("label") or "current strategy"
+    elif stamped:
+        label = stamped[-1].get("label") or "strategy"
+    else:
+        label = "strategy"
+    version_from = versions[0] if versions else (
+        (current_signature or {}).get("version", "") if is_current else ""
+    )
+    version_to = versions[-1] if versions else version_from
+
+    return StrategyGeneration(
+        key=key, label=label, version_from=version_from, version_to=version_to,
+        is_current=is_current, legacy=legacy, closed=closed, wins=wins, losses=losses,
+        timeouts=timeouts, win_rate=round(win_rate, 4),
+        win_rate_ci_low=round(low, 4), win_rate_ci_high=round(high, 4),
+        avg_r=round(avg_r, 3), avg_r_gross=avg_r_gross, realized_pnl=realized,
+    )
+
+
+def gather_strategy_generations(
+    log_path: Path, current_signature: dict | None = None
+) -> list[StrategyGeneration]:
+    """Segments the closed paper-trade record by strategy generation, so the
+    dashboard can show the CURRENT strategy's forward performance apart from
+    the trades taken under an old config (institutional costs, tight stops,
+    etc.). The current generation is always included even with zero closed
+    trades yet -- that "0W-0L, still measuring" state is the honest headline
+    right after a strategy change, and the whole point of the split. Ordered
+    current first, then other generations by trade count, legacy last."""
+    rows = _read_jsonl(log_path)
+    current_key = strategy_key(current_signature) if current_signature else None
+
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(strategy_key(r.get("strategy")), []).append(r)
+    # The live strategy always gets a row, even before it has closed a trade.
+    if current_key:
+        groups.setdefault(current_key, [])
+
+    gens = [
+        _generation_stats(key, grp, current_key, current_signature)
+        for key, grp in groups.items()
+    ]
+    gens.sort(key=lambda g: (not g.is_current, g.legacy, -g.closed))
+    return gens
 
 
 def gather_recent_signals(log_path: Path, limit: int = 25) -> list[dict]:

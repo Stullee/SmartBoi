@@ -25,7 +25,7 @@ from pathlib import Path
 from smartboi.news import redact_token, redact_url
 from smartboi.paper_journal import cost_buckets, trade_economics
 from smartboi.usage import CATEGORIES
-from smartboi.status import gather_dossiers, gather_paper_trade_stats
+from smartboi.status import gather_dossiers, gather_paper_trade_stats, gather_strategy_generations
 from smartboi.event_study import (
     OUTCOME_LABELS,
     attach_outcomes,
@@ -274,7 +274,7 @@ _DIAGNOSTIC_SETTINGS = (
     "signal_confidence_threshold", "min_independent_sources",
     "min_independent_sources_news_only", "max_horizon_days",
     "max_favorable_drift_pct", "signal_entry_deadline_days",
-    "stop_loss_pct", "take_profit_pct", "transaction_cost_bps_per_side",
+    "stop_loss_pct", "take_profit_pct", "strategy_label", "transaction_cost_bps_per_side",
     "transaction_cost_profile",
     "initial_trading_capital", "trading_currency", "max_concurrent_positions",
     "max_daily_llm_calls", "max_daily_usd",
@@ -489,10 +489,28 @@ def run_diagnostics(engine) -> str:
     # trades the point estimate alone reads as fact when it is noise, and the
     # interval width is exactly what says whether the record can be told apart
     # from the break-even hit rate below.
-    add(f"  closed: {stats.closed} (W{stats.wins}/L{stats.losses}/T{stats.timeouts}), "
+    add(f"  closed (all generations): {stats.closed} (W{stats.wins}/L{stats.losses}/T{stats.timeouts}), "
         f"win rate {stats.win_rate * 100:.0f}% "
         f"(95% CI {stats.win_rate_ci_low * 100:.0f}-{stats.win_rate_ci_high * 100:.0f}%), "
         f"avg R {stats.avg_r:.2f}")
+    # The all-time line above pools every strategy the record has ever run.
+    # This splits it by generation so the CURRENT strategy is measured on its
+    # own trades, not dragged by an old, abandoned config (see status.py).
+    gens = gather_strategy_generations(log_dir / "paper_trades.jsonl", s.strategy_signature())
+    if gens:
+        add("  strategy record (win/loss by generation):")
+        for g in gens:
+            ver = ""
+            if not g.legacy and g.version_from:
+                ver = f" v{g.version_from}"
+                if g.version_to and g.version_to != g.version_from:
+                    ver += f"-v{g.version_to}"
+            tag = "  <- current" if g.is_current else ""
+            if g.closed:
+                add(f"    {g.label}{ver}: {g.wins}W/{g.losses}L/{g.timeouts}T, win {g.win_rate * 100:.0f}% "
+                    f"(CI {g.win_rate_ci_low * 100:.0f}-{g.win_rate_ci_high * 100:.0f}%), avg R {g.avg_r:+.2f}{tag}")
+            else:
+                add(f"    {g.label}{ver}: no closed trades yet{tag}")
     for symbol, trade in engine.journal.open_trades.items():
         econ = trade_economics(
             s.stop_loss_pct, s.take_profit_pct, trade.cost_bps_round_trip, trade.direction

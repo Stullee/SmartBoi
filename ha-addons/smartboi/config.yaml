@@ -61,6 +61,7 @@ options:
   signal_entry_deadline_days: 5
   stop_loss_pct: 50.0
   take_profit_pct: 100.0
+  strategy_label: "hold-to-horizon"
   initial_trading_capital: 5000
   trading_currency: "EUR"
   max_concurrent_positions: 15
@@ -123,6 +124,7 @@ schema:
   signal_entry_deadline_days: int(1,60)
   stop_loss_pct: float(0.1,50)
   take_profit_pct: float(0.1,100)
+  strategy_label: str
   initial_trading_capital: float(0,100000000)
   trading_currency: str
   max_concurrent_positions: int(1,200)

@@ -12,9 +12,38 @@ dossier updates are skipped with a clear one-time warning) rather than
 refuse to start. See engine.py's startup log for what's active."""
 from __future__ import annotations
 
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from smartboi.universe import DEFAULT_UNIVERSE, CompanySpec, build_universe
+
+
+# The trade-governing parameters -- the ones that actually define a strategy
+# "generation". A change to any of them starts a new generation whose forward
+# record must be measured separately: pooling the old regime's win rate with
+# the new one measures two different strategies as a single number, which is
+# exactly the contamination the generation split exists to remove. Cosmetic
+# things (the app version, the display label) are deliberately excluded, so a
+# dashboard-only release cannot fork the record -- only a real rule change can.
+_STRATEGY_PARAM_KEYS = (
+    "stop_loss_pct",
+    "take_profit_pct",
+    "signal_confidence_threshold",
+    "transaction_cost_profile",
+    "max_favorable_drift_pct",
+    "max_horizon_days",
+)
+
+
+def strategy_key(strategy: dict | None) -> str:
+    """Stable grouping key for a stamped strategy signature -- the governing
+    params only, in a fixed order. None/empty (a trade opened before strategy
+    stamping existed) maps to "" so those pool into one clearly-labelled
+    'legacy' generation rather than each appearing as its own."""
+    if not strategy:
+        return ""
+    return "|".join(f"{k}={strategy.get(k)}" for k in _STRATEGY_PARAM_KEYS)
 
 
 class Settings(BaseSettings):
@@ -353,6 +382,13 @@ class Settings(BaseSettings):
     # has no intraday bar/ATR data at a weeks-long holding horizon) ---
     stop_loss_pct: float = 50.0
     take_profit_pct: float = 100.0
+    # A human-readable name for the CURRENT strategy generation, shown on the
+    # dashboard's strategy-record panel (e.g. "hold-to-horizon"). Display only:
+    # it is stamped on each paper trade at open but never affects which
+    # generation a trade belongs to -- that is decided purely by the trade-
+    # governing parameters above (see strategy_signature / strategy_key), so
+    # renaming the strategy does not fork its forward record.
+    strategy_label: str = "hold-to-horizon"
 
     # --- Account model: turns the abstract R-multiple record into an actual
     # currency P&L. Each paper trade is sized at initial_trading_capital /
@@ -465,6 +501,20 @@ class Settings(BaseSettings):
     @property
     def edgar_forms_set(self) -> set[str]:
         return {f.strip() for f in self.edgar_forms.split(",") if f.strip()}
+
+    def strategy_signature(self) -> dict:
+        """The strategy 'fingerprint' stamped on each paper trade at open, so
+        the closed record can later be segmented by strategy generation (see
+        status.gather_strategy_generations). The trade-governing params define
+        the generation; `label` and `version` ride along for display only and
+        never change which generation a trade belongs to -- so a cosmetic
+        release or a rename can't fork the forward record, only a real rule
+        change can. `version` is the running add-on version (SMARTBOI_VERSION,
+        set in the Docker image), used purely to label when a generation began."""
+        sig = {k: getattr(self, k) for k in _STRATEGY_PARAM_KEYS}
+        sig["label"] = self.strategy_label
+        sig["version"] = os.environ.get("SMARTBOI_VERSION", "")
+        return sig
 
 
 def load_settings() -> Settings:

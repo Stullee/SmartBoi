@@ -608,3 +608,44 @@ def test_a_timeout_still_closes_outside_the_session(tmp_path):
 
     assert journal.expire_past_horizon(now=past_horizon)
     assert not journal.has_open("UCTT")
+
+
+# --- Strategy generation stamp: each trade records the config it was opened
+# under, so the closed record can be segmented by strategy (see status.py). ---
+
+def test_open_stamps_the_strategy_and_it_survives_a_reload(tmp_path):
+    sig = {"stop_loss_pct": 50.0, "take_profit_pct": 100.0,
+           "label": "hold-to-horizon", "version": "0.43.0"}
+    journal = _journal(tmp_path)
+    trade = journal.open("UCTT", "LONG", 100.0, 50.0, 100.0, horizon_days=21,
+                         thesis_summary="t", confidence=0.7, independent_source_count=2,
+                         citations=[], strategy=sig)
+    assert trade.strategy == sig
+    # Round-trips through the open-state snapshot (reload from disk).
+    reloaded = PaperTradeJournal(tmp_path / "logs" / "paper_trades.jsonl")
+    assert reloaded.open_trades["UCTT"].strategy == sig
+
+
+def test_strategy_stamp_is_written_to_the_closed_log(tmp_path):
+    """The stamp has to reach paper_trades.jsonl -- that closed log is exactly
+    what gather_strategy_generations reads to split the record by generation."""
+    sig = {"stop_loss_pct": 50.0, "label": "hold-to-horizon", "version": "0.43.0"}
+    journal = _journal(tmp_path)
+    journal.open("UCTT", "LONG", 100.0, 50.0, 100.0, horizon_days=21,
+                 thesis_summary="t", confidence=0.7, independent_source_count=2,
+                 citations=[], strategy=sig)
+    journal.expire_past_horizon(now=datetime.now(timezone.utc) + timedelta(days=22))
+
+    rows = [json.loads(line) for line in
+            (tmp_path / "logs" / "paper_trades.jsonl").read_text().splitlines() if line.strip()]
+    assert rows[0]["strategy"] == sig
+
+
+def test_a_pre_stamp_trade_loads_with_no_strategy(tmp_path):
+    """Records written before generation stamping existed have no `strategy`
+    field; they must still load (defaulting to None), which is what puts them
+    in the single 'legacy' bucket rather than crashing the reader."""
+    trade = PaperTrade(symbol="UCTT", direction="LONG", entry_price=100.0, stop_price=92.0,
+                       target_price=116.0, opened_at="2026-01-01T00:00:00+00:00", horizon_days=21,
+                       thesis_summary="t", confidence=0.7, independent_source_count=2)
+    assert trade.strategy is None

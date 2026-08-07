@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from smartboi.config import Settings
+from smartboi.config import Settings, strategy_key
 from smartboi.universe import DEFAULT_UNIVERSE
 
 
@@ -29,6 +29,35 @@ def test_symbols_override(monkeypatch):
 def test_edgar_forms_set_parses_csv():
     settings = Settings(_env_file=None, edgar_forms="8-K, 10-K,4")
     assert settings.edgar_forms_set == {"8-K", "10-K", "4"}
+
+
+# --- Strategy signature/generation: a paper trade is stamped with the config
+# it was opened under, so the closed record can be split by strategy and a new
+# strategy's win rate is never pooled with an old, abandoned one. ---
+
+def test_strategy_signature_captures_the_governing_params():
+    s = Settings(_env_file=None, stop_loss_pct=50.0, take_profit_pct=100.0,
+                 strategy_label="hold-to-horizon")
+    sig = s.strategy_signature()
+    assert sig["stop_loss_pct"] == 50.0
+    assert sig["take_profit_pct"] == 100.0
+    assert sig["transaction_cost_profile"] == s.transaction_cost_profile
+    assert sig["label"] == "hold-to-horizon"
+    assert "version" in sig  # stamped for display (the running add-on version)
+
+
+def test_strategy_key_forks_on_a_rule_change_but_not_a_rename_or_version():
+    base = Settings(_env_file=None, stop_loss_pct=50.0).strategy_signature()
+    # A rename or a version bump is cosmetic -- it must NOT fork the record,
+    # or a dashboard-only release would falsely reset a strategy's stats.
+    renamed = dict(base, label="something else", version="9.9.9")
+    assert strategy_key(base) == strategy_key(renamed)
+    # A real rule change (a different stop) IS a new generation.
+    changed = dict(base, stop_loss_pct=8.0)
+    assert strategy_key(base) != strategy_key(changed)
+    # An unstamped trade (opened before stamping existed) collapses to the
+    # single "legacy" bucket rather than looking like its own strategy.
+    assert strategy_key(None) == ""
 
 
 def test_optional_integrations_default_off_without_keys():
