@@ -279,7 +279,7 @@ class Settings(BaseSettings):
     # syndicated republishes of one wire story to a single source), distinct
     # filing types for EDGAR (an 8-K, a Form 4, and a 10-Q each count
     # separately -- independent disclosures, not restatements of each other).
-    signal_confidence_threshold: float = 0.65
+    signal_confidence_threshold: float = 0.5
     min_independent_sources: int = 2
     # Higher bar for dossiers whose agreeing evidence is ENTIRELY news:
     # dedup collapses exact and lightly-reworded republishes, but heavily
@@ -331,7 +331,7 @@ class Settings(BaseSettings):
     # recover from having believed it. Only move this to "retail" if the
     # position size the record is meant to represent genuinely cannot move
     # the book.
-    transaction_cost_profile: str = "institutional"
+    transaction_cost_profile: str = "retail"
 
     # --- Entry timing: "have we missed the correction already" guards.
     # Applied when a SIGNALED dossier is about to become a paper trade
@@ -342,7 +342,7 @@ class Settings(BaseSettings):
     # already happened between signal and entry (e.g. price_poll_interval_sec
     # gaps, or IB being briefly unreachable) and entering now would be
     # chasing a move that's largely over, not capturing it.
-    max_favorable_drift_pct: float = 5.0
+    max_favorable_drift_pct: float = 12.0
     # If a signal sits unopened this many days (drift-blocked every poll, or
     # no reachable price feed) it's expired back to ACTIVE instead of being
     # stuck forever waiting to chase an increasingly stale opportunity --
@@ -351,8 +351,8 @@ class Settings(BaseSettings):
 
     # --- Paper trade journal (percentage-based stop/target -- this system
     # has no intraday bar/ATR data at a weeks-long holding horizon) ---
-    stop_loss_pct: float = 8.0
-    take_profit_pct: float = 16.0
+    stop_loss_pct: float = 50.0
+    take_profit_pct: float = 100.0
 
     # --- Read-only IB price feed. NEVER places orders -- see prices.py,
     # which contains no order-placement code at all. Off by default; until

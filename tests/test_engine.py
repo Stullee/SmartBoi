@@ -71,6 +71,11 @@ def engine(tmp_path, monkeypatch):
         enable_relationship_backfill=False, enable_universe_autoscreen=False,
         enable_dashboard=False, max_propagated_evidence_per_link=1,
         propagated_evidence_cooldown_hours=6,
+        # The drift-guard lifecycle tests run a ~10% pre-entry move expecting
+        # a skip. The shipped default drift bar is now 12% (hold-to-horizon
+        # config), so pin the 5% the scenarios were written against rather
+        # than inherit it.
+        max_favorable_drift_pct=5.0,
     )
     e = Engine(settings)
     e.edgar_client = FakeEdgarClient()
