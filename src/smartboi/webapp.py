@@ -617,11 +617,15 @@ setInterval(refresh, 10000);
 async def _status_payload(engine) -> dict:
     settings = engine.settings
     log_dir = Path(settings.log_dir)
-    paper_stats, closed_trades = gather_paper_trade_stats(log_dir / "paper_trades.jsonl")
+    paper_stats, closed_trades = gather_paper_trade_stats(
+        log_dir / "paper_trades.jsonl",
+        settings.initial_trading_capital, settings.trading_currency,
+    )
     open_trades = []
     for t in engine.journal.open_trades.values():
         row = asdict(t)
         row["unrealized_r"] = t.unrealized_r_multiple()
+        row["unrealized_currency"] = t.unrealized_currency()
         open_trades.append(row)
 
     return {

@@ -38,6 +38,14 @@ class PaperTradeStats:
     # into one headline number would overstate what was actually executable.
     borrow_assumed: int = 0
     avg_r_clean: float = 0.0
+    # Currency P&L overlay (see config's account model). `currency` is the ISO
+    # code, `realized_pnl` sums the closed trades' currency_pnl, and `equity`
+    # is the starting capital plus that realized P&L. Open positions' unrealized
+    # P&L is marked live from the journal, not here, so equity stays "realized".
+    currency: str = ""
+    initial_capital: float = 0.0
+    realized_pnl: float = 0.0
+    equity: float = 0.0
 
 
 def gather_dossiers(store: DossierStore) -> list[dict]:
@@ -175,9 +183,11 @@ def _wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, fl
     return (max(0.0, center - margin), min(1.0, center + margin))
 
 
-def gather_paper_trade_stats(log_path: Path) -> tuple[PaperTradeStats, list[dict]]:
+def gather_paper_trade_stats(
+    log_path: Path, initial_capital: float = 0.0, currency: str = ""
+) -> tuple[PaperTradeStats, list[dict]]:
     rows = _read_jsonl(log_path)
-    stats = PaperTradeStats(closed=len(rows))
+    stats = PaperTradeStats(closed=len(rows), currency=currency, initial_capital=initial_capital)
     if rows:
         stats.wins = sum(1 for r in rows if r.get("status") == "WIN")
         stats.losses = sum(1 for r in rows if r.get("status") == "LOSS")
@@ -194,6 +204,9 @@ def gather_paper_trade_stats(log_path: Path) -> tuple[PaperTradeStats, list[dict
         stats.borrow_assumed = sum(1 for r in rows if r.get("assumes_borrow"))
         clean = [r.get("r_multiple") or 0.0 for r in rows if not r.get("assumes_borrow")]
         stats.avg_r_clean = round(sum(clean) / len(clean), 3) if clean else 0.0
+        pnls = [r.get("currency_pnl") for r in rows if r.get("currency_pnl") is not None]
+        stats.realized_pnl = round(sum(pnls), 2) if pnls else 0.0
+    stats.equity = round(initial_capital + stats.realized_pnl, 2)
     return stats, rows[-20:]
 
 

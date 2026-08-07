@@ -2633,6 +2633,12 @@ class Engine:
             self.settings.transaction_cost_bps_per_side,
             self.settings.transaction_cost_profile,
         )
+        # Equal-weight notional: the account is split into a fixed number of
+        # slots, and each trade takes one slot's worth. This sizes the record
+        # in real currency without capping how many signals are measured (see
+        # config's account-model note).
+        slots = max(1, self.settings.max_concurrent_positions)
+        position_value = self.settings.initial_trading_capital / slots
         trade = self.journal.open(
             symbol, dossier.direction, price,
             self.settings.stop_loss_pct, self.settings.take_profit_pct,
@@ -2640,6 +2646,7 @@ class Engine:
             dossier.independent_source_count, citations,
             cost_bps_round_trip=cost_per_side * 2,
             market_cap_musd=market_cap,
+            position_value=position_value,
         )
         self._record_decision("trade_opened", symbol, dossier.direction, dossier.signaled_at,
                               price=price)

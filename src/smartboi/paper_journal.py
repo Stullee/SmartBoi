@@ -180,6 +180,11 @@ class PaperTrade:
     r_multiple: float | None = None            # NET of transaction costs
     r_multiple_gross: float | None = None      # before costs, for comparison
     last_price: float | None = None
+    # When last_price was last refreshed (UTC ISO). Surfaced so the dashboard
+    # can show how stale an open trade's mark is -- the IB feed can lag or drop
+    # for stretches, and a confident-looking unrealized number sitting on a
+    # price from hours ago should read as exactly that.
+    last_marked_at: str | None = None
     # Round-trip cost charged against this trade, in basis points of notional
     # (both sides combined). Recorded per trade rather than assumed, so a
     # record stays interpretable if the assumption is ever changed.
@@ -193,6 +198,32 @@ class PaperTrade:
     # assumes_borrow(). Kept per trade so win-rate/avg-R statistics can be
     # split into "clean" vs "assumes a borrow existed".
     assumes_borrow: bool = False
+    # Currency notional this trade represents (initial_trading_capital /
+    # max_concurrent_positions at open), and the realised currency P&L
+    # (notional * net-of-cost return) filled in at close. 0.0 / None on a
+    # record written before the account model existed, which the stats treat
+    # as "no currency data" rather than a real zero.
+    position_value: float = 0.0
+    currency_pnl: float | None = None
+
+    def _net_return_fraction(self, exit_price: float) -> float:
+        """Net-of-cost return as a fraction of the entry notional -- the
+        per-currency-unit result, so position_value * this is the currency
+        P&L. Entry price of 0 (never expected) yields 0 rather than raising."""
+        return self._net_pnl(exit_price) / self.entry_price if self.entry_price else 0.0
+
+    def currency_result(self, exit_price: float) -> float:
+        """Currency P&L of this trade at `exit_price`: the notional times the
+        net-of-cost return. 0 when the trade carries no sized notional (a
+        pre-account-model record)."""
+        return self.position_value * self._net_return_fraction(exit_price)
+
+    def unrealized_currency(self) -> float | None:
+        """Marked-to-market currency P&L for an open trade, net of the
+        round-trip cost -- None when unpriced or unsized."""
+        if self.last_price is None or not self.position_value:
+            return None
+        return round(self.currency_result(self.last_price), 2)
 
     def _net_pnl(self, exit_price: float) -> float:
         """P&L per share after the round-trip transaction cost.
@@ -300,6 +331,7 @@ class PaperTradeJournal:
         citations: list[dict],
         cost_bps_round_trip: float = 0.0,
         market_cap_musd: float | None = None,
+        position_value: float = 0.0,
     ) -> PaperTrade:
         if direction == "LONG":
             stop_price = entry_price * (1 - stop_loss_pct / 100)
@@ -322,6 +354,7 @@ class PaperTradeJournal:
             cost_bps_round_trip=cost_bps_round_trip,
             market_cap_musd=market_cap_musd,
             assumes_borrow=assumes_borrow(direction, market_cap_musd),
+            position_value=position_value,
         )
         self.open_trades[symbol] = trade
         self._write_open_state()
@@ -360,6 +393,7 @@ class PaperTradeJournal:
             return
         now = now or datetime.now(timezone.utc)
         trade.last_price = current_price
+        trade.last_marked_at = now.isoformat()
         day_high = high if high is not None else current_price
         day_low = low if low is not None else current_price
 
@@ -464,6 +498,7 @@ class PaperTradeJournal:
         trade.closed_at = now.isoformat()
         trade.r_multiple_gross = round(gross / risk, 3) if risk > 0 else 0.0
         trade.r_multiple = round(trade._net_pnl(exit_price) / risk, 3) if risk > 0 else 0.0
+        trade.currency_pnl = round(trade.currency_result(exit_price), 2) if trade.position_value else None
         log.info(
             "[PAPER] Closed %s %s: %s @ %.2f (R=%.2f net, %.2f gross, %.0fbp round-trip)",
             trade.direction, trade.symbol, status, exit_price,
