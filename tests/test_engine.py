@@ -2016,3 +2016,96 @@ async def test_the_daily_price_marks_pass_runs_on_a_weekday(engine):
 
     assert (Path(engine.settings.log_dir) / "price_marks.jsonl").exists()
     assert not engine._daily_pass_due("price_marks")
+
+
+# --- Graph maintenance: the rolling re-extraction refresh -------------------
+# The graph IS the strategy -- an edge is the only path by which an anchor's
+# news reaches a tradeable -- and the backfill reads each symbol exactly once,
+# ever. These lock in the pass that keeps it from decaying.
+
+def _mark_backfilled(engine, symbol, stamp):
+    engine.backfill_state.set(symbol, {"backfilled_at": stamp, "accession": "x"})
+
+
+def test_graph_refresh_requeues_the_least_recently_extracted_symbols(engine):
+    """Oldest-first: a refresh slot spent on a freshly-read symbol is a slot
+    not spent on one carrying holes from when the universe was smaller."""
+    engine.settings.graph_refresh_symbols_per_day = 2
+    _mark_backfilled(engine, "FORM", "2026-01-01T00:00:00+00:00")   # oldest
+    _mark_backfilled(engine, "UCTT", "2026-06-01T00:00:00+00:00")
+    _mark_backfilled(engine, "INTC", "2026-07-01T00:00:00+00:00")   # newest (an anchor)
+
+    assert engine._run_graph_refresh() == 2
+
+    # The two stalest markers are cleared -- backfill re-reads them next tick.
+    assert engine.backfill_state.get("FORM") is None
+    assert engine.backfill_state.get("UCTT") is None
+    assert engine.backfill_state.get("INTC") is not None
+
+
+def test_graph_refresh_includes_anchors(engine):
+    """The old rebuild button skipped anchors, but an anchor with no edge to a
+    tradeable is inert -- its news resolves to zero targets and is discarded
+    unread -- so it is exactly what most needs re-reading."""
+    engine.settings.graph_refresh_symbols_per_day = 1
+    _mark_backfilled(engine, "INTC", "2020-01-01T00:00:00+00:00")   # anchor, stalest
+    _mark_backfilled(engine, "FORM", "2026-07-01T00:00:00+00:00")
+
+    engine._run_graph_refresh()
+
+    assert engine.backfill_state.get("INTC") is None
+
+
+def test_graph_refresh_skips_symbols_already_pending(engine):
+    """A symbol with no marker is already queued for backfill; spending a
+    refresh slot on it would displace one that has actually gone stale."""
+    engine.settings.graph_refresh_symbols_per_day = 5
+    _mark_backfilled(engine, "FORM", "2026-01-01T00:00:00+00:00")
+    # UCTT and INTC have no marker at all -- already pending.
+
+    assert engine._run_graph_refresh() == 1
+
+
+def test_graph_refresh_is_a_no_op_when_disabled_or_zero(engine):
+    engine.settings.graph_refresh_symbols_per_day = 0
+    _mark_backfilled(engine, "FORM", "2026-01-01T00:00:00+00:00")
+
+    assert engine._run_graph_refresh() == 0
+    assert engine.backfill_state.get("FORM") is not None
+
+
+async def test_graph_refresh_runs_once_a_day_from_the_tick(engine):
+    """Scheduled off the PERSISTED daily marker, like the other daily passes:
+    a process-local timer would re-fire on every restart and burn a fresh
+    batch of extraction calls each time."""
+    engine.settings.enable_graph_refresh = True
+    engine.settings.graph_refresh_symbols_per_day = 1
+    engine.settings.enable_auto_supplier_research = False
+    _mark_backfilled(engine, "FORM", "2026-01-01T00:00:00+00:00")
+    _mark_backfilled(engine, "UCTT", "2026-06-01T00:00:00+00:00")
+
+    await engine._tick()
+    assert engine.backfill_state.get("FORM") is None      # stalest was re-queued
+    assert not engine._daily_pass_due("graph_refresh")
+
+    # A second tick the same day must not queue another batch.
+    await engine._tick()
+    assert engine.backfill_state.get("UCTT") is not None
+
+
+async def test_auto_supplier_research_failure_never_kills_the_tick(engine, monkeypatch):
+    """It is a web-search-backed LLM call -- the flakiest thing in the system.
+    A failure must degrade to 'nothing happened today', not stop ingestion,
+    scoring and signalling, which share this single task."""
+    async def boom(_engine):
+        raise RuntimeError("web search exploded")
+
+    monkeypatch.setattr("smartboi.tools.run_supplier_research", boom)
+    engine.settings.enable_auto_supplier_research = True
+    engine.settings.anthropic_api_key = "test-key"
+
+    await engine._tick()   # must not raise
+
+    # Marked done anyway: retrying an expensive pass every 30s tick until it
+    # succeeds is far worse than waiting a day.
+    assert not engine._daily_pass_due("supplier_research")

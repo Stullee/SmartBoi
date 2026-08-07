@@ -25,6 +25,7 @@ from pathlib import Path
 from aiohttp import web
 
 from smartboi.news import redact_token
+from smartboi.research import researched_anchors
 from smartboi.screen import (
     DEFAULT_MAX_ANALYSTS as SCREEN_MAX_ANALYSTS,
     DEFAULT_MAX_CAP_MUSD as SCREEN_MAX_CAP_MUSD,
@@ -42,6 +43,7 @@ from smartboi.status import (
     gather_coverage,
     gather_dossiers,
     gather_graph_stats,
+    gather_graph_health,
     gather_paper_trade_stats,
     gather_strategy_generations,
     gather_recent_signals,
@@ -382,6 +384,12 @@ _INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
+  <div class="eyebrow">Graph health &amp; maintenance</div>
+  <div class="grid" style="grid-template-columns:1fr 1fr; align-items:start;" id="ghGrid">
+    <div class="panel pad" id="ghStats"></div>
+    <div class="panel pad" id="ghMaint"></div>
+  </div>
+
   <div class="eyebrow">Live now</div>
   <div class="grid work">
     <div class="panel">
@@ -663,6 +671,55 @@ function renderBudget(d){
     '<div class="budget-cats">'+rows+"</div>";
 }
 
+// Graph health: the mechanism the whole strategy runs on. An edge is the only
+// path by which an anchor's news reaches a tradeable, so a missing edge is a
+// trade that never happens -- these are the numbers that say whether the edge
+// map is being kept alive.
+function ratioRow(label, have, total, hint, warnBelow){
+  var pct=total?Math.round(have/total*100):0;
+  var col=(warnBelow!==undefined&&pct<warnBelow)?"var(--warn)":"var(--accent)";
+  return '<div class="stage" style="grid-template-columns:132px 1fr auto"><div class="lab">'+label+
+    (hint?"<small>"+hint+"</small>":"")+'</div><div class="bar"><span style="width:'+pct+"%;background:"+col+'"></span></div>'+
+    '<div class="val mono">'+have+' <small>/'+total+"</small></div></div>";
+}
+function renderGraphHealth(d){
+  var g=d.graph_health; if(!g){ el("ghStats").innerHTML=""; el("ghMaint").innerHTML=""; return; }
+  var types=Object.keys(g.edges_by_type||{}).map(function(k){
+    return '<span class="lc"><span class="lc-dot" style="background:var(--gc-'+
+      ({customer:"cust",supplier:"supp",competitor:"comp",regulator:"reg"}[k]||"eco")+')"></span>'+esc(k)+
+      ' <b class="mono">'+g.edges_by_type[k]+"</b></span>";
+  }).join("");
+  var warn = g.disconnected_with_thesis
+    ? '<div class="regime"><span>&#9873;</span><span><b>'+g.disconnected_with_thesis+
+      '</b> tradeable(s) carry a thesis with <b>no graph edge at all</b> &mdash; their dossier came only from their own filings, so the cross-company mechanism never fired for them. The rolling refresh re-reads filings against the current universe to close exactly these holes.'+
+      (g.disconnected_with_thesis_symbols&&g.disconnected_with_thesis_symbols.length
+        ? '<div class="mono" style="margin-top:5px;opacity:0.85">'+g.disconnected_with_thesis_symbols.join(" ")+"</div>":"")+
+      "</span></div>" : "";
+  el("ghStats").innerHTML='<div class="k">Relationship graph</div>'+
+    '<div class="big mono">'+g.edges+'<span class="u"> edges</span></div>'+
+    '<div class="catleg" style="grid-template-columns:1fr 1fr 1fr">'+types+"</div>"+
+    '<div class="funnel" style="margin-top:12px">'+
+      ratioRow("Tradeables linked","tradeables_connected" in g?g.tradeables_connected:0,g.tradeables,"can receive anchor news",60)+
+      ratioRow("Anchors live",g.anchors_live,g.anchors,"linked to a tradeable",40)+
+    "</div>"+warn;
+
+  var ra=g.last_refresh_days, sa=g.last_research_days;
+  function ago(v){ return v===null||v===undefined?"never":(v<1?"today":v.toFixed(0)+"d ago"); }
+  var rows=[
+    ["Rolling re-extraction", g.refresh_per_day?(g.refresh_per_day+"/day &middot; full pass ~"+Math.round(g.cycle_days)+"d"):"<span class='warn'>disabled</span>", ago(ra)],
+    ["Supplier research", g.researched_anchors+" / "+g.anchors+" anchors done", ago(sa)],
+    ["Extraction age", (g.median_extraction_age_days===null?"&mdash;":"median "+Math.round(g.median_extraction_age_days)+"d")+
+       (g.stalest_days!==null&&g.stalest_days!==undefined?" &middot; stalest "+Math.round(g.stalest_days)+"d":""),
+       g.never_extracted?(g.never_extracted+" never"):"all read"]
+  ].map(function(r){
+    return '<div class="gen"><div class="gen-name"><b>'+r[0]+'</b></div><div class="mono" style="text-align:right;color:var(--muted)">'+r[1]+
+      '</div><div class="mono" style="text-align:right">'+r[2]+"</div></div>";
+  }).join("");
+  el("ghMaint").innerHTML='<div class="k">Maintenance</div>'+
+    '<div class="gens" style="margin-top:6px">'+rows+"</div>"+
+    '<div class="note" style="margin-top:9px">The graph only grows two ways: filings (annual/quarterly) and web research. The rolling pass re-reads the least-recently-extracted names <b>against the current universe</b> &mdash; extraction only writes an edge when the counterparty is already a member, so re-reading is what fills holes left when the universe was smaller.</div>';
+}
+
 function renderLadder(d){
   var ds=(d.dossiers||[]).slice().sort(function(a,b){return (b.confidence*b.magnitude)-(a.confidence*a.magnitude);}).slice(0,14);
   var rows=ds.map(function(x){ var sc=x.confidence*x.magnitude, pct=Math.min(100,sc*100), isS=x.direction==="SHORT";
@@ -861,7 +918,8 @@ function updateWire(d){
 // ===========================================================================
 function renderAll(d){
   renderCaps(d); renderPnl(d); renderWinRate(d); renderExposure(d); renderExpectancy(d);
-  renderGenrec(d); renderFunnel(d); renderBudget(d); renderLadder(d); renderOpen(d); renderSignals(d); renderDetail(d);
+  renderGenrec(d); renderFunnel(d); renderBudget(d); renderGraphHealth(d); renderLadder(d);
+  renderOpen(d); renderSignals(d); renderDetail(d);
   updateWire(d);
 }
 
@@ -919,6 +977,15 @@ async def _status_payload(engine) -> dict:
         "coverage": gather_coverage(engine.universe, engine.graph, engine.dossiers),
         "dossiers": gather_dossiers(engine.dossiers),
         "graph": gather_graph_stats(engine.graph, engine.universe, engine.dossiers),
+        "graph_health": gather_graph_health(
+            engine.graph, engine.universe, engine.dossiers,
+            backfill_state=engine.backfill_state.data,
+            last_refresh=engine.periodic_state.get("graph_refresh", "") or "",
+            last_research=engine.periodic_state.get("supplier_research", "") or "",
+            researched_anchor_count=len(researched_anchors(engine.candidates, engine.research_state)),
+            refresh_per_day=(settings.graph_refresh_symbols_per_day
+                             if settings.enable_graph_refresh else 0),
+        ),
         "open_paper_trades": open_trades,
         "closed_paper_trades": closed_trades,
         "paper_stats": paper_stats.__dict__,

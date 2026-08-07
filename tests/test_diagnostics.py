@@ -212,3 +212,20 @@ def test_an_unconfigured_webhook_does_not_scrub_the_empty_string():
     line = "some ordinary warning line"
     assert redact_url("", line) == line
     assert redact_url("   ", line) == line
+
+
+def test_the_bundle_reports_graph_health_and_maintenance(engine):
+    """The graph IS the strategy -- an edge is the only path by which an
+    anchor's news reaches a tradeable -- so the pasteable bundle has to say
+    whether the edge map is being kept alive, not just what the dossiers say.
+    Also guards the section's own formatting: it is the one block built from
+    live engine state (backfill markers, periodic timestamps) rather than
+    settings, so a shape change here fails loudly instead of at 3am on the
+    operator's dashboard."""
+    report = run_diagnostics(engine)
+
+    assert "--- Graph health" in report
+    assert "tradeables connected:" in report
+    assert "anchors linked to a tradeable:" in report
+    assert "rolling refresh:" in report
+    assert "anchors researched for suppliers:" in report

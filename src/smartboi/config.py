@@ -93,6 +93,56 @@ class Settings(BaseSettings):
     # supplier changes and are run through the same relationship
     # extraction (see engine.py), keeping the graph fresher between annual
     # 10-Ks instead of only updating once a year.
+    # --- Graph maintenance ---------------------------------------------
+    # The relationship graph IS the strategy: an edge is the only path by
+    # which an anchor's news reaches a tradeable, so a missing edge is a
+    # trade that never happens. Two structural problems made the graph decay
+    # rather than improve, both fixed by the passes these settings drive:
+    #
+    # 1. The initial backfill reads each symbol's latest 10-K exactly ONCE,
+    #    ever. Extraction only writes an edge when the counterparty is
+    #    ALREADY in the universe -- otherwise it records a watchlist
+    #    candidate and moves on. So every symbol read while the universe was
+    #    smaller left permanent holes: counterparties accepted later are
+    #    named in a filing that is never re-read. Measured live: tradeables
+    #    carrying a full thesis with no graph edge at all, i.e. names whose
+    #    dossier came entirely from their own filings and which therefore
+    #    never used the cross-company mechanism this system exists for.
+    # 2. Nothing re-read a filing on any schedule. The only refresh was a
+    #    dashboard button a human had to remember to press.
+    #
+    # This re-extracts the N least-recently-extracted symbols per day
+    # (anchors included -- an anchor with no edge to a tradeable is inert,
+    # so it has the most to gain), clearing their backfill marker so the
+    # existing backfill pass picks them up on the next tick. graph.add
+    # dedupes on (from, to, rel_type), so a refresh can only ever ADD an
+    # edge, never remove one -- and the daily LLM budget defers the rest to
+    # tomorrow exactly as it does for the first-run backfill.
+    #
+    # At 10/day a ~300-symbol universe fully re-extracts about monthly,
+    # which is the right order: 10-Ks are annual, so the value of re-reading
+    # is not fresher filing text but a filing re-read against a LARGER
+    # universe. Set to 0 (or disable) to go back to once-ever + the button.
+    enable_graph_refresh: bool = True
+    graph_refresh_symbols_per_day: int = 10
+    # Runs the web-search supplier research automatically, most-inert anchors
+    # first, instead of only when someone presses the dashboard button.
+    #
+    # This is the ONLY mechanism that can find the small-cap suppliers of a
+    # giant: the filing path structurally cannot: a giant's 10-K names its
+    # big CUSTOMERS, not its small suppliers, so an anchor's supplier list is
+    # information SEC filings never contain in the direction this strategy
+    # needs. Left manual, it simply never ran (measured live: $0.00 spent
+    # against a reserved 10-20% research budget share, i.e. an entire class
+    # of edge permanently missing).
+    #
+    # It writes universe CANDIDATES only -- never a relationship edge and
+    # never a trade -- because a web-sourced link is a lead, not a
+    # disclosure; accepting one backfills its own 10-K, which is where a real
+    # edge comes from. That is why this is safe to run unattended.
+    # Already-researched anchors are skipped, so the pass works through the
+    # anchor list and then costs nothing until new anchors are added.
+    enable_auto_supplier_research: bool = True
     # Widened beyond the original 8-K/10-K/10-Q/4. The forms filter is
     # applied CLIENT-SIDE to a submissions payload that is fetched whole
     # regardless, so adding a form type costs zero extra HTTP requests --

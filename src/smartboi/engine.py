@@ -1053,6 +1053,22 @@ class Engine:
             # daily auto-accept budget is spent.
             self._reconcile_accepted_types()
             await self._auto_accept_candidates()
+        # Graph maintenance. Both are marked done unconditionally: they are
+        # daily passes whose failure mode is "nothing happened today", and
+        # retrying an expensive extraction/web-search pass every 30-second
+        # tick until it succeeds is far worse than waiting a day. Neither
+        # loses work -- the refresh's cleared markers stay cleared, and each
+        # researched anchor is marked individually as it completes.
+        if self.settings.enable_graph_refresh and self._daily_pass_due("graph_refresh"):
+            self._mark_daily_pass_done("graph_refresh")
+            self._run_graph_refresh()
+        if (
+            self.settings.enable_auto_supplier_research
+            and self.settings.anthropic_api_key.strip()
+            and self._daily_pass_due("supplier_research")
+        ):
+            self._mark_daily_pass_done("supplier_research")
+            await self._run_auto_supplier_research()
         if self._due(self._last_heartbeat, HEARTBEAT_INTERVAL_SEC, now):
             self._last_heartbeat = now
             self._log_heartbeat()
@@ -1815,6 +1831,93 @@ class Engine:
                 log.exception("%s: relationship backfill failed -- will retry on a later tick.", symbol)
         log.info("Relationship backfill complete: %d/%d symbol(s) processed, graph now has %d edge(s).",
                  done, len(pending), len(self.graph.relationships))
+
+    # --- Graph maintenance (see config's graph-maintenance settings) ---
+
+    def _run_graph_refresh(self) -> int:
+        """Re-queues the N least-recently-extracted symbols for relationship
+        re-extraction, by clearing their once-ever backfill marker so the
+        backfill pass above picks them up on the next tick.
+
+        This exists because the backfill is once-ever and extraction only
+        writes an edge when the counterparty is ALREADY in the universe --
+        otherwise it records a watchlist candidate and moves on. Every symbol
+        read while the universe was smaller therefore left permanent holes,
+        and the only repair was a dashboard button a human had to remember to
+        press. The observable symptom was tradeables carrying a full thesis
+        with NO graph edge at all: names whose dossier came entirely from
+        their own filings, which never used the cross-company mechanism this
+        system exists for.
+
+        Oldest-first, and anchors are included (unlike the rebuild button,
+        which skipped them) -- an anchor with no edge to any tradeable is
+        inert by construction, its news resolving to zero targets and being
+        discarded unread, so it is exactly what most needs re-reading.
+
+        Safe by construction: graph.add dedupes on (from, to, rel_type), so a
+        refresh can only ever ADD an edge, never remove one, and it touches no
+        dossier, trade or log. Cost is bounded to N extraction calls a day,
+        and a spent daily budget defers the rest to tomorrow exactly as it
+        does on first run."""
+        limit = max(0, self.settings.graph_refresh_symbols_per_day)
+        if limit == 0:
+            return 0
+        dated: list[tuple[str, str]] = []
+        for spec in self.universe:
+            if spec.signal_source_only and not self.settings.backfill_anchors:
+                continue
+            marker = self.backfill_state.get(spec.symbol)
+            if not marker:
+                # No marker means it is already pending -- the backfill pass
+                # will read it regardless, so spending a refresh slot on it
+                # would just displace a symbol that has actually gone stale.
+                continue
+            stamp = marker.get("backfilled_at", "") if isinstance(marker, dict) else ""
+            dated.append((stamp, spec.symbol))
+        if not dated:
+            return 0
+        # Plain ISO-8601 string sort: lexicographic order IS chronological for
+        # these stamps, and an unparseable/absent one ("") sorts first, which
+        # is the right priority -- unknown age is the stalest case.
+        dated.sort()
+        selected = [symbol for _, symbol in dated[:limit]]
+        for symbol in selected:
+            self.backfill_state.delete(symbol)
+        # A previous budget-exhausted backfill may have backed off; this is a
+        # fresh day's work, so let the next tick try immediately.
+        self._backfill_retry_after = 0.0
+        log.info("[GRAPH] Refresh: re-queued %d least-recently-extracted symbol(s) for "
+                 "re-extraction against the current %d-symbol universe: %s",
+                 len(selected), len(self.universe), ", ".join(selected))
+        return len(selected)
+
+    async def _run_auto_supplier_research(self) -> None:
+        """Runs the web-search supplier research on a daily cadence instead of
+        only when someone presses the dashboard button.
+
+        This is the only mechanism that can find the small-cap SUPPLIERS of a
+        giant. The filing path structurally cannot: a giant's 10-K names its
+        big customers, not its small suppliers, so the direction this strategy
+        needs is information SEC filings never contain. Left manual it simply
+        never ran -- measured live at $0.00 spent against a reserved research
+        budget share, i.e. an entire class of edge permanently missing.
+
+        Writes universe CANDIDATES only -- never a relationship edge and never
+        a trade -- because a web-sourced link is a lead, not a disclosure.
+        Accepting a candidate backfills its own 10-K, which is where a real
+        edge comes from. That is what makes this safe to run unattended.
+
+        Imported locally: this is the engine's only dependency on tools.py,
+        which is otherwise a leaf module built on top of the engine's state."""
+        from smartboi.tools import run_supplier_research
+
+        try:
+            report = await run_supplier_research(self)
+        except Exception:  # noqa: BLE001 - a research failure must never kill the tick
+            log.exception("[GRAPH] Automatic supplier research failed -- retrying tomorrow.")
+            return
+        headline = next((line for line in (report or "").splitlines() if line.strip()), "(no output)")
+        log.info("[GRAPH] Automatic supplier research: %s", headline)
 
     # --- News ingestion ---
 
