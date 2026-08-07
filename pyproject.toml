@@ -15,7 +15,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.2", "pytest-asyncio>=0.23"]
+# pyyaml is test-only (tests/test_config.py parses the add-on's config.yaml),
+# but it is not optional in practice: without it the six schema-drift guards
+# that keep ha-addons/smartboi/config.yaml in sync with Settings ERROR out
+# instead of running, and CI reports a failure that reads like a broken test
+# rather than a missing dependency. Measured live: every CI run on main
+# failed this way for a full day of merges, so the guard that checks an
+# add-on default still matches its code default was never actually enforcing.
+dev = ["pytest>=8.2", "pytest-asyncio>=0.23", "pyyaml>=6"]
 
 [build-system]
 requires = ["setuptools>=68"]

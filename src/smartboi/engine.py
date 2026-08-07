@@ -2751,6 +2751,22 @@ class Engine:
             market_cap_musd=market_cap,
             position_value=position_value,
             strategy=self.settings.strategy_signature(),
+            # The episode key, the other half of the score, and the synthesis
+            # verdict as it stands right now -- everything needed to ask, after
+            # the fact, WHY this trade was opened. The dossier keeps evolving
+            # after this moment (every merge and every decay pass recomputes
+            # the aggregate, and thesis_summary is regenerated from whichever
+            # three items are newest), so anything not captured here is not
+            # recoverable later by reading the dossier file.
+            episode=dossier.signaled_at,
+            magnitude=dossier.magnitude,
+            synthesis={
+                "synthesis_at": dossier.synthesis_at,
+                "synthesis_confidence": dossier.synthesis_confidence,
+                "synthesis_magnitude": dossier.synthesis_magnitude,
+                "distinct_fact_count": dossier.distinct_fact_count,
+                "already_priced_in": dossier.already_priced_in,
+            },
         )
         self._record_decision("trade_opened", symbol, dossier.direction, dossier.signaled_at,
                               price=price)

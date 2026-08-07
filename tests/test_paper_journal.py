@@ -649,3 +649,81 @@ def test_a_pre_stamp_trade_loads_with_no_strategy(tmp_path):
                        target_price=116.0, opened_at="2026-01-01T00:00:00+00:00", horizon_days=21,
                        thesis_summary="t", confidence=0.7, independent_source_count=2)
     assert trade.strategy is None
+
+
+# --- Post-mortem traceability: a closed trade has to be joinable back to the
+# signal episode, the score, and the synthesis verdict that produced it. The
+# dossier itself cannot answer any of that after the fact -- it is live, and
+# its aggregate is recomputed on every merge and every decay pass. ---
+
+def test_closed_trade_carries_the_episode_key_through_to_the_log(tmp_path):
+    """The join key to signals.jsonl / decisions.jsonl, which key their rows
+    on the dossier's signaled_at. Without it the only link from a closed
+    trade back to its signal is "same symbol, opened at about the same
+    time", which is ambiguous exactly when a symbol signals repeatedly."""
+    journal = _journal(tmp_path)
+    journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.7, 3, [],
+                 episode="2026-08-07T00:21:00+00:00", magnitude=0.62)
+    journal.update("UCTT", 116.0, now=_next_session())  # target -> WIN
+
+    row = json.loads((tmp_path / "logs" / "paper_trades.jsonl").read_text().splitlines()[-1])
+    assert row["status"] == "WIN"
+    assert row["episode"] == "2026-08-07T00:21:00+00:00"
+    # Both halves of the score, so the bar it cleared is recoverable from the
+    # row alone rather than only from signals.jsonl.
+    assert row["confidence"] == pytest.approx(0.7)
+    assert row["magnitude"] == pytest.approx(0.62)
+
+
+def test_the_synthesis_verdict_at_open_is_recorded_on_the_trade(tmp_path):
+    """A trade that opened while synthesis said already_priced_in is the
+    documented synthesis-bypass (AUDIT-2026-08 2.1/A1) captured as a fact on
+    the row, rather than something to be inferred from log timestamps."""
+    journal = _journal(tmp_path)
+    journal.open("DCO", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.9, 5, [],
+                 episode="e1", magnitude=0.95,
+                 synthesis={
+                     "synthesis_at": "2026-08-07T00:21:00+00:00",
+                     "synthesis_confidence": 0.0,
+                     "synthesis_magnitude": 0.0,
+                     "distinct_fact_count": 1,
+                     "already_priced_in": True,
+                 })
+    trade = journal.open_trades["DCO"]
+    assert trade.already_priced_in is True
+    assert trade.synthesis_at == "2026-08-07T00:21:00+00:00"
+    assert trade.distinct_fact_count == 1
+
+
+def test_a_never_synthesized_dossier_records_as_no_synthesis(tmp_path):
+    """Synthesis is skipped below a score floor, so plenty of trades open
+    with no verdict at all. That must record as absent, not raise."""
+    journal = _journal(tmp_path)
+    trade = journal.open("AAA", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.7, 2, [],
+                         episode="e1", synthesis=None)
+    assert trade.synthesis_at == ""
+    assert trade.already_priced_in is False
+    assert trade.distinct_fact_count == 0
+
+
+def test_open_state_written_before_episode_stamping_still_loads(tmp_path):
+    """The live deployment has open trades on disk that predate these
+    fields. They must load on defaults -- an unreadable open-state file is
+    treated as "no open trades", which would silently abandon real
+    positions."""
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "open_paper_trades.json").write_text(json.dumps({
+        "UCTT": {
+            "symbol": "UCTT", "direction": "LONG", "entry_price": 100.0,
+            "stop_price": 92.0, "target_price": 116.0,
+            "opened_at": "2026-08-01T12:00:00+00:00", "horizon_days": 21,
+            "thesis_summary": "legacy", "confidence": 0.7,
+            "independent_source_count": 2,
+        }
+    }))
+    journal = _journal(tmp_path)
+    assert journal.has_open("UCTT")
+    trade = journal.open_trades["UCTT"]
+    assert trade.episode == ""          # unbackfillable: nothing remembers it
+    assert trade.magnitude == 0.0
+    assert trade.synthesis_at == ""
