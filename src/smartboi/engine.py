@@ -1008,6 +1008,24 @@ class Engine:
             # Leave the poll pending but back off the connection attempt.
             self._last_price_poll = now - price_interval + IB_RETRY_GAP_SEC
 
+    @staticmethod
+    def _closed_trade_alert_body(trade, suffix: str = "") -> str:
+        """Alert text for a closed paper trade.
+
+        VOID trades carry no exit price and no R multiple -- deliberately,
+        because both would be numbers computed across a break in the price
+        series (see corporate_actions). Formatting them with ":.2f" would
+        raise TypeError on None inside the marking loop, so the void case
+        gets its own sentence rather than a hole in the usual one."""
+        if trade.status == "VOID":
+            return (f"{trade.direction} entry={trade.entry_price:.2f}. VOIDED, not scored: "
+                    f"{trade.price_discontinuity_note or 'price series discontinuity'}. "
+                    "Nothing here adjusts for corporate actions, so the alternative was a "
+                    "fabricated exit. Excluded from every performance statistic.")
+        exit_price = f"{trade.exit_price:.2f}" if trade.exit_price is not None else "n/a"
+        r_multiple = f"{trade.r_multiple:.2f}" if trade.r_multiple is not None else "n/a"
+        return f"{trade.direction} entry={trade.entry_price:.2f} exit={exit_price} R={r_multiple}{suffix}"
+
     def _log_heartbeat(self) -> None:
         signaled = sum(1 for s in self.dossiers.all_symbols() if self.dossiers.load(s).status == "SIGNALED")
         log.info(
@@ -3094,9 +3112,9 @@ class Engine:
             await self.alerts.send(
                 "paper_trade_closed",
                 f"Paper trade closed: {trade.symbol} {trade.status} (stale mark)",
-                f"{trade.direction} entry={trade.entry_price:.2f} exit={trade.exit_price:.2f} "
-                f"R={trade.r_multiple:.2f}. Closed at its horizon without a fresh price -- no "
-                "source could mark it.",
+                self._closed_trade_alert_body(
+                    trade, ". Closed at its horizon without a fresh price -- no source could mark it.",
+                ),
                 asdict(trade),
             )
             dossier = self.dossiers.load(trade.symbol)
@@ -3123,8 +3141,7 @@ class Engine:
                 await self.alerts.send(
                     "paper_trade_closed",
                     f"Paper trade closed: {trade.symbol} {trade.status}",
-                    f"{trade.direction} entry={trade.entry_price:.2f} exit={trade.exit_price:.2f} "
-                    f"R={trade.r_multiple:.2f}",
+                    self._closed_trade_alert_body(trade),
                     asdict(trade),
                 )
                 dossier = self.dossiers.load(symbol)

@@ -19,6 +19,14 @@ from smartboi.graph import RelationshipGraph
 class PaperTradeStats:
     closed: int = 0
     wins: int = 0
+    # Trades closed VOID because the price series broke under them -- a
+    # corporate action, almost always a split (see corporate_actions.py).
+    # Counted and shown, never scored: they are excluded from `closed` and
+    # therefore from win_rate, avg_r and the Wilson interval, because a
+    # voided trade is not a loss and not a win. Surfaced because a rising
+    # count is itself information -- either the universe is full of
+    # compliance reverse splits, or the detector is too eager.
+    voided: int = 0
     losses: int = 0
     timeouts: int = 0
     win_rate: float = 0.0
@@ -372,8 +380,16 @@ def _wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, fl
 def gather_paper_trade_stats(
     log_path: Path, initial_capital: float = 0.0, currency: str = ""
 ) -> tuple[PaperTradeStats, list[dict]]:
-    rows = _read_jsonl(log_path)
-    stats = PaperTradeStats(closed=len(rows), currency=currency, initial_capital=initial_capital)
+    all_rows = _read_jsonl(log_path)
+    # VOID rows are dropped from every statistic below, not merely from the
+    # numerators. Leaving them in `closed` would silently count each one as
+    # a non-win in the win-rate denominator, which is exactly the kind of
+    # quiet bias this whole exercise exists to remove.
+    rows = [r for r in all_rows if r.get("status") != "VOID"]
+    stats = PaperTradeStats(
+        closed=len(rows), currency=currency, initial_capital=initial_capital,
+        voided=len(all_rows) - len(rows),
+    )
     if rows:
         stats.wins = sum(1 for r in rows if r.get("status") == "WIN")
         stats.losses = sum(1 for r in rows if r.get("status") == "LOSS")
@@ -393,7 +409,9 @@ def gather_paper_trade_stats(
         pnls = [r.get("currency_pnl") for r in rows if r.get("currency_pnl") is not None]
         stats.realized_pnl = round(sum(pnls), 2) if pnls else 0.0
     stats.equity = round(initial_capital + stats.realized_pnl, 2)
-    return stats, rows[-20:]
+    # The tail shown on the dashboard keeps VOID rows: the operator should
+    # see that a trade was voided, even though nothing scores it.
+    return stats, all_rows[-20:]
 
 
 def _generation_stats(
@@ -401,6 +419,7 @@ def _generation_stats(
 ) -> StrategyGeneration:
     legacy = key == ""
     is_current = bool(current_key) and key == current_key and not legacy
+    rows = [r for r in rows if r.get("status") != "VOID"]  # see gather_paper_trade_stats
     closed = len(rows)
     wins = sum(1 for r in rows if r.get("status") == "WIN")
     losses = sum(1 for r in rows if r.get("status") == "LOSS")

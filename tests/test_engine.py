@@ -528,14 +528,18 @@ async def test_full_lifecycle_signal_open_close_reset(engine):
     trade = engine.journal.open_trades["FORM"]
     assert trade.entry_price == 10.0
 
-    # Close: move price to the take-profit target and mark again.
-    engine.price_feed.prices["FORM"] = trade.target_price + 0.01
+    # Close: move price to the take-profit target and mark again. In two
+    # steps -- a single mark that doubles the price looks exactly like a
+    # 1-for-2 reverse split and is voided rather than banked.
+    engine.price_feed.prices["FORM"] = 15.0
     # Backdated one day: the journal deliberately refuses to resolve a
     # stop or target on the ENTRY session, because the bar's high/low is the
     # whole session's range and on the entry day it includes prints from
     # before the position existed. A close therefore always happens on a
     # later session, and this is what that looks like.
     _backdate_entry(engine, "FORM")
+    await engine._mark_and_execute()
+    engine.price_feed.prices["FORM"] = trade.target_price + 0.01
     await engine._mark_and_execute()
     assert not engine.journal.has_open("FORM")
 
@@ -1831,8 +1835,14 @@ async def test_the_same_cold_start_closes_the_trade_when_the_target_trades(engin
     await engine._mark_and_execute()
     trade = engine.journal.open_trades["FORM"]
 
-    engine.finnhub.quotes_by_symbol["FORM"] = trade.target_price + 0.05
     _backdate_entry(engine, "FORM")  # a stop/target never resolves on the entry session
+    # Marked up in two steps rather than doubling in one. A single mark that
+    # doubles the price is indistinguishable from a 1-for-2 reverse split and
+    # is now (correctly) voided -- see the corporate-action tests below. Real
+    # positions are marked daily, so a target is reached across several marks.
+    engine.finnhub.quotes_by_symbol["FORM"] = 15.0
+    await engine._mark_and_execute()
+    engine.finnhub.quotes_by_symbol["FORM"] = trade.target_price + 0.05
     await engine._mark_and_execute()
 
     assert not engine.journal.has_open("FORM")

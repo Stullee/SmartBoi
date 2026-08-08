@@ -10,6 +10,8 @@ from __future__ import annotations
 import random
 from datetime import date, timedelta
 
+from smartboi.corporate_actions import classify_price_jump
+
 # Score buckets: is the forward-return relationship monotonic across them?
 # A real edge should show higher buckets outperforming lower ones; if it
 # doesn't, raising the signal threshold is not obviously the fix either.
@@ -86,6 +88,25 @@ def price_marks_by_symbol(rows: list[dict]) -> dict[str, dict[str, float]]:
     return out
 
 
+def window_has_corporate_action(marks: dict[str, float], start_date: str, end_date: str) -> bool:
+    """Whether this symbol's mark series jumps like a split anywhere inside
+    [start_date, end_date].
+
+    Consecutive marks only -- a gap in the series (a day the price sources
+    were all down) legitimately spans more than one session and a bigger
+    move across it is not evidence of anything. The comparison is therefore
+    deliberately conservative about what it calls an action, in the same
+    direction as everything else here: it is better to keep a real outlier
+    than to invent a filter that quietly removes genuine extremes, which are
+    disproportionately where a small-cap strategy's returns live."""
+    dates = sorted(d for d in marks if start_date <= d <= end_date)
+    for previous, current in zip(dates, dates[1:]):
+        jump = classify_price_jump(marks[previous], marks[current])
+        if jump is not None and jump.is_split_like:
+            return True
+    return False
+
+
 def snapshot_session(snapshot: dict) -> str:
     """The session a dossier snapshot describes, falling back to its write
     timestamp for rows predating the session anchor."""
@@ -141,6 +162,17 @@ def compute_forward_return(
     if exit_ is None:
         return None
     exit_date, exit_price = exit_
+    # A corporate action inside the window is not a return. Dividing two raw
+    # marks across a 1-for-10 reverse split yields +900%, and one such row
+    # swamps the mean and the bootstrap CI of every bucket it lands in --
+    # this panel is the dataset that reaches significance first, so a single
+    # unfiltered split can decide the answer on its own.
+    #
+    # Checked across the WHOLE window, not just the endpoints: a split that
+    # happens mid-window and is partly retraced could otherwise slip through
+    # an endpoint-only ratio test.
+    if window_has_corporate_action(marks, entry_date, exit_date):
+        return None
     raw_pct = (exit_price - entry_price) / entry_price * 100.0
     signed_pct = raw_pct if direction == "LONG" else -raw_pct
     return {

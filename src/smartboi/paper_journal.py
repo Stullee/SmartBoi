@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from smartboi.corporate_actions import classify_price_jump
 from smartboi.market_hours import is_regular_trading_hours
 from smartboi.persist import atomic_write_json, quarantine, read_json
 
@@ -198,7 +199,15 @@ class PaperTrade:
     # recoverable from the trade record -- only from signals.jsonl, which
     # needed the join key above to reach.
     magnitude: float = 0.0
-    status: str = "OPEN"  # OPEN | WIN | LOSS | TIMEOUT
+    # OPEN | WIN | LOSS | TIMEOUT | VOID.
+    #
+    # VOID means the price series broke under the position -- a corporate
+    # action, almost always a split -- so this trade has no honest P&L and
+    # is excluded from every performance statistic. It is recorded rather
+    # than deleted: "we took this trade and cannot score it" is a fact about
+    # the record, and dropping the row would quietly bias the sample toward
+    # names that never split.
+    status: str = "OPEN"
     closed_at: str | None = None
     exit_price: float | None = None
     r_multiple: float | None = None            # NET of transaction costs
@@ -213,6 +222,13 @@ class PaperTrade:
     # (both sides combined). Recorded per trade rather than assumed, so a
     # record stays interpretable if the assumption is ever changed.
     cost_bps_round_trip: float = 0.0
+    # Set when a price discontinuity is detected under an open position (see
+    # corporate_actions). Once set, stops and targets are never resolved
+    # again for this trade -- the frozen dollar levels no longer refer to
+    # the same share -- and the trade closes VOID.
+    price_discontinuity_ratio: float | None = None
+    price_discontinuity_at: str = ""
+    price_discontinuity_note: str = ""
     # Market cap ($M) at open, when a lookup source was available -- what
     # the cost bucket above was derived from, recorded so the derivation
     # stays auditable per trade. None when no source could price it.
@@ -461,8 +477,43 @@ class PaperTradeJournal:
         if trade is None:
             return
         now = now or datetime.now(timezone.utc)
+
+        # Corporate-action guard, BEFORE the mark overwrites the reference.
+        #
+        # entry/stop/target are frozen dollar levels. A split changes what
+        # one share is without changing what the position is worth, so after
+        # the ex-date those levels refer to a different instrument and every
+        # comparison against them is meaningless. With -50%/+100% bands any
+        # split of 2:1 or more lands outside the band immediately, so the
+        # very first post-split mark books a maximal WIN or a stop-out on a
+        # position that did not move. Sub-$1 compliance reverse splits are
+        # routine in this universe.
+        #
+        # Compared against the previous MARK rather than the entry price, so
+        # the reference is one session old and the ratio is the jump itself
+        # rather than the trade's cumulative move -- a position genuinely up
+        # 120% over three weeks must not be mistaken for a 1-for-2 reverse.
+        reference = trade.last_price if trade.last_price is not None else trade.entry_price
+        if trade.price_discontinuity_ratio is None:
+            jump = classify_price_jump(reference, current_price)
+            if jump is not None and jump.is_split_like:
+                trade.price_discontinuity_ratio = round(jump.ratio, 6)
+                trade.price_discontinuity_at = now.isoformat()
+                trade.price_discontinuity_note = jump.describe()
+                log.error(
+                    "[PAPER] %s: price discontinuity under an OPEN position -- %s. Stops and "
+                    "targets will NOT be resolved for this trade again and it will close VOID: "
+                    "its frozen levels no longer refer to the same share. Nothing here adjusts "
+                    "for splits, so the alternative was a fabricated exit.",
+                    symbol, jump.describe(),
+                )
+
         trade.last_price = current_price
         trade.last_marked_at = now.isoformat()
+        if trade.price_discontinuity_ratio is not None:
+            # Marked (so staleness stays visible) but never resolved.
+            self._write_open_state()
+            return
         day_high = high if high is not None else current_price
         day_low = low if low is not None else current_price
 
@@ -556,6 +607,24 @@ class PaperTradeJournal:
         return expired
 
     def _close(self, trade: PaperTrade, status: str, exit_price: float, now: datetime) -> None:
+        if trade.price_discontinuity_ratio is not None:
+            # No R multiple, no currency P&L, no exit price: every one of
+            # them would be a number computed across a break in the series.
+            # The row is still written -- see PaperTrade.status.
+            trade.status = "VOID"
+            trade.closed_at = now.isoformat()
+            trade.exit_price = None
+            trade.r_multiple = None
+            trade.r_multiple_gross = None
+            trade.currency_pnl = None
+            log.warning(
+                "[PAPER] Closed %s %s: VOID (%s). Excluded from every performance statistic.",
+                trade.direction, trade.symbol, trade.price_discontinuity_note,
+            )
+            self._append_to_log(trade)
+            del self.open_trades[trade.symbol]
+            self._write_open_state()
+            return
         risk = abs(trade.entry_price - trade.stop_price)
         gross = (
             exit_price - trade.entry_price
