@@ -253,12 +253,22 @@ async def test_second_discovery_with_a_resolved_ticker_merges_the_orphan(engine)
 
     # Second mention (a different filing/symbol): this time a ticker
     # resolves -- must merge into the ticker key, not orphan the first.
+    #
+    # A genuinely distinct filing, not the same FilingEvent re-passed: an
+    # accession number belongs to exactly one filer, so reusing it for a
+    # second symbol is a state that cannot occur live -- and seen_count is
+    # now counted per filing, so it would (correctly) refuse to count the
+    # same document twice.
+    other_filing = FilingEvent(
+        symbol="UCTT", cik10="0000000002", form="10-K", filing_date="2026-07-02",
+        accession_number="0001234567-26-000002", primary_document="uctt.htm",
+    )
     engine.extractor.default = [{
         "counterparty_name": "Some Uncommon Co", "counterparty_ticker": "ZZZZ",
         "rel_type": "supplier", "description": "our supplier, Some Uncommon Co",
         "confidence": 0.8, "quote": "our supplier, Some Uncommon Co",
     }]
-    await engine._extract_relationships("UCTT", filing, "filing text")
+    await engine._extract_relationships("UCTT", other_filing, "filing text")
 
     assert "SOME UNCOMMON CO" not in engine.candidates.data
     merged = engine.candidates.get("ZZZZ")
@@ -2109,3 +2119,55 @@ async def test_auto_supplier_research_failure_never_kills_the_tick(engine, monke
     # Marked done anyway: retrying an expensive pass every 30s tick until it
     # succeeds is far worse than waiting a day.
     assert not engine._daily_pass_due("supplier_research")
+
+
+# --- Invariant: seen_count counts FILINGS, not extraction passes. It gates
+# tradeable auto-accept and means "disclosed across filings", so re-reading
+# one filing must never manufacture repeat disclosure. 0.47.0's rolling
+# monthly re-extraction made this reachable on a schedule. ---
+
+async def test_re_extracting_the_same_filing_does_not_inflate_seen_count(engine):
+    """The regression the graph refresh introduced: the refresh clears a
+    symbol's backfill marker so its latest 10-K is read again, and an
+    unconditional increment turned one disclosure into two -- crossing
+    auto_accept_min_seen_count (default 2) with no new filing in
+    existence."""
+    filing = FilingEvent(
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000001", primary_document="form.htm",
+    )
+    engine.extractor.default = [{
+        "counterparty_name": "Some Uncommon Co", "counterparty_ticker": "ZZZZ",
+        "rel_type": "customer", "description": "our largest customer",
+        "confidence": 0.9, "quote": "our largest customer, Some Uncommon Co",
+    }]
+    await engine._extract_relationships("FORM", filing, "filing text")
+    assert engine.candidates.get("ZZZZ")["seen_count"] == 1
+
+    # The monthly refresh re-reads the very same document, twice over.
+    await engine._extract_relationships("FORM", filing, "filing text")
+    await engine._extract_relationships("FORM", filing, "filing text")
+    entry = engine.candidates.get("ZZZZ")
+    assert entry["seen_count"] == 1, "re-reading one filing is not repeat disclosure"
+    assert entry["sources"] == [filing.document_url]
+
+
+async def test_a_second_real_filing_does_increment_seen_count(engine):
+    """The other half: the guard must still let genuine repeat disclosure
+    through, or the rolling refresh would freeze every candidate at 1 and no
+    tradeable could ever auto-accept again."""
+    engine.extractor.default = [{
+        "counterparty_name": "Some Uncommon Co", "counterparty_ticker": "ZZZZ",
+        "rel_type": "customer", "description": "our largest customer",
+        "confidence": 0.9, "quote": "our largest customer, Some Uncommon Co",
+    }]
+    for n, symbol in ((1, "FORM"), (2, "UCTT")):
+        await engine._extract_relationships(symbol, FilingEvent(
+            symbol=symbol, cik10=f"000000000{n}", form="10-K",
+            filing_date=f"2026-07-0{n}", accession_number=f"0001234567-26-00000{n}",
+            primary_document=f"{symbol.lower()}.htm",
+        ), "filing text")
+
+    entry = engine.candidates.get("ZZZZ")
+    assert entry["seen_count"] == 2  # two filers, two filings -> real corroboration
+    assert len(entry["sources"]) == 2

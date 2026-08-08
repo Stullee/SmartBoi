@@ -1441,7 +1441,27 @@ class Engine:
             }
         elif ticker and not entry.get("ticker"):
             entry["ticker"] = ticker  # a later pass resolved a ticker this one didn't have yet
-        entry["seen_count"] += 1
+        # Counted once per FILING, not once per extraction pass.
+        #
+        # seen_count gates tradeable auto-accept, and it means "disclosed
+        # across filings" (see config.auto_accept_min_seen_count): one
+        # throwaway mention in a single filing must not be enough to start
+        # taking positions on a name. The increment was unconditional, which
+        # was harmless only while a filing was read exactly once -- the
+        # backfill was once-ever. 0.47.0 turned that into a rolling monthly
+        # re-extraction, so re-reading the SAME 10-K bumped the counter
+        # again, and a counterparty named in exactly one filing crossed the
+        # repeat-disclosure bar on the next refresh cycle without any new
+        # disclosure existing anywhere. The guard defeated itself on a
+        # schedule.
+        #
+        # Keyed on document_url because that is what `sources` already
+        # dedupes on immediately below -- the data needed to count this
+        # correctly was being maintained one line away. Existing entries
+        # therefore need no migration: a candidate whose sources already
+        # carry the URL simply stops re-counting it.
+        if filing.document_url not in entry["sources"]:
+            entry["seen_count"] += 1
         entry["last_seen_at"] = now
         entry["description"] = rel.get("description") or entry["description"]
         if symbol not in entry["related_to"]:
