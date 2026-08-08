@@ -2721,3 +2721,55 @@ async def test_the_capture_runs_once_the_market_shuts(engine, monkeypatch):
     assert (Path(engine.settings.log_dir) / "price_marks.jsonl").exists()
     assert (Path(engine.settings.log_dir) / "dossier_snapshots.jsonl").exists()
     assert not engine._session_pass_due("price_marks", SESSION)
+
+
+async def test_a_split_between_signal_and_entry_does_not_skip_the_trade(engine, caplog):
+    """signaled_price is frozen at signal time. A 1-for-10 reverse split
+    prints ten times that, and favorable_drift_pct reads it as '+900%
+    already moved in your favour' -- so a perfectly good entry is skipped as
+    'already priced in' on a move that never happened.
+
+    The censoring is not random with respect to outcome either: the names
+    that reverse-split are distressed sub-$1 small caps, so this quietly
+    removes a whole class of symbol from the record."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 20.0})  # post 1-for-10
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}",
+            published_at="2026-07-29T12:00:00+00:00",
+        )
+    dossier = engine.dossiers.load("FORM")
+    assert dossier.status == "SIGNALED"
+    dossier.signaled_price = 2.0  # the pre-split baseline
+    engine.dossiers.save(dossier)
+
+    with caplog.at_level("WARNING"):
+        await engine._mark_and_execute()
+
+    assert engine.journal.has_open("FORM"), "a split must not read as favorable drift"
+    assert "Re-baselining" in caplog.text
+    assert engine.dossiers.load("FORM").signaled_price == 20.0
+
+
+async def test_a_genuine_favorable_drift_still_skips_the_entry(engine):
+    """The guard must keep working: a real move past the bar is still a
+    skip, and re-baselining must not swallow it."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 11.0})  # +10% vs a 5% bar
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://y/{i}", headline=f"h{i}",
+            published_at="2026-07-29T12:00:00+00:00",
+        )
+    dossier = engine.dossiers.load("FORM")
+    dossier.signaled_price = 10.0
+    engine.dossiers.save(dossier)
+
+    await engine._mark_and_execute()
+
+    assert not engine.journal.has_open("FORM")

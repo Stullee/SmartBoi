@@ -39,6 +39,7 @@ from pathlib import Path
 from smartboi.alerts import AlertSender
 from smartboi import persist
 from smartboi.backup import run_backup
+from smartboi.corporate_actions import classify_price_jump
 from smartboi.config import Settings
 from smartboi.dedup import DedupIndex, fingerprint, source_domain
 from smartboi.edgar import _truncate_head_tail, describe_8k_items
@@ -2934,6 +2935,35 @@ class Engine:
             return
 
         if dossier.signaled_price is not None:
+            # A corporate action between signal and entry makes the baseline
+            # incomparable, and the failure is one-directional and silent.
+            # signaled_price is frozen at signal time; a 1-for-10 reverse
+            # split prints ten times that, and favorable_drift_pct reads it
+            # as "+900% already moved in your favour" and skips the entry as
+            # too late. The thesis is untouched -- a split changes what one
+            # share is, not what the company is worth -- so the signal would
+            # be discarded for nothing.
+            #
+            # Worse than losing one trade: the names that reverse-split are
+            # distressed sub-$1 small caps, so the censoring is not random
+            # with respect to outcome. It quietly removes a whole class of
+            # symbol from the record, which is the same defect as the
+            # ingestion-order bias, arriving by a different route.
+            #
+            # Re-baselined rather than skipped: the entry is still evaluated,
+            # just against a baseline that refers to the same share as the
+            # price it is compared with.
+            split = classify_price_jump(dossier.signaled_price, price)
+            if split is not None and split.is_split_like:
+                log.warning(
+                    "[SIGNAL] %s: %s between the signal and the entry gate. Re-baselining the "
+                    "drift check to $%.4g -- the old baseline refers to a different share, and "
+                    "reading the ratio as drift would have skipped this entry as 'already priced "
+                    "in' on a move that never happened.",
+                    symbol, split.describe(), price,
+                )
+                dossier.signaled_price = price
+                self.dossiers.save(dossier)
             drift = favorable_drift_pct(dossier.direction, dossier.signaled_price, price)
             if drift >= self.settings.max_favorable_drift_pct:
                 if not dossier.drift_alert_sent:

@@ -83,6 +83,55 @@ fixes.**
 
 ---
 
+## 0b. Remediation status (updated 2026-08-08, 0.52.0)
+
+Phases 0 and 1 have shipped. This section is the honest ledger; the rest of
+the document is left as written at audit time so the two can be compared.
+Everything below is Lane A — `SCORING_VERSION`, `_STRATEGY_PARAM_KEYS` and
+every threshold are untouched, so the forward record has not forked.
+
+| Finding | Status |
+|---|---|
+| C1 universe wipe on a Finnhub outage | **Fixed** — `lookup_failed` sentinel + a 10% blast-radius refusal |
+| C2 corporate actions fabricate P&L | **Fixed (detection, not adjustment)** — split-vs-real-move classifier; VOID on the trade path, unjoinable on the panel, re-baselined on the drift guard |
+| C3 forward-return lookahead | **Fixed** — both capture passes keyed on the last completed session *and* gated on the market being shut |
+| C4 `SCORING_VERSION` filtered nowhere | **Fixed** — reader-side filter, default = version in force, plus a pre-registered decision gate |
+| N1 rationing lottery | **Fixed** — persisted rotating ingestion cursor |
+| N2 auto-accept demand pump | **Partial** — rotation means accepted symbols are now reachable; they still double LLM demand and cost idle HTTP polls |
+| N3 score saturates at two items | **Open — Lane B**, belongs in Fork 2 |
+| N4 corrupt state hard-crashes | **Fixed** — `persist.py` across all five stores, plus the add-on entrypoint |
+| N5 EUR account, USD prices | **Warned, not fixed** — no FX exists; startup warning states the label is cosmetic |
+| N6 citations misattribute propagated evidence | **Fixed** — full provenance incl. `origin_symbol`, `is_propagated`, `rel_type` |
+| Unauthenticated dashboard on the LAN | **Mitigated** — configurable bind host + startup warning; the real fix is auth |
+| No backup | **Fixed** — nightly tarball, 14 daily + 8 weekly, age-based retention |
+| Silence indistinguishable from death | **Partial** — `boot: auto`, a cheap `/api/health` watchdog, quarantine events repeated on every heartbeat; no ingestion-staleness alarm yet |
+
+**Three defects were found in the fixes themselves**, by re-checking each
+against the finding it claimed to close rather than trusting the commit
+message. All three are corrected:
+
+- the session anchor initially filed a **mid-session price as a session
+  close** (`last_completed_session` answers "which session closed"; the
+  price sources answer "what is the last print" — they agree only when the
+  market is shut);
+- `dominant_rel_type` was inferred by keyword-matching the relationship
+  note, and the ecosystem-fallback note's own disclaimer contains
+  "customer, supplier or competitor", so the weakest evidence in the system
+  was labelled `mixed`;
+- the watchdog pointed at `/api/status`, which builds the whole dashboard
+  payload on the engine's event loop behind an 8s timeout — a busy tick
+  would have answered 504 and had the add-on **restarted**, and restarts
+  are precisely what corrupts this record.
+
+Two more surfaced while wiring C2: VOID rows sat in the win-rate
+**denominator**, and both close-alert paths formatted `exit_price`/
+`r_multiple` with `:.2f`, which raises on the `None` a VOID carries —
+inside the loop that closes every other trade.
+
+Test count over the four commits: 591 → 694.
+
+---
+
 ## 1. Grades
 
 Graded against what a serious version of *this system* would look like,

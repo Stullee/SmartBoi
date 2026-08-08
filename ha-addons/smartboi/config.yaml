@@ -1,6 +1,6 @@
 ---
 name: SmartBoi (Evidence Synthesis, Paper-Only)
-version: "0.52.0"
+version: "0.52.1"
 slug: smartboi
 description: >-
   LLM-driven cross-company evidence synthesis for equity research: ingests
@@ -18,7 +18,7 @@ boot: auto
 host_network: true
 ingress: true
 ingress_port: 8100
-watchdog: http://[HOST]:[PORT:8100]/api/status
+watchdog: http://[HOST]:[PORT:8100]/api/health
 map:
   - config:rw
 panel_icon: mdi:graph-outline

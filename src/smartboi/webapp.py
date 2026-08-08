@@ -1015,6 +1015,31 @@ def create_app(engine) -> web.Application:
         log.debug("Dashboard: /api/status responded in %.2fs", time.monotonic() - start)
         return web.json_response(data)
 
+    async def handle_health(request: web.Request) -> web.Response:
+        """Liveness for the add-on watchdog. Deliberately trivial.
+
+        The watchdog must NOT point at /api/status. That handler builds the
+        whole dashboard payload -- it deserializes every dossier several
+        times -- on the engine's own event loop, behind an 8-second timeout,
+        and returns 504 when it exceeds it. Pointing a supervisor watchdog
+        at it means a busy-but-healthy tick answers non-2xx and the add-on
+        gets RESTARTED. Restarts are the specific thing this system cannot
+        afford: they clear the in-memory propagation limiters and, before
+        the session anchor, wrote duplicate snapshot batches into the record.
+        A watchdog that restarts a healthy container under load is worse
+        than no watchdog.
+
+        Answering at all is the signal worth having. This handler touches no
+        files and no engine state, so a response proves the event loop is
+        still turning -- which is exactly the failure the watchdog exists to
+        catch, because a hung tick blocks aiohttp too. A slow tick that is
+        still yielding answers fine and is left alone."""
+        return web.json_response({
+            "status": "ok",
+            "universe": len(engine.symbol_list),
+            "open_trades": len(engine.journal.open_trades),
+        })
+
     async def handle_accept_candidate(request: web.Request) -> web.Response:
         """The dashboard's one-click Accept: adds a discovered universe
         candidate into the live universe (see engine.accept_candidate).
@@ -1195,6 +1220,7 @@ def create_app(engine) -> web.Application:
     app = web.Application(middlewares=[_require_csrf_header])
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_status)
+    app.router.add_get("/api/health", handle_health)
     app.router.add_post("/api/candidates/accept", handle_accept_candidate)
     app.router.add_post("/api/tools/screen", handle_tool_screen)
     app.router.add_post("/api/tools/supplier-research", handle_tool_supplier_research)

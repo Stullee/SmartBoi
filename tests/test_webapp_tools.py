@@ -251,3 +251,25 @@ async def test_rebuild_graph_leaves_anchors_alone(engine):
         body = await (await client.post("/api/universe/rebuild-graph", json={})).json()
 
     assert "RTX" not in body["symbols"]
+
+
+async def test_health_is_cheap_and_never_touches_the_dossier_store(engine, monkeypatch):
+    """The watchdog target. It must answer without reading anything, because
+    the failure it exists to catch is a hung event loop -- and because a
+    watchdog that returns non-2xx under load restarts a healthy add-on.
+
+    Guarded by making the dossier store explode: if health ever starts
+    reading state, this fails rather than quietly becoming expensive."""
+    def _boom(*args, **kwargs):
+        raise AssertionError("/api/health must not read the dossier store")
+
+    monkeypatch.setattr(engine.dossiers, "all_symbols", _boom)
+    monkeypatch.setattr(engine.dossiers, "load", _boom)
+
+    # No CSRF header on the client: the supervisor's watchdog sends a plain
+    # GET, so the endpoint has to answer one.
+    async with TestClient(TestServer(create_app(engine))) as client:
+        response = await client.get("/api/health")
+        assert response.status == 200
+        assert (await response.json())["status"] == "ok"
+
