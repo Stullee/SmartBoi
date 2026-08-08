@@ -1214,9 +1214,21 @@ async def run_dashboard(engine) -> None:
     app = create_app(engine)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", engine.settings.dashboard_port)
+    bind_host = engine.settings.dashboard_bind_host
+    site = web.TCPSite(runner, bind_host, engine.settings.dashboard_port)
     await site.start()
-    log.info("Dashboard listening on 0.0.0.0:%d", engine.settings.dashboard_port)
+    log.info("Dashboard listening on %s:%d", bind_host, engine.settings.dashboard_port)
+    if bind_host not in ("127.0.0.1", "localhost", "::1"):
+        # Said out loud once per start, because the exposure is easy to
+        # forget and the endpoints behind it spend money and delete state.
+        log.warning(
+            "Dashboard is bound to %s with NO authentication. Anything on this network can "
+            "reach it, including accept-candidate, reset-accepted, rebuild-graph and the "
+            "research tools -- the CSRF header only stops cross-origin browser POSTs, not a "
+            "direct request. Set DASHBOARD_BIND_HOST=127.0.0.1 if you only use the Home "
+            "Assistant Ingress panel and have confirmed it still loads.",
+            bind_host,
+        )
     try:
         await asyncio.Event().wait()
     finally:

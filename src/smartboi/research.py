@@ -45,9 +45,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from anthropic import AsyncAnthropic
-
-from smartboi.llm import cacheable_system, request_kwargs
+from smartboi.llm import cacheable_system, make_client, request_kwargs
 from smartboi.usage import CAT_RESEARCH, UsageTracker
 
 log = logging.getLogger(__name__)
@@ -178,7 +176,7 @@ class SupplierResearcher:
     from a deployment with no general outbound network access."""
 
     def __init__(self, api_key: str, model: str, usage: UsageTracker):
-        self._client = AsyncAnthropic(api_key=api_key)
+        self._client = make_client(api_key)
         self._model = model
         self._usage = usage
 

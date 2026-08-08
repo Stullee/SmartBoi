@@ -49,12 +49,24 @@ class FakeFinnhub:
         self.market_cap_by_symbol: dict[str, float] = {}
         self.analyst_count_by_symbol: dict[str, int] = {}
         self.quotes_by_symbol: dict[str, float] = {}
+        # Symbols whose market-data lookup should behave as a TRANSPORT
+        # failure (timeout / 401 / 5xx / exhausted 429 retries) rather than
+        # as "Finnhub answered and has no data". The real client
+        # distinguishes these because _prune_dead_symbols deletes on the
+        # second and must never delete on the first.
+        self.market_cap_lookup_fails: set[str] = set()
 
     async def recent_news(self, symbol, from_date, to_date):
         return self.articles_by_symbol.get(symbol, [])
 
+    async def market_cap_musd_result(self, symbol):
+        if symbol in self.market_cap_lookup_fails:
+            return None, True
+        return self.market_cap_by_symbol.get(symbol), False
+
     async def market_cap_musd(self, symbol):
-        return self.market_cap_by_symbol.get(symbol)
+        value, _ = await self.market_cap_musd_result(symbol)
+        return value
 
     async def analyst_count(self, symbol):
         return self.analyst_count_by_symbol.get(symbol)

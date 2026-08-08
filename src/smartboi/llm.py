@@ -33,6 +33,33 @@ shape (no effort, no thinking, no temperature), which is valid on every
 model in the table."""
 from __future__ import annotations
 
+from anthropic import AsyncAnthropic
+
+# Every outbound LLM call in this system runs INLINE on the engine's single
+# asyncio task: while one is in flight, nothing else happens -- no entry
+# evaluation, no trade marking, no heartbeat. The SDK's defaults are a
+# 600-second read timeout and 2 retries, so one hung socket can stall the
+# whole engine for up to ~30 minutes with no log line and no way to tell it
+# apart from a quiet news day.
+#
+# 90s is comfortably above the slowest legitimate call measured here (an
+# Opus synthesis pass with thinking, on a full evidence body, lands in the
+# 20-40s range) and far below a stall an operator would notice. With 2
+# retries and the SDK's backoff the true worst case per call is ~4-5
+# minutes rather than ~30.
+LLM_TIMEOUT_SEC = 90.0
+LLM_MAX_RETRIES = 2
+
+
+def make_client(api_key: str) -> AsyncAnthropic:
+    """The one place an Anthropic client is constructed. Five call sites
+    each built their own with SDK defaults; a timeout added to four of them
+    is not a timeout."""
+    return AsyncAnthropic(
+        api_key=api_key, timeout=LLM_TIMEOUT_SEC, max_retries=LLM_MAX_RETRIES,
+    )
+
+
 # Model families, matched as a PREFIX of the configured model id so both the
 # alias ("claude-haiku-4-5") and the dated snapshot
 # ("claude-haiku-4-5-20251001") resolve to the same capabilities.

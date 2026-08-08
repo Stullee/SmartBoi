@@ -6,17 +6,15 @@ update to the company's dossier; skeptic.py then tries to refute it before
 it's allowed to move the aggregate confidence (see merge_evidence)."""
 from __future__ import annotations
 
-import json
 import logging
 import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from anthropic import AsyncAnthropic
-
-from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
+from smartboi.llm import cacheable_system, first_tool_use, make_client, request_kwargs
 from smartboi.usage import CAT_DOSSIER, CAT_SYNTHESIS, UsageTracker
+from smartboi.persist import atomic_write_json, quarantine, read_json
 
 log = logging.getLogger(__name__)
 
@@ -159,19 +157,25 @@ class DossierStore:
         path = self._path(symbol)
         if not path.exists():
             return Dossier(symbol=symbol)
+        raw = read_json(path, expect=dict)
+        if raw is None:
+            # Missing (normal) or quarantined (logged as ERROR by persist,
+            # and the bytes are preserved next to it). Either way this
+            # symbol starts from an empty dossier rather than crashing the
+            # decay pass for every other symbol behind it.
+            return Dossier(symbol=symbol)
         try:
-            raw = json.loads(path.read_text())
             raw["evidence"] = [EvidenceRecord(**e) for e in raw.get("evidence", [])]
             return Dossier(**raw)
-        except (json.JSONDecodeError, OSError, TypeError):
-            log.warning("Could not read dossier for %s, starting fresh.", symbol)
+        except TypeError as exc:
+            # Parsed as a dict but the fields do not match the dataclass --
+            # a hand-edit, or a rollback to a version that predates a field.
+            # Same loss, same treatment: keep the bytes, start empty.
+            quarantine(path, f"dossier fields do not match the schema: {exc}")
             return Dossier(symbol=symbol)
 
     def save(self, dossier: Dossier) -> None:
-        path = self._path(dossier.symbol)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(dossier.to_dict(), indent=2))
-        tmp.replace(path)
+        atomic_write_json(self._path(dossier.symbol), dossier.to_dict(), indent=2)
 
     def all_symbols(self) -> list[str]:
         return sorted(p.stem for p in self.dir_path.glob("*.json"))
@@ -703,7 +707,7 @@ _SYSTEM_PROMPT = (
 
 class DossierUpdater:
     def __init__(self, api_key: str, model: str, usage: UsageTracker):
-        self._client = AsyncAnthropic(api_key=api_key)
+        self._client = make_client(api_key)
         self._model = model
         self._usage = usage
 
@@ -876,7 +880,7 @@ class DossierSynthesizer:
     point of failure for committing capital."""
 
     def __init__(self, api_key: str, model: str, usage: UsageTracker):
-        self._client = AsyncAnthropic(api_key=api_key)
+        self._client = make_client(api_key)
         self._model = model
         self._usage = usage
 

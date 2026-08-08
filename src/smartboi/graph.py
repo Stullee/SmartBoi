@@ -9,14 +9,12 @@ every new item instead of only reacting to news that names the trade target
 directly."""
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from anthropic import AsyncAnthropic
-
-from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
+from smartboi.llm import cacheable_system, first_tool_use, make_client, request_kwargs
+from smartboi.persist import atomic_write_json, quarantine, read_json
 from smartboi.usage import CAT_EXTRACTION, UsageTracker
 
 log = logging.getLogger(__name__)
@@ -41,12 +39,15 @@ class RelationshipGraph:
     relationships: list[Relationship] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if self.path.exists():
+        raw = read_json(self.path, expect=list)
+        if raw is not None:
             try:
-                raw = json.loads(self.path.read_text())
                 loaded = [Relationship(**r) for r in raw]
-            except (json.JSONDecodeError, OSError, TypeError):
-                log.warning("Could not read %s, starting with an empty graph.", self.path)
+            except TypeError as exc:
+                # Parsed as a list, but the rows are not relationship
+                # shapes -- same class of loss as unparseable bytes, so it
+                # gets the same treatment rather than a warning and a wipe.
+                quarantine(self.path, f"list rows are not relationships: {exc}")
                 return
             # Self-healing cleanup: an invalid rel_type could only have
             # gotten in from before engine.py's _extract_relationships
@@ -65,10 +66,7 @@ class RelationshipGraph:
                 self._save()
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps([asdict(r) for r in self.relationships], indent=2))
-        tmp.replace(self.path)
+        atomic_write_json(self.path, [asdict(r) for r in self.relationships], indent=2)
 
     def add(self, rel: Relationship) -> bool:
         """Returns False (no-op) if an equivalent edge already exists,
@@ -158,7 +156,7 @@ _SYSTEM_PROMPT = (
 
 class RelationshipExtractor:
     def __init__(self, api_key: str, model: str, usage: UsageTracker):
-        self._client = AsyncAnthropic(api_key=api_key)
+        self._client = make_client(api_key)
         self._model = model
         self._usage = usage
 

@@ -157,3 +157,51 @@ def test_format_screening_report_handles_no_fitting_candidates():
     report = format_screening_report(results)
     assert "0 fit the bounds" in report
     assert "NOPE" in report
+
+
+# --- lookup failure is not a verdict ---
+
+async def test_a_failed_market_data_lookup_is_not_a_failed_screen():
+    """The whole point of the lookup_failed split. A transient Finnhub
+    error used to be indistinguishable from "Finnhub says this ticker has
+    no market cap", and _prune_dead_symbols deletes on the latter."""
+    finnhub = FakeFinnhub()
+    finnhub.market_cap_lookup_fails.add("UCTT")
+    universe = [_spec("UCTT", "semi_equipment")]
+
+    (result,) = await screen_universe(
+        universe, finnhub, min_market_cap_musd=100, max_market_cap_musd=3000, max_analyst_count=6
+    )
+
+    assert result.lookup_failed is True
+    assert result.still_fits is True, "an unscreened symbol has not failed a screen"
+    assert result.market_cap_musd is None
+
+
+async def test_a_failed_lookup_on_an_anchor_is_not_a_dead_anchor():
+    finnhub = FakeFinnhub()
+    finnhub.market_cap_lookup_fails.add("ASML")
+    universe = [_spec("ASML", "semi_equipment", signal_source_only=True)]
+
+    (result,) = await screen_universe(
+        universe, finnhub, min_market_cap_musd=100, max_market_cap_musd=3000, max_analyst_count=6
+    )
+
+    assert result.lookup_failed is True
+    assert result.still_fits is True
+    assert result.is_anchor is True
+
+
+async def test_a_genuine_no_data_answer_is_still_reported_as_dead():
+    """The guard must not swing so far that real delistings stop being
+    detected -- that was the original problem it is fixing."""
+    finnhub = FakeFinnhub()  # no entry at all => Finnhub answered with nothing
+    universe = [_spec("DEADCO", "semi_equipment")]
+
+    (result,) = await screen_universe(
+        universe, finnhub, min_market_cap_musd=100, max_market_cap_musd=3000, max_analyst_count=6
+    )
+
+    assert result.lookup_failed is False
+    assert result.still_fits is False
+    assert result.market_cap_musd is None

@@ -301,6 +301,11 @@ _DIAGNOSTIC_SETTINGS = (
     "enable_relationship_backfill", "backfill_anchors",
     "enable_graph_refresh", "graph_refresh_symbols_per_day", "enable_auto_supplier_research",
     "enable_ib_price_feed", "ib_host", "ib_port",
+    "enable_local_backup", "backup_dir",
+    # Reported, not omitted: it decides whether an unauthenticated write
+    # surface is on the LAN, which an operator reading a diagnostics bundle
+    # needs to see without going to look for it.
+    "dashboard_bind_host",
 )
 MAX_LOG_LINES = 40
 MAX_LISTED_ROWS = 60

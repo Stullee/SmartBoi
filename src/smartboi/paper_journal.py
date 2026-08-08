@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from smartboi.market_hours import is_regular_trading_hours
+from smartboi.persist import atomic_write_json, quarantine, read_json
 
 log = logging.getLogger(__name__)
 
@@ -321,13 +322,16 @@ class PaperTradeJournal:
         self.open_trades: dict[str, PaperTrade] = self._load_open_state()
 
     def _load_open_state(self) -> dict[str, PaperTrade]:
-        if not self.open_state_path.exists():
+        raw = read_json(self.open_state_path, expect=dict)
+        if raw is None:
             return {}
         try:
-            raw = json.loads(self.open_state_path.read_text())
             trades = {symbol: PaperTrade(**fields) for symbol, fields in raw.items()}
-        except (json.JSONDecodeError, OSError, TypeError):
-            log.warning("Could not read %s, starting with no open paper trades.", self.open_state_path)
+        except TypeError as exc:
+            # In-flight positions are the highest-value state in the tree:
+            # losing them drops open trades out of the record AND lets the
+            # same symbol re-enter as a duplicate. Preserve the bytes.
+            quarantine(self.open_state_path, f"open-trade rows do not match the schema: {exc}")
             return {}
         # Self-heal the close-crash window: _close appends to the closed
         # log BEFORE rewriting the open-state snapshot, so a crash between
@@ -360,11 +364,8 @@ class PaperTradeJournal:
         return keys
 
     def _write_open_state(self) -> None:
-        self.open_state_path.parent.mkdir(parents=True, exist_ok=True)
         snapshot = {symbol: asdict(trade) for symbol, trade in self.open_trades.items()}
-        tmp = self.open_state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(snapshot))
-        tmp.replace(self.open_state_path)
+        atomic_write_json(self.open_state_path, snapshot)
 
     def has_open(self, symbol: str) -> bool:
         return symbol in self.open_trades

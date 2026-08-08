@@ -257,13 +257,38 @@ class FinnhubClient:
         bar = await self.quote_bar(symbol)
         return bar[0] if bar is not None else None
 
-    async def market_cap_musd(self, symbol: str) -> float | None:
+    async def market_cap_musd_result(self, symbol: str) -> tuple[float | None, bool]:
+        """Returns (market_cap, lookup_failed).
+
+        The two None cases are NOT the same fact and callers that act
+        destructively must not conflate them:
+          - (None, False) -- Finnhub answered and has no market cap for this
+            ticker. Evidence it is delisted, acquired, or uncovered.
+          - (None, True)  -- the request failed: connect timeout, 401/403 on
+            a revoked or over-quota key, 5xx, or a 429 that outlived the
+            retries. Evidence of NOTHING about the ticker.
+
+        Measured consequence of conflating them, before this split existed:
+        `_prune_dead_symbols` deleted every runtime-accepted symbol whose
+        market cap came back None and archived its dossier. One transient
+        Finnhub failure during the ~12-minute monthly screen would therefore
+        have deleted the entire auto-accepted universe -- 144 symbols and
+        their accumulated evidence -- and `dossiers_archived/` has no reader,
+        so it would not have come back."""
         try:
             response = await self._throttled_get(_PROFILE_URL, {"symbol": symbol})
         except httpx.HTTPError as exc:
             log.warning("%s: Finnhub profile fetch failed: %s", symbol, redact_token(exc))
-            return None
-        return response.json().get("marketCapitalization")  # already millions USD per Finnhub's docs
+            return None, True
+        return response.json().get("marketCapitalization"), False  # already millions USD per Finnhub's docs
+
+    async def market_cap_musd(self, symbol: str) -> float | None:
+        """Market cap, or None for either "no data" or "lookup failed".
+        Fine for the non-destructive callers (candidate recommendations,
+        auto-accept bounds); anything that DELETES needs
+        market_cap_musd_result so it can tell the two apart."""
+        value, _ = await self.market_cap_musd_result(symbol)
+        return value
 
     async def analyst_count(self, symbol: str) -> int | None:
         """Most recent month's total analyst recommendation count across

@@ -36,6 +36,11 @@ class ScreenResult:
     # design don't apply to them. Callers acting on a failed screen must
     # distinguish the two or they will "prune" every anchor.
     is_anchor: bool = False
+    # True when the market-data lookup itself failed rather than answering.
+    # still_fits is forced True in that case: a symbol that was not
+    # successfully screened has not failed a screen, and must never be
+    # counted as evidence for pruning.
+    lookup_failed: bool = False
 
 
 # The one screen verdict that means "this ticker is dead", not "this ticker
@@ -43,6 +48,7 @@ class ScreenResult:
 # (see Engine._prune_dead_symbols), so it is a shared constant rather than a
 # string matched by eye in two places.
 _NO_MARKET_DATA = "no market cap data (possibly delisted/acquired, or just not covered)"
+_LOOKUP_FAILED = "market-data lookup failed (transient) -- not screened this cycle"
 
 
 def _fits_thin_coverage_bounds(
@@ -83,7 +89,15 @@ async def screen_universe(
     outright."""
     results = []
     for company in universe:
-        market_cap = await finnhub.market_cap_musd(company.symbol)
+        market_cap, lookup_failed = await finnhub.market_cap_musd_result(company.symbol)
+        if lookup_failed:
+            # Not screened this cycle. Reported as still-fitting so no
+            # downstream consumer treats an outage as a verdict.
+            results.append(ScreenResult(
+                company.symbol, True, _LOOKUP_FAILED, None, None,
+                is_anchor=company.signal_source_only, lookup_failed=True,
+            ))
+            continue
         if company.signal_source_only:
             alive = market_cap is not None
             results.append(ScreenResult(
@@ -102,6 +116,13 @@ async def screen_universe(
     # and an anchor with no market data at all are different problems with
     # different fixes, and one combined line said "no longer fits the
     # small/mid-cap criteria" about anchors those criteria never applied to.
+    unscreened = [r for r in results if r.lookup_failed]
+    if unscreened:
+        log.warning(
+            "Universe screen: %d symbol(s) could not be screened because the market-data "
+            "lookup failed: %s. They are reported as unchanged, NOT as failing the screen.",
+            len(unscreened), ", ".join(r.symbol for r in unscreened),
+        )
     dropped = [r for r in results if not r.still_fits and not r.is_anchor]
     if dropped:
         log.warning(

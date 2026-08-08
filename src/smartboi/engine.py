@@ -37,6 +37,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from smartboi.alerts import AlertSender
+from smartboi import persist
+from smartboi.backup import run_backup
 from smartboi.config import Settings
 from smartboi.dedup import DedupIndex, fingerprint, source_domain
 from smartboi.edgar import _truncate_head_tail, describe_8k_items
@@ -266,6 +268,15 @@ _BIOGRAPHY_TITLES = (
     "evp", "svp", "management team", "board member", "director of",
 )
 _BIOGRAPHY_ROLE_MARKERS = ("role at", "roles at", "positions at", "position at")
+
+# Blast-radius cap on the monthly universe prune (see _prune_dead_symbols).
+# 10% of a ~280-symbol universe is ~28 simultaneous delistings in one month;
+# the real rate is one or two. The absolute floor keeps the fraction from
+# being uselessly permissive on a small custom universe -- at 12 symbols,
+# 10% rounds to one, and losing one genuinely-dead ticker to caution costs
+# a single wasted poll while a wrong prune costs months of evidence.
+_PRUNE_MAX_FRACTION = 0.10
+_PRUNE_MIN_ABSOLUTE = 3
 
 _NON_COMPANY_KEYWORDS = (
     "government", "department", "agency", "administration", "bureau",
@@ -925,6 +936,19 @@ class Engine:
             len(self.symbol_list), len(self.dossiers.all_symbols()), signaled,
             len(self.graph.relationships), len(self.candidates.data), len(self.journal.open_trades),
         )
+        # Repeated on EVERY heartbeat, not once at the moment it happened.
+        # A quarantine is data loss, and the ERROR that recorded it scrolls
+        # out of the log within hours while the loss is permanent. An
+        # operator skimming a heartbeat line a week later still needs to
+        # see that something is missing and has never been acknowledged.
+        if persist.quarantine_events:
+            newest = persist.quarantine_events[-1]
+            log.error(
+                "heartbeat: %d UNACKNOWLEDGED corrupt-file quarantine(s) since start. "
+                "Most recent: %s -> %s (%s). Data that is not in a backup is gone; "
+                "inspect the quarantined copies, then restart to clear this warning.",
+                len(persist.quarantine_events), newest.path, newest.quarantined_to, newest.reason,
+            )
 
     async def _tick(self) -> None:
         now = time.monotonic()
@@ -952,6 +976,14 @@ class Engine:
         # So both now run FIRST, in the order fire-then-act, and the price
         # poll re-reads the clock. Ingestion is the slow, latency-tolerant
         # part of the tick and belongs behind them.
+        # Runs BEFORE the decay pass, and therefore before anything in the
+        # tick that mutates or deletes: the decay pass expires signals, the
+        # universe screen prunes symbols and archives dossiers. A backup
+        # taken after those has already lost whatever they got wrong today.
+        if self._daily_pass_due("backup"):
+            if self._run_backup():
+                self._mark_daily_pass_done("backup")
+
         if self._daily_pass_due("decay_pass"):
             self._archive_orphaned_dossiers()
             await self._run_decay_pass()
@@ -1073,6 +1105,23 @@ class Engine:
             self._last_heartbeat = now
             self._log_heartbeat()
 
+    def _run_backup(self) -> bool:
+        """Daily tarball of data/ + logs/. Returns True when one was written,
+        so the caller only marks the day done on success and a failed night
+        is retried on the next tick rather than skipped until tomorrow.
+
+        Gated on a setting because a deployment that already snapshots its
+        whole /config volume elsewhere does not need a second copy inside
+        it -- but it defaults ON, because the failure mode of not having a
+        backup is the only one in this system that cannot be recovered from
+        at all."""
+        if not self.settings.enable_local_backup:
+            return True  # deliberately off: mark done, don't retry every tick
+        return run_backup(
+            [DATA_DIR, Path(self.settings.log_dir)],
+            Path(self.settings.backup_dir),
+        ) is not None
+
     def _universe_screen_due(self) -> bool:
         """Scheduled off the PERSISTED last-screen timestamp (wall clock),
         so the monthly cadence survives restarts -- a process-local timer
@@ -1123,7 +1172,18 @@ class Engine:
     async def _poll_edgar(self) -> None:
         since_date = (date.today() - timedelta(days=self.settings.edgar_lookback_days)).isoformat()
         for symbol in self.symbol_list:
-            if await self._is_unknown_to_edgar(symbol):
+            # Inside its own guard, not merely inside the per-filing try
+            # below. This call populates the CIK cache, so on a cold cache
+            # it makes a network request -- and it sits BEFORE the try that
+            # protects the rest of the symbol's work. An SEC outage or a
+            # rejected User-Agent on the first symbol therefore aborted the
+            # entire EDGAR sweep, every cycle, for as long as the condition
+            # lasted, and the symptom was silence rather than an error.
+            try:
+                if await self._is_unknown_to_edgar(symbol):
+                    continue
+            except Exception:  # noqa: BLE001 - one bad symbol must not stop the sweep
+                log.exception("%s: EDGAR CIK lookup failed", symbol)
                 continue
             # Deliberately NOT gated on _can_produce_evidence, unlike the
             # news poll. An anchor's own 10-K/10-Q is how that anchor gets
@@ -2815,7 +2875,21 @@ class Engine:
             dossier = self.dossiers.load(symbol)
             if dossier.status != "SIGNALED" or self.journal.has_open(symbol):
                 continue
-            await self._try_open_from_signal(symbol, dossier)
+            # Per-symbol isolation, matching every other sweep in this file
+            # (_run_decay_pass, _poll_edgar's filing loop, _poll_news's
+            # article loop). This loop was the exception, and it is the one
+            # that decides whether a signal ever becomes a trade: an
+            # exception on the FIRST signalled symbol -- one unpriceable
+            # ticker, one malformed dossier -- aborted the whole pass, so
+            # every other pending entry behind it went unevaluated. With a
+            # deterministic cause that is permanent, and it looks exactly
+            # like "no signals crossed the bar today".
+            try:
+                await self._try_open_from_signal(symbol, dossier)
+            except Exception:  # noqa: BLE001 - one bad symbol must not block the rest
+                log.exception("%s: entry evaluation failed", symbol)
+                pending = True  # unresolved, so keep the tight cadence alive
+                continue
             # _try_open_from_signal mutates this dossier in place: an expiry
             # flips it to ACTIVE, an open leaves it SIGNALED with a trade on
             # the books. Anything still SIGNALED and unopened (drift-blocked,
@@ -3343,8 +3417,37 @@ class Engine:
         choice: removing it here would be un-undoable from the dashboard and
         would silently fight the operator's own list on every screen. Those
         are reported loudly instead, and recorded so the diagnostics bundle
-        can show them without needing the log."""
-        dead = [r.symbol for r in results if r.market_cap_musd is None]
+        can show them without needing the log.
+
+        Two guards stand between a Finnhub problem and deleted evidence,
+        because this is the only routinely-scheduled code path in the system
+        that destroys accumulated data:
+
+        1. `r.lookup_failed` excludes symbols whose market-data request never
+           answered. Before this existed, `market_cap_musd` returned None on
+           any HTTPError and the line below read every one of them as
+           "delisted" -- so a single transient failure inside the monthly
+           screen's ~12-minute window deleted the whole runtime universe.
+        2. A blast-radius cap. Even with (1), a systemic answer-but-empty
+           failure (a plan downgrade returning empty profiles with HTTP 200,
+           a Finnhub schema change) would still present as every symbol being
+           dead at once. Real delistings arrive one or two at a time; a
+           double-digit percentage of the universe dying in one month is a
+           data-source failure, not news. When that happens the pass refuses
+           to prune anything and says so."""
+        dead = [r.symbol for r in results if r.market_cap_musd is None and not r.lookup_failed]
+        screened = [r for r in results if not r.lookup_failed]
+        if screened and len(dead) > max(_PRUNE_MAX_FRACTION * len(screened), _PRUNE_MIN_ABSOLUTE):
+            log.error(
+                "[UNIVERSE] Screen reported %d of %d screened symbol(s) with no market data "
+                "(%.0f%%, above the %.0f%% blast-radius cap). Refusing to prune ANY of them: "
+                "that many simultaneous delistings is a market-data failure, not news. "
+                "Nothing was deleted; investigate the Finnhub key/plan and re-run the screen.",
+                len(dead), len(screened), 100.0 * len(dead) / len(screened), 100.0 * _PRUNE_MAX_FRACTION,
+            )
+            self.universe_screen_state.set("prune_refused_at", datetime.now(timezone.utc).isoformat())
+            self.universe_screen_state.set("prune_refused_symbols", sorted(dead))
+            return []
         pruned, curated = [], []
         for symbol in dead:
             if symbol in self.accepted_candidates.data:

@@ -6,12 +6,12 @@ Only genuinely distinct source domains count toward the two-independent-
 source rule dossier signals require (see signals.py)."""
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+from smartboi.persist import atomic_write_json, read_json
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _PUNCTUATION_RE = re.compile(r"[^\w\s]")
@@ -106,11 +106,8 @@ class DedupIndex:
     _seen: dict[str, list] = field(default_factory=dict)  # fingerprint -> [source_domain, registered_at_iso]
 
     def __post_init__(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            raw = json.loads(self.path.read_text())
-        except (json.JSONDecodeError, OSError):
+        raw = read_json(self.path, expect=dict)
+        if raw is None:
             return
         now = datetime.now(timezone.utc)
         cutoff = (now - timedelta(days=self.max_age_days)).isoformat()
@@ -164,7 +161,4 @@ class DedupIndex:
         if fp in self._seen:
             return
         self._seen[fp] = [domain, registered_at or datetime.now(timezone.utc).isoformat()]
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._seen))
-        tmp.replace(self.path)
+        atomic_write_json(self.path, self._seen)

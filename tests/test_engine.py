@@ -2249,3 +2249,131 @@ async def test_the_daily_snapshot_records_the_synthesis_verdict(engine):
     assert row["synthesis_at"] != ""
     assert row["score"] == 0.0
     assert row["scoring_version"] == 4  # the regime where score is the CAPPED number
+
+
+# --- _prune_dead_symbols: the universe-wipe guards ---
+#
+# This is the only routinely-scheduled path in the system that destroys
+# accumulated evidence, and none of it was covered.
+
+def _screened(symbol, market_cap, lookup_failed=False):
+    from smartboi.universe_screen import ScreenResult
+    return ScreenResult(
+        symbol, market_cap is not None, "", market_cap, None, lookup_failed=lookup_failed,
+    )
+
+
+def test_a_transient_lookup_failure_never_prunes(engine):
+    """The CRITICAL finding this guards. market_cap_musd returned None on
+    ANY HTTPError, and every one of those was read as 'delisted' -- so a
+    single Finnhub timeout inside the monthly screen's ~12-minute window
+    deleted the entire runtime-accepted universe and archived its
+    dossiers, with no reader for dossiers_archived/ to get them back."""
+    engine.accepted_candidates.set("AAAA", {"as": "tradeable", "source": "auto"})
+
+    pruned = engine._prune_dead_symbols([_screened("AAAA", None, lookup_failed=True)])
+
+    assert pruned == []
+    assert "AAAA" in engine.accepted_candidates.data
+
+
+def test_a_genuinely_dead_symbol_is_still_pruned(engine):
+    """The guards must not disable the behaviour they are protecting."""
+    engine.accepted_candidates.set("DEADCO", {"as": "tradeable", "source": "auto"})
+
+    pruned = engine._prune_dead_symbols([
+        _screened("DEADCO", None),
+        *[_screened(f"OK{i}", 500.0) for i in range(30)],
+    ])
+
+    assert pruned == ["DEADCO"]
+    assert "DEADCO" not in engine.accepted_candidates.data
+
+
+def test_a_mass_no_data_result_refuses_to_prune_anything(engine):
+    """Even with the lookup_failed split, a systemic answer-but-empty
+    failure (plan downgrade returning empty profiles with HTTP 200, a
+    schema change) presents as every symbol dying at once. Real
+    delistings arrive one or two at a time."""
+    for i in range(20):
+        engine.accepted_candidates.set(f"S{i}", {"as": "tradeable", "source": "auto"})
+    results = [_screened(f"S{i}", None) for i in range(20)]
+
+    pruned = engine._prune_dead_symbols(results)
+
+    assert pruned == []
+    assert len(engine.accepted_candidates.data) == 20
+    assert engine.universe_screen_state.get("prune_refused_at")
+    assert engine.universe_screen_state.get("prune_refused_symbols") == sorted(f"S{i}" for i in range(20))
+
+
+def test_the_blast_radius_cap_is_measured_against_screened_symbols_only(engine):
+    """A screen where most symbols failed to look up must not make the few
+    genuine deaths look like a mass extinction -- nor hide behind them."""
+    engine.accepted_candidates.set("DEADCO", {"as": "tradeable", "source": "auto"})
+    results = [
+        _screened("DEADCO", None),
+        *[_screened(f"OK{i}", 500.0) for i in range(30)],
+        *[_screened(f"UNK{i}", None, lookup_failed=True) for i in range(50)],
+    ]
+
+    assert engine._prune_dead_symbols(results) == ["DEADCO"]
+
+
+def test_curated_symbols_are_reported_but_never_pruned(engine):
+    """Unchanged behaviour, pinned: a curated symbol is a human decision."""
+    results = [_screened("FORM", None), *[_screened(f"OK{i}", 500.0) for i in range(30)]]
+
+    assert engine._prune_dead_symbols(results) == []
+    assert engine.universe_screen_state.get("curated_no_market_data") == ["FORM"]
+
+
+# --- nightly backup wiring ---
+
+def test_backup_runs_before_anything_that_can_destroy_state(engine, tmp_path):
+    """Ordering is the whole point: the decay pass expires signals and the
+    universe screen archives dossiers. A backup taken after those has
+    already lost whatever they got wrong today."""
+    from smartboi.backup import BACKUP_DIR_NAME
+
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "graph.json").write_text("[]")
+
+    assert engine._run_backup() is True
+    written = list((tmp_path / BACKUP_DIR_NAME).glob("smartboi-*.tar.gz"))
+    assert len(written) == 1
+
+
+def test_backup_pass_stays_due_when_it_fails(engine, tmp_path, monkeypatch):
+    """Marked done only on success, like the snapshot and price-mark
+    passes -- a night silently skipped is a night with no copy."""
+    import smartboi.engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "run_backup", lambda *a, **k: None)
+    assert engine._daily_pass_due("backup") is True
+    assert engine._run_backup() is False
+    assert engine._daily_pass_due("backup") is True, "a failed backup must be retried"
+
+
+def test_backup_can_be_turned_off_without_retrying_every_tick(engine):
+    engine.settings.enable_local_backup = False
+    assert engine._run_backup() is True  # 'done', so the tick stops asking
+
+
+def test_quarantined_data_loss_is_repeated_on_every_heartbeat(engine, caplog):
+    """The ERROR that records a quarantine scrolls out of the log within
+    hours; the loss is permanent. Silence must not look like health."""
+    from smartboi import persist
+
+    persist.quarantine_events.clear()
+    persist.quarantine_events.append(persist.QuarantineEvent(
+        path="data/graph.json", quarantined_to="data/graph.json.corrupt-x",
+        reason="invalid JSON", at="2026-08-08T00:00:00+00:00", bytes_preserved=2048,
+    ))
+    try:
+        with caplog.at_level("ERROR"):
+            engine._log_heartbeat()
+        assert "UNACKNOWLEDGED corrupt-file quarantine" in caplog.text
+        assert "data/graph.json" in caplog.text
+    finally:
+        persist.quarantine_events.clear()

@@ -528,6 +528,19 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
     log_dir: str = "logs"
+    # Nightly gzipped tarball of data/ + logs/ into backup_dir, keeping 14
+    # dailies and 8 weeklies (see backup.py). ON by default: every other
+    # failure in this system is recoverable, and losing the accumulated
+    # evidence and the forward record is not -- there is no replay path, so
+    # a lost dossier cannot be rebuilt even with the same code and keys.
+    # Turn it off only if the whole volume is already snapshotted elsewhere.
+    enable_local_backup: bool = True
+    # Sibling of data/ and logs/ rather than a subdirectory of either, so a
+    # backup is never inside the tree it archives. On the add-on this lands
+    # in the mapped /config share, which means it is visible over Samba and
+    # is included in a Home Assistant partial backup of /config -- still the
+    # same physical host, so it is a rollback, not a disaster recovery.
+    backup_dir: str = "backups"
     # Optional: a JSON payload is POSTed here on every signal and paper
     # trade open/close (see alerts.py) -- point it at a Home Assistant
     # webhook trigger or any HTTP endpoint. Empty disables alerts.
@@ -535,6 +548,23 @@ class Settings(BaseSettings):
 
     enable_dashboard: bool = True
     dashboard_port: int = 8100
+    # Interface the dashboard listens on. Defaults to all interfaces, which
+    # is NOT a security judgement -- it is a compatibility one. The add-on
+    # runs with host_network: true, and Home Assistant's ingress proxy
+    # reaches the add-on over the host network rather than its loopback, so
+    # binding 127.0.0.1 would make the Ingress panel itself unreachable.
+    #
+    # The consequence is real and worth stating plainly: on the default the
+    # dashboard is reachable from any device on the LAN with no
+    # authentication, and it has state-changing endpoints (accept candidate,
+    # reset accepted, rebuild graph, run the paid research tools). The
+    # _CSRF_HEADER check in webapp.py stops a cross-origin BROWSER POST; it
+    # does nothing against a direct request from anything on the network.
+    #
+    # Set this to 127.0.0.1 if you reach the dashboard only through the
+    # Ingress panel and have verified that works for your install, or if you
+    # run outside Home Assistant and tunnel to it.
+    dashboard_bind_host: str = "0.0.0.0"
 
     @property
     def universe(self) -> list[CompanySpec]:
