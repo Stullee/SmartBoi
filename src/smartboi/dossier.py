@@ -282,7 +282,20 @@ MAX_CONFIDENCE_CORROBORATION_BONUS = 0.25
 # forward-validation record can be split at the boundary instead of silently
 # mixing scores that mean different things -- forward data cannot be
 # backfilled, and re-scoring old rows with new logic would be look-ahead.
-SCORING_VERSION = 3
+# 4: the daily synthesis verdict is now PERSISTED after every run, so the
+# capped score (a veto zeroes it, a trim lowers it) reaches the dossier file
+# and therefore the snapshot series. Before this it was computed, used for
+# the rest of the decay pass, and discarded unless a signal fired or expired
+# in the same pass -- so snapshots recorded the UNCAPPED arithmetic score for
+# most dossiers and the capped one for a few, silently mixed.
+#
+# _aggregate itself is unchanged: the same evidence still produces the same
+# arithmetic. What changed is which of the two numbers gets recorded, and
+# that is exactly a rules boundary -- it moves scores in the high region the
+# forward-return question is asked about, so the two regimes must not be
+# pooled. Forward data cannot be backfilled and old rows must never be
+# re-scored, so splitting here is the only honest option.
+SCORING_VERSION = 4
 # Weight an evidence item keeps right at its stale cutoff, before being
 # excluded entirely -- never fully zero a moment before exclusion, since
 # aged corroboration is still weak signal that a persistent theme existed.

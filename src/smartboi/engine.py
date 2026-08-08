@@ -2942,8 +2942,6 @@ class Engine:
         before = self._decay_fingerprint(dossier)
         recompute_decay(dossier, now)
         changed = before != self._decay_fingerprint(dossier)
-        if changed:
-            self.dossiers.save(dossier)
 
         # Evaluated on EVERY pass, not only when the score moved. A
         # dossier can sit above the bar with perfectly stable numbers --
@@ -2955,11 +2953,31 @@ class Engine:
         # pure function over fields already in hand, so running it
         # unconditionally costs nothing.
         if self.journal.has_open(symbol):
+            if changed:
+                self.dossiers.save(dossier)
             return
         # Synthesis runs here and nowhere else: once a day, only for a
         # dossier that has resolved a direction, so this is a few dozen
         # calls against a budget the deployment runs at a few percent of.
-        await self._apply_synthesis(dossier, now)
+        synthesized = await self._apply_synthesis(dossier, now)
+        # Saved once, AFTER synthesis, rather than only when the decay
+        # fingerprint moved.
+        #
+        # The decay-only save meant a synthesis verdict was computed, used to
+        # cap the score for the rest of this pass, and then thrown away: the
+        # fields _apply_synthesis writes (synthesis_at/note/catalyst/
+        # distinct_fact_count/already_priced_in and the capped scores) reached
+        # disk only when something ELSE happened to save the dossier in the
+        # same pass -- a signal firing or an expiry. For an ACTIVE dossier
+        # that stayed below the bar, which is the common case, the most
+        # expensive judgement in the system left no trace at all. That made
+        # Dossier's own claim -- verdicts "recorded even when the verdict
+        # changes nothing, so the pass's actual effect on outcomes is
+        # measurable" -- untrue, and left the per-trade synthesis stamp
+        # (paper_journal.PaperTrade) reading a verdict that was usually stale
+        # or absent rather than the one that had just run.
+        if changed or synthesized:
+            self.dossiers.save(dossier)
         signal = evaluate(dossier, self.settings.signal_confidence_threshold,
                           self.settings.min_independent_sources,
                           self.settings.min_independent_sources_news_only)
@@ -2972,7 +2990,7 @@ class Engine:
                      dossier.confidence * dossier.magnitude, dossier.independent_source_count)
             await self._fire_signal(dossier, signal)
 
-    async def _apply_synthesis(self, dossier: Dossier, now: datetime) -> None:
+    async def _apply_synthesis(self, dossier: Dossier, now: datetime) -> bool:
         """Runs the whole-evidence-body pass and folds its verdict into the
         dossier as a CAP on the arithmetic aggregate.
 
@@ -2988,9 +3006,15 @@ class Engine:
         adversarial pass rather than one confident opinion.
 
         Failure is a no-op, not a block: a transient error or an exhausted
-        budget leaves the arithmetic aggregate exactly as it was."""
+        budget leaves the arithmetic aggregate exactly as it was.
+
+        Returns True when a verdict was actually applied to this dossier --
+        the caller persists on that, so the verdict survives the pass even
+        when it changed no decision (see _decay_one). False means nothing
+        was written: no synthesizer, no resolved direction, a score too far
+        below the bar for a cap to matter, or a failed/deferred call."""
         if self.synthesizer is None or dossier.direction not in ("LONG", "SHORT"):
-            return
+            return False
         # Only where it can change the outcome. Synthesis is a CAP -- it can
         # veto and trim, never lift -- so on a dossier far below the bar the
         # only reachable outcomes are "unchanged" and "even further below",
@@ -2999,13 +3023,13 @@ class Engine:
         # rather than one per watchlist entry.
         floor = self.settings.signal_confidence_threshold * self.settings.synthesis_score_floor_pct
         if dossier.confidence * dossier.magnitude < floor:
-            return
+            return False
         spec = self.spec_by_symbol.get(dossier.symbol)
         verdict = await self.synthesizer.synthesize(
             dossier, ecosystem=spec.ecosystem if spec is not None else "", now=now,
         )
         if verdict is None:
-            return
+            return False
 
         dossier.synthesis_at = now.isoformat()
         dossier.synthesis_note = str(verdict.get("thesis") or "")[:600]
@@ -3038,7 +3062,7 @@ class Engine:
             dossier.synthesis_magnitude = 0.0
             dossier.confidence = 0.0
             dossier.magnitude = 0.0
-            return
+            return True
 
         dossier.synthesis_confidence = _clamp_unit(verdict.get("confidence"))
         dossier.synthesis_magnitude = _clamp_unit(verdict.get("magnitude"))
@@ -3053,6 +3077,7 @@ class Engine:
                 dossier.distinct_fact_count, dossier.independent_source_count,
                 dossier.synthesis_catalyst[:120],
             )
+        return True
 
     # --- Forward-validation capture (Phase A): daily dossier score
     # snapshots and daily price marks, the raw material for eventually

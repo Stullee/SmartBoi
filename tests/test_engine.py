@@ -18,6 +18,7 @@ import smartboi.engine
 from smartboi.dossier import SCORING_VERSION
 from smartboi.engine import ECOSYSTEM_LINK_CONFIDENCE, Engine, is_common_equity
 from smartboi.ratelimit import SlidingWindowLimiter
+from smartboi.status import snapshot_dossier
 from smartboi.graph import Relationship
 from smartboi.news import NewsArticle
 
@@ -2171,3 +2172,80 @@ async def test_a_second_real_filing_does_increment_seen_count(engine):
     entry = engine.candidates.get("ZZZZ")
     assert entry["seen_count"] == 2  # two filers, two filings -> real corroboration
     assert len(entry["sources"]) == 2
+
+
+# --- Invariant: a synthesis verdict SURVIVES the pass that produced it.
+#
+# The verdict used to be computed, used to cap the score for the rest of the
+# decay pass, and then dropped: it reached disk only when something else
+# happened to save the dossier in the same pass (a signal firing, an expiry).
+# For an ACTIVE dossier that stayed below the bar -- the common case -- the
+# most expensive judgement in the system left no trace, so its effect on
+# outcomes could never be measured, and the per-trade synthesis stamp read a
+# verdict that was usually stale or absent. ---
+
+async def test_a_verdict_on_an_active_dossier_is_persisted(engine):
+    """The case that was being lost: nothing else saves this dossier, so
+    without an explicit save the verdict evaporates at end of pass."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(confidence=0.4, magnitude=0.5,
+                                                           distinct_fact_count=1))
+    # Above the synthesis floor (0.5 * 0.6) but below the signal bar (0.5),
+    # so synthesis runs and NOTHING else in the pass saves this dossier --
+    # no signal fires, no expiry. That is precisely the case the verdict
+    # used to be lost in.
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    assert dossier.status == "ACTIVE"
+
+    await engine._decay_one("FORM", datetime.now(timezone.utc))
+
+    reloaded = engine.dossiers.load("FORM")
+    assert reloaded.synthesis_at != "", "the verdict never reached disk"
+    assert reloaded.distinct_fact_count == 1
+    assert reloaded.synthesis_confidence == 0.4
+    # ...and the CAP it implies is on disk too, not just in memory.
+    assert reloaded.confidence == 0.4
+    assert reloaded.magnitude == 0.5
+
+
+async def test_a_veto_is_persisted_rather_than_recomputed_away(engine):
+    """A veto zeroes the score. If it is not written down, the record cannot
+    tell a vetoed thesis from one that simply decayed to nothing."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    # ACTIVE, so there is no expiry path to persist this as a side effect.
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    assert dossier.status == "ACTIVE"
+
+    await engine._decay_one("FORM", datetime.now(timezone.utc))
+
+    reloaded = engine.dossiers.load("FORM")
+    assert reloaded.already_priced_in is True
+    assert reloaded.confidence == 0.0
+    assert reloaded.magnitude == 0.0
+
+
+async def test_a_deferred_synthesis_does_not_rewrite_the_dossier(engine):
+    """Budget exhaustion / transient failure must stay a no-op: no verdict,
+    and no save claiming one happened."""
+    engine.synthesizer = FakeSynthesizer(default=None)
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    before = (dossier.confidence, dossier.magnitude)
+
+    await engine._decay_one("FORM", datetime.now(timezone.utc))
+
+    reloaded = engine.dossiers.load("FORM")
+    assert reloaded.synthesis_at == ""
+    assert (reloaded.confidence, reloaded.magnitude) == before
+
+
+async def test_the_daily_snapshot_records_the_synthesis_verdict(engine):
+    """The snapshot is the primary forward dataset. Without these columns a
+    0.000 row from a veto and one from a dead thesis are indistinguishable."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    await engine._decay_one("FORM", datetime.now(timezone.utc))
+
+    row = snapshot_dossier(engine.dossiers.load("FORM"), "2026-08-07T00:00:00+00:00")
+    assert row["already_priced_in"] is True
+    assert row["synthesis_at"] != ""
+    assert row["score"] == 0.0
+    assert row["scoring_version"] == 4  # the regime where score is the CAPPED number
