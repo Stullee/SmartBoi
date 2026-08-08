@@ -531,6 +531,24 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str) -> dict:
         "score": round(d.confidence * d.magnitude, 4),
         "independent_source_count": d.independent_source_count,
         "status": d.status,
+        # The synthesis verdict behind the score above.
+        #
+        # `score` is the CAPPED number once synthesis has run (see engine's
+        # _apply_synthesis: a veto zeroes it, a trim lowers it), and until
+        # these columns existed the record could not tell a decayed score
+        # from a vetoed one -- a 0.000 row and a genuinely dead thesis were
+        # indistinguishable. That made the one pass built to answer
+        # overlap/coherence/priced-in the only pass whose effect on the
+        # forward record could not be measured at all.
+        #
+        # synthesis_at is a timestamp rather than a flag so staleness stays
+        # visible: a verdict from days ago capping today's score is a fact
+        # about the record, not a detail to hide.
+        "synthesis_at": d.synthesis_at,
+        "synthesis_confidence": round(d.synthesis_confidence, 4),
+        "synthesis_magnitude": round(d.synthesis_magnitude, 4),
+        "distinct_fact_count": d.distinct_fact_count,
+        "already_priced_in": d.already_priced_in,
     }
 
 

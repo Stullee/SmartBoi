@@ -18,6 +18,7 @@ import smartboi.engine
 from smartboi.dossier import SCORING_VERSION
 from smartboi.engine import ECOSYSTEM_LINK_CONFIDENCE, Engine, is_common_equity
 from smartboi.ratelimit import SlidingWindowLimiter
+from smartboi.status import snapshot_dossier
 from smartboi.graph import Relationship
 from smartboi.news import NewsArticle
 
@@ -253,12 +254,22 @@ async def test_second_discovery_with_a_resolved_ticker_merges_the_orphan(engine)
 
     # Second mention (a different filing/symbol): this time a ticker
     # resolves -- must merge into the ticker key, not orphan the first.
+    #
+    # A genuinely distinct filing, not the same FilingEvent re-passed: an
+    # accession number belongs to exactly one filer, so reusing it for a
+    # second symbol is a state that cannot occur live -- and seen_count is
+    # now counted per filing, so it would (correctly) refuse to count the
+    # same document twice.
+    other_filing = FilingEvent(
+        symbol="UCTT", cik10="0000000002", form="10-K", filing_date="2026-07-02",
+        accession_number="0001234567-26-000002", primary_document="uctt.htm",
+    )
     engine.extractor.default = [{
         "counterparty_name": "Some Uncommon Co", "counterparty_ticker": "ZZZZ",
         "rel_type": "supplier", "description": "our supplier, Some Uncommon Co",
         "confidence": 0.8, "quote": "our supplier, Some Uncommon Co",
     }]
-    await engine._extract_relationships("UCTT", filing, "filing text")
+    await engine._extract_relationships("UCTT", other_filing, "filing text")
 
     assert "SOME UNCOMMON CO" not in engine.candidates.data
     merged = engine.candidates.get("ZZZZ")
@@ -2109,3 +2120,132 @@ async def test_auto_supplier_research_failure_never_kills_the_tick(engine, monke
     # Marked done anyway: retrying an expensive pass every 30s tick until it
     # succeeds is far worse than waiting a day.
     assert not engine._daily_pass_due("supplier_research")
+
+
+# --- Invariant: seen_count counts FILINGS, not extraction passes. It gates
+# tradeable auto-accept and means "disclosed across filings", so re-reading
+# one filing must never manufacture repeat disclosure. 0.47.0's rolling
+# monthly re-extraction made this reachable on a schedule. ---
+
+async def test_re_extracting_the_same_filing_does_not_inflate_seen_count(engine):
+    """The regression the graph refresh introduced: the refresh clears a
+    symbol's backfill marker so its latest 10-K is read again, and an
+    unconditional increment turned one disclosure into two -- crossing
+    auto_accept_min_seen_count (default 2) with no new filing in
+    existence."""
+    filing = FilingEvent(
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        accession_number="0001234567-26-000001", primary_document="form.htm",
+    )
+    engine.extractor.default = [{
+        "counterparty_name": "Some Uncommon Co", "counterparty_ticker": "ZZZZ",
+        "rel_type": "customer", "description": "our largest customer",
+        "confidence": 0.9, "quote": "our largest customer, Some Uncommon Co",
+    }]
+    await engine._extract_relationships("FORM", filing, "filing text")
+    assert engine.candidates.get("ZZZZ")["seen_count"] == 1
+
+    # The monthly refresh re-reads the very same document, twice over.
+    await engine._extract_relationships("FORM", filing, "filing text")
+    await engine._extract_relationships("FORM", filing, "filing text")
+    entry = engine.candidates.get("ZZZZ")
+    assert entry["seen_count"] == 1, "re-reading one filing is not repeat disclosure"
+    assert entry["sources"] == [filing.document_url]
+
+
+async def test_a_second_real_filing_does_increment_seen_count(engine):
+    """The other half: the guard must still let genuine repeat disclosure
+    through, or the rolling refresh would freeze every candidate at 1 and no
+    tradeable could ever auto-accept again."""
+    engine.extractor.default = [{
+        "counterparty_name": "Some Uncommon Co", "counterparty_ticker": "ZZZZ",
+        "rel_type": "customer", "description": "our largest customer",
+        "confidence": 0.9, "quote": "our largest customer, Some Uncommon Co",
+    }]
+    for n, symbol in ((1, "FORM"), (2, "UCTT")):
+        await engine._extract_relationships(symbol, FilingEvent(
+            symbol=symbol, cik10=f"000000000{n}", form="10-K",
+            filing_date=f"2026-07-0{n}", accession_number=f"0001234567-26-00000{n}",
+            primary_document=f"{symbol.lower()}.htm",
+        ), "filing text")
+
+    entry = engine.candidates.get("ZZZZ")
+    assert entry["seen_count"] == 2  # two filers, two filings -> real corroboration
+    assert len(entry["sources"]) == 2
+
+
+# --- Invariant: a synthesis verdict SURVIVES the pass that produced it.
+#
+# The verdict used to be computed, used to cap the score for the rest of the
+# decay pass, and then dropped: it reached disk only when something else
+# happened to save the dossier in the same pass (a signal firing, an expiry).
+# For an ACTIVE dossier that stayed below the bar -- the common case -- the
+# most expensive judgement in the system left no trace, so its effect on
+# outcomes could never be measured, and the per-trade synthesis stamp read a
+# verdict that was usually stale or absent. ---
+
+async def test_a_verdict_on_an_active_dossier_is_persisted(engine):
+    """The case that was being lost: nothing else saves this dossier, so
+    without an explicit save the verdict evaporates at end of pass."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(confidence=0.4, magnitude=0.5,
+                                                           distinct_fact_count=1))
+    # Above the synthesis floor (0.5 * 0.6) but below the signal bar (0.5),
+    # so synthesis runs and NOTHING else in the pass saves this dossier --
+    # no signal fires, no expiry. That is precisely the case the verdict
+    # used to be lost in.
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    assert dossier.status == "ACTIVE"
+
+    await engine._decay_one("FORM", datetime.now(timezone.utc))
+
+    reloaded = engine.dossiers.load("FORM")
+    assert reloaded.synthesis_at != "", "the verdict never reached disk"
+    assert reloaded.distinct_fact_count == 1
+    assert reloaded.synthesis_confidence == 0.4
+    # ...and the CAP it implies is on disk too, not just in memory.
+    assert reloaded.confidence == 0.4
+    assert reloaded.magnitude == 0.5
+
+
+async def test_a_veto_is_persisted_rather_than_recomputed_away(engine):
+    """A veto zeroes the score. If it is not written down, the record cannot
+    tell a vetoed thesis from one that simply decayed to nothing."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    # ACTIVE, so there is no expiry path to persist this as a side effect.
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    assert dossier.status == "ACTIVE"
+
+    await engine._decay_one("FORM", datetime.now(timezone.utc))
+
+    reloaded = engine.dossiers.load("FORM")
+    assert reloaded.already_priced_in is True
+    assert reloaded.confidence == 0.0
+    assert reloaded.magnitude == 0.0
+
+
+async def test_a_deferred_synthesis_does_not_rewrite_the_dossier(engine):
+    """Budget exhaustion / transient failure must stay a no-op: no verdict,
+    and no save claiming one happened."""
+    engine.synthesizer = FakeSynthesizer(default=None)
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    before = (dossier.confidence, dossier.magnitude)
+
+    await engine._decay_one("FORM", datetime.now(timezone.utc))
+
+    reloaded = engine.dossiers.load("FORM")
+    assert reloaded.synthesis_at == ""
+    assert (reloaded.confidence, reloaded.magnitude) == before
+
+
+async def test_the_daily_snapshot_records_the_synthesis_verdict(engine):
+    """The snapshot is the primary forward dataset. Without these columns a
+    0.000 row from a veto and one from a dead thesis are indistinguishable."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    await engine._decay_one("FORM", datetime.now(timezone.utc))
+
+    row = snapshot_dossier(engine.dossiers.load("FORM"), "2026-08-07T00:00:00+00:00")
+    assert row["already_priced_in"] is True
+    assert row["synthesis_at"] != ""
+    assert row["score"] == 0.0
+    assert row["scoring_version"] == 4  # the regime where score is the CAPPED number
