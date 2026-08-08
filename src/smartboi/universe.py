@@ -140,6 +140,57 @@ class CompanySpec:
     notes: str = ""
 
 
+# Index/sector ETFs marked daily alongside the universe (engine's
+# _run_daily_price_marks) purely so the forward record can be measured
+# RELATIVE to something. They are never traded, never dossiered, never
+# polled for news or filings -- they exist only in price_marks.jsonl.
+#
+# This is the highest-leverage capture in the system, and the arithmetic is
+# why. Raw forward returns in this universe carry the market and the sector
+# almost undiluted: nine ecosystems that are largely one bet on the AI/
+# electrification capex cycle, so per-trade residual vol runs ~15% over a
+# 21-day hold and the pairwise correlation across a 15-position book is
+# ~0.4. Subtract a matched benchmark and residual vol falls to ~10.5% while
+# residual pairwise correlation collapses to ~0.05 -- which takes the
+# observations needed to detect a 1%/trade edge from ~1,150 to ~196, i.e.
+# from roughly five years down to roughly one.
+#
+# The existing ecosystem_benchmark_return (forward_returns.py) averages the
+# universe's OWN members, which answers a different and narrower question:
+# "did this name beat its peers." It cannot answer "is any of this alpha
+# rather than beta," because every peer carries the same market exposure.
+# Both are worth having; only this one can separate alpha from beta.
+#
+# One extra Finnhub /quote per symbol per day. No LLM cost, no EDGAR cost.
+MARKET_BENCHMARK_SYMBOLS: tuple[str, ...] = (
+    "SPY",   # large-cap market
+    "IWM",   # small-cap market -- the right beta for this universe
+)
+
+# One liquid sector ETF per ecosystem. Chosen for tracking the ecosystem's
+# actual economics rather than for name similarity, and deliberately broad:
+# a thin, exotic ETF would add its own idiosyncratic noise to the benchmark,
+# which is the opposite of the point.
+ECOSYSTEM_BENCHMARK_ETF: dict[str, str] = {
+    "semi_equipment": "SMH",          # semiconductors incl. the equipment makers
+    "defense_tier2": "ITA",           # aerospace & defense
+    "grid_datacenter": "XLU",         # utilities -- the buildout's demand side
+    "battery_storage": "LIT",         # lithium & battery tech
+    "medtech_supply": "IHI",          # medical devices
+    "auto_supply": "CARZ",            # autos & components
+    "energy_services": "OIH",         # oil services & equipment
+    "industrial_machinery": "XLI",    # industrials
+    "transport_logistics": "IYT",     # transportation
+}
+
+
+def benchmark_symbols() -> list[str]:
+    """Every symbol to price-mark that is not a universe member. Sorted and
+    de-duplicated so the daily marking order is stable and a symbol shared
+    between two ecosystems is fetched once."""
+    return sorted({*MARKET_BENCHMARK_SYMBOLS, *ECOSYSTEM_BENCHMARK_ETF.values()})
+
+
 DEFAULT_UNIVERSE: list[CompanySpec] = [
     # ================================================================
     # Semiconductor equipment & materials

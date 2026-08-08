@@ -506,7 +506,7 @@ def gather_universe_candidates(candidates: dict, accepted: dict) -> list[dict]:
     return rows
 
 
-def snapshot_dossier(d: Dossier, snapshotted_at: str) -> dict:
+def snapshot_dossier(d: Dossier, snapshotted_at: str, session: str = "") -> dict:
     """One row for the daily dossier-snapshot log (logs/dossier_snapshots.jsonl,
     see engine.py's _run_daily_snapshot) -- the raw material for eventually
     validating whether confidence*magnitude predicts forward returns,
@@ -524,6 +524,14 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str) -> dict:
         # boundary. Forward data can't be backfilled and old rows must never
         # be re-scored with new logic, so the split is the only honest option.
         "scoring_version": SCORING_VERSION,
+        # The market session this row describes, and the JOIN KEY against
+        # price_marks.jsonl. snapshotted_at is the wall clock the row was
+        # written at and is kept only as an audit trail: the two used to be
+        # the same thing, which is exactly how a snapshot dated D came to be
+        # joined against D-1's closing price (see
+        # market_hours.last_completed_session). Empty on rows written before
+        # this column existed; readers fall back to snapshotted_at[:10].
+        "session_date": session,
         "symbol": d.symbol,
         "direction": d.direction,
         "confidence": round(d.confidence, 4),
@@ -549,6 +557,61 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str) -> dict:
         "synthesis_magnitude": round(d.synthesis_magnitude, 4),
         "distinct_fact_count": d.distinct_fact_count,
         "already_priced_in": d.already_priced_in,
+        # --- What KIND of evidence produced this score ---
+        #
+        # The system's central hypothesis is that evidence arriving over a
+        # graph edge (a customer's news reaching its supplier with a lag)
+        # predicts returns. Nothing in the record could test it: every row
+        # carried the score and none carried the composition behind it, so
+        # "do propagated theses beat direct ones" -- the question the whole
+        # design exists to answer -- was unanswerable from the data the
+        # system had been collecting for weeks.
+        #
+        # Derived, not stored: these are computed from the evidence list at
+        # snapshot time, so they cost nothing and cannot drift from it.
+        **_evidence_composition(d),
+    }
+
+
+def _evidence_composition(d: Dossier) -> dict:
+    """The discriminating columns for the forward record: how much of this
+    dossier is second-order, how strong the links behind it are, and which
+    kind of link dominates.
+
+    All bounded to the evidence that actually contributes -- an item the
+    skeptic zeroed is in the list but is not part of the thesis."""
+    contributing = [e for e in d.evidence if e.confidence > 0]
+    total = len(contributing)
+    if not total:
+        return {
+            "evidence_count": 0, "propagated_count": 0, "propagated_share": 0.0,
+            "direct_filing_count": 0, "max_relationship_confidence": 0.0,
+            "dominant_rel_type": "", "distinct_origin_count": 0,
+        }
+    propagated = [e for e in contributing if e.is_propagated]
+    rel_confidences = [
+        e.relationship_confidence for e in propagated if e.relationship_confidence is not None
+    ]
+    # rel_type is not carried on EvidenceRecord (it is not threaded through
+    # the propagation path at all -- a known gap), so the closest available
+    # discriminator is the relationship_note the extractor wrote. Recorded
+    # as a coarse bucket rather than parsed into a false precision.
+    notes = " ".join(e.relationship_note.lower() for e in propagated)
+    rel_type = ""
+    for candidate in ("customer", "supplier", "competitor", "regulator"):
+        if candidate in notes:
+            rel_type = candidate if not rel_type else "mixed"
+    return {
+        "evidence_count": total,
+        "propagated_count": len(propagated),
+        "propagated_share": round(len(propagated) / total, 4),
+        "direct_filing_count": sum(
+            1 for e in contributing
+            if not e.is_propagated and e.source_type in ("8-K", "10-K", "10-Q", "4")
+        ),
+        "max_relationship_confidence": round(max(rel_confidences), 4) if rel_confidences else 0.0,
+        "dominant_rel_type": rel_type,
+        "distinct_origin_count": len({e.origin_symbol for e in contributing if e.origin_symbol}),
     }
 
 

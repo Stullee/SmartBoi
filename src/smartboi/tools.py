@@ -37,9 +37,11 @@ from smartboi.event_study import (
     collapse_episodes,
     format_event_study,
 )
+from smartboi.dossier import SCORING_VERSION
 from smartboi.forward_returns import (
     compute_forward_return,
     dedup_snapshots,
+    filter_by_scoring_version,
     format_report,
     price_marks_by_symbol,
 )
@@ -200,6 +202,7 @@ def run_forward_returns(
     log_dir: str | Path,
     universe: list[CompanySpec],
     horizons: tuple[int, ...] | list[int] = DEFAULT_HORIZONS,
+    scoring_version: int | None = SCORING_VERSION,
 ) -> str:
     """The "does score predict forward returns" report over every captured
     dossier snapshot, for each horizon -- the analysis half of the
@@ -223,6 +226,31 @@ def run_forward_returns(
             f"{len(snapshots)} distinct (symbol, date) observations remain.\n"
         )
 
+    # Restricted to ONE scoring regime, by default the one in force. The
+    # stamp existed from the start and no reader had ever applied it, so
+    # every report until now silently averaged incompatible rule sets --
+    # and the stamp has already been bumped four times, most recently when
+    # the synthesis cap started reaching the record at all.
+    before_version = len(snapshots)
+    snapshots = filter_by_scoring_version(snapshots, scoring_version)
+    excluded = before_version - len(snapshots)
+    if scoring_version is None:
+        lines.append(
+            "WARNING: pooling ALL scoring versions. Rows scored under different rules are not "
+            "comparable and the numbers below mix them.\n"
+        )
+    elif excluded:
+        lines.append(
+            f"Scoring version {scoring_version} only: {excluded} row(s) from earlier versions "
+            f"excluded, {len(snapshots)} remain. Forward data cannot be re-scored, so a rules "
+            f"change splits the record rather than extending it.\n"
+        )
+    if not snapshots:
+        return "".join(lines) + (
+            f"No snapshots at scoring version {scoring_version} yet. The rules changed recently; "
+            "the record restarts from that boundary."
+        )
+
     price_marks = price_marks_by_symbol(marks)
     ecosystem_by_symbol = {symbol: spec.ecosystem for symbol, spec in spec_by_symbol(universe).items()}
     directional = [s for s in snapshots if s.get("direction") in ("LONG", "SHORT")]
@@ -234,7 +262,29 @@ def run_forward_returns(
         lines.append(format_report(horizon_days, joined, price_marks, ecosystem_by_symbol,
                                    attempted=len(directional)))
         lines.append("")
+    lines.append(_DECISION_GATE)
     return "\n".join(lines)
+
+
+_DECISION_GATE = """
+--------------------------------------------------------------------------
+PRE-REGISTERED DECISION GATE -- read before interpreting anything above.
+
+Fix ONE cell before looking: one horizon, one statistic, one bucket. Every
+extra interval you read raises the chance that the best-looking one is
+noise; roughly thirty are printed here.
+
+Judge on the BENCHMARK-RELATIVE columns, not the raw ones. Raw returns in
+this universe are mostly market and sector beta.
+
+Judge on N_eff, not Rows. One thesis persisting for weeks contributes a row
+per day with almost fully overlapping windows -- near-copies of a single
+observation.
+
+Rough scale: detecting a 1%/trade edge needs on the order of 200 effective
+observations benchmark-relative, and ~1,150 raw. If N_eff is in the tens,
+this report cannot yet distinguish an edge from noise, whatever it shows.
+--------------------------------------------------------------------------"""
 
 
 def run_event_study(

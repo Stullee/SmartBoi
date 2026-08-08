@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -15,6 +15,10 @@ import pytest
 from smartboi.config import Settings
 from smartboi.edgar import FilingEvent
 import smartboi.engine
+import smartboi.market_hours
+
+# The session the conftest pins last_completed_session to.
+SESSION = date(2026, 8, 6)
 from smartboi.dossier import SCORING_VERSION
 from smartboi.engine import ECOSYSTEM_LINK_CONFIDENCE, Engine, is_common_equity
 from smartboi.ratelimit import SlidingWindowLimiter
@@ -1047,7 +1051,7 @@ async def test_daily_price_marks_fall_back_to_finnhub_and_include_anchors(engine
     engine.price_feed = FakePriceFeed(connected=False)
     engine.finnhub.quotes_by_symbol = {"FORM": 10.0, "UCTT": 20.0, "INTC": 30.0}
 
-    assert await engine._run_daily_price_marks() is True
+    assert await engine._run_daily_price_marks(SESSION) is True
 
     marks = (Path(engine.settings.log_dir) / "price_marks.jsonl").read_text().splitlines()
     marked_symbols = {__import__("json").loads(m)["symbol"] for m in marks}
@@ -1058,7 +1062,7 @@ async def test_daily_price_marks_report_failure_when_no_source(engine):
     engine.price_feed = FakePriceFeed(connected=False)
     engine.finnhub.quotes_by_symbol = {}
 
-    assert await engine._run_daily_price_marks() is False
+    assert await engine._run_daily_price_marks(SESSION) is False
     assert not (Path(engine.settings.log_dir) / "price_marks.jsonl").exists()
 
 
@@ -1918,8 +1922,8 @@ def test_a_snapshot_that_wrote_nothing_leaves_the_day_due(engine):
     done unconditionally -- on the pass whose data is the less replaceable
     of the two."""
     assert engine.dossiers.all_symbols() == []
-    assert engine._run_daily_snapshot() is False
-    assert engine._daily_pass_due("dossier_snapshot")  # still due, will retry
+    assert engine._run_daily_snapshot(SESSION) is False
+    assert engine._session_pass_due("dossier_snapshot", SESSION)  # still due, will retry
 
 
 def test_a_snapshot_that_wrote_rows_marks_the_day_done(engine):
@@ -1927,7 +1931,7 @@ def test_a_snapshot_that_wrote_rows_marks_the_day_done(engine):
     dossier.direction = "LONG"
     engine.dossiers.save(dossier)
 
-    assert engine._run_daily_snapshot() is True
+    assert engine._run_daily_snapshot(SESSION) is True
     rows = (Path(engine.settings.log_dir) / "dossier_snapshots.jsonl").read_text().splitlines()
     assert len(rows) == 1
 
@@ -2002,21 +2006,68 @@ async def test_a_non_object_relationship_does_not_kill_the_paid_for_extraction(e
     assert any(r.to_symbol == "UCTT" for r in engine.graph.relationships)
 
 
-async def test_the_daily_price_marks_pass_is_skipped_at_the_weekend(engine, monkeypatch):
+async def test_a_weekend_mark_is_keyed_to_the_session_it_actually_is(engine, monkeypatch):
     """Both price sources answer on a Saturday, with Friday's close -- a
-    real-looking number under a weekend date key. forward_returns walks
-    FORWARD to the first date at or after its target, so a horizon landing on
-    a weekend joins that stale row instead of Monday's, truncating the window
-    by a day or two. It never extends it, so the bias is one-directional:
-    every measured return, hit rate and correlation is attenuated."""
-    monkeypatch.setattr(smartboi.engine, "is_trading_day", lambda now=None: False)
+    real-looking number that used to be written under a WEEKEND date key.
+    forward_returns walks FORWARD to the first date at or after its target,
+    so a horizon landing on a weekend joined that stale row instead of
+    Monday's, truncating the window. The bias was one-directional: every
+    measured return, hit rate and correlation attenuated toward zero.
+
+    Keying on the last COMPLETED session fixes it without throwing the data
+    away: a quote fetched on Saturday really is Friday's close, so it is
+    recorded as Friday's close rather than discarded."""
+    saturday = datetime(2026, 8, 8, 16, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        smartboi.engine, "last_completed_session",
+        lambda now=None: smartboi.market_hours.last_completed_session(saturday),
+    )
     engine.price_feed = None
     engine.finnhub.quotes_by_symbol["FORM"] = 10.0
 
     await engine._tick()
 
-    assert not (Path(engine.settings.log_dir) / "price_marks.jsonl").exists()
-    assert engine._daily_pass_due("price_marks")  # still due, picked up on Monday
+    rows = [json.loads(r) for r in
+            (Path(engine.settings.log_dir) / "price_marks.jsonl").read_text().splitlines()]
+    assert rows, "a Saturday quote is Friday's real close -- capture it, don't drop it"
+    assert {r["session_date"] for r in rows} == {"2026-08-07"}, "Friday, not Saturday"
+
+
+async def test_a_session_is_captured_exactly_once(engine):
+    """The pass ran on an elapsed-time schedule, so several restarts in one
+    day wrote a full duplicate batch each time -- 6 duplicate batches from 6
+    restarts was measured live, inflating that day's analysis 6x."""
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol["FORM"] = 10.0
+
+    await engine._tick()
+    await engine._tick()
+    await engine._tick()
+
+    rows = [json.loads(r) for r in
+            (Path(engine.settings.log_dir) / "price_marks.jsonl").read_text().splitlines()]
+    assert len({(r["symbol"], r["session_date"]) for r in rows}) == len(rows)
+
+
+async def test_the_pass_never_records_a_non_session_date(engine, monkeypatch):
+    """The invariant that matters, stated directly: whatever the clock says,
+    no row may be keyed to a day the market was shut. Christmas Day 2026 is
+    a Friday, so a weekday test alone would have let it through."""
+    christmas = datetime(2026, 12, 25, 22, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        smartboi.engine, "last_completed_session",
+        lambda now=None: smartboi.market_hours.last_completed_session(christmas),
+    )
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol["FORM"] = 10.0
+
+    await engine._tick()
+
+    rows = [json.loads(r) for r in
+            (Path(engine.settings.log_dir) / "price_marks.jsonl").read_text().splitlines()]
+    assert {r["session_date"] for r in rows} == {"2026-12-24"}
+    assert all(smartboi.market_hours.is_session_date(date.fromisoformat(r["session_date"]))
+               for r in rows)
 
 
 async def test_the_daily_price_marks_pass_runs_on_a_weekday(engine):
@@ -2377,3 +2428,172 @@ def test_quarantined_data_loss_is_repeated_on_every_heartbeat(engine, caplog):
         assert "data/graph.json" in caplog.text
     finally:
         persist.quarantine_events.clear()
+
+
+# --- ingestion rotation: the rationing lottery ---
+
+def test_ingestion_order_starts_at_the_cursor(engine):
+    order = engine.ingestion_order()
+    assert sorted(order) == sorted(engine.symbol_list)
+    assert order == engine.symbol_list, "cursor starts at 0"
+
+    engine.periodic_state.set("ingestion_cursor", 1)
+    rotated = engine.ingestion_order()
+    assert rotated[0] == engine.symbol_list[1]
+    assert sorted(rotated) == sorted(engine.symbol_list), "a rotation drops nothing"
+
+
+def test_the_cursor_survives_a_restart(engine):
+    """In-memory would defeat the whole point: a deployment that restarts
+    daily would re-anchor to index 0 every time, which is the bias being
+    fixed."""
+    engine.periodic_state.set("ingestion_cursor", 2)
+    reloaded = smartboi.engine.JsonState(engine.periodic_state.path)
+    assert reloaded.get("ingestion_cursor") == 2
+
+
+def test_every_symbol_reaches_the_front_within_a_few_polls(engine):
+    """The property that matters. Under a fixed order the tail of the list
+    is never served once demand exceeds budget -- measured live, seven of
+    nine ecosystems got zero scored evidence, permanently."""
+    engine.universe = [smartboi.engine.CompanySpec(f"S{i}", f"S{i}", "eco") for i in range(30)]
+    seen_first = set()
+    for _ in range(12):
+        seen_first.add(engine.ingestion_order()[0])
+        engine._advance_ingestion_cursor()
+    assert len(seen_first) > 1, "the starting point must move"
+    # With a stride of len//3 the whole list is covered by the 3rd poll.
+    covered = set()
+    engine.periodic_state.set("ingestion_cursor", 0)
+    for _ in range(3):
+        covered.update(engine.ingestion_order()[:10])
+        engine._advance_ingestion_cursor()
+    assert len(covered) == 30, "three polls should reach every symbol"
+
+
+def test_a_corrupt_cursor_does_not_break_ingestion(engine):
+    engine.periodic_state.set("ingestion_cursor", "not an int")
+    assert engine.ingestion_order() == engine.symbol_list
+
+
+# --- benchmark price marks ---
+
+async def test_benchmarks_are_marked_alongside_the_universe(engine):
+    """Without an index mark there is no way to tell alpha from beta, and
+    the marks cannot be backfilled."""
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol = {"FORM": 10.0, "IWM": 200.0, "SPY": 500.0}
+
+    assert await engine._run_daily_price_marks(SESSION) is True
+
+    rows = [json.loads(r) for r in
+            (Path(engine.settings.log_dir) / "price_marks.jsonl").read_text().splitlines()]
+    marked = {r["symbol"] for r in rows}
+    assert {"IWM", "SPY"} <= marked
+    assert all(r["session_date"] == SESSION.isoformat() for r in rows)
+
+
+def test_benchmarks_are_never_traded_or_dossiered(engine):
+    """They exist only in price_marks.jsonl -- they are not universe
+    members, so nothing can open a position in one."""
+    from smartboi.universe import benchmark_symbols
+
+    for symbol in benchmark_symbols():
+        assert symbol not in engine.symbol_list
+        assert not engine._is_tradeable(symbol)
+
+
+# --- trade provenance: can the record say WHY it took the trade? ---
+
+async def test_a_propagated_trade_records_the_edge_it_came_over(engine):
+    """Before this, a propagated trade wrote headlines ABOUT INTEL into a
+    FORM trade with no field saying so -- so any reader, including the
+    three analysis scripts, would read "Intel raises capex guidance" as
+    evidence about FORM. It also made the system's central hypothesis
+    untestable from its own output: whether second-order evidence predicts
+    returns better than direct evidence is THE question, and the trade
+    record did not say which kind each trade was."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    # The fixture pins one propagated item per link; this test needs two
+    # independent sources to clear the corroboration bar.
+    engine._propagation_limiter.max_events = 5
+    engine.graph.add(Relationship("INTC", "FORM", "customer",
+                                  "Intel is a customer of FORM", "10-K", 0.92, "2026-07-23"))
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="INTC", evidence_text=f"Intel capex news {i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"Intel news {i}",
+            published_at="2026-07-29T12:00:00+00:00",
+        )
+    await engine._mark_and_execute()
+
+    assert engine.journal.has_open("FORM")
+    citations = engine.journal.open_trades["FORM"].citations
+    assert citations, "a trade with no citations cannot be judged later"
+    for c in citations:
+        assert c["origin_symbol"] == "INTC", "the headline is about Intel, and must say so"
+        assert c["is_propagated"] is True
+        assert c["relationship_confidence"] == pytest.approx(0.92)
+        assert "customer" in c["relationship_note"].lower()
+
+
+async def test_a_direct_trade_is_distinguishable_from_a_propagated_one(engine):
+    """The discriminator has to work in both directions or it measures
+    nothing."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"FORM news {i}", source_type="news",
+            source_name=source, url=f"https://y/{i}", headline=f"FORM news {i}",
+            published_at="2026-07-29T12:00:00+00:00",
+        )
+    await engine._mark_and_execute()
+
+    citations = engine.journal.open_trades["FORM"].citations
+    assert all(c["is_propagated"] is False for c in citations)
+    assert all(c["origin_symbol"] == "FORM" for c in citations)
+
+
+def test_the_snapshot_records_what_kind_of_evidence_produced_the_score(engine):
+    """The same discriminator on the panel side, which is the dataset that
+    reaches significance first."""
+    from smartboi.dossier import EvidenceRecord
+    from smartboi.status import snapshot_dossier
+
+    def evidence_record(**overrides):
+        fields = dict(
+            evidence_id="e", source_type="news", source_name="reuters.com",
+            url="https://x", headline="h", published_at="2026-08-01T00:00:00+00:00",
+            origin_symbol="FORM", is_propagated=False, relationship_note="",
+            direction="LONG", magnitude=0.5, confidence=0.5, horizon_days=10,
+            reasoning="r", skeptic_note="",
+        )
+        fields.update(overrides)
+        return EvidenceRecord(**fields)
+
+    dossier = engine.dossiers.load("FORM")
+    dossier.direction = "LONG"
+    dossier.evidence = [
+        evidence_record(evidence_id="a", origin_symbol="INTC", is_propagated=True,
+                        relationship_note="INTC is a customer of FORM",
+                        relationship_confidence=0.9, confidence=0.7),
+        evidence_record(evidence_id="b", origin_symbol="FORM", is_propagated=False,
+                        source_type="8-K", confidence=0.6),
+    ]
+
+    row = snapshot_dossier(dossier, "2026-08-06T21:00:00+00:00", session="2026-08-06")
+
+    assert row["session_date"] == "2026-08-06"
+    assert row["evidence_count"] == 2
+    assert row["propagated_count"] == 1
+    assert row["propagated_share"] == pytest.approx(0.5)
+    assert row["direct_filing_count"] == 1
+    assert row["max_relationship_confidence"] == pytest.approx(0.9)
+    assert row["dominant_rel_type"] == "customer"
+    assert row["distinct_origin_count"] == 2

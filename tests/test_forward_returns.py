@@ -1,10 +1,14 @@
+import pytest
+
 from smartboi.forward_returns import (
-    bucket_returns,
     benchmark_relative_returns,
+    bucket_returns,
     compute_forward_return,
     dedup_snapshots,
     ecosystem_benchmark_return,
+    filter_by_scoring_version,
     format_report,
+    market_benchmark_return,
     pearson_correlation,
     per_symbol_breakdown,
     price_marks_by_symbol,
@@ -376,3 +380,124 @@ def test_format_report_shows_join_accounting():
     assert "1 of 4" in report
     assert "3 unjoinable" in report
     assert "N_eff" in report
+
+
+# --- session-keyed joins, the market benchmark, and the version filter ---
+
+def test_the_join_uses_the_session_not_the_write_time():
+    """The lookahead this closes: a mark WRITTEN at 00:30 ET Monday holds
+    Friday's close. Keyed on marked_at it looked like a Monday price and a
+    Monday snapshot joined to it; keyed on the session it is Friday's, and
+    joins to Friday's snapshot."""
+    marks = price_marks_by_symbol([
+        {"marked_at": "2026-08-10T04:30:00+00:00", "session_date": "2026-08-07",
+         "symbol": "FORM", "price": 10.0},
+        {"marked_at": "2026-08-17T04:30:00+00:00", "session_date": "2026-08-14",
+         "symbol": "FORM", "price": 11.0},
+    ])
+    assert marks["FORM"] == {"2026-08-07": 10.0, "2026-08-14": 11.0}
+
+    row = compute_forward_return(
+        {"symbol": "FORM", "direction": "LONG", "score": 0.8,
+         "snapshotted_at": "2026-08-10T04:31:00+00:00", "session_date": "2026-08-07"},
+        marks, horizon_days=7,
+    )
+    assert row["entry_date"] == "2026-08-07"
+    assert row["entry_price"] == 10.0
+    assert row["signed_return_pct"] == pytest.approx(10.0)
+
+
+def test_rows_written_before_the_session_anchor_still_join():
+    """Backward compatibility: pre-anchor rows have no session_date and
+    must fall back to the wall-clock key rather than vanishing."""
+    marks = price_marks_by_symbol([
+        {"marked_at": "2026-07-01T20:00:00+00:00", "symbol": "FORM", "price": 10.0},
+        {"marked_at": "2026-07-08T20:00:00+00:00", "symbol": "FORM", "price": 12.0},
+    ])
+    row = compute_forward_return(
+        {"symbol": "FORM", "direction": "LONG", "score": 0.8,
+         "snapshotted_at": "2026-07-01T20:05:00+00:00"},
+        marks, horizon_days=7,
+    )
+    assert row is not None and row["signed_return_pct"] == pytest.approx(20.0)
+
+
+def test_dedup_collapses_on_the_session_not_the_clock():
+    rows = dedup_snapshots([
+        {"symbol": "FORM", "snapshotted_at": "2026-08-07T20:30:00+00:00", "session_date": "2026-08-07"},
+        {"symbol": "FORM", "snapshotted_at": "2026-08-08T02:00:00+00:00", "session_date": "2026-08-07"},
+    ])
+    assert len(rows) == 1, "two writes describing one session are one observation"
+
+
+def test_market_relative_separates_alpha_from_beta():
+    """The point of marking IWM. A LONG that gained 10% while the market
+    gained 10% has no alpha, however good the raw number looks."""
+    marks = price_marks_by_symbol([
+        {"session_date": "2026-08-07", "symbol": "FORM", "price": 10.0, "marked_at": "x"},
+        {"session_date": "2026-08-14", "symbol": "FORM", "price": 11.0, "marked_at": "x"},
+        {"session_date": "2026-08-07", "symbol": "IWM", "price": 100.0, "marked_at": "x"},
+        {"session_date": "2026-08-14", "symbol": "IWM", "price": 110.0, "marked_at": "x"},
+    ])
+    row = compute_forward_return(
+        {"symbol": "FORM", "direction": "LONG", "score": 0.8, "session_date": "2026-08-07"},
+        marks, horizon_days=7,
+    )
+    (out,) = benchmark_relative_returns([row], marks, {"FORM": "semi_equipment"})
+    assert out["signed_return_pct"] == pytest.approx(10.0)
+    assert out["market_benchmark_pct"] == pytest.approx(10.0)
+    assert out["market_relative_pct"] == pytest.approx(0.0)
+
+
+def test_market_relative_is_sign_matched_for_shorts():
+    marks = price_marks_by_symbol([
+        {"session_date": "2026-08-07", "symbol": "FORM", "price": 10.0, "marked_at": "x"},
+        {"session_date": "2026-08-14", "symbol": "FORM", "price": 9.0, "marked_at": "x"},
+        {"session_date": "2026-08-07", "symbol": "IWM", "price": 100.0, "marked_at": "x"},
+        {"session_date": "2026-08-14", "symbol": "IWM", "price": 95.0, "marked_at": "x"},
+    ])
+    row = compute_forward_return(
+        {"symbol": "FORM", "direction": "SHORT", "score": 0.8, "session_date": "2026-08-07"},
+        marks, horizon_days=7,
+    )
+    (out,) = benchmark_relative_returns([row], marks, {"FORM": "semi_equipment"})
+    # Stock -10%, market -5%: the short made 10 but a short of the index
+    # would have made 5, so alpha is +5.
+    assert out["signed_return_pct"] == pytest.approx(10.0)
+    assert out["market_relative_pct"] == pytest.approx(5.0)
+
+
+def test_a_missing_benchmark_is_none_not_zero():
+    """Before IWM was marked there are no index prices. That must read as
+    'unknown', never as 'zero alpha'."""
+    marks = price_marks_by_symbol([
+        {"session_date": "2026-08-07", "symbol": "FORM", "price": 10.0, "marked_at": "x"},
+        {"session_date": "2026-08-14", "symbol": "FORM", "price": 11.0, "marked_at": "x"},
+    ])
+    row = compute_forward_return(
+        {"symbol": "FORM", "direction": "LONG", "score": 0.8, "session_date": "2026-08-07"},
+        marks, horizon_days=7,
+    )
+    (out,) = benchmark_relative_returns([row], marks, {"FORM": "semi_equipment"})
+    assert out["market_relative_pct"] is None
+
+
+def test_the_scoring_version_filter_actually_filters():
+    """It was written at three sites and read at zero, so every report
+    silently pooled incompatible rule sets."""
+    rows = [
+        {"symbol": "A", "scoring_version": 3, "session_date": "2026-08-01"},
+        {"symbol": "B", "scoring_version": 4, "session_date": "2026-08-05"},
+        {"symbol": "C", "scoring_version": 4, "session_date": "2026-08-07"},
+    ]
+    assert [r["symbol"] for r in filter_by_scoring_version(rows, 4)] == ["B", "C"]
+    assert [r["symbol"] for r in filter_by_scoring_version(rows, 3)] == ["A"]
+    assert len(filter_by_scoring_version(rows, None)) == 3, "None pools deliberately"
+
+
+def test_the_since_filter_cuts_on_the_session():
+    rows = [
+        {"symbol": "A", "scoring_version": 4, "session_date": "2026-08-01"},
+        {"symbol": "B", "scoring_version": 4, "session_date": "2026-08-07"},
+    ]
+    assert [r["symbol"] for r in filter_by_scoring_version(rows, 4, since="2026-08-05")] == ["B"]

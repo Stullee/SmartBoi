@@ -65,6 +65,7 @@ from smartboi.signals import (
     favorable_drift_pct,
     is_regular_trading_hours,
     is_trading_day,
+    last_completed_session,
     log_decision,
     log_signal,
     signal_expired,
@@ -72,7 +73,9 @@ from smartboi.signals import (
 from smartboi.skeptic import Skeptic
 from smartboi.state import JsonState
 from smartboi.status import snapshot_dossier
-from smartboi.universe import SEED_RELATIONSHIPS, CompanySpec, spec_by_symbol
+from smartboi.universe import (
+    SEED_RELATIONSHIPS, CompanySpec, benchmark_symbols, spec_by_symbol,
+)
 from smartboi.universe_screen import guess_ecosystem, recommend_candidate_type, screen_universe
 from smartboi.usage import CAT_EXTRACTION, CAT_RESEARCH, CAT_SYNTHESIS, UsageTracker
 from smartboi.webapp import run_dashboard
@@ -421,6 +424,63 @@ class Engine:
         which grows at runtime as candidates are accepted (see
         accept_candidate) without requiring a restart."""
         return [c.symbol for c in self.universe]
+
+    def ingestion_order(self) -> list[str]:
+        """symbol_list, rotated by a persisted cursor so the daily LLM
+        budget is not spent on the same prefix of the list every day.
+
+        This exists because of a measured, first-order bias in the forward
+        record, and the mechanism is entirely undramatic. Demand for dossier
+        calls runs several times the daily budget cap. Both ingestion loops
+        walk the universe in declaration order. When the budget is exhausted
+        an item is deferred WITHOUT being registered in the dedup index, so
+        it is retried on the next poll -- which starts again at index 0.
+
+        The budget was therefore consumed front-to-back from the same
+        starting point every poll, every day. Driving the real UsageTracker
+        with shipped defaults over the real 140-symbol order, at the demand
+        rate measured live, the cut lands around index 29: seven of nine
+        ecosystems, and every runtime-accepted symbol (all of which are
+        appended past the curated entries), received no scored evidence at
+        all -- permanently, not occasionally.
+
+        Two consequences, and the second is worse than the first. The
+        obvious one: the five ecosystems added specifically to fix "the book
+        behaved like one correlated bet on AI capex" sit past index 79 and
+        so could never be reached, meaning the diversification shipped and
+        could not take effect. The subtle one: because the censor is
+        DETERMINISTIC rather than random, the missing data is not ignorable.
+        Every bucket mean, hit rate and bootstrap CI in the forward-return
+        report was conditioned on "symbol index < ~30", which correlates
+        with market cap, ecosystem, news volume and beta simultaneously. No
+        amount of clustering or bootstrapping repairs a non-random censor.
+
+        Rotating the start offset does not create budget -- the same number
+        of items get scored. It makes WHICH ones unbiased, which is the part
+        that decides whether the record can be analysed at all."""
+        symbols = self.symbol_list
+        if not symbols:
+            return symbols
+        cursor = self.periodic_state.get("ingestion_cursor", 0)
+        if not isinstance(cursor, int):
+            cursor = 0
+        start = cursor % len(symbols)
+        return symbols[start:] + symbols[:start]
+
+    def _advance_ingestion_cursor(self) -> None:
+        """Moves the starting point on by a stride that is coprime with no
+        particular list length -- a plain +1 per poll would take as many
+        polls as there are symbols to give the tail its first turn. A stride
+        near a third of the list covers the whole universe in three polls
+        while still visiting every position over time."""
+        symbols = self.symbol_list
+        if not symbols:
+            return
+        cursor = self.periodic_state.get("ingestion_cursor", 0)
+        if not isinstance(cursor, int):
+            cursor = 0
+        stride = max(1, len(symbols) // 3)
+        self.periodic_state.set("ingestion_cursor", (cursor + stride) % len(symbols))
 
     @staticmethod
     def _accepted_entry(value) -> tuple[str, str, str]:
@@ -1008,6 +1068,14 @@ class Engine:
         if self.finnhub is not None and self._due(self._last_news_poll, self.settings.news_poll_interval_sec, now):
             self._last_news_poll = now
             await self._poll_news()
+            # Advanced once per NEWS poll rather than per tick or per EDGAR
+            # poll: the news sweep is the dominant consumer of the dossier
+            # budget, so its starting point is the one that decides which
+            # symbols get scored. Advancing here also means the cursor moves
+            # at the slowest ingestion cadence, so a symbol that gets served
+            # stays served long enough to accumulate a thesis rather than
+            # being handed one item every few days.
+            self._advance_ingestion_cursor()
         # Ingestion above may have fired a signal. Run the entry poll again so
         # it gets its evaluation inside THIS tick rather than waiting out a
         # full entry interval -- _fire_signal clears _last_price_poll on a
@@ -1035,7 +1103,8 @@ class Engine:
         # retried on the next tick instead of silently losing the day's
         # capture. Duplicate rows from a partial write are handled
         # downstream (dedup_snapshots / last-mark-wins), a lost day is not.
-        if self._daily_pass_due("dossier_snapshot"):
+        session = last_completed_session()
+        if self._session_pass_due("dossier_snapshot", session):
             # Gated on the return value, exactly like price marks below.
             # This used to call and mark unconditionally, so the comment
             # above described a property only ONE of the two passes had --
@@ -1043,34 +1112,35 @@ class Engine:
             # replaceable of the two. A snapshot that wrote nothing (no
             # dossiers loaded yet on a cold start, a read that returned
             # empty) was recorded as a completed day, and the day was gone.
-            if self._run_daily_snapshot():
-                self._mark_daily_pass_done("dossier_snapshot")
+            if self._run_daily_snapshot(session):
+                self._mark_session_pass_done("dossier_snapshot", session)
         # Daily price marks are deliberately NOT gated on IB being enabled
         # or reachable -- they are the raw material for the forward-return
         # validation, and a missed day is permanently unbackfillable. IB is
         # preferred when available; Finnhub's /quote fills in otherwise.
-        # Weekends are SKIPPED, not merely tolerated. Both price sources
-        # answer on a Saturday -- with Friday's close, a real-looking number
-        # -- so the pass wrote a duplicate mark under a weekend date key.
-        # forward_returns._price_on_or_after takes the first date at or after
-        # its target, so a snapshot whose entry_date + horizon lands on a
-        # weekend joins to that stale row instead of walking on to Monday,
-        # truncating the realized window by a day or two. It never extends
-        # it, so the error is one-directional: it attenuates every measured
-        # return, hit rate and correlation toward zero, and occasionally
-        # manufactures an exact 0.00% row out of nothing. Neither default
-        # horizon (5, 20) is a multiple of 7, so a meaningful share of rows
-        # are affected rather than a rare few -- and none of it is
-        # repairable afterwards, because a weekend row is indistinguishable
-        # from a genuine one once written.
+        #
+        # Non-session days are skipped by the SESSION key rather than by a
+        # weekday test. Both price sources answer on a Saturday -- with
+        # Friday's close, a real-looking number -- so the pass used to write
+        # a duplicate mark under a weekend date key, and
+        # forward_returns._price_on_or_after would take that stale row
+        # instead of walking on to Monday, truncating the realized window.
+        # The error was one-directional: it attenuated every measured
+        # return, hit rate and correlation toward zero.
+        #
+        # `is_trading_day()` covered weekends and nothing else. It is a bare
+        # weekday check with no hour bound, so it also let the pass run just
+        # after ET midnight and record the PREVIOUS session's close under
+        # today's date -- the lookahead described in last_completed_session.
+        # Keying on the completed session covers weekends, holidays and the
+        # hour of day at once, and makes the snapshot/price-mark join exact.
         if (
             (self.price_feed is not None or self.finnhub is not None)
             and now >= self._price_marks_retry_after
-            and is_trading_day()
-            and self._daily_pass_due("price_marks")
+            and self._session_pass_due("price_marks", session)
         ):
-            if await self._run_daily_price_marks():
-                self._mark_daily_pass_done("price_marks")
+            if await self._run_daily_price_marks(session):
+                self._mark_session_pass_done("price_marks", session)
             else:
                 self._price_marks_retry_after = time.monotonic() + IB_RETRY_GAP_SEC
         if (
@@ -1167,11 +1237,35 @@ class Engine:
     def _mark_daily_pass_done(self, state_key: str) -> None:
         self.periodic_state.set(state_key, datetime.now(timezone.utc).isoformat())
 
+    def _session_pass_due(self, state_key: str, session: date) -> bool:
+        """Due once per completed MARKET SESSION, not once per 86400s.
+
+        The two capture passes -- dossier snapshots and price marks -- are
+        the forward record, and they are joined to each other by date. An
+        elapsed-interval schedule gave each its own free-running anchor that
+        drifted with however slow the deployment was that week, and left the
+        price-mark pass re-anchoring to just after ET midnight every Monday,
+        where the quote returned is the PREVIOUS session's close stamped
+        with today's date (see market_hours.last_completed_session).
+
+        Keyed on the session date, both passes capture exactly once per
+        session, both agree on which session it was, and the join between
+        them is exact instead of approximate."""
+        return self.periodic_state.get(f"{state_key}_session") != session.isoformat()
+
+    def _mark_session_pass_done(self, state_key: str, session: date) -> None:
+        self.periodic_state.set(f"{state_key}_session", session.isoformat())
+        # The old wall-clock marker is kept up to date alongside it purely so
+        # a rollback to a build that reads it does not immediately re-run
+        # every pass and write a duplicate day into the record.
+        self._mark_daily_pass_done(state_key)
+
     # --- EDGAR ingestion ---
 
     async def _poll_edgar(self) -> None:
         since_date = (date.today() - timedelta(days=self.settings.edgar_lookback_days)).isoformat()
-        for symbol in self.symbol_list:
+        # Rotated, not declaration order -- see ingestion_order.
+        for symbol in self.ingestion_order():
             # Inside its own guard, not merely inside the per-filing try
             # below. This call populates the CIK cache, so on a cold cache
             # it makes a network request -- and it sits BEFORE the try that
@@ -2061,7 +2155,11 @@ class Engine:
         to_date = date.today().isoformat()
         from_date = (date.today() - timedelta(days=self.settings.news_lookback_days)).isoformat()
         skipped: list[str] = []
-        for symbol in self.symbol_list:
+        # Rotated, not declaration order -- see ingestion_order. The news
+        # poll is the bigger of the two spenders (two LLM calls per article
+        # per target), so it is where the front-to-back bias did most of
+        # its damage.
+        for symbol in self.ingestion_order():
             if not self._can_produce_evidence(symbol):
                 skipped.append(symbol)
                 continue
@@ -2793,12 +2891,42 @@ class Engine:
             self._expire_signal(dossier, "no confirmed entry within the deadline", price=price)
             return
 
+        # Provenance, not just headlines.
+        #
+        # This used to keep four fields from the last five evidence items,
+        # and the omission made the record actively misleading rather than
+        # merely thin. A propagated trade -- Intel news reaching FORM over a
+        # disclosed customer edge -- wrote two headlines ABOUT INTEL into a
+        # FORM trade with no field anywhere saying so. Anyone reading
+        # paper_trades.jsonl, including the three analysis scripts, would
+        # read "Intel raises capex guidance" as evidence about FORM.
+        #
+        # It also made the system's central hypothesis untestable from its
+        # own output: whether second-order evidence predicts returns better
+        # or worse than direct evidence is THE question this design exists
+        # to answer, and the trade record did not say which kind each trade
+        # was built from.
+        #
+        # Every CONTRIBUTING item now, not the last five: an arbitrary tail
+        # slice of a list that grows by arrival order is not a summary of
+        # the thesis, and the items the skeptic zeroed are excluded because
+        # they are not part of it.
+        contributing = [e for e in dossier.evidence if e.confidence > 0]
         citations = [
             {
                 "source_name": e.source_name, "url": e.url,
                 "headline": e.headline, "published_at": e.published_at,
+                "source_type": e.source_type,
+                # The three fields that make a citation attributable.
+                "origin_symbol": e.origin_symbol,
+                "is_propagated": e.is_propagated,
+                "relationship_note": e.relationship_note,
+                "relationship_confidence": e.relationship_confidence,
+                "confidence": e.confidence,
+                "magnitude": e.magnitude,
+                "scored_by_model": e.scored_by_model,
             }
-            for e in dossier.evidence[-5:]
+            for e in contributing
         ]
         horizon = min(dossier.horizon_days or self.settings.max_horizon_days, self.settings.max_horizon_days)
         # Market cap decides the transaction-cost bucket (and the borrow
@@ -3162,7 +3290,7 @@ class Engine:
     # all except price marks needing a live price to mark. Forward data
     # can't be backfilled, so this starts accruing from day one. ---
 
-    def _run_daily_snapshot(self) -> bool:
+    def _run_daily_snapshot(self, session: date) -> bool:
         """Appends every dossier's current score to
         logs/dossier_snapshots.jsonl, once a day, unconditionally (even a
         dossier with zero evidence gets a real score=0 row) -- see
@@ -3184,7 +3312,8 @@ class Engine:
         with path.open("a") as f:
             for symbol in self.dossiers.all_symbols():
                 dossier = self.dossiers.load(symbol)
-                f.write(json.dumps(snapshot_dossier(dossier, snapshotted_at)) + "\n")
+                row = snapshot_dossier(dossier, snapshotted_at, session=session.isoformat())
+                f.write(json.dumps(row) + "\n")
                 written += 1
         if not written:
             log.warning(
@@ -3193,7 +3322,7 @@ class Engine:
             )
         return written > 0
 
-    async def _run_daily_price_marks(self) -> bool:
+    async def _run_daily_price_marks(self, session: date) -> bool:
         """Appends every universe symbol's last price to
         logs/price_marks.jsonl, once a day -- the raw material for joining
         against dossier_snapshots.jsonl by symbol/date. ANCHORS are marked
@@ -3218,7 +3347,14 @@ class Engine:
         permanently lost sample. Returns False when NO source produced
         anything -- the caller leaves the pass due so the next tick retries
         instead of marking a lost day done."""
-        symbols = [c.symbol for c in self.universe]
+        # Benchmarks are marked alongside the universe and are NOT universe
+        # members: they never trade, never get a dossier, and are never
+        # polled for news or filings. They exist so the forward record can
+        # be measured relative to the market and the sector instead of raw
+        # -- see universe.MARKET_BENCHMARK_SYMBOLS for the arithmetic.
+        # Appended AFTER the universe so a partially-priced day still covers
+        # the symbols that actually have theses.
+        symbols = [c.symbol for c in self.universe] + benchmark_symbols()
         if not symbols:
             return True
         prices: dict[str, float] = {}
@@ -3241,7 +3377,17 @@ class Engine:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a") as f:
             for symbol, price in prices.items():
-                f.write(json.dumps({"marked_at": marked_at, "symbol": symbol, "price": price}) + "\n")
+                # session_date is the JOIN key; marked_at is kept as the
+                # audit trail of when the row was actually written. They
+                # differ by design -- a mark taken at 16:20 ET on a Friday
+                # is Friday's close, and after this pass moved to a session
+                # anchor it is no longer safe to infer one from the other.
+                f.write(json.dumps({
+                    "marked_at": marked_at,
+                    "session_date": session.isoformat(),
+                    "symbol": symbol,
+                    "price": price,
+                }) + "\n")
         if len(prices) < len(symbols):
             log.warning("Daily price marks: %d of %d symbols priced (no source had the rest).",
                         len(prices), len(symbols))

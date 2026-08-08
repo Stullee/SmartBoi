@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import pytest
 
+from datetime import date as _date
+
 
 @pytest.fixture(autouse=True)
 def _inside_regular_trading_hours(monkeypatch):
@@ -37,6 +39,14 @@ def _inside_regular_trading_hours(monkeypatch):
 
     monkeypatch.setattr(smartboi.engine, "is_regular_trading_hours", lambda now=None: True)
     monkeypatch.setattr(smartboi.engine, "is_trading_day", lambda now=None: True)
+    # The two capture passes are keyed on the last COMPLETED session rather
+    # than on elapsed time (see market_hours.last_completed_session), so
+    # without pinning it every snapshot/price-mark test would depend on
+    # what day the suite happens to run -- and would silently do nothing
+    # over a weekend or a market holiday. Pinned to an ordinary Thursday.
+    monkeypatch.setattr(
+        smartboi.engine, "last_completed_session", lambda now=None: _date(2026, 8, 6)
+    )
     # paper_journal holds its OWN reference (stop/target resolution also
     # requires the session to be open -- the daily bar does not roll until
     # the next US open, so a bar fetched overnight is still the entry

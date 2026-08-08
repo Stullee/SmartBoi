@@ -21,6 +21,12 @@ from datetime import date, timedelta
 SCORE_BUCKETS = ((0.0, 0.2), (0.2, 0.35), (0.35, 0.5), (0.5, 0.65), (0.65, 1.01))
 
 
+# The small-cap market index, not the large-cap one: this universe is
+# small/mid caps, so IWM is the beta they actually carry. SPY is marked too
+# and can be swapped in here, but IWM is the honest default.
+MARKET_BENCHMARK = "IWM"
+
+
 def _bucket_label(score: float) -> str:
     for lo, hi in SCORE_BUCKETS:
         if lo <= score < hi:
@@ -45,10 +51,10 @@ def dedup_snapshots(rows: list[dict]) -> list[dict]:
     out = []
     for row in rows:
         symbol = row.get("symbol")
-        snapshotted_at = row.get("snapshotted_at") or ""
-        if not symbol or not snapshotted_at:
+        session = snapshot_session(row)
+        if not symbol or not session:
             continue
-        key = (symbol, snapshotted_at[:10])
+        key = (symbol, session)
         if key in seen:
             continue
         seen.add(key)
@@ -65,11 +71,25 @@ def price_marks_by_symbol(rows: list[dict]) -> dict[str, dict[str, float]]:
     for row in rows:
         symbol = row.get("symbol")
         price = row.get("price")
-        marked_at = row.get("marked_at") or ""
-        if not symbol or price is None or not marked_at:
+        # session_date is the real key: it says which SESSION this close
+        # belongs to. marked_at is when the row happened to be written, and
+        # the two genuinely differ -- a mark taken at 16:20 ET Friday, or on
+        # the Saturday after, is Friday's close either way. Rows written
+        # before the session anchor existed have no session_date, so they
+        # fall back to the old wall-clock key; that is also exactly the
+        # population carrying the lookahead the anchor fixed, which is why
+        # scoring_version and --since exist to exclude them.
+        key = row.get("session_date") or (row.get("marked_at") or "")[:10]
+        if not symbol or price is None or not key:
             continue
-        out.setdefault(symbol, {})[marked_at[:10]] = price
+        out.setdefault(symbol, {})[key] = price
     return out
+
+
+def snapshot_session(snapshot: dict) -> str:
+    """The session a dossier snapshot describes, falling back to its write
+    timestamp for rows predating the session anchor."""
+    return snapshot.get("session_date") or (snapshot.get("snapshotted_at") or "")[:10]
 
 
 def _price_on_or_after(marks: dict[str, float], target_date: str, max_lookahead_days: int = 5) -> tuple[str, float] | None:
@@ -107,10 +127,10 @@ def compute_forward_return(
     marks = price_marks.get(symbol)
     if not marks:
         return None
-    snapshotted_at = snapshot.get("snapshotted_at") or ""
-    if not snapshotted_at:
+    session = snapshot_session(snapshot)
+    if not session:
         return None
-    entry = _price_on_or_after(marks, snapshotted_at[:10], max_lookahead_days)
+    entry = _price_on_or_after(marks, session, max_lookahead_days)
     if entry is None:
         return None
     entry_date, entry_price = entry
@@ -306,11 +326,70 @@ def ecosystem_benchmark_return(
     return sum(returns) / len(returns)
 
 
+def market_benchmark_return(
+    price_marks: dict[str, dict[str, float]],
+    entry_date: str,
+    horizon_days: int,
+    benchmark_symbol: str,
+    max_lookahead_days: int = 5,
+) -> float | None:
+    """Raw (unsigned) return of one benchmark ETF over the same window.
+
+    Distinct from ecosystem_benchmark_return, and the distinction is the
+    whole point. The ecosystem benchmark averages this universe's OWN
+    members, so it answers "did this name beat its peers" -- useful, but it
+    cannot separate alpha from beta, because every peer carries the same
+    market exposure. An index ETF can. With nine ecosystems that are largely
+    one bet on the AI/electrification capex cycle, that separation is the
+    difference between a measurable edge and a leveraged position on the
+    small-cap market."""
+    marks = price_marks.get(benchmark_symbol)
+    if not marks:
+        return None
+    entry = _price_on_or_after(marks, entry_date, max_lookahead_days)
+    if entry is None or entry[1] == 0:
+        return None
+    entry_used, entry_price = entry
+    target = (date.fromisoformat(entry_used) + timedelta(days=horizon_days)).isoformat()
+    exit_ = _price_on_or_after(marks, target, max_lookahead_days)
+    if exit_ is None:
+        return None
+    return (exit_[1] - entry_price) / entry_price * 100.0
+
+
+def filter_by_scoring_version(
+    rows: list[dict], scoring_version: int | None = None, since: str = "",
+) -> list[dict]:
+    """Restrict snapshots to one scoring regime, and optionally to rows on
+    or after a session date.
+
+    This function is the missing half of a guard that already existed.
+    `SCORING_VERSION` was stamped on every snapshot and signal row, with a
+    docstring explaining precisely why pooling across a rules change is
+    dishonest -- and NOTHING in any reader ever filtered on it. It was
+    written at three sites and read at zero, so every report silently pooled
+    v1 through v4. A version stamp nothing filters on is a comment.
+
+    Defaults to the CURRENT scoring version, so the default report answers
+    "what is the edge under the rules in force" rather than "what is the
+    average of four incompatible rule sets". Pass scoring_version=None to
+    deliberately pool everything."""
+    out = []
+    for row in rows:
+        if scoring_version is not None and row.get("scoring_version") != scoring_version:
+            continue
+        if since and snapshot_session(row) < since:
+            continue
+        out.append(row)
+    return out
+
+
 def benchmark_relative_returns(
     rows: list[dict],
     price_marks: dict[str, dict[str, float]],
     ecosystem_by_symbol: dict[str, str],
     max_lookahead_days: int = 5,
+    market_symbol: str = MARKET_BENCHMARK,
 ) -> list[dict]:
     """Each row's signed return minus its own ecosystem's mean RAW return
     over the same [entry_date, entry_date + horizon] window (sign-matched
@@ -325,6 +404,7 @@ def benchmark_relative_returns(
     than being dropped; rows whose ecosystem has no benchmarkable price
     data get benchmark_relative_pct=None rather than a misleading 0.0."""
     cache: dict[tuple[str, str, str, int], float | None] = {}
+    market_cache: dict[tuple[str, str, int], float | None] = {}
     out = []
     for r in rows:
         eco = ecosystem_by_symbol.get(r["symbol"], "?")
@@ -341,7 +421,25 @@ def benchmark_relative_returns(
         else:
             signed_benchmark = raw_benchmark if r["direction"] == "LONG" else -raw_benchmark
             relative = r["signed_return_pct"] - signed_benchmark
-        out.append({**r, "ecosystem": eco, "ecosystem_benchmark_pct": signed_benchmark, "benchmark_relative_pct": relative})
+        row = {**r, "ecosystem": eco, "ecosystem_benchmark_pct": signed_benchmark,
+               "benchmark_relative_pct": relative}
+        # Market-relative, in addition to peer-relative. Sign-matched the
+        # same way, so positive always means "beat the benchmark in the
+        # direction the thesis was taking".
+        market_key = (market_symbol, r["entry_date"], r["horizon_days"])
+        if market_key not in market_cache:
+            market_cache[market_key] = market_benchmark_return(
+                price_marks, r["entry_date"], r["horizon_days"], market_symbol, max_lookahead_days,
+            )
+        raw_market = market_cache[market_key]
+        if raw_market is None:
+            row["market_benchmark_pct"] = None
+            row["market_relative_pct"] = None
+        else:
+            signed_market = raw_market if r["direction"] == "LONG" else -raw_market
+            row["market_benchmark_pct"] = signed_market
+            row["market_relative_pct"] = r["signed_return_pct"] - signed_market
+        out.append(row)
     return out
 
 
@@ -421,6 +519,29 @@ def format_report(
     bench_for_bucket = [{**r, "signed_return_pct": r["benchmark_relative_pct"]} for r in benchmarked]
     if bench_for_bucket:
         lines.extend(_bucket_table(bench_for_bucket, horizon_days, "Mean Alpha %"))
+
+    # Market-relative, and this is the table to read. The ecosystem
+    # benchmark above compares a name against its own peers, all of which
+    # carry the same market exposure, so it cannot separate alpha from beta.
+    # IWM can, and doing so is what takes the observations needed to detect
+    # a 1%/trade edge from roughly a thousand down to a couple of hundred.
+    market_rows = [r for r in bench_rows if r.get("market_relative_pct") is not None]
+    lines.append("")
+    lines.append(f"-- By score bucket (market-relative: minus {MARKET_BENCHMARK}, sign-matched to direction) --")
+    if not market_rows:
+        lines.append(
+            f"({MARKET_BENCHMARK} has no price marks over these windows yet. It is marked daily "
+            "alongside the universe from the first tick after this shipped, so this table fills "
+            "in one horizon from then -- it cannot be backfilled.)"
+        )
+    else:
+        skipped = len(bench_rows) - len(market_rows)
+        if skipped:
+            lines.append(f"({skipped} row(s) skipped -- no {MARKET_BENCHMARK} mark over their window)")
+        lines.extend(_bucket_table(
+            [{**r, "signed_return_pct": r["market_relative_pct"]} for r in market_rows],
+            horizon_days, "Mean Alpha %",
+        ))
 
     lines.append("")
     lines.append("-- Per-symbol breakdown (worst first) --")

@@ -23,7 +23,11 @@ from pathlib import Path
 from smartboi.dossier import SCORING_VERSION, Dossier
 # Re-exported: these lived here before market_hours.py existed, and both
 # engine.py and the test suite import them from this module.
-from smartboi.market_hours import is_regular_trading_hours, is_trading_day  # noqa: F401
+from smartboi.market_hours import (  # noqa: F401
+    is_regular_trading_hours,
+    is_trading_day,
+    last_completed_session,
+)
 
 log = logging.getLogger(__name__)
 
