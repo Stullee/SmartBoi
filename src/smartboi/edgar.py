@@ -307,7 +307,13 @@ class EdgarClient:
                     cache_fresh = fetched_at >= (now - _CIK_CACHE_MAX_AGE).isoformat()
                 else:
                     cached = {"map": raw, "names": {}}  # legacy flat format, no names yet -> refresh
-            except (json.JSONDecodeError, OSError):
+            except (ValueError, OSError):
+                # ValueError rather than JSONDecodeError: a cache file with
+                # invalid UTF-8 raises UnicodeDecodeError, which is a
+                # ValueError but NOT a JSONDecodeError, so it used to escape
+                # this handler entirely. Not quarantined like the stores in
+                # persist.py -- the CIK map is regenerable from SEC on the
+                # next fetch, so re-downloading it is the correct repair.
                 pass
 
         if cached is not None and cache_fresh:

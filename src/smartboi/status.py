@@ -592,15 +592,15 @@ def _evidence_composition(d: Dossier) -> dict:
     rel_confidences = [
         e.relationship_confidence for e in propagated if e.relationship_confidence is not None
     ]
-    # rel_type is not carried on EvidenceRecord (it is not threaded through
-    # the propagation path at all -- a known gap), so the closest available
-    # discriminator is the relationship_note the extractor wrote. Recorded
-    # as a coarse bucket rather than parsed into a false precision.
-    notes = " ".join(e.relationship_note.lower() for e in propagated)
-    rel_type = ""
-    for candidate in ("customer", "supplier", "competitor", "regulator"):
-        if candidate in notes:
-            rel_type = candidate if not rel_type else "mixed"
+    # Read off the recorded rel_type, not inferred from the note text. An
+    # earlier version keyword-matched relationship_note, which was wrong in
+    # exactly the case that matters most: the ecosystem-fallback note's own
+    # disclaimer contains the words "customer, supplier or competitor", so
+    # the weakest evidence in the system was labelled "mixed" instead of
+    # being identifiable as a non-disclosed sector association.
+    kinds = {e.rel_type for e in propagated if e.rel_type}
+    rel_type = "" if not kinds else (kinds.pop() if len(kinds) == 1 else "mixed")
+    ecosystem_items = [e for e in propagated if e.rel_type == "ecosystem"]
     return {
         "evidence_count": total,
         "propagated_count": len(propagated),
@@ -611,6 +611,13 @@ def _evidence_composition(d: Dossier) -> dict:
         ),
         "max_relationship_confidence": round(max(rel_confidences), 4) if rel_confidences else 0.0,
         "dominant_rel_type": rel_type,
+        # Share of the thesis resting on sector membership rather than any
+        # disclosed link. This is the number that decides whether ecosystem
+        # propagation is earning its place: the red team drove six such
+        # items -- no filing, no disclosed relationship, 0.25 confidence
+        # each -- to a score of 0.527 against a 0.5 bar, and nothing in the
+        # record could say afterwards that that is what had happened.
+        "ecosystem_share": round(len(ecosystem_items) / total, 4),
         "distinct_origin_count": len({e.origin_symbol for e in contributing if e.origin_symbol}),
     }
 

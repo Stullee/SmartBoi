@@ -278,6 +278,11 @@ _BIOGRAPHY_ROLE_MARKERS = ("role at", "roles at", "positions at", "position at")
 # being uselessly permissive on a small custom universe -- at 12 symbols,
 # 10% rounds to one, and losing one genuinely-dead ticker to caution costs
 # a single wasted poll while a wrong prune costs months of evidence.
+# The pseudo rel_type stamped on ecosystem-fallback evidence. Not one of
+# graph.REL_TYPES on purpose -- it is precisely NOT a disclosed relationship,
+# and the record has to be able to say so.
+ECOSYSTEM_REL_TYPE = "ecosystem"
+
 _PRUNE_MAX_FRACTION = 0.10
 _PRUNE_MIN_ABSOLUTE = 3
 
@@ -864,6 +869,21 @@ class Engine:
                 "ENABLE_IB_PRICE_FEED=true. This never places real orders (see prices.py).",
             )
 
+        # Said once at start because it is silently false everywhere else.
+        # trading_currency is read at exactly two places, both as a display
+        # LABEL. Every price in the system -- IB bars, Finnhub quotes, entry,
+        # stop, target, P&L -- is USD, initial_trading_capital is divided
+        # into position sizes without conversion, and there is no FX rate
+        # anywhere in the tree. So a non-USD label does not describe a
+        # currency the arithmetic uses; it just mislabels USD notional.
+        if self.settings.trading_currency.upper() != "USD":
+            log.warning(
+                "TRADING_CURRENCY is %s but every price and P&L figure in this system is USD, "
+                "and no FX rate exists anywhere -- INITIAL_TRADING_CAPITAL is treated as USD "
+                "notional and the dashboard's currency label is cosmetic. Set TRADING_CURRENCY=USD "
+                "to make the record say what it actually measures.",
+                self.settings.trading_currency,
+            )
         if self.alerts.enabled:
             log.info("Webhook alerts: ENABLED (signals and paper trade opens/closes)")
         else:
@@ -1103,8 +1123,28 @@ class Engine:
         # retried on the next tick instead of silently losing the day's
         # capture. Duplicate rows from a partial write are handled
         # downstream (dedup_snapshots / last-mark-wins), a lost day is not.
+        # Both capture passes are additionally gated on the market being
+        # SHUT, and this is not belt-and-braces -- without it the session
+        # anchor is actively wrong.
+        #
+        # last_completed_session() answers "which session's close has
+        # happened", but the price sources answer "what is the last print".
+        # Those agree only outside the session. At 10:00 ET on a Monday the
+        # last completed session is Friday while the last print is Monday's
+        # intraday, so a mark taken then would be filed as Friday's close --
+        # reintroducing exactly the stale-price-under-the-wrong-date bug the
+        # anchor exists to remove. The same applies to the snapshot: a score
+        # that already reflects Monday morning's news must not be joined to
+        # Friday's closing price.
+        #
+        # Reachable, not theoretical: it fires whenever a session is still
+        # due during market hours -- on the first tick after an upgrade
+        # (no session marker exists yet), and after any outage that spanned
+        # a close. If a session is missed entirely it stays missed; a lost
+        # row is visible in the record, a wrong one is not.
         session = last_completed_session()
-        if self._session_pass_due("dossier_snapshot", session):
+        capture_window_open = not is_regular_trading_hours()
+        if capture_window_open and self._session_pass_due("dossier_snapshot", session):
             # Gated on the return value, exactly like price marks below.
             # This used to call and mark unconditionally, so the comment
             # above described a property only ONE of the two passes had --
@@ -1137,6 +1177,7 @@ class Engine:
         if (
             (self.price_feed is not None or self.finnhub is not None)
             and now >= self._price_marks_retry_after
+            and capture_window_open
             and self._session_pass_due("price_marks", session)
         ):
             if await self._run_daily_price_marks(session):
@@ -2253,16 +2294,32 @@ class Engine:
             return False  # collected but not scoreable yet -- retried once a key is configured
 
         universe = set(self.symbol_list)
-        # (target_symbol, relationship_note, relationship_confidence) --
-        # confidence is the graph edge's own extracted confidence (None for
+        # (target_symbol, rel_type, relationship_note, relationship_confidence)
+        # -- confidence is the graph edge's own extracted confidence (None for
         # direct/non-propagated evidence, which has no edge at all).
-        targets: list[tuple[str, str, float | None]] = []
+        #
+        # rel_type is carried here purely so it can be RECORDED on the
+        # evidence item and reach the forward record. It deliberately does
+        # NOT enter the propagation math or either prompt: making a
+        # competitor's good news propagate as bad news is a real change to
+        # what the system decides, and belongs in a batched strategy change,
+        # not a capture fix. But it cannot be evaluated later without having
+        # been recorded now, and the record is unbackfillable.
+        #
+        # The ecosystem fallback gets the distinct pseudo-type "ecosystem",
+        # which is the discriminator that matters most: it is not a
+        # disclosed link at all, and until now nothing downstream could tell
+        # it apart from one. Inferring it from the relationship_note text
+        # does not work -- the note's own disclaimer contains the words
+        # "customer, supplier or competitor", so a keyword match labels the
+        # weakest evidence in the system as "mixed".
+        targets: list[tuple[str, str, str, float | None]] = []
         propagation_keys: dict[str, str] = {}  # target_symbol -> limiter key, propagated targets only
         ecosystem_keys: set[str] = set()  # of those, the ones on the ecosystem limiter
 
         origin_spec = self.spec_by_symbol.get(origin_symbol)
         if origin_spec is None or not origin_spec.signal_source_only:
-            targets.append((origin_symbol, "", None))
+            targets.append((origin_symbol, "", "", None))
 
         now = time.monotonic()
         throttled = 0
@@ -2287,7 +2344,7 @@ class Engine:
                 throttled += 1
                 continue
             propagation_keys[linked_symbol] = key
-            targets.append((linked_symbol, rel.description, rel.confidence))
+            targets.append((linked_symbol, rel.rel_type, rel.description, rel.confidence))
         # Ecosystem fallback: only for an origin with NO disclosed link to
         # any tradeable at all. A disclosed contractual relationship is
         # strictly better evidence, so this never runs alongside one and
@@ -2308,6 +2365,7 @@ class Engine:
                 ecosystem_keys.add(key)
                 targets.append((
                     linked_symbol,
+                    ECOSYSTEM_REL_TYPE,
                     f"{origin_symbol} and {linked_symbol} are both in the {origin_spec.ecosystem} "
                     "ecosystem. NOTE: this is an industry-level association inferred from sector "
                     "membership, NOT a contractual relationship disclosed in any filing -- there is "
@@ -2348,10 +2406,10 @@ class Engine:
             return True
 
         all_definitive = True
-        for target_symbol, relationship_note, relationship_confidence in targets:
+        for target_symbol, rel_type, relationship_note, relationship_confidence in targets:
             outcome = await self._update_dossier(
-                target_symbol, evidence_text, origin_symbol, relationship_note, relationship_confidence,
-                source_type, source_name, url, headline, published_at,
+                target_symbol, evidence_text, origin_symbol, rel_type, relationship_note,
+                relationship_confidence, source_type, source_name, url, headline, published_at,
             )
             # Only a target handled fresh THIS pass consumes a cooldown
             # slot -- "already" means an earlier, partially-deferred pass
@@ -2426,6 +2484,7 @@ class Engine:
         target_symbol: str,
         evidence_text: str,
         origin_symbol: str,
+        rel_type: str,
         relationship_note: str,
         relationship_confidence: float | None,
         source_type: str,
@@ -2495,6 +2554,7 @@ class Engine:
             published_at=published_at,
             origin_symbol=origin_symbol,
             is_propagated=(target_symbol != origin_symbol),
+            rel_type=rel_type,
             relationship_note=relationship_note,
             relationship_confidence=relationship_confidence,
             scored_by_model=self.settings.dossier_model,
@@ -2920,6 +2980,7 @@ class Engine:
                 # The three fields that make a citation attributable.
                 "origin_symbol": e.origin_symbol,
                 "is_propagated": e.is_propagated,
+                "rel_type": e.rel_type,
                 "relationship_note": e.relationship_note,
                 "relationship_confidence": e.relationship_confidence,
                 "confidence": e.confidence,
@@ -3593,6 +3654,11 @@ class Engine:
             )
             self.universe_screen_state.set("prune_refused_at", datetime.now(timezone.utc).isoformat())
             self.universe_screen_state.set("prune_refused_symbols", sorted(dead))
+            # Cleared rather than left behind: curated_no_market_data is
+            # rendered as "these curated symbols look dead", and this screen
+            # established no such thing. Leaving the previous run's list in
+            # place would present a stale verdict as a current one.
+            self.universe_screen_state.set("curated_no_market_data", [])
             return []
         pruned, curated = [], []
         for symbol in dead:

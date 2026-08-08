@@ -19,6 +19,15 @@ import smartboi.market_hours
 
 # The session the conftest pins last_completed_session to.
 SESSION = date(2026, 8, 6)
+
+
+def _open_capture_window(monkeypatch):
+    """The conftest pins regular trading hours OPEN for the whole suite so
+    entry tests work. The two capture passes require the opposite -- they
+    only run when the market is SHUT, because that is the only time the
+    last print IS the session's close (see engine._tick). A capture test
+    has to say so explicitly."""
+    monkeypatch.setattr(smartboi.engine, "is_regular_trading_hours", lambda now=None: False)
 from smartboi.dossier import SCORING_VERSION
 from smartboi.engine import ECOSYSTEM_LINK_CONFIDENCE, Engine, is_common_equity
 from smartboi.ratelimit import SlidingWindowLimiter
@@ -439,7 +448,7 @@ async def test_retry_after_deferred_skeptic_does_not_repropose(engine):
     engine.skeptic.queue(None)  # first attempt: skeptic call itself deferred
 
     first = await engine._update_dossier(
-        "FORM", "evidence text", "FORM", "", None, "news", "reuters.com",
+        "FORM", "evidence text", "FORM", "", "", None, "news", "reuters.com",
         "https://x/1", "h1", "2026-07-23",
     )
     assert first == "deferred"
@@ -447,7 +456,7 @@ async def test_retry_after_deferred_skeptic_does_not_repropose(engine):
 
     engine.skeptic.queue(verdict(refuted=False))  # retry: skeptic now answers
     second = await engine._update_dossier(
-        "FORM", "evidence text", "FORM", "", None, "news", "reuters.com",
+        "FORM", "evidence text", "FORM", "", "", None, "news", "reuters.com",
         "https://x/1", "h1", "2026-07-23",
     )
     assert second == "handled"
@@ -1036,7 +1045,7 @@ async def test_propagation_slot_not_double_counted_on_retry_of_merged_target(eng
 async def test_malformed_proposal_is_dropped_not_crashing(engine):
     engine.updater.default = {"direction": "LONG"}  # missing magnitude/confidence/horizon
     outcome = await engine._update_dossier(
-        "FORM", "evidence text", "FORM", "", None, "news", "reuters.com",
+        "FORM", "evidence text", "FORM", "", "", None, "news", "reuters.com",
         "https://x/1", "h1", "2026-07-23",
     )
     assert outcome == "handled"
@@ -2022,6 +2031,8 @@ async def test_a_weekend_mark_is_keyed_to_the_session_it_actually_is(engine, mon
         smartboi.engine, "last_completed_session",
         lambda now=None: smartboi.market_hours.last_completed_session(saturday),
     )
+    _open_capture_window(monkeypatch)
+    _open_capture_window(monkeypatch)
     engine.price_feed = None
     engine.finnhub.quotes_by_symbol["FORM"] = 10.0
 
@@ -2033,10 +2044,11 @@ async def test_a_weekend_mark_is_keyed_to_the_session_it_actually_is(engine, mon
     assert {r["session_date"] for r in rows} == {"2026-08-07"}, "Friday, not Saturday"
 
 
-async def test_a_session_is_captured_exactly_once(engine):
+async def test_a_session_is_captured_exactly_once(engine, monkeypatch):
     """The pass ran on an elapsed-time schedule, so several restarts in one
     day wrote a full duplicate batch each time -- 6 duplicate batches from 6
     restarts was measured live, inflating that day's analysis 6x."""
+    _open_capture_window(monkeypatch)
     engine.price_feed = None
     engine.finnhub.quotes_by_symbol["FORM"] = 10.0
 
@@ -2058,6 +2070,7 @@ async def test_the_pass_never_records_a_non_session_date(engine, monkeypatch):
         smartboi.engine, "last_completed_session",
         lambda now=None: smartboi.market_hours.last_completed_session(christmas),
     )
+    _open_capture_window(monkeypatch)
     engine.price_feed = None
     engine.finnhub.quotes_by_symbol["FORM"] = 10.0
 
@@ -2070,7 +2083,8 @@ async def test_the_pass_never_records_a_non_session_date(engine, monkeypatch):
                for r in rows)
 
 
-async def test_the_daily_price_marks_pass_runs_on_a_weekday(engine):
+async def test_the_daily_price_marks_pass_runs_on_a_weekday(engine, monkeypatch):
+    _open_capture_window(monkeypatch)
     engine.price_feed = None
     engine.finnhub.quotes_by_symbol["FORM"] = 10.0
 
@@ -2581,7 +2595,7 @@ def test_the_snapshot_records_what_kind_of_evidence_produced_the_score(engine):
     dossier.direction = "LONG"
     dossier.evidence = [
         evidence_record(evidence_id="a", origin_symbol="INTC", is_propagated=True,
-                        relationship_note="INTC is a customer of FORM",
+                        rel_type="customer", relationship_note="INTC is a customer of FORM",
                         relationship_confidence=0.9, confidence=0.7),
         evidence_record(evidence_id="b", origin_symbol="FORM", is_propagated=False,
                         source_type="8-K", confidence=0.6),
@@ -2596,4 +2610,104 @@ def test_the_snapshot_records_what_kind_of_evidence_produced_the_score(engine):
     assert row["direct_filing_count"] == 1
     assert row["max_relationship_confidence"] == pytest.approx(0.9)
     assert row["dominant_rel_type"] == "customer"
+    assert row["ecosystem_share"] == pytest.approx(0.0)
     assert row["distinct_origin_count"] == 2
+
+
+def test_ecosystem_fallback_evidence_is_identifiable_in_the_record(engine):
+    """The discriminator that decides whether ecosystem propagation earns
+    its place. An earlier version inferred rel_type by keyword-matching
+    relationship_note, and the ecosystem note's own disclaimer contains the
+    words "customer, supplier or competitor" -- so the weakest evidence in
+    the system was labelled "mixed" and could not be told from a disclosed
+    customer edge."""
+    from smartboi.dossier import EvidenceRecord
+    from smartboi.engine import ECOSYSTEM_REL_TYPE
+    from smartboi.status import snapshot_dossier
+
+    eco_note = (
+        "INTC and FORM are both in the semi_equipment ecosystem. NOTE: this is an "
+        "industry-level association inferred from sector membership, NOT a contractual "
+        "relationship disclosed in any filing -- there is no stated customer, supplier "
+        "or competitor link between these two companies."
+    )
+    dossier = engine.dossiers.load("FORM")
+    dossier.direction = "LONG"
+    dossier.evidence = [
+        EvidenceRecord(
+            evidence_id="e", source_type="news", source_name="s", url="u", headline="h",
+            published_at="2026-08-01T00:00:00+00:00", origin_symbol="INTC",
+            is_propagated=True, rel_type=ECOSYSTEM_REL_TYPE, relationship_note=eco_note,
+            direction="LONG", magnitude=0.5, confidence=0.25, horizon_days=10,
+            reasoning="r", skeptic_note="",
+        )
+    ]
+
+    row = snapshot_dossier(dossier, "2026-08-06T21:00:00+00:00", session="2026-08-06")
+
+    assert row["dominant_rel_type"] == "ecosystem"
+    assert row["ecosystem_share"] == pytest.approx(1.0)
+
+
+async def test_the_propagation_path_stamps_the_real_edge_type(engine):
+    """End to end, not just on a hand-built record."""
+    engine.graph.add(Relationship("INTC", "FORM", "supplier",
+                                  "FORM supplies INTC", "10-K", 0.8, "2026-07-23"))
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="Intel news", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h1",
+        published_at="2026-07-23T12:00:00+00:00",
+    )
+
+    evidence = engine.dossiers.load("FORM").evidence
+    assert evidence and evidence[-1].rel_type == "supplier"
+
+
+async def test_no_capture_happens_while_the_market_is_open(engine, monkeypatch):
+    """A regression guard on a bug the session anchor itself introduced.
+
+    last_completed_session() answers "which session has CLOSED"; the price
+    sources answer "what is the last PRINT". Those agree only when the
+    market is shut. At 10:00 ET on a Monday the last completed session is
+    Friday while the last print is Monday's intraday, so a mark taken then
+    would be filed as Friday's close -- the exact stale-price-under-the-
+    wrong-date bug the anchor was added to remove.
+
+    Reachable in practice, not theoretical: it fires whenever a session is
+    still due during market hours, which is the first tick after an upgrade
+    (no session marker exists yet) and any outage that spanned a close."""
+    monkeypatch.setattr(smartboi.engine, "is_regular_trading_hours", lambda now=None: True)
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol["FORM"] = 10.0
+    dossier = engine.dossiers.load("FORM")
+    dossier.direction = "LONG"
+    engine.dossiers.save(dossier)
+
+    await engine._tick()
+
+    assert not (Path(engine.settings.log_dir) / "price_marks.jsonl").exists(), \
+        "a mid-session print must never be filed as a session close"
+    assert not (Path(engine.settings.log_dir) / "dossier_snapshots.jsonl").exists(), \
+        "a score reflecting today's news must not be joined to yesterday's close"
+    # ...and the session stays due, so it is captured properly after the close.
+    assert engine._session_pass_due("price_marks", SESSION)
+    assert engine._session_pass_due("dossier_snapshot", SESSION)
+
+
+async def test_the_capture_runs_once_the_market_shuts(engine, monkeypatch):
+    """The other half: deferring must not mean never."""
+    _open_capture_window(monkeypatch)
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol["FORM"] = 10.0
+    dossier = engine.dossiers.load("FORM")
+    dossier.direction = "LONG"
+    engine.dossiers.save(dossier)
+
+    await engine._tick()
+
+    assert (Path(engine.settings.log_dir) / "price_marks.jsonl").exists()
+    assert (Path(engine.settings.log_dir) / "dossier_snapshots.jsonl").exists()
+    assert not engine._session_pass_due("price_marks", SESSION)

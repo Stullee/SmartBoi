@@ -39,6 +39,19 @@ class EvidenceRecord:
     reasoning: str
     skeptic_note: str
     relationship_confidence: float | None = None  # the graph edge's own extracted confidence; None when not propagated
+    # The KIND of link the evidence travelled over: one of graph.REL_TYPES,
+    # or "ecosystem" for the sector-membership fallback (which is not a
+    # disclosed relationship at all), or "" for direct evidence.
+    #
+    # Recorded only. It deliberately does not enter the propagation math or
+    # either prompt -- making a competitor's good news propagate as bad news
+    # changes what the system decides, and that belongs in a batched
+    # strategy change. But "does a customer edge predict better than a
+    # competitor edge, and does the ecosystem fallback predict anything at
+    # all" cannot be answered later unless it is captured now, and forward
+    # data cannot be backfilled. Defaulted so existing dossier files load
+    # unchanged.
+    rel_type: str = ""
     # The exact model snapshots that produced this record. Forward-only
     # testing is this system's core validity claim (README point 7), and it
     # has one fragile edge: an LLM whose training corpus covers the period
