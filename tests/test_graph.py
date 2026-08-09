@@ -18,6 +18,42 @@ def test_add_dedupes_on_from_to_type(tmp_path):
     assert len(graph.relationships) == 1
 
 
+def test_add_upgrades_an_edge_when_a_stronger_disclosure_arrives(tmp_path):
+    """A weak passing-mention edge extracted first must NOT permanently block a
+    later quantified-concentration disclosure from raising it above the
+    disclosed-link bar (2.4)."""
+    graph = RelationshipGraph(tmp_path / "graph.json")
+    graph.add(Relationship("UCTT", "AMAT", "customer", "passing mention", "10-Q", 0.55, "2026-07-01T00:00:00"))
+    upgraded = graph.add(Relationship("UCTT", "AMAT", "customer", "25% of net sales", "10-K", 0.95, "2026-07-21T00:00:00"))
+
+    assert upgraded is True
+    assert len(graph.relationships) == 1
+    edge = graph.relationships[0]
+    assert edge.confidence == 0.95
+    assert edge.description == "25% of net sales"
+    assert edge.extracted_at == "2026-07-21T00:00:00"
+    # And it persists (not just in memory).
+    assert RelationshipGraph(tmp_path / "graph.json").relationships[0].confidence == 0.95
+
+
+def test_add_does_not_downgrade_a_strong_edge_but_refreshes_its_age(tmp_path):
+    graph = RelationshipGraph(tmp_path / "graph.json")
+    graph.add(Relationship("UCTT", "AMAT", "customer", "25% of net sales", "10-K", 0.95, "2026-06-01T00:00:00"))
+    result = graph.add(Relationship("UCTT", "AMAT", "customer", "vague", "news", 0.55, "2026-07-01T00:00:00"))
+
+    assert result is False
+    edge = graph.relationships[0]
+    assert edge.confidence == 0.95 and edge.description == "25% of net sales"  # substance unchanged
+    assert edge.extracted_at == "2026-07-01T00:00:00"  # but re-confirmation moved the aging anchor
+
+
+def test_add_refreshes_extracted_at_on_equal_confidence_reconfirmation(tmp_path):
+    graph = RelationshipGraph(tmp_path / "graph.json")
+    graph.add(Relationship("UCTT", "AMAT", "customer", "d", "s", 0.85, "2026-06-01T00:00:00"))
+    graph.add(Relationship("UCTT", "AMAT", "customer", "d", "s", 0.85, "2026-07-01T00:00:00"))
+    assert graph.relationships[0].extracted_at == "2026-07-01T00:00:00"
+
+
 def test_add_allows_different_rel_type_same_pair(tmp_path):
     graph = RelationshipGraph(tmp_path / "graph.json")
     graph.add(_rel(rel_type="customer"))

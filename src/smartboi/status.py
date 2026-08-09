@@ -230,6 +230,13 @@ def gather_graph_stats(graph: RelationshipGraph, universe=None, store=None) -> d
     }
 
 
+# An edge not re-confirmed by any filing in this many days is "stale": the
+# rolling re-extraction re-reads the whole universe every ~40 days, so ~120
+# days is roughly three missed re-reads -- long enough that silence is a real
+# signal (the relationship may have ended) rather than refresh lag.
+_STALE_EDGE_DAYS = 120
+
+
 def _days_since(stamp: str) -> float | None:
     """Whole-ish days since an ISO-8601 UTC stamp; None if absent/unparseable."""
     if not stamp:
@@ -282,6 +289,7 @@ def gather_graph_health(
     linked: dict[str, set[str]] = {}
     by_type: dict[str, int] = {}
     edge_ages: list[float] = []
+    stale_edges = 0
     for r in graph.relationships:
         linked.setdefault(r.from_symbol, set()).add(r.to_symbol)
         linked.setdefault(r.to_symbol, set()).add(r.from_symbol)
@@ -289,6 +297,13 @@ def gather_graph_health(
         age = _days_since(getattr(r, "extracted_at", ""))
         if age is not None:
             edge_ages.append(age)
+            # Not re-confirmed by any filing in _STALE_EDGE_DAYS -- graph.add
+            # now refreshes extracted_at on every re-confirmation, so a stale
+            # edge genuinely means "no filing has mentioned this relationship
+            # in months" (a lost customer is itself a tradeable event), not
+            # merely "first extracted long ago".
+            if age > _STALE_EDGE_DAYS:
+                stale_edges += 1
 
     connected = [s for s in tradeables if linked.get(s)]
     disconnected = sorted(tradeable_set - set(connected))
@@ -325,6 +340,7 @@ def gather_graph_health(
         "edges": len(graph.relationships),
         "edges_by_type": dict(sorted(by_type.items(), key=lambda kv: -kv[1])),
         "edge_age_median_days": round(edge_ages[len(edge_ages) // 2], 1) if edge_ages else None,
+        "stale_edges": stale_edges,
         "tradeables": len(tradeables),
         "tradeables_connected": len(connected),
         "tradeables_disconnected": len(disconnected),
