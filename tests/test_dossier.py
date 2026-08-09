@@ -496,6 +496,22 @@ def _propagated(origin, source_name, evidence_id, magnitude=0.3, confidence=0.6)
     return record
 
 
+def test_a_corrupt_dossier_file_is_quarantined_not_silently_wiped(tmp_path):
+    """A dossier is the permanent record of accumulated evidence, so a corrupt
+    one must be renamed aside (recoverable) rather than silently overwritten by
+    the next save."""
+    store = DossierStore(tmp_path)
+    (tmp_path / "UCTT.json").write_text("{ not valid json")
+
+    dossier = store.load("UCTT")  # must not raise
+
+    assert dossier.symbol == "UCTT"
+    assert dossier.evidence == []
+    quarantined = list(tmp_path.glob("UCTT.json.corrupt-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text() == "{ not valid json"
+
+
 def _ecosystem(origin, source_name, evidence_id, magnitude=0.3, confidence=0.6):
     """A propagated item over an ECOSYSTEM-association link (sector
     co-membership), the weakest propagation type -- relationship_confidence at

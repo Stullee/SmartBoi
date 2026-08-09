@@ -33,10 +33,11 @@ actually opens trades, through at least four independent mechanisms.
 
 ---
 
-## Update — top fixes implemented on this branch (2026-08-08)
+## Update — fixes implemented on this branch (2026-08-08)
 
-The highest-leverage code fixes from this report are now implemented on
-`claude/full-system-audit-46xlq3` (SCORING_VERSION 4→5; 605 tests green):
+Implemented on `claude/full-system-audit-46xlq3` (616 tests green).
+
+**Synthesis-gate + saturation (SCORING_VERSION 4→5):**
 
 - **Merge-path synthesis cap (2.1.1 / A1)** — `engine._cap_with_synthesis`
   re-applies the persisted synthesis verdict (veto or trim) after every
@@ -56,11 +57,29 @@ The highest-leverage code fixes from this report are now implemented on
   runtime-accepted tradeable that has graduated past the cap ceiling to an
   anchor, driven off the screen's own re-fetched market data.
 
-Still open (each deferred to its own change): the config-only containment
-(A9.1), position-cap enforcement/disclosure (A5), the measurement de-biasing
-(MED-1/2/3), the robustness set (A4 IB breaker, 2.5 retry-state, 2.3
-corrupt-file + `fsync`, SIGTERM), the skeptic readout + tier decision, and
-the smaller items. The findings below are the full audit as first written.
+**Robustness / hardening:**
+
+- **Corrupt-file quarantine + `fsync` (2.3 + MED)** — `state.py` now writes
+  durably (`fsync` of file and dir before/after rename) and QUARANTINES an
+  unreadable file (`<name>.corrupt-<ts>` + loud warning) instead of silently
+  starting fresh and letting the next save clobber it. Shared by `JsonState`,
+  `DossierStore` and `RelationshipGraph`.
+- **Persisted retry state (2.5)** — `_handled_outcomes` / `_pending_proposals`
+  now persist to `retry_state.json` with wall-clock stamps, so a restart can
+  no longer forget a refuted marker and let a second nondeterministic skeptic
+  run accept what the first refuted.
+- **IB circuit breaker (A4)** — `prices.py` opens a data-level breaker after N
+  consecutive call timeouts (skips IB → Finnhub for 30 min, one probe to
+  recover), and collapses the per-symbol traceback spam into one summary
+  WARNING. Removes the ~10.5-min-per-cycle / ~73-min whole-universe stall
+  under a half-dead Gateway.
+- **SIGTERM handler** — `main.py` translates SIGTERM/SIGINT into task
+  cancellation so `run_forever`'s cleanup runs on a normal HA/Docker stop.
+
+Still open (each its own change): the config-only containment (A9.1),
+position-cap enforcement/disclosure (A5), the measurement de-biasing
+(MED-1/2/3), the skeptic readout + tier decision, and the smaller items. The
+findings below are the full audit as first written.
 
 ---
 

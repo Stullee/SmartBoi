@@ -17,6 +17,7 @@ from pathlib import Path
 from anthropic import AsyncAnthropic
 
 from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
+from smartboi.state import atomic_write_json, quarantine_corrupt_file
 from smartboi.usage import CAT_EXTRACTION, UsageTracker
 
 log = logging.getLogger(__name__)
@@ -45,8 +46,11 @@ class RelationshipGraph:
             try:
                 raw = json.loads(self.path.read_text())
                 loaded = [Relationship(**r) for r in raw]
-            except (json.JSONDecodeError, OSError, TypeError):
-                log.warning("Could not read %s, starting with an empty graph.", self.path)
+            except (json.JSONDecodeError, OSError, TypeError) as exc:
+                # Quarantined rather than silently discarded: the next _save()
+                # would overwrite the original, and the graph is expensive to
+                # rebuild (a full-universe re-extraction). See state.py.
+                quarantine_corrupt_file(self.path, exc)
                 return
             # Self-healing cleanup: an invalid rel_type could only have
             # gotten in from before engine.py's _extract_relationships
@@ -65,10 +69,7 @@ class RelationshipGraph:
                 self._save()
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps([asdict(r) for r in self.relationships], indent=2))
-        tmp.replace(self.path)
+        atomic_write_json(self.path, [asdict(r) for r in self.relationships], indent=2)
 
     def add(self, rel: Relationship) -> bool:
         """Returns False (no-op) if an equivalent edge already exists,

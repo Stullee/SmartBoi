@@ -16,6 +16,7 @@ from pathlib import Path
 from anthropic import AsyncAnthropic
 
 from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
+from smartboi.state import atomic_write_json, quarantine_corrupt_file
 from smartboi.usage import CAT_DOSSIER, CAT_SYNTHESIS, UsageTracker
 
 log = logging.getLogger(__name__)
@@ -163,15 +164,16 @@ class DossierStore:
             raw = json.loads(path.read_text())
             raw["evidence"] = [EvidenceRecord(**e) for e in raw.get("evidence", [])]
             return Dossier(**raw)
-        except (json.JSONDecodeError, OSError, TypeError):
-            log.warning("Could not read dossier for %s, starting fresh.", symbol)
+        except (json.JSONDecodeError, OSError, TypeError) as exc:
+            # A dossier is the permanent record of accumulated evidence, so a
+            # corrupt one is quarantined (not silently overwritten by the next
+            # save) and the loss is logged loudly rather than reported as a
+            # routine "starting fresh".
+            quarantine_corrupt_file(path, exc)
             return Dossier(symbol=symbol)
 
     def save(self, dossier: Dossier) -> None:
-        path = self._path(dossier.symbol)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(dossier.to_dict(), indent=2))
-        tmp.replace(path)
+        atomic_write_json(self._path(dossier.symbol), dossier.to_dict(), indent=2)
 
     def all_symbols(self) -> list[str]:
         return sorted(p.stem for p in self.dir_path.glob("*.json"))

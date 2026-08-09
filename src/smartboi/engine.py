@@ -354,12 +354,10 @@ class Engine:
         # the skeptic call is deferred by an exhausted daily LLM call budget
         # (see usage.py), the retry on a later poll doesn't re-pay for
         # propose_update -- it already has the answer, it just needs the
-        # skeptic's verdict. In-memory only: on a restart the worst case is
-        # falling back to today's behavior (re-propose from scratch), never
-        # a new failure mode, so this doesn't need to survive a restart.
-        # Values are (proposal, cached_at_monotonic) so entries whose
-        # evidence has aged out of every ingestion lookback window (and so
-        # can never be retried) are evicted instead of leaking forever.
+        # skeptic's verdict. Values are (proposal, cached_at_wallclock) so
+        # entries whose evidence has aged out of every ingestion lookback
+        # window (and so can never be retried) are evicted instead of leaking
+        # forever.
         self._pending_proposals: dict[str, tuple[dict, float]] = {}
         # (target_symbol, evidence_id) pairs handled definitively WITHOUT a
         # merge (skeptic-refuted, judged not-new, or a malformed proposal).
@@ -368,9 +366,18 @@ class Engine:
         # SIBLING target of the same evidence item was budget-deferred, the
         # retry re-paid propose_update (and the skeptic) for targets that
         # were already definitively done, and a second skeptic run could
-        # even accept what the first had refuted. In-memory only, same
-        # restart trade-off as _pending_proposals.
+        # even accept what the first had refuted.
         self._handled_outcomes: dict[str, float] = {}
+        # Both caches are PERSISTED (with wall-clock stamps) rather than kept
+        # purely in-memory. The HA deployment restarts several times a day, and
+        # a purely-in-memory _handled_outcomes reintroduced a fixed bug through
+        # the restart door: a refuted/not-new marker was forgotten on restart,
+        # so the still-unregistered evidence (a sibling target had deferred)
+        # was re-proposed and a nondeterministic second skeptic run could
+        # ACCEPT what the first had refuted. Persisting closes that door and
+        # also spares the re-paid propose_update on a mid-flight restart.
+        self._retry_state = JsonState(DATA_DIR / "retry_state.json")
+        self._load_retry_state()
 
         self.edgar_client: EdgarClient | None = None
         self.finnhub: FinnhubClient | None = None
@@ -2221,8 +2228,37 @@ class Engine:
     # window (14-day EDGAR is the longest) and the entry is just a leak.
     _EVIDENCE_CACHE_TTL_SEC = 15 * 86400
 
+    def _load_retry_state(self) -> None:
+        """Restore the propose/skeptic retry caches persisted by the last run,
+        pruning anything already aged past the ingestion lookback window (so a
+        long downtime cannot resurrect a marker whose evidence can never be
+        re-ingested). Malformed persisted entries are skipped rather than
+        trusted -- the file is small JSON that a human could have edited."""
+        cutoff = time.time() - self._EVIDENCE_CACHE_TTL_SEC
+        handled = self._retry_state.get("handled_outcomes") or {}
+        self._handled_outcomes = {
+            k: float(t) for k, t in handled.items()
+            if isinstance(t, (int, float)) and t >= cutoff
+        }
+        pending = self._retry_state.get("pending_proposals") or {}
+        restored: dict[str, tuple[dict, float]] = {}
+        for k, v in pending.items():
+            # Persisted as [proposal, wall_time]; tolerate anything malformed.
+            if (isinstance(v, list) and len(v) == 2 and isinstance(v[0], dict)
+                    and isinstance(v[1], (int, float)) and v[1] >= cutoff):
+                restored[k] = (v[0], float(v[1]))
+        self._pending_proposals = restored
+
+    def _persist_retry_state(self) -> None:
+        self._retry_state.update({
+            "handled_outcomes": self._handled_outcomes,
+            "pending_proposals": {
+                k: [proposal, t] for k, (proposal, t) in self._pending_proposals.items()
+            },
+        })
+
     def _evict_stale_evidence_caches(self) -> None:
-        cutoff = time.monotonic() - self._EVIDENCE_CACHE_TTL_SEC
+        cutoff = time.time() - self._EVIDENCE_CACHE_TTL_SEC
         self._pending_proposals = {
             k: v for k, v in self._pending_proposals.items() if v[1] >= cutoff
         }
@@ -2236,9 +2272,11 @@ class Engine:
         by a SIBLING target's deferral -- doesn't re-pay propose_update and
         the skeptic for a target that was already definitively done (and,
         worse, give a nondeterministic second skeptic run the chance to
-        accept what the first refuted)."""
-        self._handled_outcomes[proposal_key] = time.monotonic()
+        accept what the first refuted). Persisted so this survives the
+        several-restarts-a-day reality (see _load_retry_state)."""
+        self._handled_outcomes[proposal_key] = time.time()
         self._evict_stale_evidence_caches()
+        self._persist_retry_state()
         return "handled"
 
     @staticmethod
@@ -2326,12 +2364,17 @@ class Engine:
                 # fraction of items it silently discards.
                 log.info("%s: evidence judged not new information -- not merged.", target_symbol)
                 return self._mark_handled(proposal_key)
-            self._pending_proposals[proposal_key] = (proposed, time.monotonic())
+            # Wall-clock stamp (not monotonic) so the cache survives a restart:
+            # a mid-flight restart between propose and skeptic otherwise re-pays
+            # propose_update. Persisted immediately for the same reason.
+            self._pending_proposals[proposal_key] = (proposed, time.time())
+            self._persist_retry_state()
 
         verdict = await self.skeptic.review(evidence_text, proposed, relationship_note, relationship_confidence)
         if verdict is None:
             return "deferred"  # transient LLM failure or budget exhausted -- retry later
         self._pending_proposals.pop(proposal_key, None)
+        self._persist_retry_state()
         if verdict.get("refuted"):
             log.info("%s: evidence refuted by skeptic (%s)", target_symbol, verdict.get("reasoning", ""))
             return self._mark_handled(proposal_key)

@@ -78,3 +78,20 @@ def test_graph_persists_across_instances(tmp_path):
     reloaded = RelationshipGraph(path)
     assert len(reloaded.relationships) == 1
     assert reloaded.relationships[0].from_symbol == "UCTT"
+
+
+def test_a_corrupt_graph_file_is_quarantined_not_silently_wiped(tmp_path):
+    """The graph is expensive to rebuild (a full-universe re-extraction), so a
+    corrupt file is renamed aside rather than overwritten by the next _save()."""
+    path = tmp_path / "graph.json"
+    path.write_text("{ not valid json")
+
+    graph = RelationshipGraph(path)  # must not raise
+
+    assert graph.relationships == []
+    quarantined = list(tmp_path.glob("graph.json.corrupt-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text() == "{ not valid json"
+    # A subsequent add writes a clean file rather than clobbering the original.
+    graph.add(_rel())
+    assert len(RelationshipGraph(path).relationships) == 1

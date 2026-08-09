@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import signal
 
 from smartboi.config import load_settings
 from smartboi.engine import Engine
@@ -27,10 +29,28 @@ async def _amain() -> None:
     )
 
     engine = Engine(settings)
+    task = asyncio.ensure_future(engine.run_forever())
+    # HA add-ons and Docker stop a container with SIGTERM, which Python's
+    # default handler turns into an immediate process exit WITHOUT raising
+    # KeyboardInterrupt -- so run_forever's finally-cleanup (close the HTTP
+    # clients, disconnect IB) never ran on a normal add-on stop/restart, only
+    # on Ctrl-C (SIGINT). Translate both signals into task cancellation so the
+    # existing cleanup path runs on every shutdown, which the several-restarts-
+    # a-day HA reality exercises constantly.
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown(signame: str) -> None:
+        log.info("Shutdown requested (%s) -- stopping engine.", signame)
+        task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, _request_shutdown, sig.name)
+
     try:
-        await engine.run_forever()
-    except KeyboardInterrupt:
-        log.info("Shutdown requested by user.")
+        await task
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        log.info("Shutdown complete.")
 
 
 def main() -> None:

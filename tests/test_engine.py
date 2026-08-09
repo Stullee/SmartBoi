@@ -1828,6 +1828,34 @@ async def test_a_synthesis_veto_survives_a_later_evidence_merge(engine):
     assert after.confidence == 0.0 and after.magnitude == 0.0  # veto held, no re-fire
 
 
+async def test_a_refuted_outcome_survives_a_restart_and_is_not_re_judged(engine):
+    """The 2.5 fix: a skeptic-refuted marker is persisted, so after one of the
+    several-daily restarts the same (still-unregistered) evidence is NOT
+    re-proposed and re-run through a nondeterministic skeptic that could accept
+    what the first run refuted."""
+    engine.updater.default = proposal()
+    engine.skeptic.default = verdict(refuted=True)
+    args = dict(target_symbol="FORM", evidence_text="e", origin_symbol="FORM",
+                relationship_note="", relationship_confidence=None, source_type="news",
+                source_name="reuters.com", url="https://x/9", headline="h9",
+                published_at="2026-07-23")
+    assert await engine._update_dossier(**args) == "handled"
+    key = "FORM:news:https://x/9:2026-07-23"
+    assert key in engine._handled_outcomes
+
+    # "Restart": a fresh Engine in the same working dir loads the persisted
+    # retry state rather than starting with an empty _handled_outcomes.
+    restarted = Engine(engine.settings)
+    assert key in restarted._handled_outcomes
+
+    # Re-processing the same evidence is now a no-op, and the skeptic is not
+    # re-run -- so it can never accept what the first pass refuted.
+    restarted.updater, restarted.skeptic = engine.updater, engine.skeptic
+    skeptic_calls_before = len(engine.skeptic.calls)
+    assert await restarted._update_dossier(**args) == "already"
+    assert len(engine.skeptic.calls) == skeptic_calls_before
+
+
 async def test_already_priced_in_is_a_veto(engine):
     engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
     dossier = await _build_thesis(engine)
