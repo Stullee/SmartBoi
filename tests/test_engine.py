@@ -15,8 +15,15 @@ import pytest
 from smartboi.config import Settings
 from smartboi.edgar import FilingEvent
 import smartboi.engine
-from smartboi.dossier import SCORING_VERSION
+from smartboi.dossier import (
+    ECOSYSTEM_ASSOCIATION_CONFIDENCE,
+    SCORING_VERSION,
+    Dossier,
+    EvidenceRecord,
+    merge_evidence,
+)
 from smartboi.engine import ECOSYSTEM_LINK_CONFIDENCE, Engine, is_common_equity
+from smartboi.universe import CompanySpec
 from smartboi.ratelimit import SlidingWindowLimiter
 from smartboi.status import snapshot_dossier
 from smartboi.graph import Relationship
@@ -390,6 +397,52 @@ async def test_reconcile_demotes_but_never_promotes(engine):
 
     assert engine.accepted_candidates.get("AAAA")["as"] == "anchor"      # demoted
     assert engine.accepted_candidates.get("BBBB")["as"] == "anchor"      # NOT promoted
+
+
+async def test_monthly_screen_demotes_a_graduated_tradeable(engine):
+    """A runtime-accepted tradeable that outgrows the cap ceiling on its own is
+    demoted to anchor by the monthly screen, WITHOUT the operator ever changing
+    the bounds -- the drift the reconcile pass's bounds-gated recheck could
+    never catch (AUDIT-2026-08-FOLLOWUP HIGH-2)."""
+    engine.accepted_candidates.set(
+        "GRAD", {"as": "tradeable", "source": "auto", "ecosystem": "semi_equipment"})
+    engine.universe = engine.universe + [CompanySpec("GRAD", "Graduated Co", "semi_equipment")]
+    engine.spec_by_symbol = {c.symbol: c for c in engine.universe}
+    engine.finnhub.market_cap_by_symbol["GRAD"] = 500_000.0  # $500B -- far past the ceiling
+
+    await engine._run_universe_screen()
+
+    assert engine.accepted_candidates.get("GRAD")["as"] == "anchor"
+    assert engine.spec_by_symbol["GRAD"].signal_source_only is True
+
+
+async def test_monthly_screen_leaves_a_subfloor_tradeable_alone(engine):
+    """A tradeable that dips below the floor is still a valid (just smaller)
+    trade target -- recommend_candidate_type keeps it 'tradeable' -- so the
+    screen must NOT demote it, only graduated (over-ceiling) names."""
+    engine.accepted_candidates.set(
+        "SMALL", {"as": "tradeable", "source": "auto", "ecosystem": "semi_equipment"})
+    engine.universe = engine.universe + [CompanySpec("SMALL", "Small Co", "semi_equipment")]
+    engine.spec_by_symbol = {c.symbol: c for c in engine.universe}
+    engine.finnhub.market_cap_by_symbol["SMALL"] = 10.0  # $10M -- below the floor, still tradeable
+
+    await engine._run_universe_screen()
+
+    assert engine.accepted_candidates.get("SMALL")["as"] == "tradeable"
+
+
+async def test_monthly_screen_does_not_demote_a_curated_tradeable(engine):
+    """Only RUNTIME-ACCEPTED symbols are the screen's to overrule; a curated
+    symbol (universe.py / SYMBOLS) that outgrows the bounds is reported loudly
+    but left in place, exactly as _prune_dead_symbols treats curated dead ones."""
+    engine.universe = engine.universe + [CompanySpec("CURATED", "Curated Co", "semi_equipment")]
+    engine.spec_by_symbol = {c.symbol: c for c in engine.universe}
+    engine.finnhub.market_cap_by_symbol["CURATED"] = 500_000.0  # graduated, but curated
+
+    await engine._run_universe_screen()
+
+    assert "CURATED" not in engine.accepted_candidates.data
+    assert engine.spec_by_symbol["CURATED"].signal_source_only is False  # untouched
 
 
 # --- Invariant: evidence is registered only on definitive handling ---
@@ -1704,6 +1757,178 @@ async def test_synthesis_cannot_inflate_a_score(engine):
     assert dossier.magnitude == before_m
 
 
+def test_ecosystem_confidence_constants_match():
+    """dossier._aggregate excludes ecosystem-association evidence from the
+    independent-source count by comparing against its OWN copy of the ecosystem
+    link confidence (it cannot import engine). If engine's value ever drifts,
+    the containment silently stops matching the value engine actually stamps
+    on the evidence -- so pin them equal."""
+    assert ECOSYSTEM_ASSOCIATION_CONFIDENCE == ECOSYSTEM_LINK_CONFIDENCE
+
+
+def test_merge_cap_applies_a_fresh_synthesis_trim(engine):
+    now = datetime.now(timezone.utc)
+    dossier = Dossier(symbol="FORM", direction="LONG", confidence=0.8, magnitude=0.8,
+                      synthesis_at=now.isoformat(),
+                      synthesis_confidence=0.4, synthesis_magnitude=0.5)
+    engine._cap_with_synthesis(dossier, now)
+    assert dossier.confidence == 0.4
+    assert dossier.magnitude == 0.5
+
+
+def test_merge_cap_honours_an_already_priced_in_veto(engine):
+    now = datetime.now(timezone.utc)
+    dossier = Dossier(symbol="FORM", direction="LONG", confidence=0.9, magnitude=0.9,
+                      already_priced_in=True, synthesis_at=now.isoformat())
+    engine._cap_with_synthesis(dossier, now)
+    assert dossier.confidence == 0.0
+    assert dossier.magnitude == 0.0
+
+
+def test_merge_cap_never_lifts_a_score(engine):
+    """A cap, never a lift -- a synthesis value ABOVE the arithmetic must not
+    raise it (the whole reason synthesis is min(), not assignment)."""
+    now = datetime.now(timezone.utc)
+    dossier = Dossier(symbol="FORM", direction="LONG", confidence=0.3, magnitude=0.3,
+                      synthesis_at=now.isoformat(),
+                      synthesis_confidence=0.9, synthesis_magnitude=0.9)
+    engine._cap_with_synthesis(dossier, now)
+    assert dossier.confidence == 0.3
+    assert dossier.magnitude == 0.3
+
+
+def test_merge_cap_ignores_a_stale_verdict(engine):
+    """Once the daily pass stops refreshing a dossier, the cap lapses rather
+    than suppressing the thesis forever -- so a merge past the freshness window
+    sees the raw arithmetic, and a genuine direction flip is re-judged by the
+    next decay pass instead of being pinned to a days-old veto."""
+    now = datetime.now(timezone.utc)
+    stale = (now - timedelta(hours=48)).isoformat()
+    dossier = Dossier(symbol="FORM", direction="LONG", confidence=0.8, magnitude=0.8,
+                      already_priced_in=True, synthesis_at=stale)
+    engine._cap_with_synthesis(dossier, now)
+    assert dossier.confidence == 0.8
+    assert dossier.magnitude == 0.8
+
+
+async def test_a_synthesis_veto_survives_a_later_evidence_merge(engine):
+    """The load-bearing 2.1.1 fix: a dossier the daily synthesis vetoed as
+    already-priced-in must STAY capped when fresh evidence merges, instead of
+    re-firing on the raw arithmetic _aggregate rebuilds. Before this, the merge
+    path never consulted synthesis and the veto was erased by the next item."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    now = datetime.now(timezone.utc)
+    await _build_thesis(engine, confidence=0.8, magnitude=0.8)
+    await engine._decay_one("FORM", now)
+    vetoed = engine.dossiers.load("FORM")
+    assert vetoed.already_priced_in is True
+    assert vetoed.confidence == 0.0 and vetoed.magnitude == 0.0
+
+    # A brand-new evidence item merges (distinct id -> not deduped as handled).
+    await engine._process_evidence(
+        origin_symbol="FORM", evidence_text="e2", source_type="news",
+        source_name="ft.com", url="https://x/2", headline="h2", published_at="2026-07-24",
+    )
+
+    after = engine.dossiers.load("FORM")
+    assert after.confidence == 0.0 and after.magnitude == 0.0  # veto held, no re-fire
+
+
+async def test_a_refuted_outcome_survives_a_restart_and_is_not_re_judged(engine):
+    """The 2.5 fix: a skeptic-refuted marker is persisted, so after one of the
+    several-daily restarts the same (still-unregistered) evidence is NOT
+    re-proposed and re-run through a nondeterministic skeptic that could accept
+    what the first run refuted."""
+    engine.updater.default = proposal()
+    engine.skeptic.default = verdict(refuted=True)
+    args = dict(target_symbol="FORM", evidence_text="e", origin_symbol="FORM",
+                relationship_note="", relationship_confidence=None, source_type="news",
+                source_name="reuters.com", url="https://x/9", headline="h9",
+                published_at="2026-07-23")
+    assert await engine._update_dossier(**args) == "handled"
+    key = "FORM:news:https://x/9:2026-07-23"
+    assert key in engine._handled_outcomes
+
+    # "Restart": a fresh Engine in the same working dir loads the persisted
+    # retry state rather than starting with an empty _handled_outcomes.
+    restarted = Engine(engine.settings)
+    assert key in restarted._handled_outcomes
+
+    # Re-processing the same evidence is now a no-op, and the skeptic is not
+    # re-run -- so it can never accept what the first pass refuted.
+    restarted.updater, restarted.skeptic = engine.updater, engine.skeptic
+    skeptic_calls_before = len(engine.skeptic.calls)
+    assert await restarted._update_dossier(**args) == "already"
+    assert len(engine.skeptic.calls) == skeptic_calls_before
+
+
+async def test_reset_runtime_state_clears_signals_and_trades_but_keeps_evidence(engine):
+    """The clean-measurement-window reset: open (previous-regime) paper trades
+    are archived, dossiers reset to ACTIVE with their synthesis episode cleared,
+    but the accumulated evidence is kept (it re-aggregates under the new rules)."""
+    d = Dossier(symbol="FORM", status="SIGNALED", signaled_at="2026-08-01T00:00:00+00:00",
+                signaled_price=10.0, already_priced_in=True, synthesis_at="2026-08-01T00:00:00+00:00")
+    merge_evidence(d, EvidenceRecord(
+        evidence_id="e1", source_type="news", source_name="reuters.com", url="u", headline="h",
+        published_at="2026-07-23", origin_symbol="FORM", is_propagated=False, relationship_note="",
+        direction="LONG", magnitude=0.5, confidence=0.5, horizon_days=20, reasoning="r", skeptic_note=""))
+    d.status = "SIGNALED"  # merge_evidence doesn't touch status; keep it signaled for the test
+    engine.dossiers.save(d)
+    engine.journal.open("FORM", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.9, 3, [])
+
+    result = engine.reset_runtime_state()
+
+    assert result["archived_open_trades"] == ["FORM"]
+    assert engine.journal.open_trades == {}
+    reloaded = engine.dossiers.load("FORM")
+    assert reloaded.status == "ACTIVE"
+    assert reloaded.signaled_at == "" and reloaded.already_priced_in is False
+    assert reloaded.synthesis_at == ""
+    assert len(reloaded.evidence) == 1  # evidence KEPT -- re-aggregates under the new rules
+
+
+async def test_a_refutation_is_logged_for_the_skeptic_readout(engine):
+    """A skeptic refutation left no stored record, so the refutation rate was
+    unmeasurable. It now appends to logs/skeptic_refutations.jsonl (see
+    skeptic_report / run_skeptic_report)."""
+    engine.updater.default = proposal()
+    engine.skeptic.default = verdict(refuted=True, reasoning="generic sector filler")
+    await engine._update_dossier(
+        target_symbol="FORM", evidence_text="e", origin_symbol="INTC",  # propagated: origin != target
+        relationship_note="INTC is a customer", relationship_confidence=0.9, source_type="news",
+        source_name="reuters.com", url="https://x/ref", headline="h", published_at="2026-07-23")
+
+    rows = [json.loads(line) for line in
+            (Path(engine.settings.log_dir) / "skeptic_refutations.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "FORM"
+    assert rows[0]["is_propagated"] is True
+    assert rows[0]["model"] == engine.settings.skeptic_model
+
+
+async def test_extraction_is_not_re_billed_when_scoring_defers(engine):
+    """2.2: relationship extraction (a paid ~150k-char call) runs before
+    dossier scoring, and the filing is dedup-registered only once scoring
+    completes. When scoring defers on an exhausted budget the filing stays
+    unregistered, so the next poll must RETRY SCORING but must NOT re-run the
+    already-completed extraction."""
+    filing = FilingEvent("FORM", "0000000001", "10-K", "2026-07-28", "acc-1", "d10k.htm")
+    engine.edgar_client.text_by_accession["acc-1"] = "some 10-K text with a customer"
+    engine.extractor.default = []      # extraction runs and returns no edges (not None -> True)
+    engine.updater.default = None      # dossier scoring defers (budget-exhausted shape)
+
+    await engine._process_filing("FORM", filing)
+    assert len(engine.extractor.calls) == 1                       # extracted once
+    assert engine.extracted_filings.get("filing:FORM:acc-1")     # marked extracted
+    assert not engine.dedup.is_duplicate("filing:FORM:acc-1")    # scoring deferred -> unregistered
+
+    updater_calls_after_first = len(engine.updater.calls)
+    await engine._process_filing("FORM", filing)                 # same filing, next poll
+
+    assert len(engine.extractor.calls) == 1                       # NOT re-extracted
+    assert len(engine.updater.calls) > updater_calls_after_first  # but scoring was retried
+
+
 async def test_already_priced_in_is_a_veto(engine):
     engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
     dossier = await _build_thesis(engine)
@@ -2248,4 +2473,4 @@ async def test_the_daily_snapshot_records_the_synthesis_verdict(engine):
     assert row["already_priced_in"] is True
     assert row["synthesis_at"] != ""
     assert row["score"] == 0.0
-    assert row["scoring_version"] == 4  # the regime where score is the CAPPED number
+    assert row["scoring_version"] == 5  # the regime where score is the CAPPED number

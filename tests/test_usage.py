@@ -279,3 +279,41 @@ def test_no_reservation_configured_reproduces_the_old_behaviour(tmp_path):
                      category_shares={CAT_SYNTHESIS: 0.25})
     u.record(10_000_000, 0, model="claude-haiku-4-5", category=CAT_DOSSIER)
     assert not u.budget_remaining(CAT_SYNTHESIS)
+
+
+# --- Call reservations. The dollar reservation protected synthesis's SPEND
+# but not its CALLS, and the total call cap is exactly what high-volume fan-out
+# exhausts first -- so on the busiest evidence days synthesis was refused
+# before it priced a token and the whole-body cap silently failed open
+# (AUDIT-2026-08-FOLLOWUP MED-5). The same reservation fractions now hold calls
+# too, so a call cap reached by dossier fan-out can no longer starve synthesis.
+
+
+def test_the_call_cap_reserves_calls_for_synthesis(tmp_path):
+    """dollar cap OFF so only the CALL axis is under test: 3 of 10 calls are
+    reserved for synthesis, so dossier is refused at the 7-call non-reserved
+    pool while synthesis still has room."""
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=10, daily_usd_budget=0.0,
+                     category_reserved={CAT_SYNTHESIS: 0.30})
+    for _ in range(7):
+        u.record(1000, 100, category=CAT_DOSSIER)  # no model -> call count only
+
+    assert not u.budget_remaining(CAT_DOSSIER)   # held at the reserved boundary
+    assert u.budget_remaining(CAT_SYNTHESIS)     # its 3 reserved calls survive
+
+
+def test_a_spent_call_reservation_no_longer_holds_calls_back(tmp_path):
+    """Once synthesis has actually used its reserved calls, they stop being set
+    aside -- dossier can then use the whole remaining budget, so the protection
+    costs the other categories nothing once the reserved pass has run."""
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=10, daily_usd_budget=0.0,
+                     category_reserved={CAT_SYNTHESIS: 0.30})
+    for _ in range(3):  # synthesis spends its entire 3-call reserve
+        u.record(1000, 100, category=CAT_SYNTHESIS)
+
+    for _ in range(7):  # nothing reserved now, so dossier gets all seven
+        assert u.budget_remaining(CAT_DOSSIER)
+        u.record(1000, 100, category=CAT_DOSSIER)
+
+    assert u.snapshot().calls == 10
+    assert not u.budget_remaining(CAT_DOSSIER)  # only the total cap binds now

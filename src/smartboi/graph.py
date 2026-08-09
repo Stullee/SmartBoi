@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from anthropic import AsyncAnthropic
 
 from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
+from smartboi.state import atomic_write_json, quarantine_corrupt_file
 from smartboi.usage import CAT_EXTRACTION, UsageTracker
 
 log = logging.getLogger(__name__)
@@ -45,8 +46,11 @@ class RelationshipGraph:
             try:
                 raw = json.loads(self.path.read_text())
                 loaded = [Relationship(**r) for r in raw]
-            except (json.JSONDecodeError, OSError, TypeError):
-                log.warning("Could not read %s, starting with an empty graph.", self.path)
+            except (json.JSONDecodeError, OSError, TypeError) as exc:
+                # Quarantined rather than silently discarded: the next _save()
+                # would overwrite the original, and the graph is expensive to
+                # rebuild (a full-universe re-extraction). See state.py.
+                quarantine_corrupt_file(self.path, exc)
                 return
             # Self-healing cleanup: an invalid rel_type could only have
             # gotten in from before engine.py's _extract_relationships
@@ -65,23 +69,46 @@ class RelationshipGraph:
                 self._save()
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps([asdict(r) for r in self.relationships], indent=2))
-        tmp.replace(self.path)
+        atomic_write_json(self.path, [asdict(r) for r in self.relationships], indent=2)
 
     def add(self, rel: Relationship) -> bool:
-        """Returns False (no-op) if an equivalent edge already exists,
-        checked on (from, to, rel_type) only -- a re-extraction from a newer
-        filing just skips instead of duplicating. It doesn't refresh an
-        existing edge's description/confidence; graph.json is plain JSON a
-        human can review and hand-edit if an extracted edge is low quality."""
-        for existing in self.relationships:
+        """Adds a new (from, to, rel_type) edge, or UPGRADES an existing one
+        when the new extraction is stronger. Returns True when a new edge was
+        added or an existing one raised to higher confidence; False when the
+        edge already existed at >= this confidence.
+
+        Upgrade-on-stronger fixes a real trap: a weak passing-mention edge
+        (say 0.55) extracted first would otherwise PERMANENTLY block a later
+        quantified-concentration disclosure ("GM accounted for 25% of net
+        sales", 0.95) from ever raising it -- and DISCLOSED_LINK_CONFIDENCE
+        (0.85, see dossier.py) gates has_disclosed_link_evidence, which decides
+        the corroboration bar signals.evaluate applies. The strongest
+        structural edge in the system could be held below its own gate forever
+        by whichever extraction happened to run first.
+
+        extracted_at is refreshed on EVERY re-confirmation (even a weaker one),
+        without downgrading the stored confidence/description/source, so a
+        relationship re-seen in a newer filing ages from the newer date and an
+        edge that STOPS appearing in filings can be surfaced as stale rather
+        than looking freshly confirmed forever (see status.gather_graph_health).
+        graph.json stays plain JSON a human can review and hand-edit."""
+        for i, existing in enumerate(self.relationships):
             if (
                 existing.from_symbol == rel.from_symbol
                 and existing.to_symbol == rel.to_symbol
                 and existing.rel_type == rel.rel_type
             ):
+                if rel.confidence > existing.confidence:
+                    # Stronger disclosure supersedes the weaker one wholesale
+                    # (confidence, description, source and the fresh stamp).
+                    self.relationships[i] = rel
+                    self._save()
+                    return True
+                # Equal-or-weaker: keep the stronger substance, but record that
+                # the relationship was re-confirmed now -- the aging anchor.
+                if rel.extracted_at and rel.extracted_at != existing.extracted_at:
+                    self.relationships[i] = replace(existing, extracted_at=rel.extracted_at)
+                    self._save()
                 return False
         self.relationships.append(rel)
         self._save()

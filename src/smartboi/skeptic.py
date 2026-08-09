@@ -25,6 +25,7 @@ away rather than scaled down and counted for what it's actually worth."""
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from anthropic import AsyncAnthropic
 
@@ -152,7 +153,7 @@ class Skeptic:
 
     async def review(
         self, evidence_text: str, proposed: dict, relationship_note: str = "",
-        relationship_confidence: float | None = None,
+        relationship_confidence: float | None = None, now: datetime | None = None,
     ) -> dict | None:
         """Returns the verdict dict, or None on a transient API failure OR
         an exhausted daily LLM call budget (usage.py) -- the caller
@@ -173,6 +174,7 @@ class Skeptic:
         if not self._usage.budget_remaining(CAT_DOSSIER):
             log.info("Daily LLM call budget reached -- deferring skeptic review.")
             return None
+        now = now or datetime.now(timezone.utc)
         confidence_suffix = (
             f" [relationship confidence: {relationship_confidence:.2f}]" if relationship_confidence is not None else ""
         )
@@ -182,7 +184,12 @@ class Skeptic:
             if relationship_note
             else "This evidence is about the company directly (not propagated).\n"
         )
+        # Today's date so the "old/already-priced-in news treated as new"
+        # refute trigger in _TOOL is actually computable against the evidence's
+        # published date, instead of the model anchoring "now" to its training
+        # cutoff (which also silently interacts with the model-provenance clock).
         prompt = (
+            f"Today: {now.date().isoformat()}\n"
             f"Proposed update: direction={proposed.get('direction')}, "
             f"magnitude={proposed.get('magnitude')}, confidence={proposed.get('confidence')}, "
             f"reasoning: {proposed.get('reasoning')}\n"

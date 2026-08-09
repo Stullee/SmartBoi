@@ -438,6 +438,7 @@ _INDEX_HTML = """<!doctype html>
       <button class="tbtn" id="btn-diagnostics">Diagnostics bundle</button>
       <button class="tbtn" id="btn-rebuild-graph">Rebuild relationship graph</button>
       <button class="tbtn danger" id="btn-reset">Reset added symbols</button>
+      <button class="tbtn danger" id="btn-reset-runtime">Reset signals &amp; trades</button>
     </div>
     <div class="thint">The first five are read-only &mdash; screening does market-cap/analyst lookups; the others read
       already-persisted state (forward returns, the signal event study, the exit analysis of the closed ledger).
@@ -529,6 +530,15 @@ el("btn-reset").addEventListener("click", function(){
       refresh();
     }).catch(function(err){ out.textContent = "Failed: " + err; });
 });
+el("btn-reset-runtime").addEventListener("click", function(){
+  if (!confirm("Start a clean measurement window? This ARCHIVES every open paper trade (they never reached an outcome) and resets every dossier's signal to ACTIVE so signals re-fire under the current scoring rules. Accumulated evidence, the graph, the universe and the captured forward logs are KEPT (old rows stay segregated by scoring version).")) return;
+  var out = el("tool-output"); showToolOutput(); out.textContent = "Resetting runtime state...";
+  fetch(API_BASE + "runtime/reset", { method:"POST", headers:POST_HEADERS, body:"{}" })
+    .then(function(r){ return r.json(); }).then(function(res){
+      out.textContent = res.error ? ("Error: " + res.error) : ("Archived " + res.archived_open_trades.length + " open trade(s): " + (res.archived_open_trades.join(", ") || "none") + ". Reset " + res.dossiers_reset + " dossier(s) to ACTIVE.");
+      refresh();
+    }).catch(function(err){ out.textContent = "Failed: " + err; });
+});
 document.getElementById("btn-copy-output").addEventListener("click", function(){ copyToolOutput(this); });
 
 function refresh(){
@@ -593,6 +603,9 @@ function renderPnl(d){
     '<div class="pnl-head"><div><div class="k">Account &middot; '+cur+" "+fx(ps.initial_capital,0)+' start</div>'+
       '<div class="big '+eqCls+'">'+cur+" "+fx(ps.equity,0)+'</div></div>'+
       '<div style="text-align:right"><div class="k">Realized</div><div class="mono '+eqCls+'" style="font-size:15px">'+sgn(ps.realized_pnl,0)+'</div></div></div>'+
+    ((ps.peak_concurrent>ps.max_concurrent_positions && ps.max_concurrent_positions>0)
+      ? '<div class="k" style="color:var(--neg)">levered: peak '+ps.peak_concurrent+' positions open vs '+ps.max_concurrent_positions+' slots - equity is a return on more than the stated capital</div>'
+      : '')+
     svg+
     '<div class="foot"><span>cum <b class="mono '+cls(last)+'">'+sgn(last)+"R</b></span>"+
       '<span><b class="mono pos">'+ps.wins+"</b>W / <b class=\\"mono neg\\">"+ps.losses+"</b>L / "+ps.timeouts+"T</span>"+
@@ -953,6 +966,7 @@ async def _status_payload(engine) -> dict:
     paper_stats, closed_trades = gather_paper_trade_stats(
         log_dir / "paper_trades.jsonl",
         settings.initial_trading_capital, settings.trading_currency,
+        settings.max_concurrent_positions,
     )
     current_strategy = settings.strategy_signature()
     strategy_generations = gather_strategy_generations(
@@ -1183,6 +1197,16 @@ def create_app(engine) -> web.Application:
         result = engine.reset_accepted_candidates()
         return web.json_response({"ok": True, **result})
 
+    async def handle_reset_runtime(request: web.Request) -> web.Response:
+        """Starts a clean measurement window: archives all OPEN paper trades
+        and resets every dossier's signal/synthesis episode to ACTIVE (see
+        engine.reset_runtime_state). Keeps evidence, the graph, the universe
+        and the version-stamped forward logs. Runs on the event loop, not a
+        worker thread, for the same reason the accepted-reset does: it mutates
+        live engine state the polling coroutines read between awaits."""
+        result = engine.reset_runtime_state()
+        return web.json_response({"ok": True, **result})
+
     async def handle_rebuild_graph(request: web.Request) -> web.Response:
         """Re-extracts relationships from every tradeable's latest 10-K (see
         engine.rebuild_relationship_graph). Additive only -- graph.add
@@ -1203,6 +1227,7 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/tools/exit-analysis", handle_tool_exit_analysis)
     app.router.add_post("/api/tools/diagnostics", handle_tool_diagnostics)
     app.router.add_post("/api/universe/reset-accepted", handle_reset_accepted)
+    app.router.add_post("/api/runtime/reset", handle_reset_runtime)
     app.router.add_post("/api/universe/rebuild-graph", handle_rebuild_graph)
     return app
 

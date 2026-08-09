@@ -152,6 +152,27 @@ class UsageTracker:
             total += max(0.0, self.daily_usd_budget * share - spent)
         return total
 
+    def _reserved_calls_elsewhere(self, category: str) -> int:
+        """Calls reserved by OTHER categories that they have not spent yet --
+        the call-count analogue of _reserved_elsewhere.
+
+        The reservation protected reserved categories' DOLLARS but not their
+        CALLS, and the total CALL cap is exactly what high-volume fan-out (the
+        dossier pass) exhausts first -- historically thousands of dossier calls
+        against a 3000-call ceiling. Once the call cap was hit, synthesis was
+        refused before it priced a single token, so the whole-evidence-body cap
+        (the one pass that catches 'ten items are one fact') silently failed
+        open on the busiest evidence days. The same reservation fractions now
+        set aside calls as well as dollars, using floor() so rounding never
+        over-reserves the discrete call budget."""
+        total = 0
+        for cat, share in self.category_reserved.items():
+            if cat == category or share <= 0:
+                continue
+            _, spent_calls = self._category_spent(cat)
+            total += max(0, int(self.daily_call_budget * share) - spent_calls)
+        return total
+
     def _category_spent(self, category: str) -> tuple[float, int]:
         usd = (self._state.get("usd_by_category") or {}).get(category, 0.0)
         calls = (self._state.get("calls_by_category") or {}).get(category, 0)
@@ -172,7 +193,13 @@ class UsageTracker:
         categories cannot."""
         today = today or self._today()
         self._roll_if_new_day(today)
-        if self._state.get("calls", 0) >= self.daily_call_budget:
+        # The total call cap, minus whatever other categories have RESERVED and
+        # not yet spent -- mirrors the dollar gate below. Without this, a
+        # reserved pass (synthesis) had its dollars protected but could still
+        # be refused the moment the shared call cap was hit by fan-out, which
+        # is the axis that actually exhausts first.
+        available_calls = self.daily_call_budget - self._reserved_calls_elsewhere(category)
+        if self._state.get("calls", 0) >= available_calls:
             return False
         # The total this category may draw against is the day MINUS whatever
         # other categories have reserved and not yet spent. Their reservation

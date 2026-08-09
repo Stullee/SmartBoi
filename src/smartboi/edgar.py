@@ -27,6 +27,12 @@ _SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik10}.json"
 # polling a few dozen symbols every hour never gets remotely close, but this
 # still spaces requests out rather than bursting all of them at once.
 _REQUEST_GAP_SEC = 0.3
+# Retry a transient SEC response (429 rate-limit, 503 maintenance) with
+# backoff before giving up, mirroring the Finnhub client. Without this a
+# momentary SEC hiccup dropped that filing for the poll -- recovered next
+# cycle (the fingerprint stays unregistered), but a first-ever run during an
+# SEC blip had nothing cached to fall back on.
+_MAX_ATTEMPTS = 3
 # The ticker->CIK map gains new listings (IPOs, ticker changes) over time; a
 # cache that never expires would leave those unresolvable forever ("no CIK
 # found") on a long-lived deployment.
@@ -278,13 +284,22 @@ class EdgarClient:
         self._last_request = 0.0
 
     async def _throttled_get(self, url: str) -> httpx.Response:
-        now = time.monotonic()
-        wait = _REQUEST_GAP_SEC - (now - self._last_request)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self._last_request = time.monotonic()
-        response = await self._client.get(url)
-        response.raise_for_status()
+        response: httpx.Response | None = None
+        for attempt in range(_MAX_ATTEMPTS):
+            now = time.monotonic()
+            wait = _REQUEST_GAP_SEC - (now - self._last_request)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request = time.monotonic()
+            response = await self._client.get(url)
+            if response.status_code not in (429, 503):
+                response.raise_for_status()
+                return response
+            retry_after = float(response.headers.get("Retry-After") or 0)
+            delay = max(retry_after, 2.0 * (attempt + 1))
+            log.warning("SEC EDGAR returned %d -- backing off %.0fs.", response.status_code, delay)
+            await asyncio.sleep(delay)
+        response.raise_for_status()  # still 429/503 after retries -> raise to the caller
         return response
 
     async def _ticker_map(self) -> tuple[dict[str, str], dict[str, str]]:
@@ -516,13 +531,17 @@ class EdgarClient:
 
         Everything else gets the primary document PLUS its substantive
         exhibits, and for an 8-K a plain-English expansion of its item codes
-        on top (see EIGHT_K_ITEMS / describe_8k_items). For an 8-K the
-        exhibit is put FIRST, because it is the news and the primary document
-        is a cover page: _process_filing re-truncates this to a few thousand
-        head-weighted characters, so anything behind the boilerplate would be
-        cut off exactly as it is now. This is the difference between the
-        dossier engine reading "the Company issued a press release, attached
-        as Exhibit 99.1" and reading the press release."""
+        on top (see EIGHT_K_ITEMS / describe_8k_items). Ordering is gated on
+        form type. For an 8-K the exhibit is put FIRST, because it is the news
+        and the primary document is a cover page: _process_filing re-truncates
+        this to a few thousand head-weighted characters, so anything behind the
+        boilerplate would be cut off. This is the difference between the dossier
+        engine reading "the Company issued a press release, attached as Exhibit
+        99.1" and reading the press release. But for a 10-K/10-Q/424B5/SC 13D
+        the primary document IS the substance (MD&A, customer-concentration
+        notes, the shelf terms), so it leads and the exhibits follow -- putting
+        a routine EX-10 contract first and labeling the 10-K a "cover document"
+        pushed the filing's own disclosures into the truncated tail."""
         if filing.form == "4":
             try:
                 response = await self._throttled_get(filing.raw_document_url)
@@ -539,19 +558,34 @@ class EdgarClient:
         sections: list[str] = []
 
         item_description = describe_8k_items(filing.items) if filing.form.startswith("8-K") else ""
-        if item_description:
-            sections.append(f"This 8-K reports: {item_description}")
 
+        exhibit_sections: list[str] = []
         for name in await self.evidence_exhibits(filing):
             exhibit_text = await self.fetch_document_text(filing.document_url_for(name))
             if exhibit_text:
-                sections.append(f"--- Attached exhibit ({name}) ---\n{exhibit_text}")
+                exhibit_sections.append(f"--- Attached exhibit ({name}) ---\n{exhibit_text}")
 
-        # No exhibits resolved -> unchanged behaviour, primary document only.
+        # No exhibits and no item expansion -> unchanged: primary document only.
+        if not exhibit_sections and not item_description:
+            return primary_text
+
+        if item_description:
+            sections.append(f"This 8-K reports: {item_description}")
+        if filing.form.startswith("8-K"):
+            # 8-K: the exhibit is the news; the primary is a cover page, so it
+            # trails (and can fall into the truncated tail without loss).
+            sections.extend(exhibit_sections)
+            if primary_text:
+                sections.append(f"--- Filing cover document ---\n{primary_text}")
+        else:
+            # 10-K/10-Q/424B5/SC 13D: the primary IS the substance -- it leads
+            # so its front matter survives head+tail truncation, exhibits after.
+            if primary_text:
+                sections.append(f"--- Filing document ({filing.form}) ---\n{primary_text}")
+            sections.extend(exhibit_sections)
+
         if not sections:
             return primary_text
-        if primary_text:
-            sections.append(f"--- Filing cover document ---\n{primary_text}")
         return "\n\n".join(sections)
 
     async def fetch_text(self, filing: FilingEvent, max_chars: int = 150_000) -> str:

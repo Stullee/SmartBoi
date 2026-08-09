@@ -83,6 +83,14 @@ def test_compute_forward_return_short_price_rise_is_negative_signed():
     assert result["signed_return_pct"] < 0  # price rose, SHORT was wrong
 
 
+def test_compute_forward_return_carries_already_priced_in():
+    marks = {"FORM": {"2026-07-01": 10.0, "2026-07-06": 11.0}}
+    vetoed = compute_forward_return({**_snapshot(), "already_priced_in": True}, marks, horizon_days=5)
+    assert vetoed["already_priced_in"] is True
+    legacy = compute_forward_return(_snapshot(), marks, horizon_days=5)  # column absent
+    assert legacy["already_priced_in"] is False
+
+
 def test_compute_forward_return_none_direction_is_unscored():
     marks = {"FORM": {"2026-07-01": 10.0, "2026-07-06": 11.0}}
     snap = _snapshot(direction="NONE")
@@ -153,6 +161,25 @@ def test_bucket_returns_omits_empty_buckets():
     rows = [{"score": 0.6, "signed_return_pct": 5.0}]
     buckets = bucket_returns(rows)
     assert len(buckets) == 1
+
+
+def test_bucket_returns_reports_symbol_weighted_stats():
+    # One thesis snapshotted 4 times (all wins) + one symbol once (a loss).
+    # Row-weighted hit = 4/5 = 80%; symbol-weighted = mean(100%, 0%) = 50% --
+    # so one long-lived thesis cannot dominate the headline number.
+    rows = [
+        {"symbol": "WIN", "score": 0.6, "signed_return_pct": 5.0},
+        {"symbol": "WIN", "score": 0.6, "signed_return_pct": 5.0},
+        {"symbol": "WIN", "score": 0.6, "signed_return_pct": 5.0},
+        {"symbol": "WIN", "score": 0.6, "signed_return_pct": 5.0},
+        {"symbol": "LOSS", "score": 0.6, "signed_return_pct": -3.0},
+    ]
+    b = bucket_returns(rows)[0]
+    assert b["n_symbols"] == 2
+    assert b["hit_rate"] == 0.8                      # row-weighted
+    assert b["hit_rate_symbol_weighted"] == 0.5      # one vote per symbol
+    assert round(b["mean_return_pct"], 2) == 3.4     # (4*5 - 3) / 5
+    assert b["mean_return_pct_symbol_weighted"] == 1.0  # mean(5, -3)
 
 
 # --- pearson_correlation ---
@@ -364,6 +391,35 @@ def test_cluster_bootstrap_ci_brackets_the_mean():
     lo, hi = ci
     assert lo <= 5.0 <= hi  # overall mean = 5.0
     assert lo < hi
+
+
+def test_format_report_excludes_and_reports_synthesis_vetoed_snapshots():
+    rows = [
+        {"symbol": "FORM", "direction": "LONG", "score": 0.7, "signed_return_pct": 8.0,
+         "entry_date": "2026-07-01", "horizon_days": 5, "already_priced_in": False},
+        {"symbol": "DCO", "direction": "LONG", "score": 0.7, "signed_return_pct": -9.0,
+         "entry_date": "2026-07-01", "horizon_days": 5, "already_priced_in": True},  # a veto
+    ]
+    price_marks = {"FORM": {"2026-07-01": 10.0, "2026-07-06": 10.8}}
+    report = format_report(5, rows, price_marks, {"FORM": "semi_equipment", "DCO": "defense_tier2"})
+
+    assert "1 joined snapshot(s) excluded" in report
+    assert "already-priced-in" in report
+    # The vetoed DCO loser must not pollute the per-symbol breakdown.
+    per_symbol_section = report.split("Per-symbol breakdown")[1]
+    assert "FORM" in per_symbol_section
+    assert "DCO" not in per_symbol_section
+
+
+def test_format_report_overall_hit_rate_is_symbol_weighted():
+    report = format_report(
+        5,
+        [{"symbol": "FORM", "direction": "LONG", "score": 0.6, "signed_return_pct": 8.0,
+          "entry_date": "2026-07-01", "horizon_days": 5}],
+        {"FORM": {"2026-07-01": 10.0, "2026-07-06": 10.8}},
+        {"FORM": "semi_equipment"},
+    )
+    assert "symbol-weighted" in report and "row-weighted" in report
 
 
 def test_format_report_shows_join_accounting():

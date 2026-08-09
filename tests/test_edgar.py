@@ -362,6 +362,35 @@ async def test_fetch_evidence_text_leads_with_the_press_release(tmp_path):
     assert text.index("$150 million contract") < text.index("incorporated by reference")
 
 
+async def test_fetch_evidence_text_leads_with_the_10k_body_not_the_exhibit(tmp_path):
+    """For a 10-K the primary document IS the substance (MD&A, customer
+    concentration), so it must lead ahead of an exhibit and never be labeled a
+    'cover document' -- otherwise head+tail truncation drops the filing's own
+    disclosures."""
+    filing = FilingEvent("DCO", "0000029669", "10-K", "2026-07-28",
+                         "0000029669-26-000099", "d10k.htm")
+    base = filing.index_url
+    client = _FakeEdgar({
+        f"{base}d10k.htm": _FakeResponse(
+            text="<html>Item 7 MD&A. Boeing accounted for 42% of net revenues in fiscal 2026, "
+                 "a customer-concentration risk.</html>",
+            headers={"content-type": "text/html"},
+        ),
+        f"{base}index.json": _index([{"name": "dex991.htm", "type": "EX-99.1"}]),
+        f"{base}dex991.htm": _FakeResponse(
+            text="<html>routine exhibit boilerplate text</html>",
+            headers={"content-type": "text/html"},
+        ),
+    }, tmp_path)
+
+    text = await client.fetch_evidence_text(filing)
+
+    assert "customer-concentration risk" in text          # the 10-K's own disclosure survives
+    assert "routine exhibit boilerplate" in text           # exhibit still included
+    assert text.index("customer-concentration risk") < text.index("routine exhibit boilerplate")
+    assert "Filing cover document" not in text             # a 10-K is not a cover page
+
+
 async def test_fetch_evidence_text_is_unchanged_when_there_are_no_exhibits(tmp_path):
     client = _FakeEdgar({
         f"{_BASE}d8k.htm": _FakeResponse(text="cover page only", headers={"content-type": "text/plain"}),

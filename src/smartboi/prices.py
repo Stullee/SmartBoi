@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import NamedTuple
 
 from ib_async import IB, Stock
@@ -52,6 +53,20 @@ _REQUEST_GAP_SEC = 1.0
 # which _price_bar already handles by falling through to Finnhub.
 _IB_CALL_TIMEOUT_SEC = 20.0
 
+# Data-level circuit breaker. The per-call timeout above bounds a SINGLE call,
+# but a half-dead Gateway (isConnected() true, so ensure_connected never
+# reconnects, while its data farms hang EVERY request) makes every symbol cost
+# the full timeout, every poll, forever: the single-task engine then spends
+# ~N x 21s per pass hung on IB before falling to Finnhub -- measured at ~10.5
+# min of a 15-min cycle at 30 open positions, and up to ~73 min for a
+# whole-universe daily-marks pass. After this many CONSECUTIVE call timeouts
+# the breaker opens: IB is skipped entirely (callers go straight to Finnhub)
+# until the cooldown elapses, at which point one call probes it and either
+# closes the breaker (recovered) or re-opens it. Consecutive, so an occasional
+# unqualifiable symbol never trips it.
+_IB_BREAKER_THRESHOLD = 5
+_IB_BREAKER_COOLDOWN_SEC = 1800.0  # 30 min
+
 
 class ReadOnlyPriceFeed:
     def __init__(self, host: str, port: int, client_id: int):
@@ -60,6 +75,33 @@ class ReadOnlyPriceFeed:
         self._client_id = client_id
         self.ib = IB()
         self._contracts: dict[str, Stock] = {}
+        # Circuit-breaker state (see the module constants). monotonic so a
+        # wall-clock adjustment can't wedge the breaker open or closed.
+        self._consecutive_failures = 0
+        self._breaker_until = 0.0
+
+    def _breaker_open(self) -> bool:
+        return time.monotonic() < self._breaker_until
+
+    def _record_ib_success(self) -> None:
+        """IB answered (a bar, an empty result, or 'no such contract') -- it is
+        not hanging, so clear the failure streak."""
+        self._consecutive_failures = 0
+
+    def _record_ib_failure(self) -> None:
+        """An IB call timed out. Trip the breaker once the streak crosses the
+        threshold; a streak already past it (a post-cooldown probe that timed
+        out again) re-opens it for another cooldown."""
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= _IB_BREAKER_THRESHOLD and not self._breaker_open():
+            self._breaker_until = time.monotonic() + _IB_BREAKER_COOLDOWN_SEC
+            log.warning(
+                "IB price feed timed out on %d consecutive calls -- opening the circuit breaker: "
+                "skipping IB for %d min and pricing off Finnhub. (The Gateway is likely up but its "
+                "data farm is hung; a per-symbol timeout of %.0fs would otherwise stall the whole "
+                "single-task engine every poll.)",
+                self._consecutive_failures, int(_IB_BREAKER_COOLDOWN_SEC / 60), _IB_CALL_TIMEOUT_SEC,
+            )
 
     async def connect(self) -> None:
         await self.ib.connectAsync(self._host, self._port, clientId=self._client_id, timeout=15)
@@ -96,35 +138,51 @@ class ReadOnlyPriceFeed:
             return False
 
     async def last_bar(self, symbol: str) -> PriceBar | None:
-        contract = self._contracts.get(symbol)
-        if contract is None:
-            candidate = Stock(symbol, "SMART", "USD")
-            # Indexed, not destructured. `[qualified] = await ...` raised
-            # ValueError("not enough values to unpack") whenever IB returned
-            # an EMPTY list, which is its normal answer for a symbol it can't
-            # resolve -- a delisted ticker, a share class SMART doesn't route,
-            # or (the case that actually bit) a Gateway whose security-
-            # definition farm is not connected yet. That turned a routine
-            # "no price for this symbol" into an exception, and in
-            # _try_open_from_signal an exception is caught and returned from
-            # WITHOUT ever reaching the entry-deadline check -- so a signal
-            # could sit SIGNALED indefinitely on an unqualifiable symbol.
-            qualified = await asyncio.wait_for(
-                self.ib.qualifyContractsAsync(candidate), timeout=_IB_CALL_TIMEOUT_SEC
-            )
-            if not qualified or not getattr(qualified[0], "conId", None):
-                log.warning("%s: could not qualify contract for price lookup.", symbol)
-                return None
-            self._contracts[symbol] = qualified[0]
-            contract = qualified[0]
+        # Breaker open: skip IB entirely and report "no price" so the caller
+        # falls straight through to Finnhub, instead of paying the timeout.
+        if self._breaker_open():
+            return None
+        try:
+            contract = self._contracts.get(symbol)
+            if contract is None:
+                candidate = Stock(symbol, "SMART", "USD")
+                # Indexed, not destructured. `[qualified] = await ...` raised
+                # ValueError("not enough values to unpack") whenever IB returned
+                # an EMPTY list, which is its normal answer for a symbol it can't
+                # resolve -- a delisted ticker, a share class SMART doesn't route,
+                # or (the case that actually bit) a Gateway whose security-
+                # definition farm is not connected yet. That turned a routine
+                # "no price for this symbol" into an exception, and in
+                # _try_open_from_signal an exception is caught and returned from
+                # WITHOUT ever reaching the entry-deadline check -- so a signal
+                # could sit SIGNALED indefinitely on an unqualifiable symbol.
+                qualified = await asyncio.wait_for(
+                    self.ib.qualifyContractsAsync(candidate), timeout=_IB_CALL_TIMEOUT_SEC
+                )
+                if not qualified or not getattr(qualified[0], "conId", None):
+                    # IB ANSWERED (there is just no such contract) -- not a hang,
+                    # so it clears the failure streak rather than tripping the
+                    # breaker.
+                    self._record_ib_success()
+                    log.warning("%s: could not qualify contract for price lookup.", symbol)
+                    return None
+                self._contracts[symbol] = qualified[0]
+                contract = qualified[0]
 
-        bars = await asyncio.wait_for(
-            self.ib.reqHistoricalDataAsync(
-                contract, endDateTime="", durationStr="2 D", barSizeSetting="1 day",
-                whatToShow="TRADES", useRTH=True,
-            ),
-            timeout=_IB_CALL_TIMEOUT_SEC,
-        )
+            bars = await asyncio.wait_for(
+                self.ib.reqHistoricalDataAsync(
+                    contract, endDateTime="", durationStr="2 D", barSizeSetting="1 day",
+                    whatToShow="TRADES", useRTH=True,
+                ),
+                timeout=_IB_CALL_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            # The half-dead-Gateway signature: connected, but every data request
+            # hangs to the timeout. Count it toward the breaker and report "no
+            # price" so the caller falls through to Finnhub.
+            self._record_ib_failure()
+            return None
+        self._record_ib_success()
         if not bars:
             return None
         bar = bars[-1]
@@ -138,17 +196,42 @@ class ReadOnlyPriceFeed:
         """Sequential with a small gap between requests -- see module
         docstring on pacing. A failure for one symbol must not stop the
         rest of the universe from being priced."""
+        if self._breaker_open():
+            # Report once, not a traceback per symbol: with the breaker open
+            # every symbol would just return None. The caller prices them off
+            # Finnhub. This is the fix for the per-symbol ERROR spam that
+            # otherwise filled the rotating log during an IB outage.
+            log.warning(
+                "IB circuit breaker open -- skipping IB for %d symbol(s) this pass, using Finnhub.",
+                len(symbols),
+            )
+            return {}
         bars: dict[str, PriceBar] = {}
+        errors = 0
         for i, symbol in enumerate(symbols):
             if i > 0:
                 await asyncio.sleep(_REQUEST_GAP_SEC)
             try:
                 bar = await self.last_bar(symbol)
             except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
-                log.exception("%s: price lookup failed.", symbol)
+                errors += 1
+                log.debug("%s: price lookup failed.", symbol)
                 continue
             if bar is not None:
                 bars[symbol] = bar
+            # The breaker tripped partway through (a run of timeouts) -- stop
+            # hammering IB for the rest of the universe and let them fall to
+            # Finnhub, rather than paying the timeout on every remaining symbol.
+            if self._breaker_open():
+                skipped = len(symbols) - (i + 1)
+                if skipped:
+                    log.warning(
+                        "IB circuit breaker tripped mid-pass -- skipping the remaining %d symbol(s), "
+                        "using Finnhub.", skipped,
+                    )
+                break
+        if errors:
+            log.warning("IB price lookup errored on %d symbol(s) this pass (using Finnhub).", errors)
         return bars
 
     async def last_prices(self, symbols: list[str]) -> dict[str, float]:

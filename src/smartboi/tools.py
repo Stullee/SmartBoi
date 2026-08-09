@@ -44,6 +44,7 @@ from smartboi.forward_returns import (
     price_marks_by_symbol,
 )
 from smartboi.exit_analysis import format_report as format_exit_report
+from smartboi.skeptic_report import analyze_skeptic_effect, format_skeptic_report
 from smartboi.screen import candidates_from_file, resolve_candidates_path
 from smartboi.universe import CompanySpec, spec_by_symbol
 from smartboi.research import (
@@ -235,6 +236,27 @@ def run_forward_returns(
                                    attempted=len(directional)))
         lines.append("")
     return "\n".join(lines)
+
+
+def run_skeptic_report(log_dir: str | Path, dossier_store) -> str:
+    """The skeptic-effect readout: refutation rate and re-scaling distribution
+    over every accepted evidence record (each carries the updater's pre-skeptic
+    proposed_confidence/proposed_magnitude) and the refutation log. The inputs
+    that decide whether the trade-gating skeptic belongs on a cheaper or
+    pricier model tier. Pure file/dossier reads; no network, no LLM."""
+    refutations = read_jsonl(Path(log_dir) / "skeptic_refutations.jsonl")
+    accepted = []
+    for symbol in dossier_store.all_symbols():
+        for e in dossier_store.load(symbol).evidence:
+            accepted.append({
+                "is_propagated": e.is_propagated,
+                "model": e.reviewed_by_model or "unknown",
+                "proposed_confidence": e.proposed_confidence,
+                "proposed_magnitude": e.proposed_magnitude,
+                "confidence": e.confidence,
+                "magnitude": e.magnitude,
+            })
+    return format_skeptic_report(analyze_skeptic_effect(accepted, refutations))
 
 
 def run_event_study(
