@@ -76,10 +76,28 @@ Implemented on `claude/full-system-audit-46xlq3` (616 tests green).
 - **SIGTERM handler** — `main.py` translates SIGTERM/SIGINT into task
   cancellation so `run_forever`'s cleanup runs on a normal HA/Docker stop.
 
+**Measurement de-biasing (makes the forward record trustworthy):**
+
+- **Symbol-equal-weighted headline (MED-1)** — `bucket_returns` now reports
+  symbol-weighted mean/hit-rate (one vote per symbol, matching the
+  symbol-clustered CI) as the headline, so one long-lived thesis can't drive a
+  "97% hit rate"; the row-weighted figure is kept but labelled.
+- **Synthesis-aware forward buckets (MED-2)** — `compute_forward_return`
+  carries `already_priced_in`, and `format_report` excludes synthesis-vetoed
+  snapshots from the tables (reporting them separately), so pre-v5 uncapped
+  vetoed scores can't contaminate the top bucket.
+- **Leverage disclosure (MED-3 / A5)** — `PaperTradeStats` now surfaces
+  `peak_concurrent` vs `max_concurrent_positions`, and the dashboard flags the
+  currency equity as levered when peak concurrency exceeded the slot count.
+- **SCORE_BUCKETS comment (A8)** — corrected the stale "0.65 is the default
+  threshold" note (the shipped default is 0.5; both are bucket edges).
+
 Still open (each its own change): the config-only containment (A9.1),
-position-cap enforcement/disclosure (A5), the measurement de-biasing
-(MED-1/2/3), the skeptic readout + tier decision, and the smaller items. The
-findings below are the full audit as first written.
+position-cap *enforcement* (A5 — the disclosure above ships; enforcement stays
+deferred to real order placement per the documented design), the skeptic
+readout + tier decision, and the smaller items (2.2, 2.7 prompts, near-dup
+window, 10-K exhibit ordering, EDGAR backoff, version guard). The findings
+below are the full audit as first written.
 
 ---
 

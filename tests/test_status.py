@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from smartboi.dossier import Dossier
 from smartboi.graph import Relationship, RelationshipGraph
 from smartboi.status import (
+    _peak_concurrent,
     gather_graph_stats,
     gather_paper_trade_stats,
     gather_strategy_generations,
@@ -94,6 +95,38 @@ _HTH_SIG = {
     "transaction_cost_profile": "retail", "max_favorable_drift_pct": 12.0, "max_horizon_days": 21,
     "label": "hold-to-horizon", "version": "0.43.0",
 }
+
+
+def test_peak_concurrent_counts_overlapping_intervals():
+    rows = [
+        {"opened_at": "2026-07-01T00:00:00", "closed_at": "2026-07-05T00:00:00"},
+        {"opened_at": "2026-07-02T00:00:00", "closed_at": "2026-07-03T00:00:00"},  # overlaps the first -> 2
+        {"opened_at": "2026-07-06T00:00:00", "closed_at": "2026-07-07T00:00:00"},  # after the first closed -> 1
+    ]
+    assert _peak_concurrent(rows) == 2
+
+
+def test_peak_concurrent_ignores_trades_missing_timestamps():
+    assert _peak_concurrent([{"status": "WIN"}, {"opened_at": "2026-07-01T00:00:00"}]) == 0
+
+
+def test_paper_stats_surface_leverage_when_peak_exceeds_slots(tmp_path):
+    """A5/MED-3: with no entry-time position cap, more than max_concurrent
+    positions can be open at once, so the currency equity reflects leverage.
+    The stats surface peak-vs-slots so that caveat is visible."""
+    path = tmp_path / "paper_trades.jsonl"
+    rows = [  # three trades open simultaneously, only two slots modelled
+        {"status": "WIN", "r_multiple": 1.0, "opened_at": "2026-07-01T00:00:00", "closed_at": "2026-07-10T00:00:00"},
+        {"status": "WIN", "r_multiple": 1.0, "opened_at": "2026-07-02T00:00:00", "closed_at": "2026-07-10T00:00:00"},
+        {"status": "LOSS", "r_multiple": -1.0, "opened_at": "2026-07-03T00:00:00", "closed_at": "2026-07-10T00:00:00"},
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    stats, _ = gather_paper_trade_stats(path, initial_capital=5000.0, currency="EUR",
+                                        max_concurrent_positions=2)
+
+    assert stats.peak_concurrent == 3
+    assert stats.max_concurrent_positions == 2  # peak > slots -> equity is levered
 
 
 def _trade(status, r, strategy=None):

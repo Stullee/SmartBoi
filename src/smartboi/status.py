@@ -48,6 +48,18 @@ class PaperTradeStats:
     initial_capital: float = 0.0
     realized_pnl: float = 0.0
     equity: float = 0.0
+    # Leverage disclosure. Each trade is sized initial_capital /
+    # max_concurrent_positions, but the entry path enforces no total-count cap
+    # (a hard cap belongs with real order placement, not signal validation --
+    # see config), so more than `max_concurrent_positions` can be open at once.
+    # When they are, the deployed book exceeds initial_capital and the currency
+    # equity above reflects a return on leverage the account model never
+    # claimed. peak_concurrent is the max simultaneously-open in the CLOSED
+    # record; peak_concurrent > max_concurrent_positions means the equity line
+    # is levered. Surfaced so the currency figure is never read as an
+    # achievable single-account return without that caveat.
+    max_concurrent_positions: int = 0
+    peak_concurrent: int = 0
 
 
 @dataclass
@@ -369,11 +381,37 @@ def _wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, fl
     return (max(0.0, center - margin), min(1.0, center + margin))
 
 
+def _peak_concurrent(rows: list[dict]) -> int:
+    """Max number of paper trades open simultaneously in the closed record --
+    a sweep over [opened_at, closed_at] intervals. Ties (an open and a close at
+    the same instant) count as overlapping, so this is the conservative (upper)
+    concurrency, which is the right side to err on for a LEVERAGE disclosure.
+    Only closed trades are visible here; currently-open positions would raise it
+    further, so this is a lower bound on the true live peak."""
+    events: list[tuple[str, int]] = []
+    for r in rows:
+        opened, closed = r.get("opened_at"), r.get("closed_at")
+        if not opened or not closed:
+            continue
+        events.append((opened, 1))
+        events.append((closed, -1))
+    # +1 (open) before -1 (close) at an equal timestamp -> counts as overlap.
+    events.sort(key=lambda e: (e[0], -e[1]))
+    peak = current = 0
+    for _, delta in events:
+        current += delta
+        peak = max(peak, current)
+    return peak
+
+
 def gather_paper_trade_stats(
-    log_path: Path, initial_capital: float = 0.0, currency: str = ""
+    log_path: Path, initial_capital: float = 0.0, currency: str = "",
+    max_concurrent_positions: int = 0,
 ) -> tuple[PaperTradeStats, list[dict]]:
     rows = _read_jsonl(log_path)
-    stats = PaperTradeStats(closed=len(rows), currency=currency, initial_capital=initial_capital)
+    stats = PaperTradeStats(closed=len(rows), currency=currency, initial_capital=initial_capital,
+                            max_concurrent_positions=max_concurrent_positions,
+                            peak_concurrent=_peak_concurrent(rows))
     if rows:
         stats.wins = sum(1 for r in rows if r.get("status") == "WIN")
         stats.losses = sum(1 for r in rows if r.get("status") == "LOSS")

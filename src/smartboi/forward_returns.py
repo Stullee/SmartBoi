@@ -13,11 +13,14 @@ from datetime import date, timedelta
 # Score buckets: is the forward-return relationship monotonic across them?
 # A real edge should show higher buckets outperforming lower ones; if it
 # doesn't, raising the signal threshold is not obviously the fix either.
-# The 0.65 boundary deliberately matches the default
-# SIGNAL_CONFIDENCE_THRESHOLD: the single most important question this
-# report answers is "does the region that actually trades (>= threshold)
-# beat the region just below it?", and a bucket straddling the threshold
-# (the old 0.5-1.01 top bucket) structurally could not answer it.
+# The single most important question this report answers is "does the region
+# that actually trades (>= the signal threshold) beat the region just below
+# it?", and a bucket straddling the threshold structurally could not answer
+# it. Both 0.5 and 0.65 are bucket EDGES so the split is clean whatever the
+# configured SIGNAL_CONFIDENCE_THRESHOLD happens to be (the shipped default is
+# 0.5; it has also run at 0.65). Do not read either edge as "the threshold" --
+# the bar a given row actually cleared is stamped on the signal row itself
+# (see signals.SignalEvent.threshold_in_force), not inferred from these edges.
 SCORE_BUCKETS = ((0.0, 0.2), (0.2, 0.35), (0.35, 0.5), (0.5, 0.65), (0.65, 1.01))
 
 
@@ -127,6 +130,13 @@ def compute_forward_return(
         "symbol": symbol,
         "direction": direction,
         "score": snapshot.get("score", 0.0),
+        # Carried through so the report can separate snapshots the daily
+        # synthesis flagged as already-priced-in (a veto) from clean ones. It
+        # matters most for pre-SCORING_VERSION-5 rows, where the merge path did
+        # not yet re-apply the synthesis cap, so a vetoed dossier could be
+        # snapshotted at its UNCAPPED arithmetic score and land in the top
+        # bucket -- exactly the region the report exists to evaluate.
+        "already_priced_in": bool(snapshot.get("already_priced_in")),
         "entry_date": entry_date,
         "entry_price": entry_price,
         "exit_date": exit_date,
@@ -209,17 +219,30 @@ def bucket_returns(rows: list[dict], horizon_days: int | None = None) -> list[di
         if not bucket_rows:
             continue
         vals = [r["signed_return_pct"] for r in bucket_rows]
+        # SYMBOL-equal-weighted stats alongside the row-weighted ones. A single
+        # thesis that persists is snapshotted once per DAY with almost-fully-
+        # overlapping forward windows, so the row-weighted mean/hit-rate can be
+        # driven almost entirely by whichever name stayed in the bucket
+        # longest -- a "97% hit rate" that is one winning thesis counted 40
+        # times. Averaging per-symbol means (one vote per symbol) is the
+        # headline the report should show, and it matches the CI, which is
+        # already bootstrapped over symbols. Row-weighted figures are kept for
+        # any programmatic consumer.
+        by_symbol: dict[str, list[float]] = {}
+        for r in bucket_rows:
+            by_symbol.setdefault(r.get("symbol", ""), []).append(r["signed_return_pct"])
+        sym_means = [sum(v) / len(v) for v in by_symbol.values()]
+        sym_hits = [sum(1 for x in v if x > 0) / len(v) for v in by_symbol.values()]
         entry = {
             "bucket": label,
             "count": len(vals),
+            "n_symbols": len(by_symbol),
             "mean_return_pct": sum(vals) / len(vals),
             "hit_rate": sum(1 for v in vals if v > 0) / len(vals),
+            "mean_return_pct_symbol_weighted": sum(sym_means) / len(sym_means),
+            "hit_rate_symbol_weighted": sum(sym_hits) / len(sym_hits),
         }
         if horizon_days is not None:
-            by_symbol: dict[str, list[float]] = {}
-            for r in bucket_rows:
-                by_symbol.setdefault(r["symbol"], []).append(r["signed_return_pct"])
-            entry["n_symbols"] = len(by_symbol)
             entry["n_effective"] = effective_sample_count(bucket_rows, horizon_days)
             entry["ci_90"] = cluster_bootstrap_ci(by_symbol)
         out.append(entry)
@@ -346,15 +369,21 @@ def benchmark_relative_returns(
 
 
 def _bucket_table(rows: list[dict], horizon_days: int, value_header: str) -> list[str]:
+    # Mean/Hit are SYMBOL-equal-weighted (one vote per symbol), which matches
+    # the symbol-clustered CI and cannot be dominated by one long-lived thesis
+    # -- see bucket_returns. The row-weighted mean is available programmatically
+    # but deliberately not the headline.
     lines = [
-        f"{'Bucket':<14}{'Rows':<7}{'Syms':<6}{'N_eff':<7}{value_header:<15}{'90% CI':<20}{'Hit Rate':<10}"
+        f"{'Bucket':<14}{'Rows':<7}{'Syms':<6}{'N_eff':<7}{value_header + ' (sym-wt)':<18}"
+        f"{'90% CI':<20}{'Hit% (sym-wt)':<14}"
     ]
     for b in bucket_returns(rows, horizon_days):
         ci = b.get("ci_90")
         ci_text = f"[{ci[0]:+.2f}, {ci[1]:+.2f}]" if ci else "n/a (1 sym)"
         lines.append(
             f"{b['bucket']:<14}{b['count']:<7}{b.get('n_symbols', 0):<6}{b.get('n_effective', 0):<7}"
-            f"{b['mean_return_pct']:<15.2f}{ci_text:<20}{b['hit_rate'] * 100:<9.1f}%"
+            f"{b['mean_return_pct_symbol_weighted']:<18.2f}{ci_text:<20}"
+            f"{b['hit_rate_symbol_weighted'] * 100:<13.1f}%"
         )
     return lines
 
@@ -396,22 +425,46 @@ def format_report(
         lines.append("No joinable snapshot/price-mark pairs yet for this horizon.")
         return "\n".join(lines)
 
+    # Snapshots the daily synthesis vetoed as already-priced-in are excluded
+    # from the tables below and reported separately: for pre-SCORING_VERSION-5
+    # rows their `score` is the UNCAPPED arithmetic, so they contaminate the
+    # top bucket -- the exact region this report exists to evaluate -- with
+    # snapshots the strategy's own whole-body pass would not have traded.
+    clean_rows = [r for r in rows if not r.get("already_priced_in")]
+    vetoed_rows = [r for r in rows if r.get("already_priced_in")]
+    if vetoed_rows:
+        vetoed_mean = sum(r["signed_return_pct"] for r in vetoed_rows) / len(vetoed_rows)
+        lines.append(
+            f"({len(vetoed_rows)} joined snapshot(s) excluded from the tables below: synthesis "
+            f"flagged them already-priced-in. Their mean forward return: {vetoed_mean:+.2f}%.)"
+        )
+    if not clean_rows:
+        lines.append("No non-vetoed snapshots to analyse for this horizon yet.")
+        return "\n".join(lines)
+
     lines.append("")
     lines.append("-- By score bucket (raw, signed in thesis direction) --")
-    lines.extend(_bucket_table(rows, horizon_days, "Mean Return %"))
+    lines.extend(_bucket_table(clean_rows, horizon_days, "Mean Return %"))
+    lines.append("(Mean%/Hit% are symbol-equal-weighted -- one vote per symbol -- so one long-lived "
+                 "thesis can't dominate them; row counts are shown for context.)")
 
-    corr = pearson_correlation([r["score"] for r in rows], [r["signed_return_pct"] for r in rows])
+    corr = pearson_correlation([r["score"] for r in clean_rows], [r["signed_return_pct"] for r in clean_rows])
     lines.append("")
     lines.append(f"Score vs. signed forward return correlation: {corr:.3f}" if corr is not None else "Score vs. signed forward return correlation: n/a (insufficient data)")
     lines.append("(row-level, so overlapping windows inflate it -- trust the bucket CIs above over this number)")
-    overall_hit_rate = sum(1 for r in rows if r["signed_return_pct"] > 0) / len(rows)
-    n_eff_total = effective_sample_count(rows, horizon_days)
+    row_hit_rate = sum(1 for r in clean_rows if r["signed_return_pct"] > 0) / len(clean_rows)
+    by_symbol_hits = {}
+    for r in clean_rows:
+        by_symbol_hits.setdefault(r["symbol"], []).append(1 if r["signed_return_pct"] > 0 else 0)
+    sym_hit_rate = sum(sum(v) / len(v) for v in by_symbol_hits.values()) / len(by_symbol_hits)
+    n_eff_total = effective_sample_count(clean_rows, horizon_days)
     lines.append(
-        f"Overall hit rate: {overall_hit_rate * 100:.1f}% "
-        f"({len(rows)} rows, ~{n_eff_total} independent thesis-windows)"
+        f"Overall hit rate: {sym_hit_rate * 100:.1f}% symbol-weighted "
+        f"({row_hit_rate * 100:.1f}% row-weighted; {len(clean_rows)} rows across "
+        f"{len(by_symbol_hits)} symbols, ~{n_eff_total} independent thesis-windows)"
     )
 
-    bench_rows = benchmark_relative_returns(rows, price_marks, ecosystem_by_symbol)
+    bench_rows = benchmark_relative_returns(clean_rows, price_marks, ecosystem_by_symbol)
     benchmarked = [r for r in bench_rows if r["benchmark_relative_pct"] is not None]
     unbenchmarked = len(bench_rows) - len(benchmarked)
     lines.append("")
@@ -425,7 +478,7 @@ def format_report(
     lines.append("")
     lines.append("-- Per-symbol breakdown (worst first) --")
     lines.append(f"{'Symbol':<8}{'Count':<8}{'Mean Return %':<16}")
-    for s in per_symbol_breakdown(rows):
+    for s in per_symbol_breakdown(clean_rows):
         lines.append(f"{s['symbol']:<8}{s['count']:<8}{s['mean_return_pct']:<16.2f}")
 
     return "\n".join(lines)

@@ -593,6 +593,9 @@ function renderPnl(d){
     '<div class="pnl-head"><div><div class="k">Account &middot; '+cur+" "+fx(ps.initial_capital,0)+' start</div>'+
       '<div class="big '+eqCls+'">'+cur+" "+fx(ps.equity,0)+'</div></div>'+
       '<div style="text-align:right"><div class="k">Realized</div><div class="mono '+eqCls+'" style="font-size:15px">'+sgn(ps.realized_pnl,0)+'</div></div></div>'+
+    ((ps.peak_concurrent>ps.max_concurrent_positions && ps.max_concurrent_positions>0)
+      ? '<div class="k" style="color:var(--neg)">levered: peak '+ps.peak_concurrent+' positions open vs '+ps.max_concurrent_positions+' slots - equity is a return on more than the stated capital</div>'
+      : '')+
     svg+
     '<div class="foot"><span>cum <b class="mono '+cls(last)+'">'+sgn(last)+"R</b></span>"+
       '<span><b class="mono pos">'+ps.wins+"</b>W / <b class=\\"mono neg\\">"+ps.losses+"</b>L / "+ps.timeouts+"T</span>"+
@@ -953,6 +956,7 @@ async def _status_payload(engine) -> dict:
     paper_stats, closed_trades = gather_paper_trade_stats(
         log_dir / "paper_trades.jsonl",
         settings.initial_trading_capital, settings.trading_currency,
+        settings.max_concurrent_positions,
     )
     current_strategy = settings.strategy_signature()
     strategy_generations = gather_strategy_generations(
