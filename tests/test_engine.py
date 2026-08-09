@@ -1856,6 +1856,29 @@ async def test_a_refuted_outcome_survives_a_restart_and_is_not_re_judged(engine)
     assert len(engine.skeptic.calls) == skeptic_calls_before
 
 
+async def test_extraction_is_not_re_billed_when_scoring_defers(engine):
+    """2.2: relationship extraction (a paid ~150k-char call) runs before
+    dossier scoring, and the filing is dedup-registered only once scoring
+    completes. When scoring defers on an exhausted budget the filing stays
+    unregistered, so the next poll must RETRY SCORING but must NOT re-run the
+    already-completed extraction."""
+    filing = FilingEvent("FORM", "0000000001", "10-K", "2026-07-28", "acc-1", "d10k.htm")
+    engine.edgar_client.text_by_accession["acc-1"] = "some 10-K text with a customer"
+    engine.extractor.default = []      # extraction runs and returns no edges (not None -> True)
+    engine.updater.default = None      # dossier scoring defers (budget-exhausted shape)
+
+    await engine._process_filing("FORM", filing)
+    assert len(engine.extractor.calls) == 1                       # extracted once
+    assert engine.extracted_filings.get("filing:FORM:acc-1")     # marked extracted
+    assert not engine.dedup.is_duplicate("filing:FORM:acc-1")    # scoring deferred -> unregistered
+
+    updater_calls_after_first = len(engine.updater.calls)
+    await engine._process_filing("FORM", filing)                 # same filing, next poll
+
+    assert len(engine.extractor.calls) == 1                       # NOT re-extracted
+    assert len(engine.updater.calls) > updater_calls_after_first  # but scoring was retried
+
+
 async def test_already_priced_in_is_a_veto(engine):
     engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
     dossier = await _build_thesis(engine)

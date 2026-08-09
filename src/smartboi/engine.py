@@ -307,6 +307,17 @@ class Engine:
         # ticker resolution, the screen, auto-accept or the dashboard count.
         self.research_state = JsonState(DATA_DIR / "anchor_research.json")
         self.accepted_candidates = JsonState(DATA_DIR / "accepted_candidates.json")
+        # Per-accession "relationship extraction already ran" markers for the
+        # POLL path. Extraction (a paid ~150k-char call) runs before dossier
+        # scoring in _process_filing, and the filing's dedup fingerprint is
+        # registered only once scoring completes DEFINITIVELY -- so when the
+        # dossier budget is exhausted, the filing stays unregistered and the
+        # next EDGAR poll re-fetches and RE-EXTRACTS it, burning the extraction
+        # budget on a filing already extracted (graph.add dedupes, so it is
+        # pure spend). This marker is checked before extracting and set after,
+        # so a budget-deferred filing retries only its SCORING, not extraction.
+        self.extracted_filings = JsonState(DATA_DIR / "extracted_filings.json")
+        self._prune_extracted_filings()
         # {date, count} -- the UTC-daily auto-accept budget (see
         # _auto_accept_candidates). Persisted so a restart cannot reset the
         # cap and let a long candidate list through in one afternoon.
@@ -1210,8 +1221,13 @@ class Engine:
         if not text:
             return  # fetch failed/empty -- unregistered, so the next poll retries it
 
-        if filing.form in RELATIONSHIP_EXTRACTION_FORMS and self.extractor is not None:
-            await self._extract_relationships(symbol, filing, text)
+        if (filing.form in RELATIONSHIP_EXTRACTION_FORMS and self.extractor is not None
+                and not self.extracted_filings.get(fp)):
+            # Marked only when extraction ACTUALLY ran (returned True) -- a
+            # budget-deferred or transiently-failed extraction stays unmarked
+            # and is retried, exactly like the dossier-scoring path.
+            if await self._extract_relationships(symbol, filing, text):
+                self.extracted_filings.set(fp, datetime.now(timezone.utc).isoformat())
 
         # Head + tail rather than a flat prefix: the first few thousand
         # characters of a filing are mostly the SEC cover page and checkbox
@@ -1250,6 +1266,19 @@ class Engine:
         )
         if scored:
             self.dedup.register(fp, "sec.gov")
+
+    def _prune_extracted_filings(self) -> None:
+        """Drop per-accession extraction markers older than the EDGAR lookback
+        (plus a few days' margin): past it a filing can no longer be re-polled
+        -- it either got scored and is dedup-registered, or aged out of the
+        lookback window -- so the marker is dead weight. Keeps
+        extracted_filings.json from growing without bound over a long run."""
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=self.settings.edgar_lookback_days + 3)).isoformat()
+        kept = {k: v for k, v in self.extracted_filings.data.items()
+                if isinstance(v, str) and v >= cutoff}
+        if len(kept) != len(self.extracted_filings.data):
+            self.extracted_filings.overwrite(kept)
 
     async def _extract_relationships(self, symbol: str, filing: FilingEvent, text: str) -> bool:
         """LLM relationship extraction from one filing's text into the

@@ -94,6 +94,12 @@ class JsonState:
         self.data.update(mapping)
         self._save()
 
+    def overwrite(self, data: dict) -> None:
+        """Replace the whole dict with one durable write -- for a bulk prune
+        that drops many keys at once (one fsync instead of one per delete)."""
+        self.data = dict(data)
+        self._save()
+
     def delete(self, key: str) -> None:
         if key in self.data:
             del self.data[key]

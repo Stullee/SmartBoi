@@ -110,11 +110,19 @@ Implemented on `claude/full-system-audit-46xlq3` (616 tests green).
 - **EDGAR 429/503 backoff** — `EdgarClient._throttled_get` now retries a
   transient SEC response with backoff, mirroring the Finnhub client.
 
+**Cost:**
+
+- **Extraction done-marker (2.2)** — a persisted per-accession
+  `extracted_filings` marker is checked before the paid relationship
+  extraction and set after it runs, so a filing whose dossier scoring defers
+  on an exhausted budget retries only its scoring, not the ~150k-char
+  extraction call it already paid for.
+
 Still open (each its own change): the config-only containment (A9.1),
 position-cap *enforcement* (A5 — the disclosure above ships; enforcement stays
 deferred to real order placement per the documented design), the skeptic-effect
-readout + tier decision, the extraction done-marker (2.2), and the version
-guard. The findings below are the full audit as first written.
+readout + tier decision, and the version guard. The findings below are the full
+audit as first written.
 
 ---
 
