@@ -3417,6 +3417,60 @@ class Engine:
                     len(removed), ", ".join(removed) or "none")
         return {"removed": removed, "universe_size": len(self.universe)}
 
+    def reset_runtime_state(self) -> dict:
+        """Starts a clean measurement window. Archives every OPEN paper trade
+        (they were opened under the previous scoring regime and never reached
+        an outcome, so they must not close into the record) and resets every
+        dossier's SIGNAL and SYNTHESIS episode to ACTIVE so signals re-fire
+        from scratch under the current scoring rules.
+
+        Deliberately KEEPS, rather than wipes: each dossier's accumulated
+        evidence (real filings/news that simply re-aggregate under the current
+        rules -- deleting it would only re-pay to re-ingest the same items),
+        the relationship graph, the universe, and the SCORING_VERSION-stamped
+        forward-capture logs (dossier_snapshots / price_marks / signals /
+        decisions split cleanly at the version boundary downstream, so old rows
+        stay segregated instead of being destroyed). For a total wipe, clear
+        data/dossiers by hand.
+
+        Exists because a scoring-rules change (a SCORING_VERSION bump) leaves
+        the live board carrying signals and open trades produced by the OLD
+        rules -- saturated theses, a synthesis veto the merge path re-fired,
+        positions beyond the modeled slot count -- with no one-click way to
+        clear them and let the new regime accumulate clean."""
+        archived_trades = self.journal.archive_open_trades()
+        self._entry_pending = False
+        reset = 0
+        for symbol in self.dossiers.all_symbols():
+            dossier = self.dossiers.load(symbol)
+            had_episode = (dossier.status != "ACTIVE" or dossier.signaled_at
+                           or dossier.synthesis_at)
+            dossier.status = "ACTIVE"
+            dossier.signaled_at = ""
+            dossier.signaled_price = None
+            dossier.signaled_direction = ""
+            dossier.drift_alert_sent = False
+            dossier.entry_attempts = 0
+            # Stale synthesis verdicts are cleared too, so a v4 veto can't cap a
+            # v5 score through the merge path's freshness window (see
+            # _cap_with_synthesis) before the daily pass re-synthesizes.
+            dossier.synthesis_at = ""
+            dossier.synthesis_confidence = 0.0
+            dossier.synthesis_magnitude = 0.0
+            dossier.already_priced_in = False
+            dossier.synthesis_note = ""
+            dossier.synthesis_catalyst = ""
+            dossier.distinct_fact_count = 0
+            if had_episode:
+                self.dossiers.save(dossier)
+                reset += 1
+        log.warning(
+            "[RESET] Clean measurement window: archived %d open paper trade(s) (%s), reset %d "
+            "dossier(s) to ACTIVE. Evidence, graph, universe and version-stamped forward logs kept.",
+            len(archived_trades), ", ".join(archived_trades) or "none", reset,
+        )
+        return {"archived_open_trades": archived_trades, "dossiers_reset": reset}
+
     def _archive_orphaned_dossiers(self) -> None:
         """Moves dossiers for symbols that are no longer tradeable out of the
         live directory into data/dossiers_archived/.

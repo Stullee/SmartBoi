@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -365,6 +366,21 @@ class PaperTradeJournal:
         tmp = self.open_state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(snapshot))
         tmp.replace(self.open_state_path)
+
+    def archive_open_trades(self) -> list[str]:
+        """Discards every currently-open paper trade WITHOUT recording an
+        outcome -- they never reached a WIN/LOSS/TIMEOUT, so they must never
+        enter the closed win-rate record. The open-state file is renamed aside
+        (recoverable), not deleted. Used by the runtime reset to start a clean
+        measurement window after a scoring-rules change (see
+        engine.reset_runtime_state)."""
+        symbols = sorted(self.open_trades)
+        self.open_trades = {}
+        if self.open_state_path.exists():
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            self.open_state_path.replace(
+                self.open_state_path.with_name(f"open_paper_trades.reset-{stamp}.json"))
+        return symbols
 
     def has_open(self, symbol: str) -> bool:
         return symbol in self.open_trades

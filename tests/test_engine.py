@@ -15,7 +15,13 @@ import pytest
 from smartboi.config import Settings
 from smartboi.edgar import FilingEvent
 import smartboi.engine
-from smartboi.dossier import ECOSYSTEM_ASSOCIATION_CONFIDENCE, SCORING_VERSION, Dossier
+from smartboi.dossier import (
+    ECOSYSTEM_ASSOCIATION_CONFIDENCE,
+    SCORING_VERSION,
+    Dossier,
+    EvidenceRecord,
+    merge_evidence,
+)
 from smartboi.engine import ECOSYSTEM_LINK_CONFIDENCE, Engine, is_common_equity
 from smartboi.universe import CompanySpec
 from smartboi.ratelimit import SlidingWindowLimiter
@@ -1854,6 +1860,31 @@ async def test_a_refuted_outcome_survives_a_restart_and_is_not_re_judged(engine)
     skeptic_calls_before = len(engine.skeptic.calls)
     assert await restarted._update_dossier(**args) == "already"
     assert len(engine.skeptic.calls) == skeptic_calls_before
+
+
+async def test_reset_runtime_state_clears_signals_and_trades_but_keeps_evidence(engine):
+    """The clean-measurement-window reset: open (previous-regime) paper trades
+    are archived, dossiers reset to ACTIVE with their synthesis episode cleared,
+    but the accumulated evidence is kept (it re-aggregates under the new rules)."""
+    d = Dossier(symbol="FORM", status="SIGNALED", signaled_at="2026-08-01T00:00:00+00:00",
+                signaled_price=10.0, already_priced_in=True, synthesis_at="2026-08-01T00:00:00+00:00")
+    merge_evidence(d, EvidenceRecord(
+        evidence_id="e1", source_type="news", source_name="reuters.com", url="u", headline="h",
+        published_at="2026-07-23", origin_symbol="FORM", is_propagated=False, relationship_note="",
+        direction="LONG", magnitude=0.5, confidence=0.5, horizon_days=20, reasoning="r", skeptic_note=""))
+    d.status = "SIGNALED"  # merge_evidence doesn't touch status; keep it signaled for the test
+    engine.dossiers.save(d)
+    engine.journal.open("FORM", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.9, 3, [])
+
+    result = engine.reset_runtime_state()
+
+    assert result["archived_open_trades"] == ["FORM"]
+    assert engine.journal.open_trades == {}
+    reloaded = engine.dossiers.load("FORM")
+    assert reloaded.status == "ACTIVE"
+    assert reloaded.signaled_at == "" and reloaded.already_priced_in is False
+    assert reloaded.synthesis_at == ""
+    assert len(reloaded.evidence) == 1  # evidence KEPT -- re-aggregates under the new rules
 
 
 async def test_a_refutation_is_logged_for_the_skeptic_readout(engine):

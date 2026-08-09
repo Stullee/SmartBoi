@@ -438,6 +438,7 @@ _INDEX_HTML = """<!doctype html>
       <button class="tbtn" id="btn-diagnostics">Diagnostics bundle</button>
       <button class="tbtn" id="btn-rebuild-graph">Rebuild relationship graph</button>
       <button class="tbtn danger" id="btn-reset">Reset added symbols</button>
+      <button class="tbtn danger" id="btn-reset-runtime">Reset signals &amp; trades</button>
     </div>
     <div class="thint">The first five are read-only &mdash; screening does market-cap/analyst lookups; the others read
       already-persisted state (forward returns, the signal event study, the exit analysis of the closed ledger).
@@ -526,6 +527,15 @@ el("btn-reset").addEventListener("click", function(){
   fetch(API_BASE + "universe/reset-accepted", { method:"POST", headers:POST_HEADERS, body:"{}" })
     .then(function(r){ return r.json(); }).then(function(res){
       out.textContent = res.error ? ("Error: " + res.error) : ("Removed " + res.removed.length + " added symbol(s): " + (res.removed.join(", ") || "none") + ". Universe is now " + res.universe_size + " symbols.");
+      refresh();
+    }).catch(function(err){ out.textContent = "Failed: " + err; });
+});
+el("btn-reset-runtime").addEventListener("click", function(){
+  if (!confirm("Start a clean measurement window? This ARCHIVES every open paper trade (they never reached an outcome) and resets every dossier's signal to ACTIVE so signals re-fire under the current scoring rules. Accumulated evidence, the graph, the universe and the captured forward logs are KEPT (old rows stay segregated by scoring version).")) return;
+  var out = el("tool-output"); showToolOutput(); out.textContent = "Resetting runtime state...";
+  fetch(API_BASE + "runtime/reset", { method:"POST", headers:POST_HEADERS, body:"{}" })
+    .then(function(r){ return r.json(); }).then(function(res){
+      out.textContent = res.error ? ("Error: " + res.error) : ("Archived " + res.archived_open_trades.length + " open trade(s): " + (res.archived_open_trades.join(", ") || "none") + ". Reset " + res.dossiers_reset + " dossier(s) to ACTIVE.");
       refresh();
     }).catch(function(err){ out.textContent = "Failed: " + err; });
 });
@@ -1187,6 +1197,16 @@ def create_app(engine) -> web.Application:
         result = engine.reset_accepted_candidates()
         return web.json_response({"ok": True, **result})
 
+    async def handle_reset_runtime(request: web.Request) -> web.Response:
+        """Starts a clean measurement window: archives all OPEN paper trades
+        and resets every dossier's signal/synthesis episode to ACTIVE (see
+        engine.reset_runtime_state). Keeps evidence, the graph, the universe
+        and the version-stamped forward logs. Runs on the event loop, not a
+        worker thread, for the same reason the accepted-reset does: it mutates
+        live engine state the polling coroutines read between awaits."""
+        result = engine.reset_runtime_state()
+        return web.json_response({"ok": True, **result})
+
     async def handle_rebuild_graph(request: web.Request) -> web.Response:
         """Re-extracts relationships from every tradeable's latest 10-K (see
         engine.rebuild_relationship_graph). Additive only -- graph.add
@@ -1207,6 +1227,7 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/tools/exit-analysis", handle_tool_exit_analysis)
     app.router.add_post("/api/tools/diagnostics", handle_tool_diagnostics)
     app.router.add_post("/api/universe/reset-accepted", handle_reset_accepted)
+    app.router.add_post("/api/runtime/reset", handle_reset_runtime)
     app.router.add_post("/api/universe/rebuild-graph", handle_rebuild_graph)
     return app
 

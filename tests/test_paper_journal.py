@@ -49,6 +49,26 @@ def _journal(tmp_path):
     return PaperTradeJournal(tmp_path / "logs" / "paper_trades.jsonl")
 
 
+def test_archive_open_trades_clears_without_recording_outcomes(tmp_path):
+    """The runtime reset discards open trades that never reached an outcome --
+    they must not enter the closed win-rate record, and the open-state file is
+    renamed aside (recoverable), not deleted."""
+    journal = _journal(tmp_path)
+    journal.open("AAA", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.9, 3, [])
+    journal.open("BBB", "SHORT", 50.0, 8.0, 16.0, 21, "t", 0.8, 2, [])
+
+    archived = journal.archive_open_trades()
+
+    assert sorted(archived) == ["AAA", "BBB"]
+    assert journal.open_trades == {}
+    # No closed-log rows written (they never reached WIN/LOSS/TIMEOUT).
+    assert not journal.log_path.exists()
+    # Open-state renamed aside, not deleted; a fresh journal starts clean.
+    assert not journal.open_state_path.exists()
+    assert list(journal.open_state_path.parent.glob("open_paper_trades.reset-*.json"))
+    assert PaperTradeJournal(journal.log_path).open_trades == {}
+
+
 def test_open_long_computes_stop_and_target(tmp_path):
     journal = _journal(tmp_path)
     trade = journal.open(
