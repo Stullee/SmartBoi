@@ -73,6 +73,19 @@ def headline_tokens(headline: str) -> frozenset[str]:
 # signals.evaluate's min_independent_sources_news_only).
 _NEAR_DUP_JACCARD = 0.7
 
+# How many calendar days back the near-duplicate check compares a candidate
+# against already-seen fingerprints. Previously it was same/previous UTC day
+# only (2 days), which was NARROWER than the news feed lookback (3 days): a
+# wire story republished with a reworded headline two-plus days later
+# (weekend syndication is the common case -- a Friday story re-picked-up
+# Monday) was still inside the feed window yet invisible to the near-dup
+# check, so it scored as a fresh independent source. 5 days comfortably spans
+# the news lookback plus a weekend. The Jaccard threshold still decides
+# IDENTITY, so widening the window only makes MORE rewordings of the same
+# story eligible to collapse -- a genuinely different story on a nearby day
+# is not near-duplicate and is unaffected.
+_NEAR_DUP_LOOKBACK_DAYS = 5
+
 
 def near_duplicate(headline_a: str, headline_b: str, threshold: float = _NEAR_DUP_JACCARD) -> bool:
     """Whether two headlines look like rewordings of the same story --
@@ -126,22 +139,24 @@ class DedupIndex:
 
     def find_near_duplicate(self, symbol: str, headline: str, published_date: str) -> str | None:
         """The fingerprint of an already-registered story this headline is
-        a likely rewording of (same symbol, same or previous calendar day,
+        a likely rewording of (same symbol, within _NEAR_DUP_LOOKBACK_DAYS,
         token overlap >= the near-dup threshold) -- or None. Checked after
         the exact fingerprint miss: syndicated wire copy is routinely
-        republished with a lightly edited headline (and sometimes after
-        UTC midnight), which produced a distinct fingerprint, a second
-        LLM-scored evidence item, and a second 'independent' source for
-        what is one underlying story. Fingerprint keys are parseable
-        because normalize_headline strips punctuation -- the embedded
-        headline can never itself contain a colon."""
+        republished with a lightly edited headline over several days, which
+        produced a distinct fingerprint, a second LLM-scored evidence item,
+        and a second 'independent' source for what is one underlying story.
+        The window looks BACK from the candidate's date (a republish carries a
+        later date than the original it echoes). Fingerprint keys are parseable
+        because normalize_headline strips punctuation -- the embedded headline
+        can never itself contain a colon."""
         candidate_tokens = headline_tokens(headline)
         if not candidate_tokens:
             return None
         dates = {published_date[:10]}
         try:
             d = datetime.fromisoformat(published_date[:10]).date()
-            dates.add((d - timedelta(days=1)).isoformat())
+            for back in range(1, _NEAR_DUP_LOOKBACK_DAYS):
+                dates.add((d - timedelta(days=back)).isoformat())
         except ValueError:
             pass
         prefix = f"{symbol}:"

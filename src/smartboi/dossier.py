@@ -773,10 +773,12 @@ class DossierUpdater:
     async def propose_update(
         self, dossier: Dossier, evidence_text: str, origin_symbol: str, relationship_note: str,
         relationship_confidence: float | None = None, ecosystem: str = "",
+        now: datetime | None = None,
     ) -> dict | None:
         if not self._usage.budget_remaining(CAT_DOSSIER):
             log.info("%s: daily LLM call budget reached -- deferring dossier update.", dossier.symbol)
             return None
+        now = now or datetime.now(timezone.utc)
         current = (
             f"Direction={dossier.direction}, magnitude={dossier.magnitude:.2f}, "
             f"confidence={dossier.confidence:.2f}, thesis: {dossier.thesis_summary or '(none yet)'}"
@@ -802,7 +804,12 @@ class DossierUpdater:
         # free -- it is already on the CompanySpec.
         sector = ECOSYSTEM_CATALYSTS.get(ecosystem, "")
         sector_note = f"\n\nSector context for {dossier.symbol}: {sector}" if sector else ""
+        # Today's date, so "old/already-priced-in news treated as new" is
+        # actually computable against the evidence's own published date rather
+        # than the model silently anchoring "now" to its training cutoff (the
+        # synthesizer already gets this; the two per-item graders did not).
         prompt = (
+            f"Today: {now.date().isoformat()}\n"
             f"Company: {dossier.symbol}\n"
             f"Current thesis: {current}\n"
             f"{propagation}{sector_note}\n\n"

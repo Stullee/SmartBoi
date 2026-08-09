@@ -92,12 +92,29 @@ Implemented on `claude/full-system-audit-46xlq3` (616 tests green).
 - **SCORE_BUCKETS comment (A8)** — corrected the stale "0.65 is the default
   threshold" note (the shipped default is 0.5; both are bucket edges).
 
+**News processing & evidence quality:**
+
+- **Today's date in the grader prompts (2.7)** — `DossierUpdater.propose_update`
+  and `Skeptic.review` now prepend `Today: <date>` (the synthesizer already
+  had it), so the "old/already-priced-in news treated as new" judgment is
+  computable against the evidence's published date instead of the model
+  anchoring "now" to its training cutoff.
+- **Widened near-dup window (MED-4)** — `dedup.find_near_duplicate` compares
+  against the last `_NEAR_DUP_LOOKBACK_DAYS` (5) rather than same/previous day
+  only, so a reworded republish 2+ days later (weekend syndication) can no
+  longer buy a second "independent" source.
+- **10-K/10-Q exhibit ordering (MED-edgar)** — `fetch_evidence_text` now leads
+  with the primary document for 10-K/10-Q/424B5/SC 13D (it is the substance),
+  exhibits-first only for 8-Ks, so head+tail truncation can't drop a filing's
+  own MD&A/customer-concentration disclosures behind a routine EX-10 contract.
+- **EDGAR 429/503 backoff** — `EdgarClient._throttled_get` now retries a
+  transient SEC response with backoff, mirroring the Finnhub client.
+
 Still open (each its own change): the config-only containment (A9.1),
 position-cap *enforcement* (A5 — the disclosure above ships; enforcement stays
-deferred to real order placement per the documented design), the skeptic
-readout + tier decision, and the smaller items (2.2, 2.7 prompts, near-dup
-window, 10-K exhibit ordering, EDGAR backoff, version guard). The findings
-below are the full audit as first written.
+deferred to real order placement per the documented design), the skeptic-effect
+readout + tier decision, the extraction done-marker (2.2), and the version
+guard. The findings below are the full audit as first written.
 
 ---
 

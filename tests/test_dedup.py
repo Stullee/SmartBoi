@@ -130,7 +130,19 @@ def test_find_near_duplicate_respects_symbol_and_distance(tmp_path):
     index.register(fp, "reuters.com")
     # Different symbol: no match.
     assert index.find_near_duplicate("ICHR", "Acme wins $50M Navy contract", "2026-07-21") is None
-    # Two days later: outside the same/previous-day window.
-    assert index.find_near_duplicate("UCTT", "Acme wins $50M Navy contract", "2026-07-23") is None
     # A genuinely different story: no match.
     assert index.find_near_duplicate("UCTT", "Acme CFO resigns unexpectedly", "2026-07-21") is None
+
+
+def test_find_near_duplicate_catches_multi_day_syndication(tmp_path):
+    """A reworded republish two-plus days later (weekend syndication) was
+    inside the news feed lookback but outside the old same/previous-day
+    near-dup window, so it bought a second 'independent' source. The widened
+    window (_NEAR_DUP_LOOKBACK_DAYS) now catches it."""
+    index = DedupIndex(tmp_path / "dedup_index.json")
+    fp = fingerprint("UCTT", "Acme Corp wins $50M Navy contract", "2026-07-21")  # Friday
+    index.register(fp, "reuters.com")
+    # Same story reworded and re-picked-up the following Monday (+3 days).
+    assert index.find_near_duplicate("UCTT", "Acme wins $50M Navy contract", "2026-07-24") == fp
+    # Well beyond the window: no longer eligible to collapse.
+    assert index.find_near_duplicate("UCTT", "Acme wins $50M Navy contract", "2026-08-05") is None
