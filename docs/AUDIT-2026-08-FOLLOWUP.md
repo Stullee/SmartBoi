@@ -33,6 +33,37 @@ actually opens trades, through at least four independent mechanisms.
 
 ---
 
+## Update — top fixes implemented on this branch (2026-08-08)
+
+The highest-leverage code fixes from this report are now implemented on
+`claude/full-system-audit-46xlq3` (SCORING_VERSION 4→5; 605 tests green):
+
+- **Merge-path synthesis cap (2.1.1 / A1)** — `engine._cap_with_synthesis`
+  re-applies the persisted synthesis verdict (veto or trim) after every
+  evidence merge, so a synthesis-blocked thesis no longer re-fires on the raw
+  arithmetic. Cheap (no new LLM call), freshness-gated at 36h, cap-never-lift.
+- **Bounded magnitude corroboration (HIGH-1)** — the magnitude multiplier is
+  capped at the same doublings as the confidence bonus
+  (`MAX_CORROBORATION_DOUBLINGS`), so fan-out mass can no longer saturate the
+  score.
+- **Ecosystem items → mass, not slots (HIGH-3 / A2)** — ecosystem-association
+  evidence (relationship confidence ≤ `ECOSYSTEM_ASSOCIATION_CONFIDENCE`) no
+  longer mints an independent-source slot, only decay mass.
+- **Synthesis call-cap reservation (MED-5)** — the reservation now protects
+  synthesis's *calls*, not just its dollars, so fan-out can't starve the
+  whole-body cap into failing open.
+- **Universe-rot demotion (HIGH-2 new)** — the monthly screen now demotes a
+  runtime-accepted tradeable that has graduated past the cap ceiling to an
+  anchor, driven off the screen's own re-fetched market data.
+
+Still open (each deferred to its own change): the config-only containment
+(A9.1), position-cap enforcement/disclosure (A5), the measurement de-biasing
+(MED-1/2/3), the robustness set (A4 IB breaker, 2.5 retry-state, 2.3
+corrupt-file + `fsync`, SIGTERM), the skeptic readout + tier decision, and
+the smaller items. The findings below are the full audit as first written.
+
+---
+
 ## 0. The one thing to take away
 
 **The daily synthesis verdict — the system's most expensive, most

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from smartboi.dossier import (
+    ECOSYSTEM_ASSOCIATION_CONFIDENCE,
     Dossier,
     DossierStore,
     EvidenceRecord,
@@ -495,6 +496,50 @@ def _propagated(origin, source_name, evidence_id, magnitude=0.3, confidence=0.6)
     return record
 
 
+def _ecosystem(origin, source_name, evidence_id, magnitude=0.3, confidence=0.6):
+    """A propagated item over an ECOSYSTEM-association link (sector
+    co-membership), the weakest propagation type -- relationship_confidence at
+    ECOSYSTEM_ASSOCIATION_CONFIDENCE, not a disclosed counterparty edge."""
+    record = _propagated(origin, source_name, evidence_id, magnitude, confidence)
+    record.relationship_confidence = ECOSYSTEM_ASSOCIATION_CONFIDENCE
+    record.relationship_note = f"{origin} and the target are both in the same ecosystem"
+    return record
+
+
+def test_ecosystem_association_items_add_mass_but_not_independent_sources():
+    """A correlated sector story fanned in from several anchors is one macro
+    fact, not several corroborations. Ecosystem-association items must feed
+    mass (direction, contest, magnitude base) but never mint an independent
+    source slot -- otherwise pure fan-out lifts the corroboration bonuses and
+    saturates the score (AUDIT-2026-08-FOLLOWUP HIGH-3)."""
+    dossier = Dossier(symbol="DCO")
+    merge_evidence(dossier, _propagated("LMT", "Yahoo", "e0"), now=NOW)  # disclosed edge (0.9)
+    base_sources = dossier.independent_source_count
+    base_conf, base_mag = dossier.confidence, dossier.magnitude
+    base_mass = dossier.mass_agree
+
+    for i in range(6):
+        merge_evidence(dossier, _ecosystem(f"ECO{i}", "Yahoo", f"x{i}"), now=NOW)
+
+    assert base_sources == 1
+    assert dossier.independent_source_count == 1          # no new slots from fan-out
+    assert dossier.confidence == pytest.approx(base_conf)  # so no corroboration lift
+    assert dossier.magnitude == pytest.approx(base_mag)
+    assert dossier.mass_agree > base_mass                  # but they DO contribute mass
+
+
+def test_pure_ecosystem_fanout_mints_no_independent_sources():
+    """Eight ecosystem items from distinct anchors resolve a direction (mass)
+    but corroborate zero independent sources -- so a dossier built purely from
+    sector fan-out can never clear the multi-source signal bar."""
+    dossier = Dossier(symbol="DCO")
+    for i in range(8):
+        merge_evidence(dossier, _ecosystem(f"ECO{i}", "Yahoo", f"x{i}"), now=NOW)
+
+    assert dossier.direction == "LONG"
+    assert dossier.independent_source_count == 0
+
+
 def test_different_counterparties_are_independent_even_from_one_publisher():
     """A Lockheed story and a Raytheon story are two different facts about
     Ducommun. Which outlet published each is irrelevant to whether they
@@ -571,5 +616,24 @@ def test_corroboration_growth_is_sublinear_and_bounded():
     # 0.60 + min(0.25, 0.10*log2(16)) = 0.60 + 0.25 -- capped, so accumulated
     # weak items can never manufacture near-certainty.
     assert dossier.confidence == pytest.approx(0.85)
-    # 0.30 * (1 + 0.25*log2(16)) = 0.30 * 2.0
-    assert dossier.magnitude == pytest.approx(0.60)
+    # Magnitude is now capped at the SAME doublings as confidence
+    # (MAX_CORROBORATION_DOUBLINGS = 2.5): 0.30 * (1 + 0.25*2.5) = 0.30 * 1.625.
+    # Previously it was 0.30 * (1 + 0.25*log2(16)) = 0.60, unbounded in S --
+    # which is what let fan-out mass alone saturate the score.
+    assert dossier.magnitude == pytest.approx(0.4875)
+
+
+def test_magnitude_corroboration_is_bounded_past_the_doublings_cap():
+    """Beyond MAX_CORROBORATION_DOUBLINGS more agreeing sources cannot lift the
+    magnitude multiplier at all -- the guard against pure fan-out saturation.
+    Eight sources already exceed the 2.5-doubling cap, so sixteen must give an
+    identical (capped) magnitude, not a larger one."""
+    def _mag(n_sources: int) -> float:
+        d = Dossier(symbol=f"S{n_sources}")
+        for i in range(n_sources):
+            merge_evidence(d, _propagated(f"ANCHOR{i}", "Yahoo", f"e{i}",
+                                          magnitude=0.30, confidence=0.60), now=NOW)
+        return d.magnitude
+
+    assert _mag(8) == pytest.approx(0.4875)
+    assert _mag(16) == pytest.approx(_mag(8))  # bounded: no growth past the cap

@@ -267,15 +267,47 @@ MIN_SOURCE_CONTRIBUTION = 0.15
 # nothing at today's operating point and only governs the range that was
 # previously unreachable.
 #
-#   S:              1      2      3      4      8     16
-#   magnitude x  1.00   1.25   1.40   1.50   1.75   2.00
-#   confidence + 0.00   0.10   0.16   0.20   0.25   0.25 (capped)
+# Both bonuses are now capped at MAX_CORROBORATION_DOUBLINGS (2.5 doublings,
+# ~5.7 sources) -- magnitude used to keep climbing past this point, which is
+# what let fan-out saturate the score (see below).
+#
+#   S:              1      2      3      4     ~6+
+#   magnitude x  1.00   1.25   1.40   1.50   1.625 (capped)
+#   confidence + 0.00   0.10   0.16   0.20   0.25  (capped)
 MAGNITUDE_CORROBORATION_STEP = 0.25
 CONFIDENCE_CORROBORATION_STEP = 0.10
 # Corroboration must never be able to manufacture near-certainty out of a
 # pile of individually weak items -- past this the strongest single agreeing
 # item's own confidence is what has to carry the thesis.
 MAX_CONFIDENCE_CORROBORATION_BONUS = 0.25
+
+# Both corroboration bonuses stop growing past this many doublings, i.e. past
+# an independent-source count of 2**this (~5.7 sources). Beyond it, more
+# agreeing items cannot push the score higher and the strongest single item's
+# own confidence/magnitude has to carry the thesis.
+#
+# Confidence was always capped here (MAX_CONFIDENCE_CORROBORATION_BONUS);
+# magnitude was NOT. Its multiplier was 1 + 0.25*log2(S) with only the final
+# min(1.0, ...) as a ceiling, so at S=8 it was x1.75, S=16 x2.0, S~=21 x2.1 --
+# unbounded in S. That let pure fan-out mass (many individually weak,
+# sector-correlated second-order items) drive magnitude to its 1.0 ceiling and
+# saturate the aggregate on the LEAST independent theses -- the exact error
+# the daily synthesis pass exists to catch, on the merge path where synthesis
+# was being bypassed. Capping both bonuses at the same doublings makes
+# corroboration stop mattering at the same amount of evidence for each.
+# See AUDIT-2026-08-FOLLOWUP HIGH-1.
+MAX_CORROBORATION_DOUBLINGS = MAX_CONFIDENCE_CORROBORATION_BONUS / CONFIDENCE_CORROBORATION_STEP
+
+# The relationship-edge confidence at or below which propagated evidence is an
+# industry-level ASSOCIATION (sector co-membership) rather than a disclosed
+# counterparty link. Must match engine.ECOSYSTEM_LINK_CONFIDENCE (asserted by
+# a test); kept here because dossier.py cannot import engine.py. Evidence at
+# this level still contributes decay MASS (direction, contest discount,
+# magnitude base) but must not each mint an "independent source": one
+# correlated macro story fanned in from three anchors is one fact, not three
+# corroborations, and counting it as three is what let fan-out saturate the
+# score. See AUDIT-2026-08-FOLLOWUP HIGH-3 / A2.
+ECOSYSTEM_ASSOCIATION_CONFIDENCE = 0.25
 
 # Bumped whenever a change alters how confidence/magnitude are computed from
 # the same evidence. Stamped onto every daily dossier snapshot so the
@@ -289,13 +321,23 @@ MAX_CONFIDENCE_CORROBORATION_BONUS = 0.25
 # in the same pass -- so snapshots recorded the UNCAPPED arithmetic score for
 # most dossiers and the capped one for a few, silently mixed.
 #
-# _aggregate itself is unchanged: the same evidence still produces the same
-# arithmetic. What changed is which of the two numbers gets recorded, and
-# that is exactly a rules boundary -- it moves scores in the high region the
-# forward-return question is asked about, so the two regimes must not be
-# pooled. Forward data cannot be backfilled and old rows must never be
-# re-scored, so splitting here is the only honest option.
-SCORING_VERSION = 4
+# 5: three related changes that all move scores in the high region the
+# forward-return question is asked about, so rows before and after must not be
+# pooled:
+#   - the magnitude corroboration multiplier is now capped at
+#     MAX_CORROBORATION_DOUBLINGS (was unbounded in S), so fan-out mass can no
+#     longer saturate magnitude;
+#   - ecosystem-association evidence (relationship confidence <=
+#     ECOSYSTEM_ASSOCIATION_CONFIDENCE) no longer counts as an independent
+#     source, only as mass, so it stops inflating both corroboration bonuses;
+#   - the persisted synthesis cap is now re-applied on the MERGE path too (see
+#     engine._cap_with_synthesis), not just the daily decay pass, so a vetoed
+#     or trimmed dossier stays capped when fresh evidence merges instead of
+#     re-firing on the raw arithmetic -- which changes which of the two
+#     numbers a merge-driven snapshot records.
+# Forward data cannot be backfilled and old rows must never be re-scored, so
+# splitting at this boundary is the only honest option.
+SCORING_VERSION = 5
 # Weight an evidence item keeps right at its stale cutoff, before being
 # excluded entirely -- never fully zero a moment before exclusion, since
 # aged corroboration is still weak signal that a persistent theme existed.
@@ -456,7 +498,22 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     # It still contributes to mass and decay for exactly what it is worth --
     # it just stops claiming a slot it did not earn.
     contributing = [e for e, w in weighted if e.confidence * w >= MIN_SOURCE_CONTRIBUTION]
-    dossier.independent_source_count = len({independence_key(e) for e in contributing})
+    # Ecosystem-association evidence contributes mass but never an independent
+    # SOURCE. It arrives over a sector-membership link (relationship confidence
+    # <= ECOSYSTEM_ASSOCIATION_CONFIDENCE), explicitly NOT a disclosed
+    # counterparty relationship, so a single correlated macro story fanned in
+    # from several anchors is one fact, not several corroborations. Counting
+    # each as an independent slot inflated both corroboration bonuses (they key
+    # off this count via _corroboration_doublings) and let pure fan-out mass
+    # cross the signal bar. Direct evidence (relationship_confidence is None)
+    # and propagation over a genuinely disclosed edge are unaffected.
+    slot_bearing = [
+        e for e in contributing
+        if not (e.is_propagated
+                and e.relationship_confidence is not None
+                and e.relationship_confidence <= ECOSYSTEM_ASSOCIATION_CONFIDENCE)
+    ]
+    dossier.independent_source_count = len({independence_key(e) for e in slot_bearing})
     # Gated on LINK quality as well as source type. Any filing set this flag,
     # including one propagated over an ECOSYSTEM edge -- an industry-level
     # association at 0.25 confidence, not a disclosed relationship. That
@@ -483,10 +540,14 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     # build on top of it exactly as before.
     best, best_weight = max(weighted, key=lambda ew: ew[0].confidence * ew[0].magnitude * ew[1] * ew[1])
     base_confidence = best.confidence * best_weight
-    doublings = _corroboration_doublings(dossier.independent_source_count)
-    corroboration_bonus = min(
-        MAX_CONFIDENCE_CORROBORATION_BONUS, CONFIDENCE_CORROBORATION_STEP * doublings
-    )
+    # Capped so BOTH bonuses stop growing at the same amount of corroboration
+    # (see MAX_CORROBORATION_DOUBLINGS). At the cap this reproduces the old
+    # confidence bonus exactly -- min(0.25, 0.10*doublings) == 0.10 *
+    # min(doublings, 2.5) -- while newly bounding the magnitude multiplier,
+    # which previously grew without limit in the source count.
+    doublings = min(_corroboration_doublings(dossier.independent_source_count),
+                    MAX_CORROBORATION_DOUBLINGS)
+    corroboration_bonus = CONFIDENCE_CORROBORATION_STEP * doublings
     raw_confidence = min(1.0, base_confidence + corroboration_bonus)
 
     w_agree = w_long if dossier.direction == "LONG" else w_short

@@ -191,6 +191,14 @@ _UNCLASSIFIED_ECOSYSTEMS = frozenset({"accepted", "?", ""})
 # both are told in numbers how weak the causal link is.
 ECOSYSTEM_LINK_CONFIDENCE = 0.25
 
+# How fresh the persisted daily synthesis verdict must be for the merge path
+# to re-apply it as a cap (see _cap_with_synthesis). The decay pass refreshes
+# every calendar day, so 36h is one day plus margin for a missed/failed pass:
+# long enough that a merge between decay passes still honours the last
+# whole-body verdict, short enough that a stale verdict cannot suppress a
+# thesis indefinitely once the daily pass stops updating it.
+_SYNTHESIS_CAP_MAX_AGE_HOURS = 36.0
+
 
 # Ticker shapes that are NOT the operating-company common stock this system
 # builds a thesis about, and must never become trade targets:
@@ -2354,6 +2362,11 @@ class Engine:
             proposed_magnitude=proposed["magnitude"],
         )
         merge_evidence(dossier, record)
+        # Re-apply the last whole-body synthesis verdict as a cap: a merge
+        # recomputes the arithmetic from scratch and would otherwise erase a
+        # veto/trim the daily pass had applied, letting a synthesis-blocked
+        # thesis re-fire on the raw score (see _cap_with_synthesis).
+        self._cap_with_synthesis(dossier, datetime.now(timezone.utc))
         self.dossiers.save(dossier)
         log.info(
             "[EVIDENCE] %s: accepted %s magnitude=%.2f confidence=%.2f (dossier now: direction=%s "
@@ -3079,6 +3092,45 @@ class Engine:
             )
         return True
 
+    def _cap_with_synthesis(self, dossier: Dossier, now: datetime) -> None:
+        """Re-applies the LAST PERSISTED synthesis verdict as a cap on the
+        freshly recomputed arithmetic aggregate, on the merge path.
+
+        _apply_synthesis runs only on the once-a-day decay pass, but a merge
+        recomputes confidence/magnitude from scratch (dossier._aggregate),
+        which erases any cap the morning's synthesis had applied -- so a thesis
+        the whole-body pass vetoed as already-priced-in, or trimmed for
+        overlap, would re-fire the instant one more item merged, on the raw
+        arithmetic the synthesis exists to correct (AUDIT-2026-08 2.1.1 / A1).
+
+        This is the cheap half of the fix: it does NOT run a fresh synthesis
+        (no LLM call) -- it re-applies the verdict already computed and
+        persisted by the last decay pass. A cap, never a lift, exactly like
+        _apply_synthesis: a veto (already_priced_in) zeroes the score, a trim
+        takes the min of the arithmetic and the synthesized values. Honoured
+        only while the verdict is still fresh (_SYNTHESIS_CAP_MAX_AGE_HOURS),
+        so once the daily pass stops refreshing a dossier the cap lapses rather
+        than suppressing it forever, and a genuine direction flip is re-judged
+        by the next decay pass within a day. No verdict, or a stale one, is a
+        no-op -- identical to today's behaviour, so this can only ever lower a
+        score, never raise one."""
+        if not dossier.synthesis_at:
+            return
+        try:
+            synth_at = datetime.fromisoformat(dossier.synthesis_at)
+        except (TypeError, ValueError):
+            return
+        if synth_at.tzinfo is None:
+            synth_at = synth_at.replace(tzinfo=timezone.utc)
+        if (now - synth_at).total_seconds() / 3600.0 > _SYNTHESIS_CAP_MAX_AGE_HOURS:
+            return
+        if dossier.already_priced_in:
+            dossier.confidence = 0.0
+            dossier.magnitude = 0.0
+            return
+        dossier.confidence = min(dossier.confidence, dossier.synthesis_confidence)
+        dossier.magnitude = min(dossier.magnitude, dossier.synthesis_magnitude)
+
     # --- Forward-validation capture (Phase A): daily dossier score
     # snapshots and daily price marks, the raw material for eventually
     # asking "does confidence*magnitude predict forward returns" across
@@ -3328,6 +3380,7 @@ class Engine:
             )
         self.universe_screen_state.set("last_screened_at", datetime.now(timezone.utc).isoformat())
         self._prune_dead_symbols(results)
+        self._demote_graduated_tradeables(results)
 
     def _prune_dead_symbols(self, results: list) -> list[str]:
         """Drops runtime-accepted symbols the screen found NO market data for
@@ -3370,3 +3423,64 @@ class Engine:
                 len(curated), ", ".join(sorted(curated)),
             )
         return pruned
+
+    def _demote_graduated_tradeables(self, results: list) -> list[str]:
+        """Demotes any RUNTIME-ACCEPTED tradeable the monthly screen finds has
+        outgrown the thin-coverage bounds -- graduated past the market-cap
+        ceiling, or picked up analyst coverage -- to an anchor: a news source,
+        never a trade target.
+
+        The accept-time guard and the bounds-change reconcile pass leave a
+        hole. A runtime-accepted tradeable's cached recommendation is only
+        re-derived when the OPERATOR moves the universe bounds (see
+        _run_candidate_ticker_recheck's `recommendation_bounds` guard), so a
+        company that graduates past the ceiling on its own keeps opening paper
+        trades forever -- the correlated-large-cap rot the monthly screen
+        exists to catch (README point 1; AUDIT-2026-08-FOLLOWUP HIGH-2). The
+        screen already re-fetches market data every run, so drive demotion off
+        ITS result rather than the frozen cached recommendation.
+
+        DEMOTE-ONLY, and only for GRADUATED names: a sub-floor small-cap still
+        screens as a valid (just smaller) trade target, so
+        recommend_candidate_type still calls it 'tradeable' and it is left
+        alone; only a name now recommended as 'anchor' is demoted. Curated
+        symbols are never touched -- a hand-picked list is the operator's call
+        (screen_universe reports them loudly instead). Safe like
+        _reconcile_accepted_types: an anchor can never open a position, so this
+        cannot bypass the tradeable-accept guards."""
+        demoted = []
+        for r in results:
+            # Anchors are exempt from the bounds; still_fits needs nothing; no
+            # market data at all is _prune_dead_symbols' job, not a demotion.
+            if r.is_anchor or r.still_fits or r.market_cap_musd is None:
+                continue
+            if r.symbol not in self.accepted_candidates.data:
+                continue  # curated -- not the screen's to overrule
+            as_type, source, ecosystem = self._accepted_entry(self.accepted_candidates.data[r.symbol])
+            if as_type != "tradeable":
+                continue  # already an anchor
+            recommendation, _reason = recommend_candidate_type(
+                r.market_cap_musd, r.analyst_count,
+                self.settings.universe_min_market_cap_musd,
+                self.settings.universe_max_market_cap_musd,
+                self.settings.universe_max_analyst_count,
+            )
+            if recommendation != "anchor":
+                continue  # sub-floor etc. -- still a legitimate (smaller) trade target
+            self.accepted_candidates.set(
+                r.symbol, {"as": "anchor", "source": source, "ecosystem": ecosystem}
+            )
+            spec = self.spec_by_symbol.get(r.symbol)
+            if spec is not None:
+                corrected = CompanySpec(
+                    spec.symbol, spec.name, spec.ecosystem, signal_source_only=True,
+                    notes=f"Accepted ({source}), demoted to anchor by the monthly screen ({r.reason})",
+                )
+                self.universe = [corrected if c.symbol == r.symbol else c for c in self.universe]
+                self.spec_by_symbol[r.symbol] = corrected
+            demoted.append(r.symbol)
+            log.warning(
+                "[UNIVERSE] %s outgrew the thin-coverage bounds (%s) -- demoted from tradeable to "
+                "anchor so it stops opening paper trades.", r.symbol, r.reason,
+            )
+        return demoted
