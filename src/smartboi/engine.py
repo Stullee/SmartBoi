@@ -2295,6 +2295,25 @@ class Engine:
             k: t for k, t in self._handled_outcomes.items() if t >= cutoff
         }
 
+    def _log_refutation(self, target_symbol: str, evidence_id: str, origin_symbol: str, verdict: dict) -> None:
+        """Append one row to logs/skeptic_refutations.jsonl for every
+        skeptic-refuted item. A refutation otherwise left NO stored record, so
+        the refutation rate -- the one number that says whether the cheap
+        trade-gating skeptic is bleeding real propagated evidence -- was
+        unmeasurable. Paired with the pre/post numbers on accepted records,
+        this feeds smartboi.skeptic_report (see tools.run_skeptic_report)."""
+        path = Path(self.settings.log_dir) / "skeptic_refutations.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps({
+                "symbol": target_symbol,
+                "evidence_id": evidence_id,
+                "is_propagated": target_symbol != origin_symbol,
+                "model": self.settings.skeptic_model,
+                "reasoning": str(verdict.get("reasoning") or "")[:300],
+                "at": datetime.now(timezone.utc).isoformat(),
+            }) + "\n")
+
     def _mark_handled(self, proposal_key: str) -> str:
         """Records a definitive non-merge outcome (not-new, refuted, or a
         malformed proposal) so a retry of the same evidence item -- forced
@@ -2406,6 +2425,7 @@ class Engine:
         self._persist_retry_state()
         if verdict.get("refuted"):
             log.info("%s: evidence refuted by skeptic (%s)", target_symbol, verdict.get("reasoning", ""))
+            self._log_refutation(target_symbol, evidence_id, origin_symbol, verdict)
             return self._mark_handled(proposal_key)
 
         record = EvidenceRecord(

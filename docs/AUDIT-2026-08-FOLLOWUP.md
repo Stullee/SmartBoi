@@ -118,11 +118,22 @@ Implemented on `claude/full-system-audit-46xlq3` (616 tests green).
   on an exhausted budget retries only its scoring, not the ~150k-char
   extraction call it already paid for.
 
+**Instrumentation:**
+
+- **Skeptic-effect readout (§3.2 / the LLM-budget agent's key finding)** — the
+  engine now logs every skeptic refutation to `logs/skeptic_refutations.jsonl`
+  (they previously left no record, so the refutation rate was unmeasurable),
+  and a new pure module `skeptic_report.py` + `tools.run_skeptic_report` +
+  `scripts/analyze_skeptic.py` compute the refutation rate, the up/down/
+  unchanged re-scaling distribution, and mean confidence/magnitude deltas —
+  overall, by direct-vs-propagated, and by model. This is the data needed to
+  decide the skeptic's model tier (previously "built but dead" instrumentation).
+
 Still open (each its own change): the config-only containment (A9.1),
 position-cap *enforcement* (A5 — the disclosure above ships; enforcement stays
-deferred to real order placement per the documented design), the skeptic-effect
-readout + tier decision, and the version guard. The findings below are the full
-audit as first written.
+deferred to real order placement per the documented design), a dashboard
+button for the skeptic readout (it is runnable via the tool/script today), and
+the version guard. The findings below are the full audit as first written.
 
 ---
 

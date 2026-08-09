@@ -1856,6 +1856,25 @@ async def test_a_refuted_outcome_survives_a_restart_and_is_not_re_judged(engine)
     assert len(engine.skeptic.calls) == skeptic_calls_before
 
 
+async def test_a_refutation_is_logged_for_the_skeptic_readout(engine):
+    """A skeptic refutation left no stored record, so the refutation rate was
+    unmeasurable. It now appends to logs/skeptic_refutations.jsonl (see
+    skeptic_report / run_skeptic_report)."""
+    engine.updater.default = proposal()
+    engine.skeptic.default = verdict(refuted=True, reasoning="generic sector filler")
+    await engine._update_dossier(
+        target_symbol="FORM", evidence_text="e", origin_symbol="INTC",  # propagated: origin != target
+        relationship_note="INTC is a customer", relationship_confidence=0.9, source_type="news",
+        source_name="reuters.com", url="https://x/ref", headline="h", published_at="2026-07-23")
+
+    rows = [json.loads(line) for line in
+            (Path(engine.settings.log_dir) / "skeptic_refutations.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "FORM"
+    assert rows[0]["is_propagated"] is True
+    assert rows[0]["model"] == engine.settings.skeptic_model
+
+
 async def test_extraction_is_not_re_billed_when_scoring_defers(engine):
     """2.2: relationship extraction (a paid ~150k-char call) runs before
     dossier scoring, and the filing is dedup-registered only once scoring
