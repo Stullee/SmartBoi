@@ -118,6 +118,18 @@ Implemented on `claude/full-system-audit-46xlq3` (616 tests green).
   on an exhausted budget retries only its scoring, not the ~150k-char
   extraction call it already paid for.
 
+**Graph edge lifecycle & operability:**
+
+- **Edge upgrade-on-stronger + aging (2.4)** — `graph.add` now supersedes a
+  weaker edge when a stronger disclosure arrives (so a 0.55 passing-mention no
+  longer permanently blocks a 0.95 quantified-concentration edge below the
+  disclosed-link bar), and refreshes `extracted_at` on every re-confirmation;
+  `gather_graph_health` surfaces `stale_edges` (not re-confirmed in ~120 days).
+- **Runtime reset (`reset_runtime_state` / "Reset signals & trades" button)** —
+  archives all open paper trades and resets dossiers to ACTIVE for a clean
+  measurement window after a scoring-rules change, keeping evidence, the graph,
+  and the version-stamped forward logs.
+
 **Instrumentation:**
 
 - **Skeptic-effect readout (§3.2 / the LLM-budget agent's key finding)** — the
@@ -129,11 +141,16 @@ Implemented on `claude/full-system-audit-46xlq3` (616 tests green).
   overall, by direct-vs-propagated, and by model. This is the data needed to
   decide the skeptic's model tier (previously "built but dead" instrumentation).
 
-Still open (each its own change): the config-only containment (A9.1),
-position-cap *enforcement* (A5 — the disclosure above ships; enforcement stays
-deferred to real order placement per the documented design), a dashboard
-button for the skeptic readout (it is runnable via the tool/script today), and
-the version guard. The findings below are the full audit as first written.
+Still open (each a deliberate decision or low-severity polish): the config-only
+containment defaults (A9.1 — the code now contains the *saturation*
+mechanically, so this is a measurement-window/spend choice, not a safety one),
+position-cap *enforcement* (A5 — the disclosure ships; enforcement stays
+deferred to real order placement per the documented design), the dashboard LAN
+exposure (accepted by the operator), the direct-filing independence key (2.6),
+cache-token pricing and the gap-through-stop fill (2.7, both minor), a
+dashboard button for the skeptic readout (runnable via tool/script today), and
+the version-consistency guard. The findings below are the full audit as first
+written.
 
 ---
 
