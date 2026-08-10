@@ -43,6 +43,24 @@ def _evidence(direction="LONG", confidence=0.7, magnitude=0.6, horizon_days=20, 
     )
 
 
+def test_a_skeptic_gutted_item_keeps_its_mass_but_loses_its_source_slot():
+    """An item the skeptic scaled toward zero (confidence * decay weight <
+    MIN_SOURCE_CONTRIBUTION) still adds decay mass, but no longer counts as an
+    independent SOURCE. A slot lifts confidence AND multiplies magnitude, so a
+    worthless item must not buy the corroboration that fires a trade."""
+    dossier = Dossier(symbol="UCTT")
+    merge_evidence(dossier, _evidence(evidence_id="e1", source_name="reuters.com", confidence=0.8), now=NOW)
+    merge_evidence(dossier, _evidence(evidence_id="e2", source_name="bloomberg.com", confidence=0.8), now=NOW)
+    assert dossier.independent_source_count == 2
+    mass_before = dossier.mass_agree
+
+    # A third, same-direction item the skeptic gutted to ~0 confidence.
+    merge_evidence(dossier, _evidence(evidence_id="e3", source_name="cnbc.com", confidence=0.05), now=NOW)
+
+    assert dossier.independent_source_count == 2  # 0.05 * ~1.0 < 0.15 -> no slot earned
+    assert dossier.mass_agree > mass_before       # ...but its mass still counts
+
+
 def test_first_evidence_sets_dossier_state():
     dossier = Dossier(symbol="UCTT")
     record = _evidence()

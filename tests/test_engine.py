@@ -1766,6 +1766,82 @@ async def test_the_grace_period_ends_once_the_gate_has_looked(engine):
     assert engine._should_expire_unopened(dossier) is True
 
 
+async def test_a_flip_refire_resets_the_grace_period(engine):
+    """A direction flip that still qualifies re-fires a fresh episode on the
+    merge path (_fire_signal). It must reset entry_attempts so the new episode
+    is born WITH its grace period -- the merge path used to leave the prior
+    episode's count, so the flipped episode could be expired unseen (the exact
+    failure the grace period exists to prevent). The decay path already reset
+    via _reset_to_active; the merge path did not."""
+    from smartboi.signals import evaluate
+
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    dossier = Dossier(
+        symbol="FORM", direction="SHORT", confidence=0.9, magnitude=0.9,
+        independent_source_count=3, has_filing_evidence=True, status="SIGNALED",
+        signaled_at="2026-08-01T00:00:00+00:00", signaled_direction="LONG", entry_attempts=2,
+    )
+    signal = evaluate(dossier, engine.settings.signal_confidence_threshold,
+                      engine.settings.min_independent_sources,
+                      engine.settings.min_independent_sources_news_only)
+    assert signal is not None  # the flipped thesis still clears the bar -> re-fires
+
+    await engine._fire_signal(dossier, signal)
+
+    assert dossier.entry_attempts == 0            # fresh episode -> grace period restored
+    assert dossier.signaled_direction == "SHORT"  # re-baselined to the new direction
+
+
+async def test_the_entry_gate_expires_a_thesis_that_flipped(engine):
+    """The entry gate's OWN flip branch: if merged evidence flipped the
+    direction while the status stayed SIGNALED, the gate must refuse to open
+    and expire, not take a position opposite the one that signaled -- distinct
+    from the merge/decay _should_expire_unopened path above."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    await _signal_form(engine)  # SIGNALED LONG
+    dossier = engine.dossiers.load("FORM")
+    dossier.direction = "SHORT"  # flipped; status still SIGNALED as LONG
+    dossier.confidence, dossier.magnitude = 0.9, 0.9  # still well over the bar
+    engine.dossiers.save(dossier)
+
+    await engine._try_open_from_signal("FORM", dossier)
+
+    assert not engine.journal.has_open("FORM")               # nothing opened
+    assert engine.dossiers.load("FORM").status == "ACTIVE"   # expired back to active
+
+
+async def test_a_runaway_horizon_is_clamped_to_the_max_hold(engine):
+    """horizon_days is clamped to max_horizon_days, so a mis-scored 900 can't
+    keep a stale item at full decay weight for years (staleness scales off it)."""
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=900)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+
+    await engine._process_evidence(
+        origin_symbol="FORM", evidence_text="e", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h", published_at="2026-07-23",
+    )
+
+    rec = engine.dossiers.load("FORM").evidence[-1]
+    assert rec.horizon_days == engine.settings.max_horizon_days  # 900 clamped to 21
+
+
+async def test_the_skeptic_adjustment_replaces_the_proposed_values(engine):
+    """The stored evidence uses the skeptic's adjusted_* (its contrarian /
+    link-strength rescaling), not the updater's proposed numbers -- and keeps
+    the pre-skeptic values so the pass's effect stays measurable."""
+    engine.updater.default = proposal(direction="LONG", magnitude=0.9, confidence=0.9, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.4, adjusted_magnitude=0.3)
+
+    await engine._process_evidence(
+        origin_symbol="FORM", evidence_text="e", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h", published_at="2026-07-23",
+    )
+
+    rec = engine.dossiers.load("FORM").evidence[-1]
+    assert (rec.confidence, rec.magnitude) == (0.4, 0.3)  # skeptic's, not the proposed 0.9/0.9
+    assert (rec.proposed_confidence, rec.proposed_magnitude) == (0.9, 0.9)  # pre-skeptic kept
+
+
 async def test_the_decay_pass_respects_the_grace_period(engine):
     engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
     await _signal_form(engine)

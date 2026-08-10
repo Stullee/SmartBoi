@@ -65,6 +65,28 @@ def test_win_rate_interval_is_zero_with_no_closed_trades(tmp_path):
     assert stats.win_rate_ci_low == 0.0 and stats.win_rate_ci_high == 0.0
 
 
+def test_win_rate_counts_any_net_of_cost_profit_as_a_win(tmp_path):
+    """A win is net-of-cost R>0, not a target hit -- so a profitable SHORT that
+    can only ever TIMEOUT (its 100%-take-profit target sits at price 0) still
+    counts, and the record is no longer biased against an entire direction."""
+    path = tmp_path / "paper_trades.jsonl"
+    _write_rows(path, [
+        {"status": "TIMEOUT", "r_multiple": 0.6, "direction": "SHORT"},   # profitable short, timed out
+        {"status": "TIMEOUT", "r_multiple": -0.3, "direction": "SHORT"},  # losing short
+        {"status": "WIN", "r_multiple": 1.9, "direction": "LONG"},        # target hit
+        {"status": "LOSS", "r_multiple": -1.0, "direction": "LONG"},      # stop hit
+    ])
+
+    stats, _ = gather_paper_trade_stats(path)
+
+    assert (stats.wins, stats.losses) == (2, 2)   # by net-of-cost R sign, not exit reason
+    assert stats.timeouts == 2                     # exit-reason overlay, unchanged
+    assert stats.win_rate == 0.5
+    # The profitable short is a win; the per-direction split makes the fix visible.
+    assert (stats.closed_short, stats.win_rate_short) == (2, 0.5)
+    assert (stats.closed_long, stats.win_rate_long) == (2, 0.5)
+
+
 # --- Currency overlay: equity = starting capital + realized currency P&L. ---
 
 def test_currency_equity_is_capital_plus_realized(tmp_path):

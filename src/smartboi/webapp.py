@@ -645,7 +645,8 @@ function renderPnl(d){
 
 function renderWinRate(d){
   var cg=currentGen(d), ps=d.paper_stats, name=cg?cg.label:"";
-  var allTime='<div class="sub">all-time '+ps.wins+"W&ndash;"+ps.losses+"L"+(ps.closed?" &middot; "+Math.round(ps.win_rate*100)+"%":"")+"</div>";
+  var dirSplit=(ps.closed_long||ps.closed_short)?(" &middot; long "+Math.round(ps.win_rate_long*100)+"% / short "+Math.round(ps.win_rate_short*100)+"%"):"";
+  var allTime='<div class="sub">all-time '+ps.wins+"W&ndash;"+ps.losses+"L net of cost"+(ps.closed?" &middot; "+Math.round(ps.win_rate*100)+"%"+dirSplit:"")+"</div>";
   if(!cg||!cg.closed){
     el("winrate").innerHTML='<div class="k">Win rate &middot; current</div><div class="big">–</div>'+
       '<div class="sub">no closed trades yet'+(name?' under <b>'+esc(name)+"</b>":"")+"</div>"+allTime; return;
