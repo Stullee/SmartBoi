@@ -231,9 +231,20 @@ async def run_edgar_supplier_search(engine) -> str:
         return not any(linked in tradeables
                        for linked, _ in engine.graph.linked_symbols(symbol, universe_symbols))
 
-    anchors = [c for c in engine.universe if c.signal_source_only and (c.name or "").strip()]
+    # Anchors already searched are skipped so a run CONTINUES through the
+    # list. Without this the pass is idempotent-by-accident when a human
+    # presses the button occasionally, but ruinous on a schedule: selection
+    # is deterministic (inertness, then ecosystem, then symbol), so a daily
+    # run would re-search the same first five anchors forever and never
+    # reach the rest. This is the identical trap research.researched_anchors
+    # documents for supplier research, and the marker is written per anchor
+    # as it completes, so a crash mid-run loses only the unfinished ones.
+    already = set(engine.edgar_search_state.data.keys())
+    anchors = [c for c in engine.universe
+               if c.signal_source_only and (c.name or "").strip() and c.symbol not in already]
     if not anchors:
-        return "No anchors with a usable company name to search on."
+        return ("Every anchor has already been searched. Delete "
+                "data/anchor_edgar_search.json to re-run them, or add more anchors.")
     anchors.sort(key=lambda c: (not is_inert(c.symbol), c.ecosystem, c.symbol))
     selected = anchors[:MAX_SEARCH_ANCHORS_PER_RUN]
     skipped = [c.symbol for c in anchors[MAX_SEARCH_ANCHORS_PER_RUN:]]
@@ -242,6 +253,15 @@ async def run_edgar_supplier_search(engine) -> str:
     new = updated = 0
     for spec in selected:
         hits = await engine.edgar_client.full_text_search(spec.name)
+        # Marked as soon as the search returns, and regardless of what came
+        # back -- the REQUEST is what was spent, so the request is what has
+        # to be recorded. Gating this on a hit would re-search a legitimately
+        # empty anchor on every future run, forever, which is the same bug
+        # research.researched_anchors was fixed for.
+        engine.edgar_search_state.set(
+            spec.symbol,
+            {"searched_at": datetime.now(timezone.utc).isoformat(), "hits": len(hits)},
+        )
         if not hits:
             lines.append(f"{spec.symbol} ({spec.name}): no hits.")
             continue
@@ -435,6 +455,7 @@ _DIAGNOSTIC_SETTINGS = (
     "auto_accept_min_seen_count", "auto_accept_max_per_day",
     "enable_relationship_backfill", "backfill_anchors",
     "enable_graph_refresh", "graph_refresh_symbols_per_day", "enable_auto_supplier_research",
+    "enable_auto_edgar_search",
     "enable_ib_price_feed", "ib_host", "ib_port",
 )
 MAX_LOG_LINES = 40

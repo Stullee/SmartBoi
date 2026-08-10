@@ -378,6 +378,13 @@ class Engine:
         # a bookkeeping marker can never be mistaken for a candidate by
         # ticker resolution, the screen, auto-accept or the dashboard count.
         self.research_state = JsonState(DATA_DIR / "anchor_research.json")
+        # The same bookkeeping for the EDGAR full-text search, kept SEPARATE
+        # from research_state on purpose. The two passes ask different
+        # questions of the same anchor -- "who does the web say supplies it"
+        # versus "which other FILERS name it" -- so an anchor covered by one
+        # has not been covered by the other, and sharing a marker would let
+        # whichever pass ran first permanently suppress the other.
+        self.edgar_search_state = JsonState(DATA_DIR / "anchor_edgar_search.json")
         self.accepted_candidates = JsonState(DATA_DIR / "accepted_candidates.json")
         # Per-accession "relationship extraction already ran" markers for the
         # POLL path. Extraction (a paid ~150k-char call) runs before dossier
@@ -1041,6 +1048,12 @@ class Engine:
                 await self.skeptic.aclose()
             if self.synthesizer is not None:
                 await self.synthesizer.aclose()
+            # Both own an httpx.AsyncClient and both were missing here, so
+            # every restart leaked two connection pools.
+            if self.fedreg is not None:
+                await self.fedreg.aclose()
+            if self.dod is not None:
+                await self.dod.aclose()
             if self.price_feed is not None:
                 self.price_feed.disconnect()
             await self.alerts.aclose()
@@ -1300,6 +1313,16 @@ class Engine:
         ):
             self._mark_daily_pass_done("supplier_research")
             await self._run_auto_supplier_research()
+        # No anthropic_api_key check, unlike the pass above: this one spends
+        # EDGAR requests, not tokens. It is gated on the EDGAR client instead,
+        # which is what it actually needs.
+        if (
+            self.settings.enable_auto_edgar_search
+            and self.edgar_client is not None
+            and self._daily_pass_due("edgar_search")
+        ):
+            self._mark_daily_pass_done("edgar_search")
+            await self._run_auto_edgar_search()
         if self._due(self._last_heartbeat, HEARTBEAT_INTERVAL_SEC, now):
             self._last_heartbeat = now
             self._log_heartbeat()
@@ -2352,6 +2375,39 @@ class Engine:
             return
         headline = next((line for line in (report or "").splitlines() if line.strip()), "(no output)")
         log.info("[GRAPH] Automatic supplier research: %s", headline)
+
+    async def _run_auto_edgar_search(self) -> None:
+        """Runs the EDGAR full-text search on a daily cadence instead of only
+        when someone presses the dashboard button.
+
+        Same omission as _run_auto_supplier_research, and it cost more. This
+        is the cheapest size-selected mechanism in the system: it asks which
+        OTHER filers name an anchor, and a filer disclosing "X accounted for
+        22% of net sales" is by construction small enough for X to matter to
+        it -- the exact direction a giant's own 10-K never contains. The hit
+        arrives carrying a ticker SEC itself supplies, so unlike every other
+        candidate path it never passes through name->ticker resolution and
+        cannot land on the wrong company that way.
+
+        It costs no LLM tokens at all (the proximity test is a regex over
+        fetched filing text), so unlike supplier research it needs no API key
+        and is not gated on the daily budget -- only on EDGAR's own request
+        spacing. Writes universe CANDIDATES only, never an edge: a regex
+        proximity hit is a lead about where to look, and accepting one
+        backfills the symbol's own filings, which is where a real edge comes
+        from. See edgar_search.py.
+
+        Imported locally, like the research pass, because tools.py is a leaf
+        module built on top of the engine's state."""
+        from smartboi.tools import run_edgar_supplier_search
+
+        try:
+            report = await run_edgar_supplier_search(self)
+        except Exception:  # noqa: BLE001 - a search failure must never kill the tick
+            log.exception("[GRAPH] Automatic EDGAR supplier search failed -- retrying tomorrow.")
+            return
+        headline = next((line for line in (report or "").splitlines() if line.strip()), "(no output)")
+        log.info("[GRAPH] Automatic EDGAR supplier search: %s", headline)
 
     # --- News ingestion ---
 
@@ -4159,13 +4215,36 @@ class Engine:
                 "symbol": ticker,
                 "name": entry.get("name") or ticker,
                 "ecosystem": ecosystem if ecosystem not in ("?", "") else "accepted",
+                # The screen's own verdict, carried through to the accept
+                # below. This used to be hardcoded "anchor", which quietly
+                # converted every candidate this arm grows -- INCLUDING ones
+                # that screen as tradeable -- into an anchor permanently:
+                # _auto_accept_candidates skips anything already in
+                # accepted_candidates, and there is no promote-to-tradeable
+                # path anywhere. So a one-way loss of exactly the scarce
+                # thing (a name small enough to trade), inflicted by the tool
+                # whose stated purpose is fixing connectivity. Anything
+                # without a tradeable recommendation still becomes an anchor,
+                # which is the conservative direction.
+                #
+                # is_common_equity is re-checked HERE rather than relied on
+                # inside accept_candidate, because the filter applied above is
+                # _anchor_equity_ok, which is deliberately LOOSER -- it admits
+                # OTC ADRs and foreign ordinaries, which are fine as anchors
+                # and are rejected as tradeables. Passing one through as
+                # "tradeable" would raise ValueError out of accept_candidate
+                # and abort the whole apply loop partway, leaving the reconcile
+                # half-applied.
+                "as_type": ("tradeable"
+                            if entry.get("recommended_as") == "tradeable" and is_common_equity(ticker)
+                            else "anchor"),
                 "links": [f"{frm}:{rel}({conf:.2f})" for frm, rel, conf in links],
             })
 
         added: list[str] = []
         if apply:
             for a in to_add:
-                spec = self.accept_candidate(a["symbol"], "anchor", source="connected")
+                spec = self.accept_candidate(a["symbol"], a["as_type"], source="connected")
                 added.append(spec.symbol)
 
         # --- PRUNE: runtime-accepted anchors with no edge to a tradeable ---

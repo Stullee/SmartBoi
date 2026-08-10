@@ -30,6 +30,7 @@ options:
   enable_graph_refresh: true
   graph_refresh_symbols_per_day: 10
   enable_auto_supplier_research: true
+  enable_auto_edgar_search: true
   edgar_user_agent: ""
   edgar_forms: "8-K,8-K/A,10-K,10-Q,4,SC 13D,SC 13D/A,424B5,424B3,NT 10-K,NT 10-Q,S-1,S-3,S-3/A,20-F,40-F,6-K,25,25-NSE,15-12B,15-12G"
   max_6k_items_per_symbol_per_day: 1
@@ -105,6 +106,7 @@ schema:
   enable_graph_refresh: bool
   graph_refresh_symbols_per_day: int(0,200)
   enable_auto_supplier_research: bool
+  enable_auto_edgar_search: bool
   edgar_user_agent: str
   edgar_forms: str
   max_6k_items_per_symbol_per_day: int(0,20)

@@ -234,6 +234,60 @@ def normalize_company_name(name: str) -> str:
     return " ".join(words)
 
 
+def boilerplate_only_prefix(a: str, b: str) -> bool:
+    """Whether two already-normalized names differ ONLY by corporate-form
+    boilerplate -- "asml" vs "asml holding" -- as opposed to by words that
+    identify a different company or a different KIND OF INSTRUMENT.
+
+    Both callers below used to accept any token-prefix in either direction,
+    which is far too generous once normalize_company_name has stripped the
+    legal suffixes. Because it strips them, a name that survives as a single
+    token is a bare brand word, and a bare brand word prefix-matches every
+    registered title that happens to start with it. Confirmed live, and this
+    is the doctrine's own named worst outcome (a ticker pointing at an
+    unrelated company):
+
+        "PGIM, Inc."  -> "pgim"  -> matched "pgim high yield bond fund"
+                                    -> GHY, a closed-end BOND FUND, accepted
+                                       as a tradeable equity
+
+    and it is the same mechanism behind the "Vertex" collision dod_contracts.py
+    warns about ("vertex" would match "vertex aerospace" as readily as Vertex
+    Pharmaceuticals).
+
+    The rule: one name must be a whole-token prefix of the other, AND every
+    remaining token must be corporate-form boilerplate. "high yield bond
+    fund" and "aerospace" fail it, because those words are doing identifying
+    work. This can only ever REFUSE a match the old code accepted -- it never
+    creates one.
+
+    Worth being precise about what that leaves, because it is stricter than
+    it first looks. Both callers pass names that have ALREADY been through
+    normalize_company_name, which strips leading and trailing legal suffixes
+    -- so neither side can normally still END in boilerplate, and the branch
+    is left firing only on interior boilerplate and on exact equality. In
+    particular "ASML" vs "ASML Holding N.V." keeps resolving because both
+    normalize to "asml" and match EXACTLY, not because the prefix allowance
+    rescues it. That is the intended end state: near-exact matching against
+    SEC's registered titles, with Finnhub's fuzzy /search as the deliberate
+    place where brand-vs-legal-name mismatches get handled instead.
+
+    The cost is accepted rather than overlooked. name_matches_ticker gates
+    auto-accept, and a refusal there is durable (engine.py records
+    auto_accept_blocked and reads it back on later passes), so a legitimate
+    pair this refuses needs a human click on the dashboard -- accept_candidate
+    does not consult this function. That is the correct direction for a guard
+    whose own docstring says unknown means "don't": a candidate waiting for a
+    human is recoverable, a trade fired against the wrong company is not."""
+    a_words, b_words = a.split(), b.split()
+    if not a_words or not b_words:
+        return False
+    shorter, longer = sorted((a_words, b_words), key=len)
+    if longer[:len(shorter)] != shorter:
+        return False
+    return all(word in _LEGAL_SUFFIXES for word in longer[len(shorter):])
+
+
 def summarize_form4(xml_text: str) -> str:
     """Compact, human/LLM-readable summary of a Form 4's non-derivative
     transactions ("insider X (CFO) open-market purchase of 10,000 shares at
@@ -436,7 +490,7 @@ class EdgarClient:
         if normalized in name_map:
             return name_map[normalized]
         for title, ticker in name_map.items():
-            if title.startswith(normalized + " ") or normalized.startswith(title + " "):
+            if boilerplate_only_prefix(title, normalized):
                 return ticker
         return None
 
@@ -453,7 +507,10 @@ class EdgarClient:
         against SEC's own registered title rather than by trusting either
         source. Matching is on the normalized core name (see
         normalize_company_name), with a prefix allowance in both directions
-        so "ASML" still matches the registered "ASML Holding N.V.".
+        so "ASML" still matches the registered "ASML Holding N.V." -- but
+        only where the difference is pure corporate-form boilerplate, since
+        an unrestricted prefix match is itself a source of wrong tickers
+        (see boilerplate_only_prefix).
 
         Returns False when the ticker isn't in SEC's map at all -- unknown
         is not a match, and a caller gating an automatic action on this
@@ -467,7 +524,7 @@ class EdgarClient:
         for title in registered:
             if title == normalized:
                 return True
-            if title.startswith(normalized + " ") or normalized.startswith(title + " "):
+            if boilerplate_only_prefix(title, normalized):
                 return True
         return False
 
