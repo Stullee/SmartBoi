@@ -80,6 +80,50 @@ that specific inefficiency, not to race anyone on speed:
    (`MAX_6K_ITEMS_PER_SYMBOL_PER_DAY`) because EDGAR independence keys on
    form *and* filing day, so an unbounded cross-filer could corroborate
    itself into a signal. See `edgar.py`.
+4b. **Primary sources that are not filings** -- two feeds where the
+   government is the publisher, so the evidence cannot be two outlets
+   rewording one wire story:
+
+   - **DoD daily contract announcements** (`dod_contracts.py`, war.gov, free):
+     every award at or above the DFARS 205.303 threshold, published ~5pm ET
+     each business day. Chosen over USASpending/FPDS for a hard reason: DoD
+     awards are withheld from those for **90 days**, ~6x past the 14-day floor
+     in `evidence_is_stale`, so that evidence would be *born aged out*.
+     (FPDS-NG's ATOM feed no longer exists either — FPDS.gov was decommissioned
+     in 2026 and folded into SAM.gov.)
+
+     The hard part is name matching, not fetching. Announcements use legal
+     entity names — "Ducommun LaBarge Technologies Inc." → DCO, "Vertex
+     Aerospace LLC" → V2X — and **"Vertex" alone collides with Vertex
+     Pharmaceuticals**. So matching is whole-word, case-insensitive, against a
+     hand-reviewed alias table and nothing else: no fuzzy matching, no
+     substrings. A banned-alias list lives in code rather than in a comment so
+     that adding a dangerous one fails a test rather than a live dossier. The
+     announcement text is passed through **verbatim**, because many "awards"
+     are IDIQ ceilings or modifications rather than new revenue and the
+     difference lives in the wording — summarising it would destroy exactly
+     what the skeptic needs to catch it. Anchor awards are gated on a value
+     floor (default $100M); a tradeable's own award never is, since $12M is
+     material to a $90M-cap company in a way the same award to Lockheed isn't.
+
+   - **Federal Register** (`federal_register.py`, free, no key): a handful of
+     hand-curated searches, never the feed — ~200 documents publish per
+     business day and watching that broadly is a disqualifying firehose. Each
+     search was written against a specific checkable claim: wind-tower AD/CVD
+     proceedings name **BWEN** as a Wind Tower Trade Coalition member; EPA AIM
+     Act HFC allowance notices are entity-specific and drive **HDSN**'s
+     refrigerant economics; BIS Entity List actions reach **AOSL**; export
+     controls and FMVSS reach two whole ecosystems.
+
+     A rule is not a company, so propagation runs from synthetic regulator
+     origins (BIS, EPA, ITC, NHTSA) over hand-seeded `regulator` edges. Those
+     are **deliberately kept out of the universe** — registering them as
+     members would put "BIS" into the EDGAR poll, the news poll and the screen
+     — and the edges are seeded at 0.60–0.80, below
+     `DISCLOSED_LINK_CONFIDENCE`, so a sector-wide rule can raise a thesis but
+     never buys the corroboration discount a quantified customer disclosure
+     earns.
+
 5. **Adversarial to itself, calibrated by directness** -- every proposed
    dossier update is reviewed by a second, skeptical LLM pass trying to
    refute it before it counts, but the bar differs deliberately for direct
@@ -215,6 +259,30 @@ newly added symbol) a one-time backfill extracts from each tradeable
 company's most recent 10-K regardless of age
 (`ENABLE_RELATIONSHIP_BACKFILL`), so the graph populates immediately
 instead of over a year of annual filings.
+
+Two dashboard buttons attack the same starvation from the other end, and
+both write **candidates only, never a graph edge**. "Research anchor
+suppliers (web)" uses a web-search-backed Claude call (`research.py`).
+"Search EDGAR for anchor suppliers" (`edgar_search.py`) uses EDGAR's own
+full-text search to ask **which other filers name this anchor** — a supplier
+disclosing "Applied Materials accounted for 22% of net sales" is making
+exactly the disclosure the anchor never would, and full-text search is the
+only mechanism that surfaces it. No LLM spend; SEC requests only.
+
+A full-text hit produces **zero evidence**, and that is the argument rather
+than a limitation: if the filer is already in the universe, `_poll_edgar`
+has already fetched that 10-K and extracted from it; if it isn't, there is
+no dossier to write to. A hit is a lead about *where to look*. It also never
+increments `seen_count`, which gates auto-accept as a trade target and is
+meant to count filing disclosures, not sightings of a name in a search index.
+
+EFTS has no proximity operator (quoted phrases and implicit AND only), so
+document-level AND over-matches — a 10-K can name the anchor in Item 1 and
+say "of our net sales" forty pages later. A local regex proximity pass over
+the fetched text decides which hits are real, and the candidate carries the
+**raw sentence verbatim** rather than a verdict: an IDIQ ceiling, a
+historical figure and a live concentration disclosure all match the same
+phrases, and only the actual words tell them apart.
 
 When a filing discloses a relationship to a company OUTSIDE the universe,
 it's recorded as a **universe candidate** (`data/universe_candidates.json`,

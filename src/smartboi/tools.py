@@ -47,8 +47,10 @@ from smartboi.exit_analysis import format_report as format_exit_report
 from smartboi.skeptic_report import analyze_skeptic_effect, format_skeptic_report
 from smartboi.screen import candidates_from_file, resolve_candidates_path
 from smartboi.universe import CompanySpec, spec_by_symbol
+from smartboi.edgar_search import MAX_HITS_PER_QUERY, concentration_context
 from smartboi.research import (
     MAX_ANCHORS_PER_RUN,
+    ResearchedSupplier,
     SupplierResearcher,
     format_research_report,
     merge_into_candidates,
@@ -197,6 +199,112 @@ async def run_supplier_research(engine) -> str:
     return format_research_report(results, new, updated, skipped)
 
 
+# Anchors per EDGAR full-text search run. Each one costs a search request
+# plus up to MAX_HITS_PER_QUERY document fetches to proximity-test, all at
+# EDGAR's 0.3s request spacing -- so this is bounded for the same reason
+# MAX_ANCHORS_PER_RUN is: an operator clicking a button wants it to finish.
+MAX_SEARCH_ANCHORS_PER_RUN = 5
+
+
+async def run_edgar_supplier_search(engine) -> str:
+    """Asks EDGAR which OTHER filers name each anchor, and routes what it
+    finds to universe CANDIDATES (see edgar_search.py for why that is the
+    only honest destination).
+
+    Operator-run rather than part of the tick loop, for the same three
+    reasons run_supplier_research is: the results need a human accept anyway,
+    the right cadence is "when the anchor list changes" rather than hourly,
+    and it is the kind of pass whose first real run should be watched rather
+    than discovered in a log three days later.
+
+    Anchors are ordered by how INERT they are -- one with no graph edge to
+    any tradeable has its news resolved to zero targets and discarded unread,
+    so it has the most to gain from a lead."""
+    if engine.edgar_client is None:
+        return ("EDGAR ingestion is disabled, so there is no client to search with. "
+                "Set ENABLE_EDGAR_INGESTION=true and EDGAR_USER_AGENT first.")
+
+    universe_symbols = set(engine.symbol_list)
+    tradeables = {c.symbol for c in engine.universe if not c.signal_source_only}
+
+    def is_inert(symbol: str) -> bool:
+        return not any(linked in tradeables
+                       for linked, _ in engine.graph.linked_symbols(symbol, universe_symbols))
+
+    anchors = [c for c in engine.universe if c.signal_source_only and (c.name or "").strip()]
+    if not anchors:
+        return "No anchors with a usable company name to search on."
+    anchors.sort(key=lambda c: (not is_inert(c.symbol), c.ecosystem, c.symbol))
+    selected = anchors[:MAX_SEARCH_ANCHORS_PER_RUN]
+    skipped = [c.symbol for c in anchors[MAX_SEARCH_ANCHORS_PER_RUN:]]
+
+    lines: list[str] = ["EDGAR full-text supplier search", "=" * 34, ""]
+    new = updated = 0
+    for spec in selected:
+        hits = await engine.edgar_client.full_text_search(spec.name)
+        if not hits:
+            lines.append(f"{spec.symbol} ({spec.name}): no hits.")
+            continue
+        found = []
+        checked = 0
+        for hit in hits[:MAX_HITS_PER_QUERY]:
+            # Already in the universe -> _poll_edgar has fetched this filing
+            # and run extraction on it already. A lead about a name we hold
+            # is not a lead.
+            if hit.ticker and hit.ticker in engine.spec_by_symbol:
+                continue
+            if not hit.cik or not hit.document:
+                continue  # cannot build an archive URL -> cannot proximity-test
+            checked += 1
+            try:
+                text = await engine.edgar_client.fetch_text(
+                    engine.edgar_client.filing_from_hit(hit), max_chars=200_000,
+                )
+            except Exception:  # noqa: BLE001 - one unreadable filing must not stop the run
+                log.exception("%s: could not fetch %s for the proximity pass", spec.symbol, hit.adsh)
+                continue
+            context = concentration_context(text, spec.name)
+            if not context:
+                continue
+            found.append(ResearchedSupplier(
+                anchor=spec.symbol,
+                name=hit.name,
+                ticker=hit.ticker,
+                rel_type="supplier",
+                # The raw sentence, verbatim and truncated, NOT a verdict.
+                # An IDIQ ceiling, a historical figure and a live
+                # concentration disclosure all match the same phrases and
+                # only the actual words tell them apart -- so the operator
+                # reads them, not a summary of them.
+                description=f"[{hit.form} {hit.filing_date}] ...{context[:320]}...",
+                evidence_url=f"https://www.sec.gov/Archives/edgar/data/{hit.cik}/"
+                             f"{hit.adsh.replace('-', '')}/",
+                # Below DISCLOSED_LINK_CONFIDENCE on purpose. This IS a
+                # primary filing disclosure, but it is being read by a regex
+                # proximity heuristic rather than by the extraction pass, and
+                # merge_into_candidates writes no edge from it either way.
+                confidence=0.6,
+            ))
+        lines.append(
+            f"{spec.symbol} ({spec.name}): {len(hits)} hit(s), {checked} fetched, "
+            f"{len(found)} with a concentration disclosure."
+        )
+        if found:
+            added, touched = merge_into_candidates(engine.candidates, found)
+            new += added
+            updated += touched
+
+    lines += ["", f"{new} new candidate(s), {updated} updated.",
+              "Candidates only -- no graph edge is written from a search hit. Accept one and "
+              "its own filings are backfilled; the edge is created only if a filing discloses it."]
+    if skipped:
+        # Never silently drop work.
+        lines.append(f"\n{len(skipped)} anchor(s) not searched this run (capped at "
+                     f"{MAX_SEARCH_ANCHORS_PER_RUN}): {', '.join(skipped[:12])}"
+                     f"{' ...' if len(skipped) > 12 else ''}. Re-run to continue.")
+    return "\n".join(lines)
+
+
 def run_forward_returns(
     log_dir: str | Path,
     universe: list[CompanySpec],
@@ -316,6 +424,10 @@ _DIAGNOSTIC_SETTINGS = (
     "signal_entry_poll_interval_sec",
     "enable_edgar_ingestion", "enable_news_ingestion", "edgar_forms",
     "max_6k_items_per_symbol_per_day", "enable_regsho",
+    "enable_federal_register", "federal_register_lookback_days",
+    "federal_register_poll_interval_sec",
+    "enable_dod_contracts", "dod_lookback_days", "dod_poll_interval_sec",
+    "dod_anchor_value_floor_usd",
     "edgar_lookback_days", "news_lookback_days", "enable_universe_autoscreen",
     "universe_min_market_cap_musd", "universe_max_market_cap_musd",
     "universe_max_analyst_count", "universe_screen_interval_days",

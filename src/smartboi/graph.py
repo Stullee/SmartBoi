@@ -179,7 +179,25 @@ _SYSTEM_PROMPT = (
     "LENDERS, underwriters or auditors as suppliers -- a credit agreement is a real "
     "disclosure, but a bank's news has no path to the borrower's fundamentals, which is "
     "the only thing this graph is used for. A financial institution should only appear when "
-    "it is a genuine CUSTOMER or competitor of the filing company."
+    "it is a genuine CUSTOMER or competitor of the filing company.\n\n"
+    # `regulator` was being used as a catch-all for any legal or structural
+    # relationship the model could not fit into the other three. Measured on
+    # the live graph, ALL THREE regulator edges were corporate structure, not
+    # regulation: a spinoff parent (CARR->RTX, 0.95) and two separation-
+    # agreement indemnification links (CTVA->DD, CTVA->DOW). None is a
+    # regulator. That matters beyond tidiness -- a relationship's TYPE now
+    # decides whether it can satisfy the disclosed-link corroboration bar
+    # (see dossier._link_type_corroborates), so a mislabeled type is a
+    # mislabeled corroboration, and it makes the type unusable for the thing
+    # it is named after.
+    "The four types are business relationships, not a catch-all for any legal connection. "
+    "`regulator` means a GOVERNMENT OR STATUTORY BODY whose rules, approvals or enforcement "
+    "bear on the filing company (FDA, EPA, FAA, BIS, FERC, a state utility commission). "
+    "It is NOT for corporate structure: a former parent, a spinoff, a joint-venture partner, "
+    "a predecessor entity, or a counterparty to a separation, indemnification, merger or "
+    "transition-services agreement is NONE of these four types -- omit it entirely rather "
+    "than forcing it into the closest-looking one. An omitted relationship costs this system "
+    "nothing; a wrong one is propagated as if it were a causal channel."
 )
 
 

@@ -753,3 +753,47 @@ def test_a_competitor_edge_alongside_a_customer_edge_still_qualifies():
     merge_evidence(dossier, _typed("LMT", "customer", "Reuters", "d1"), now=NOW)
 
     assert dossier.has_disclosed_link_evidence is True
+
+
+# --- New primary source types (regulatory documents, DoD contract awards).
+# has_filing_evidence is "not news", and its purpose is to say the evidence
+# cannot be two outlets rewording one wire story. A government document
+# cannot be. But the LINK still has to carry it. ---
+
+def test_a_direct_contract_award_is_primary_evidence():
+    """A DoD award to Ducommun IS news about Ducommun -- direct evidence, no
+    edge involved -- and a government announcement is not a reworded article."""
+    dossier = Dossier(symbol="DCO")
+    record = _evidence(source_name="DoD Contract Announcements", evidence_id="a1")
+    record.source_type = "contract_award"
+    merge_evidence(dossier, record, now=NOW)
+
+    assert dossier.has_filing_evidence is True
+
+
+def test_a_regulatory_document_over_a_weak_edge_is_not_primary_backing():
+    """The document is primary, but it reached this dossier over a seeded
+    regulator edge at 0.60-0.80 -- below DISCLOSED_LINK_CONFIDENCE. A
+    sector-wide rule can raise a thesis; it must not also relax the
+    corroboration bar, which is a claim about the LINK, not the source."""
+    dossier = Dossier(symbol="AOSL")
+    record = _typed("BIS", "regulator", "Federal Register (BIS/entity-list)", "r1",
+                    confidence=0.80)
+    record.source_type = "regulatory"
+    merge_evidence(dossier, record, now=NOW)
+
+    assert dossier.has_filing_evidence is False
+    assert dossier.has_disclosed_link_evidence is False
+
+
+def test_two_proceedings_by_one_agency_stay_independent():
+    """The search key is in the source name, so one agency running two
+    unrelated rulemakings is two facts. Collapsing them would cap a regulatory
+    thesis at one source per agency forever."""
+    dossier = Dossier(symbol="AOSL")
+    for key in ("entity-list", "semi-export-controls"):
+        record = _typed("BIS", "regulator", f"Federal Register (BIS/{key})", key, confidence=0.80)
+        record.source_type = "regulatory"
+        merge_evidence(dossier, record, now=NOW)
+
+    assert dossier.independent_source_count == 2

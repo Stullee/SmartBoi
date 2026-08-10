@@ -191,6 +191,35 @@ class Settings(BaseSettings):
     # plain-text file per trading day. Off only if the fetch is unwanted --
     # with it off the borrow flag simply falls back to the proxy.
     enable_regsho: bool = True
+    # Federal Register (free, no API key): regulatory actions that name this
+    # universe's companies -- wind-tower AD/CVD for BWEN, EPA HFC allowance
+    # allocations for HDSN, BIS Entity List for AOSL, export controls and
+    # FMVSS for two ecosystems.
+    #
+    # Scoped to a handful of HAND-CURATED searches, never the feed:
+    # ~200 documents publish per business day and watching that broadly is a
+    # disqualifying firehose. See federal_register.CURATED_SEARCHES; adding a
+    # search is a deliberate act, not a setting.
+    enable_federal_register: bool = True
+    # Deliberately longer than the poll gap. The window overlaps and the
+    # caller dedupes on document_number, so the cost of overlap is a cheap
+    # repeat request while the cost of a gap is a permanently missed rule.
+    federal_register_lookback_days: int = 3
+    federal_register_poll_interval_sec: int = 21600
+    # DoD daily contract announcements (war.gov, free, no auth): every award
+    # at or above the DFARS 205.303 threshold, published ~5pm ET each business
+    # day. Chosen over USASpending/FPDS because DoD awards are withheld from
+    # those for 90 days -- ~6x past dossier.evidence_is_stale's 14-day floor,
+    # so that evidence would be born aged out.
+    enable_dod_contracts: bool = True
+    dod_lookback_days: int = 3
+    dod_poll_interval_sec: int = 21600
+    # Awards below this are not scored for an ANCHOR. LMT/RTX/NOC/GD/BA appear
+    # most business days and their routine awards would dominate the
+    # propagation budget while saying nothing a thesis can use. No floor
+    # applies to a tradeable's own award: $12M is material to a $90M-cap
+    # company in a way the same award to Lockheed is not.
+    dod_anchor_value_floor_usd: float = 100_000_000.0
     # Per-symbol daily ceiling on 6-K ingestion.
     #
     # 6-K is the one form added above that arrives at a cadence capable of

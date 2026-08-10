@@ -2959,3 +2959,214 @@ async def test_a_verdict_predating_the_key_record_is_not_read_as_fully_stale(eng
     await engine._maybe_resynthesize(dossier, datetime.now(timezone.utc))
 
     assert len(engine.synthesizer.calls) == calls_before
+
+
+# --- EDGAR full-text search: the same safety-critical NEGATIVE property web
+# research has, for a stricter reason. A full-text hit is not a disclosure
+# ABOUT the anchor -- it is a third party's filing that happens to mention
+# it. Routed to evidence it would score one company's 10-K against another
+# company's dossier. Candidates only. ---
+
+def _hit(adsh="0001050915-25-000012", company="ICHOR HOLDINGS, LTD. (ICHR)"):
+    from smartboi.edgar_search import SearchHit
+
+    return SearchHit(adsh=adsh, cik="0001050915", company=company, form="10-K",
+                     filing_date="2025-02-14", document="ichr-20250101.htm")
+
+
+def _anchor_spec(engine):
+    """The anchor run_edgar_supplier_search will pick first."""
+    return next(c for c in engine.universe if c.signal_source_only and (c.name or "").strip())
+
+
+async def test_edgar_search_writes_candidates_and_never_an_edge(engine):
+    from smartboi.tools import run_edgar_supplier_search
+
+    anchor = _anchor_spec(engine)
+    edges_before = len(engine.graph.relationships)
+    engine.edgar_client.search_hits_by_anchor[anchor.name] = [_hit()]
+    engine.edgar_client.text_by_accession["0001050915-25-000012"] = (
+        f"{anchor.name}, our largest customer, accounted for 22% of net sales."
+    )
+
+    report = await run_edgar_supplier_search(engine)
+
+    assert len(engine.graph.relationships) == edges_before, "a hit must never mint an edge"
+    assert engine.candidates.data, "but it must produce a candidate"
+    entry = next(iter(engine.candidates.data.values()))
+    assert entry.get("researched_only") is True
+    assert not entry.get("pending_edges")
+    assert "candidate" in report.lower()
+
+
+async def test_edgar_search_does_not_inflate_seen_count(engine):
+    """seen_count gates auto-accept as a TRADE TARGET at
+    auto_accept_min_seen_count. It counts independent filing DISCLOSURES of a
+    relationship, not sightings of a name in a search index."""
+    from smartboi.tools import run_edgar_supplier_search
+
+    anchor = _anchor_spec(engine)
+    engine.edgar_client.search_hits_by_anchor[anchor.name] = [_hit()]
+    engine.edgar_client.text_by_accession["0001050915-25-000012"] = (
+        f"{anchor.name} accounted for 22% of net sales."
+    )
+
+    await run_edgar_supplier_search(engine)
+    first = next(iter(engine.candidates.data.values())).get("seen_count")
+    await run_edgar_supplier_search(engine)
+    second = next(iter(engine.candidates.data.values())).get("seen_count")
+
+    assert first == second == 1
+
+
+async def test_a_hit_without_a_concentration_disclosure_is_dropped(engine):
+    """Document-level AND over-matches by construction; the local proximity
+    pass is what makes a hit a lead rather than a coincidence."""
+    from smartboi.tools import run_edgar_supplier_search
+
+    anchor = _anchor_spec(engine)
+    engine.edgar_client.search_hits_by_anchor[anchor.name] = [_hit()]
+    engine.edgar_client.text_by_accession["0001050915-25-000012"] = (
+        f"We compete with {anchor.name} in several markets." + " filler." * 500
+    )
+
+    await run_edgar_supplier_search(engine)
+
+    assert not engine.candidates.data
+
+
+async def test_a_hit_on_a_symbol_already_held_is_skipped(engine):
+    """If the filer is already in the universe, _poll_edgar has fetched that
+    filing and run extraction on it already -- the hit adds nothing and the
+    fetch is pure waste."""
+    from smartboi.tools import run_edgar_supplier_search
+
+    anchor = _anchor_spec(engine)
+    engine.edgar_client.search_hits_by_anchor[anchor.name] = [
+        _hit(company="FORMFACTOR INC (FORM)")
+    ]
+    engine.edgar_client.text_by_accession["0001050915-25-000012"] = (
+        f"{anchor.name} accounted for 22% of net sales."
+    )
+
+    await run_edgar_supplier_search(engine)
+
+    assert engine.edgar_client.fetched == [], "a name already in the universe must not be fetched"
+    assert not engine.candidates.data
+
+
+async def test_no_hits_is_reported_not_raised(engine):
+    from smartboi.tools import run_edgar_supplier_search
+
+    report = await run_edgar_supplier_search(engine)   # must not raise
+
+    assert "no hits" in report.lower()
+
+
+# --- Federal Register: a rule is not a company, so propagation runs from a
+# synthetic regulator origin. The contract that matters is that the regulator
+# is an ORIGIN ONLY -- it must never gain a dossier, never be polled, never
+# be screened, and never buy the corroboration discount. ---
+
+def _fedreg_engine(tmp_path, monkeypatch, **overrides):
+    from smartboi.universe import CompanySpec
+
+    settings = Settings(
+        _env_file=None, symbols="BWEN,HDSN", anchor_symbols="",
+        enable_relationship_backfill=False, enable_universe_autoscreen=False,
+        enable_dashboard=False, enable_federal_register=True, **overrides,
+    )
+    monkeypatch.chdir(tmp_path)
+    e = Engine(settings)
+    e.universe = [
+        CompanySpec("BWEN", "Broadwind", "grid_datacenter"),
+        CompanySpec("HDSN", "Hudson Technologies", "industrial_machinery"),
+    ]
+    e.spec_by_symbol = {c.symbol: c for c in e.universe}
+    return e
+
+
+def test_a_regulator_is_never_a_universe_member(tmp_path, monkeypatch):
+    """Registering BIS/EPA as universe members would put them into the EDGAR
+    poll, the news poll, the screen and every count -- they are not filers and
+    have no market in them."""
+    from smartboi.federal_register import REGULATOR_SYMBOLS
+
+    engine = _fedreg_engine(tmp_path, monkeypatch)
+
+    for regulator in REGULATOR_SYMBOLS:
+        assert regulator not in engine.symbol_list
+        assert regulator not in engine.spec_by_symbol
+
+
+def test_regulator_edges_are_seeded_below_the_disclosed_link_bar(tmp_path, monkeypatch):
+    from smartboi.dossier import DISCLOSED_LINK_CONFIDENCE
+
+    engine = _fedreg_engine(tmp_path, monkeypatch)
+    engine._seed_regulator_edges()
+
+    seeded = [r for r in engine.graph.relationships if r.source == "regulator seed"]
+    assert seeded, "no regulator edges were seeded"
+    assert all(r.rel_type == "regulator" for r in seeded)
+    assert all(r.confidence < DISCLOSED_LINK_CONFIDENCE for r in seeded), (
+        "a sector-wide rule must never buy the corroboration discount"
+    )
+
+
+def test_a_regulator_edge_points_at_the_regulator(tmp_path, monkeypatch):
+    """rel_type describes what to_symbol IS to from_symbol, so the regulator
+    is the TARGET. Backwards it reads as 'BWEN is a regulator of ITC', and
+    that text goes to the dossier updater and the skeptic."""
+    engine = _fedreg_engine(tmp_path, monkeypatch)
+    engine._seed_regulator_edges()
+
+    edge = next(r for r in engine.graph.relationships
+                if r.source == "regulator seed" and r.from_symbol == "BWEN")
+    assert edge.to_symbol == "ITC"
+    assert "is a regulator of BWEN" in edge.description
+
+
+async def test_a_regulatory_document_reaches_the_company_not_the_regulator(tmp_path, monkeypatch):
+    engine = _fedreg_engine(tmp_path, monkeypatch)
+    engine.updater = FakeUpdater(default=proposal(direction="SHORT"))
+    engine.skeptic = FakeSkeptic(default=verdict(refuted=False))
+    engine._seed_regulator_edges()
+
+    await engine._process_evidence(
+        origin_symbol="ITC", evidence_text="AD/CVD final results on wind towers.",
+        source_type="regulatory", source_name="Federal Register (ITC/wind-towers-adcvd)",
+        url="https://x/1", headline="Wind towers AD/CVD", published_at="2026-08-07",
+    )
+
+    assert engine.dossiers.load("BWEN").evidence, "the rule must reach the company"
+    assert not engine.dossiers.load("ITC").evidence, "there is no thesis about a regulator"
+
+
+async def test_two_proceedings_by_one_agency_are_two_sources(tmp_path, monkeypatch):
+    """The search key is part of the source name, so one agency running two
+    unrelated rulemakings is two facts rather than one restated. Collapsing
+    them would cap a regulatory thesis at one source per agency forever."""
+    from smartboi.dossier import independence_key
+
+    from smartboi.universe import CompanySpec
+
+    engine = _fedreg_engine(tmp_path, monkeypatch)
+    # AOSL is what the BIS searches actually reach -- entity-list names it
+    # directly and semi-export-controls reaches its ecosystem.
+    engine.universe.append(CompanySpec("AOSL", "Alpha and Omega", "semi_equipment"))
+    engine.spec_by_symbol = {c.symbol: c for c in engine.universe}
+    engine.updater = FakeUpdater(default=proposal(direction="SHORT"))
+    engine.skeptic = FakeSkeptic(default=verdict(refuted=False))
+    engine._seed_regulator_edges()
+
+    for key in ("entity-list", "semi-export-controls"):
+        await engine._process_evidence(
+            origin_symbol="BIS", evidence_text=f"rule {key}", source_type="regulatory",
+            source_name=f"Federal Register (BIS/{key})", url=f"https://x/{key}",
+            headline=key, published_at="2026-08-07",
+        )
+
+    records = engine.dossiers.load("AOSL").evidence
+    assert len(records) == 2, "both proceedings must reach the company"
+    keys = {independence_key(r) for r in records}
+    assert len(keys) == 2, "and count as two independent sources, not one agency"

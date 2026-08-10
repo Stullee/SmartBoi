@@ -16,6 +16,11 @@ class FakeEdgarClient:
         # misresolution case (the confirmed-live Advantest->ATRO class)
         # rather than every test having to set it up.
         self.name_matches: bool = True
+        # EDGAR full-text search: anchor company NAME -> SearchHits, and
+        # accession -> the document text the proximity pass reads.
+        self.search_hits_by_anchor: dict[str, list] = {}
+        self.text_by_url: dict[str, str] = {}
+        self.fetched: list = []
 
     async def name_matches_ticker(self, name, ticker):
         return self.name_matches
@@ -33,10 +38,21 @@ class FakeEdgarClient:
         return self.text_by_accession.get(filing.accession_number, "")
 
     async def fetch_text(self, filing, max_chars=150_000):
+        self.fetched.append(filing)
         return self.text_by_accession.get(filing.accession_number, "")
 
     async def find_ticker_by_name(self, name):
         return self.ticker_by_name.get(name)
+
+    async def full_text_search(self, anchor_name, forms="10-K", date_from=""):
+        return self.search_hits_by_anchor.get(anchor_name, [])
+
+    def filing_from_hit(self, hit, symbol=""):
+        from smartboi.edgar import FilingEvent
+
+        return FilingEvent(symbol=symbol or hit.ticker or hit.name, cik10=hit.cik,
+                           form=hit.form, filing_date=hit.filing_date,
+                           accession_number=hit.adsh, primary_document=hit.document)
 
     async def aclose(self):
         pass
