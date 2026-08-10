@@ -217,3 +217,35 @@ def test_regulator_edges_stay_below_the_corroboration_bar():
     set HFC allowances' is real and material, and it is not evidence that some
     other item about the company is independently corroborated."""
     assert 0.80 < DISCLOSED_LINK_CONFIDENCE
+
+
+@pytest.mark.asyncio
+async def test_the_log_distinguishes_a_genuine_zero_from_an_unparsed_response(caplog):
+    """Regression, found live: five searches all logged '0 document(s)' and
+    the log could not say whether the API matched nothing or returned a shape
+    the parser rejected -- which need opposite fixes."""
+    import logging
+
+    client = FederalRegisterClient(httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"count": 0}))))
+    with caplog.at_level(logging.INFO):
+        await client.fetch(CURATED_SEARCHES[0], today=date(2026, 8, 10))
+
+    assert "count=0" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_nonzero_count_with_zero_parsed_is_visible(caplog):
+    """The failure that matters: the API found documents and the parser
+    dropped them all. Indistinguishable from a genuine miss without the count."""
+    import logging
+
+    payload = {"count": 7, "results": [{"unexpected": "shape"}]}
+    client = FederalRegisterClient(httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload))))
+    with caplog.at_level(logging.INFO):
+        docs = await client.fetch(CURATED_SEARCHES[0], today=date(2026, 8, 10))
+
+    assert docs == []
+    assert "0 document(s) parsed" in caplog.text
+    assert "count=7" in caplog.text
