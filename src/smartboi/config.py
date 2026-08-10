@@ -158,7 +158,50 @@ class Settings(BaseSettings):
     #     only ever reads good news is not a research system.
     #   8-K/A -- amended material events, which is where a restated
     #     contract value or corrected figure lands.
-    edgar_forms: str = "8-K,8-K/A,10-K,10-Q,4,SC 13D,SC 13D/A,424B5,424B3"
+    #   NT 10-K / NT 10-Q -- a Rule 12b-25 late-filing notice, one of the
+    #     cleanest small-cap SHORT catalysts there is, and it skews toward
+    #     exactly this universe (large caps rarely file one). The reaction is
+    #     conditional on the REASON given -- boilerplate reads negative, a
+    #     specific legitimate cause does not -- which is a judgement about
+    #     prose, i.e. the thing an LLM reading the filing is actually good at.
+    #   S-1 / S-3 / S-3/A -- the shelf REGISTRATION, weeks to months ahead of
+    #     the 424B5 takedown already ingested. This adds the leading indicator
+    #     to the confirming one on the cleanest SHORT catalyst above.
+    #   20-F / 40-F / 6-K -- foreign private issuers. This closes a hole
+    #     rather than adding a nicety: NVX files 20-F/6-K and NOTHING else,
+    #     so its dossier could never receive a single filing-evidence item
+    #     and its annual report could never mint a graph edge -- while being
+    #     a tradeable, and one of only two names still passing the
+    #     thin-coverage screen. Verified against the live graph: NVX appears
+    #     in neither endpoint of any of the 1066 edges, so with no filings it
+    #     had no evidence path at all. Same for anchors CAMT, TSM, ASML, MGA;
+    #     TSMC files monthly net revenue on a 6-K, a primary quantitative
+    #     datapoint for the whole semi_equipment ecosystem.
+    #   Form 25 / 25-NSE / 15-12B / 15-12G -- defensive. _is_unknown_to_edgar
+    #     only prunes a symbol once SEC's ticker file drops it, which lags the
+    #     delisting; a Form 25 is ten days' notice.
+    edgar_forms: str = (
+        "8-K,8-K/A,10-K,10-Q,4,SC 13D,SC 13D/A,424B5,424B3,"
+        "NT 10-K,NT 10-Q,S-1,S-3,S-3/A,20-F,40-F,6-K,"
+        "25,25-NSE,15-12B,15-12G"
+    )
+    # Reg SHO threshold securities list (FINRA/Nasdaq, free, no auth): the
+    # OBSERVABLE behind paper_journal.assumes_borrow, replacing a market-cap
+    # proxy for whether a hypothetical SHORT could have located shares. One
+    # plain-text file per trading day. Off only if the fetch is unwanted --
+    # with it off the borrow flag simply falls back to the proxy.
+    enable_regsho: bool = True
+    # Per-symbol daily ceiling on 6-K ingestion.
+    #
+    # 6-K is the one form added above that arrives at a cadence capable of
+    # manufacturing corroboration. Direct EDGAR evidence keys independence on
+    # form AND filing DAY (dossier.independence_key), which is correct for
+    # 8-K/10-Q but wrong for a cross-filer that pushes 30-60 6-Ks a year:
+    # each one would mint a fresh independent source slot. An ASX company
+    # dual-filing routine announcements could corroborate itself into a
+    # signal. Capped rather than excluded because the 6-K is where a foreign
+    # issuer's material news actually lives (TSMC's monthly revenue).
+    max_6k_items_per_symbol_per_day: int = 1
     # 15 minutes, not an hour. This is now the system's PRIMARY live
     # catalyst feed, not a slow background sweep of periodic reports: an
     # 8-K carries the company's own press release as an exhibit (see

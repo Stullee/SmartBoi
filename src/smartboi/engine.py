@@ -51,6 +51,7 @@ from smartboi.dossier import (
     has_evidence,
     merge_evidence,
     recompute_decay,
+    slot_keys,
 )
 from smartboi.edgar import EdgarClient, FilingEvent
 from smartboi.graph import REL_TYPES, RelationshipExtractor, RelationshipGraph, Relationship
@@ -58,9 +59,11 @@ from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal, cost_bps_per_side_for_cap
 from smartboi.prices import PriceBar, ReadOnlyPriceFeed
 from smartboi.ratelimit import SlidingWindowLimiter
+from smartboi.regsho import RegShoClient
 from smartboi.signals import (
     evaluate,
     favorable_drift_pct,
+    required_sources,
     is_regular_trading_hours,
     is_trading_day,
     log_decision,
@@ -198,6 +201,39 @@ ECOSYSTEM_LINK_CONFIDENCE = 0.25
 # whole-body verdict, short enough that a stale verdict cannot suppress a
 # thesis indefinitely once the daily pass stops updating it.
 _SYNTHESIS_CAP_MAX_AGE_HOURS = 36.0
+
+# How many NEW independent-source slots must appear since a verdict was
+# rendered before its premises count as materially changed (see
+# _maybe_resynthesize). Two, not one: a single new slot is the ordinary
+# accumulation the verdict already anticipated, while two independent facts
+# the whole-body pass never saw is a different evidence body than the one it
+# judged.
+#
+# Counting SLOTS rather than items is what makes this ungameable, and it is
+# the same accounting the signal bar uses (dossier.slot_keys). An
+# ecosystem-association burst of thirty correlated macro items mints exactly
+# one slot no matter how many arrive; three wire rewrites of one story mint
+# one, with dedup dropping two before they arrive. Nothing that cannot move
+# the signal bar can invalidate a verdict.
+_RESYNTHESIS_MIN_NEW_KEYS = 2
+
+# How far the price must move IN THE THESIS DIRECTION, since the verdict was
+# rendered, before an already-priced-in verdict counts as refuted by the tape.
+#
+# 8% is chosen against the two numbers that bracket it: it is beyond a single
+# session's noise for a micro-cap (3-5% daily vol is ordinary in this
+# universe), and it is below max_favorable_drift_pct (12%), so a verdict this
+# refutes describes a move a re-judged thesis could still plausibly enter.
+# Above 12% the entry gate would refuse the trade anyway and re-judging buys
+# nothing but an Opus call.
+_VETO_FALSIFICATION_DRIFT_PCT = 8.0
+
+# Ceiling on off-schedule re-synthesis calls per UTC day. At synthesis
+# pricing this is roughly $0.50/day of Opus in the worst case, and it exists
+# so a heavy merge day cannot consume the allowance the daily decay pass
+# needs. On exhaustion the verdict STANDS -- the fail-safe direction, since a
+# standing veto suppresses a thesis and never opens a trade.
+_MAX_RESYNTHESIS_PER_DAY = 5
 
 
 # Ticker shapes that are NOT the operating-company common stock this system
@@ -344,6 +380,15 @@ class Engine:
         # _auto_accept_candidates). Persisted so a restart cannot reset the
         # cap and let a long candidate list through in one afternoon.
         self.auto_accept_state = JsonState(DATA_DIR / "auto_accept_state.json")
+        # Off-schedule re-synthesis budget (see _maybe_resynthesize). Kept
+        # separate from the LLM usage budget rather than folded into it: this
+        # bounds how much of the day's synthesis allowance a busy MERGE day
+        # can consume, so re-judgement can never starve the daily pass that
+        # is synthesis's real job.
+        self.resynthesis_state = JsonState(DATA_DIR / "resynthesis_state.json")
+        # Per-symbol 6-K ingestion counts for one filing date (see
+        # _within_6k_daily_cap).
+        self.sixk_state = JsonState(DATA_DIR / "sixk_state.json")
         # Which model snapshots produced the existing record -- see
         # _check_model_provenance for why a change to these matters.
         self.model_state = JsonState(DATA_DIR / "model_provenance.json")
@@ -419,6 +464,13 @@ class Engine:
         self.skeptic: Skeptic | None = None
         self.synthesizer: DossierSynthesizer | None = None
         self.price_feed: ReadOnlyPriceFeed | None = None
+        # Free and unauthenticated -- no key to be missing and no budget to
+        # compete for, so the only gate is the setting. With it off, or with
+        # the list empty, the borrow flag falls back to the market-cap proxy
+        # (see paper_journal.assumes_borrow).
+        self.regsho: RegShoClient | None = (
+            RegShoClient() if settings.enable_regsho else None
+        )
 
         self._warned: set[str] = set()
         # None = never polled this process -> due immediately on the first
@@ -1110,6 +1162,13 @@ class Engine:
                 self._mark_daily_pass_done("price_marks")
             else:
                 self._price_marks_retry_after = time.monotonic() + IB_RETRY_GAP_SEC
+        # One plain-text file a day, free and unauthenticated, refreshed on
+        # trading days only (the list is published per SETTLEMENT day). A
+        # failure leaves the previous list in place and is not marked done, so
+        # the next tick retries.
+        if self.regsho is not None and is_trading_day() and self._daily_pass_due("regsho"):
+            if await self.regsho.refresh():
+                self._mark_daily_pass_done("regsho")
         if (
             self.edgar_client is not None
             and self._due(self._last_candidate_recheck, CANDIDATE_RECHECK_INTERVAL_SEC, now)
@@ -1255,14 +1314,59 @@ class Engine:
             )
         return True
 
+    def _6k_count(self, symbol: str, filing_date: str) -> int:
+        """How many 6-Ks this symbol has already had ingested for this filing
+        date. Rolls when the date changes, so the store stays a handful of
+        keys rather than growing one per symbol per day forever."""
+        if self.sixk_state.get("date") != filing_date:
+            return 0
+        return int((self.sixk_state.get("counts") or {}).get(symbol, 0) or 0)
+
+    def _spend_6k_slot(self, symbol: str, filing_date: str) -> None:
+        if self.sixk_state.get("date") != filing_date:
+            self.sixk_state.set("date", filing_date)
+            self.sixk_state.set("counts", {})
+        counts = dict(self.sixk_state.get("counts") or {})
+        counts[symbol] = int(counts.get(symbol, 0) or 0) + 1
+        self.sixk_state.set("counts", counts)
+
+    def _within_6k_daily_cap(self, symbol: str, filing: FilingEvent) -> bool:
+        """Whether this 6-K may be ingested, given how many already were for
+        this symbol on this filing date. Every other form passes through.
+
+        The 6-K is the only high-cadence form in edgar_forms, and direct EDGAR
+        evidence keys independence on form AND filing day
+        (dossier.independence_key) -- correct for an 8-K, wrong for a
+        cross-filer pushing routine announcements weekly, where each one would
+        mint a fresh independent-source slot and the filer could corroborate
+        itself into a signal.
+
+        Read-only, like the propagation limiter's would_allow: the slot is
+        spent by _spend_6k_slot only once the filing text has actually been
+        fetched. Consuming it here would let a failed fetch burn the day's
+        allowance on a filing that was never ingested, and the next poll --
+        which is supposed to retry exactly that case -- would find the cap
+        already spent."""
+        if filing.form != "6-K":
+            return True
+        if self._6k_count(symbol, filing.filing_date) >= self.settings.max_6k_items_per_symbol_per_day:
+            log.info("%s: 6-K daily cap reached for %s -- skipping %s.",
+                     symbol, filing.filing_date, filing.accession_number)
+            return False
+        return True
+
     async def _process_filing(self, symbol: str, filing: FilingEvent) -> None:
         fp = f"filing:{symbol}:{filing.accession_number}"
         if self.dedup.is_duplicate(fp):
+            return
+        if not self._within_6k_daily_cap(symbol, filing):
             return
 
         text = await self.edgar_client.fetch_evidence_text(filing)
         if not text:
             return  # fetch failed/empty -- unregistered, so the next poll retries it
+        if filing.form == "6-K":
+            self._spend_6k_slot(symbol, filing.filing_date)
 
         if (filing.form in RELATIONSHIP_EXTRACTION_FORMS and self.extractor is not None
                 and not self.extracted_filings.get(fp)):
@@ -2196,16 +2300,21 @@ class Engine:
             return False  # collected but not scoreable yet -- retried once a key is configured
 
         universe = set(self.symbol_list)
-        # (target_symbol, relationship_note, relationship_confidence) --
-        # confidence is the graph edge's own extracted confidence (None for
-        # direct/non-propagated evidence, which has no edge at all).
-        targets: list[tuple[str, str, float | None]] = []
+        # (target_symbol, relationship_note, relationship_confidence,
+        # relationship_type) -- confidence is the graph edge's own extracted
+        # confidence and type is its REL_TYPES kind (both None/"" for
+        # direct/non-propagated evidence, which has no edge at all). The type
+        # rides along because confidence alone cannot say whether a link is a
+        # causal transmission channel: see dossier.COMPETITOR_SATISFIES_
+        # DISCLOSED_LINK, where a competitor edge is high-confidence and still
+        # must not buy the corroboration discount.
+        targets: list[tuple[str, str, float | None, str]] = []
         propagation_keys: dict[str, str] = {}  # target_symbol -> limiter key, propagated targets only
         ecosystem_keys: set[str] = set()  # of those, the ones on the ecosystem limiter
 
         origin_spec = self.spec_by_symbol.get(origin_symbol)
         if origin_spec is None or not origin_spec.signal_source_only:
-            targets.append((origin_symbol, "", None))
+            targets.append((origin_symbol, "", None, ""))
 
         now = time.monotonic()
         throttled = 0
@@ -2230,7 +2339,7 @@ class Engine:
                 throttled += 1
                 continue
             propagation_keys[linked_symbol] = key
-            targets.append((linked_symbol, rel.description, rel.confidence))
+            targets.append((linked_symbol, rel.description, rel.confidence, rel.rel_type))
         # Ecosystem fallback: only for an origin with NO disclosed link to
         # any tradeable at all. A disclosed contractual relationship is
         # strictly better evidence, so this never runs alongside one and
@@ -2256,6 +2365,10 @@ class Engine:
                     "membership, NOT a contractual relationship disclosed in any filing -- there is "
                     "no stated customer, supplier or competitor link between these two companies.",
                     ECOSYSTEM_LINK_CONFIDENCE,
+                    # Not a REL_TYPES kind at all -- sector co-membership, no
+                    # graph edge behind it. Left empty rather than borrowing a
+                    # real type it does not have.
+                    "",
                 ))
 
         if throttled:
@@ -2291,10 +2404,11 @@ class Engine:
             return True
 
         all_definitive = True
-        for target_symbol, relationship_note, relationship_confidence in targets:
+        for target_symbol, relationship_note, relationship_confidence, relationship_type in targets:
             outcome = await self._update_dossier(
                 target_symbol, evidence_text, origin_symbol, relationship_note, relationship_confidence,
                 source_type, source_name, url, headline, published_at,
+                relationship_type=relationship_type,
             )
             # Only a target handled fresh THIS pass consumes a cooldown
             # slot -- "already" means an earlier, partially-deferred pass
@@ -2433,6 +2547,7 @@ class Engine:
         url: str,
         headline: str,
         published_at: str,
+        relationship_type: str = "",
     ) -> str:
         """Outcome of folding one evidence item into one dossier:
         "handled"  -- definitively handled fresh this pass (merged, judged
@@ -2503,6 +2618,7 @@ class Engine:
             is_propagated=(target_symbol != origin_symbol),
             relationship_note=relationship_note,
             relationship_confidence=relationship_confidence,
+            relationship_type=relationship_type,
             scored_by_model=self.settings.dossier_model,
             reviewed_by_model=self.settings.skeptic_model,
             direction=proposed["direction"],
@@ -2523,11 +2639,18 @@ class Engine:
         # favourable move already happened WHILE corroboration accumulated
         # (see _capture_inception and the drift guard in _try_open_from_signal).
         await self._capture_inception(dossier)
+        merged_at = datetime.now(timezone.utc)
+        # Before re-applying yesterday's verdict, ask whether it is still a
+        # judgement of THIS dossier: two new independent sources, or a price
+        # that has refuted an already-priced-in call, mean the whole-body pass
+        # never saw what it is now capping. Bounded, and fails safe -- if it
+        # cannot produce a fresh verdict the old one stands (_maybe_resynthesize).
+        await self._maybe_resynthesize(dossier, merged_at)
         # Re-apply the last whole-body synthesis verdict as a cap: a merge
         # recomputes the arithmetic from scratch and would otherwise erase a
         # veto/trim the daily pass had applied, letting a synthesis-blocked
         # thesis re-fire on the raw score (see _cap_with_synthesis).
-        self._cap_with_synthesis(dossier, datetime.now(timezone.utc))
+        self._cap_with_synthesis(dossier, merged_at)
         self.dossiers.save(dossier)
         log.info(
             "[EVIDENCE] %s: accepted %s magnitude=%.2f confidence=%.2f (dossier now: direction=%s "
@@ -2539,6 +2662,16 @@ class Engine:
 
         signal = evaluate(dossier, self.settings.signal_confidence_threshold, self.settings.min_independent_sources,
                           self.settings.min_independent_sources_news_only)
+        if signal is None and dossier.status == "ACTIVE":
+            # New evidence merged and the thesis still did not qualify. Logged
+            # with the merge as its own event so "which lever is binding" can
+            # be asked of the evidence that ARRIVED, not just of the daily
+            # population -- the two answer different questions and the event
+            # name keeps them separable.
+            self._record_decision(
+                "below_bar_on_merge", target_symbol, dossier.direction, dossier.signaled_at,
+                reason=self._below_bar_reason(dossier, "after new evidence merged"),
+            )
         if signal is not None:
             await self._fire_signal(dossier, signal)
         elif (
@@ -2735,6 +2868,31 @@ class Engine:
             dossier.inception_at = datetime.now(timezone.utc).isoformat()
             dossier.inception_direction = dossier.direction
 
+    async def _capture_synthesis_price(self, dossier: Dossier, now: datetime) -> None:
+        """Snapshots the price at the instant a synthesis verdict is rendered,
+        so the verdict becomes a claim the tape can later refute.
+
+        `already_priced_in` asserts something testable -- the market has
+        absorbed this -- and until this existed nothing in the system ever
+        compared it to a price. A verdict could be violently wrong and be
+        re-asserted every day forever, because the only thing that could
+        contradict it was another copy of itself.
+
+        Same IB-then-Finnhub fallback as the inception baseline (_price_bar),
+        and the same graceful failure: no reachable price leaves it unset,
+        which leaves the verdict standing. That is the fail-safe direction --
+        an unfalsifiable veto suppresses a thesis, it never opens a trade."""
+        try:
+            if self.price_feed is not None:
+                await self.price_feed.ensure_connected()
+            bar = await self._price_bar(dossier.symbol)
+        except Exception:  # noqa: BLE001 - a missing price just leaves the verdict unfalsifiable
+            log.exception("%s: could not snapshot synthesis-time price.", dossier.symbol)
+            return
+        if bar is not None:
+            dossier.synthesis_price = bar.close
+            dossier.synthesis_price_at = now.isoformat()
+
     def _reset_to_active(self, dossier: Dossier) -> None:
         dossier.status = "ACTIVE"
         dossier.signaled_at = ""
@@ -2790,15 +2948,23 @@ class Engine:
         except OSError:
             log.exception("Could not append to decisions.jsonl")
 
+    def _required_sources(self, dossier: Dossier) -> int:
+        """The independent-source bar this dossier is held to, resolved by
+        the same function signals.evaluate uses so a diagnostic can never
+        report a bar the gate did not apply."""
+        return required_sources(
+            dossier,
+            self.settings.min_independent_sources,
+            self.settings.min_independent_sources_news_only,
+        )
+
     def _below_bar_reason(self, dossier: Dossier, when: str) -> str:
         """Why evaluate() refused a dossier, in numbers -- which of the two
-        gates it failed and by how much. Recomputes the source bar the same
-        way signals.evaluate does so a news-only dossier reports the higher
-        bar it was actually held to, not the base one."""
-        required = self.settings.min_independent_sources
+        gates it failed and by how much. Reports the source bar this dossier
+        was actually held to (see _required_sources), so a news-only dossier
+        reports the elevated one rather than the base setting."""
+        required = self._required_sources(dossier)
         unbacked = not (dossier.has_filing_evidence or dossier.has_disclosed_link_evidence)
-        if unbacked:
-            required = max(required, self.settings.min_independent_sources_news_only)
         parts = []
         if dossier.independent_source_count < required:
             parts.append(
@@ -3017,6 +3183,14 @@ class Engine:
                 "distinct_fact_count": dossier.distinct_fact_count,
                 "already_priced_in": dossier.already_priced_in,
             },
+            # The borrow OBSERVABLE, where one is in hand: presence on the Reg
+            # SHO threshold list is a fact about persistent failures to
+            # deliver, not the market-cap inference that stood in for it. See
+            # paper_journal.assumes_borrow -- absence still falls through to
+            # the proxy, so this can only tighten the flag.
+            on_threshold_list=(
+                self.regsho.is_threshold(symbol) if self.regsho is not None else None
+            ),
         )
         self._record_decision("trade_opened", symbol, dossier.direction, dossier.signaled_at,
                               price=price)
@@ -3214,6 +3388,19 @@ class Engine:
         if signal is None:
             if dossier.status == "SIGNALED" and self._should_expire_unopened(dossier):
                 self._expire_signal(dossier, self._below_bar_reason(dossier, "on the daily decay pass"))
+            else:
+                # Every below-bar dossier, every day -- not only the ones that
+                # happened to be sitting SIGNALED. The reason a dossier did
+                # NOT qualify was previously computed at exactly one moment
+                # (expiry) and discarded everywhere else, so the population
+                # question -- which gate is actually binding, on how many
+                # names, by how much -- had no data behind it at all. One
+                # bounded row per dossier per day, joining the daily snapshot
+                # on symbol/date.
+                self._record_decision(
+                    "below_bar", symbol, dossier.direction, dossier.signaled_at,
+                    reason=self._below_bar_reason(dossier, "on the daily decay pass"),
+                )
         elif dossier.status == "ACTIVE":
             log.info("[SIGNAL] %s: qualifies on the daily decay pass with no new evidence "
                      "(score=%.3f, sources=%d).", symbol,
@@ -3279,23 +3466,48 @@ class Engine:
             )
             dossier.distinct_fact_count = 0
         dossier.already_priced_in = bool(verdict.get("already_priced_in"))
+        # What this verdict is a claim ABOUT, recorded so it can later be
+        # falsified rather than merely re-asserted: the arithmetic it capped,
+        # the evidence body it read, and the price it judged. All three are
+        # written on EVERY path including the veto -- a claim whose premises
+        # are not recorded is unfalsifiable by construction, which is exactly
+        # what the veto was.
+        dossier.pre_synthesis_score = dossier.confidence * dossier.magnitude
+        dossier.synthesis_keys = sorted(slot_keys(dossier, now))
+        await self._capture_synthesis_price(dossier, now)
+        # A fresh verdict re-opens both questions its predecessor closed.
+        dossier.veto_falsified_by_price = False
+        dossier.synthesis_stale_evidence = False
+
+        dossier.synthesis_confidence = _clamp_unit(verdict.get("confidence"))
+        dossier.synthesis_magnitude = _clamp_unit(verdict.get("magnitude"))
 
         if verdict.get("direction") != dossier.direction or dossier.already_priced_in:
             # Synthesis disagrees with the resolved direction, or says the
             # move is over. Either way this is not a thesis to enter on --
             # zero the score rather than trading against the only pass that
             # looked at the evidence as a whole.
+            #
+            # synthesis_confidence/magnitude are deliberately NOT zeroed here
+            # any more. They used to be, and the cost was total: every vetoed
+            # row recorded 0.0 for both the raw and the capped number, so a
+            # thesis this pass rated 0.9-but-priced-in could never be
+            # distinguished from one it rated 0.05 -- permanently, and for the
+            # most expensive pass in the system. Zeroing them also silently
+            # disarmed the falsification path below, because a lifted veto
+            # falls through to min(score, synthesis_confidence) in
+            # _cap_with_synthesis and min(anything, 0.0) is 0.0. The scores
+            # this pass actually caps (confidence/magnitude) are still zeroed,
+            # so the VETO's effect is unchanged.
             reason = "already priced in" if dossier.already_priced_in else "direction disagrees"
-            log.info("[SYNTHESIS] %s: vetoed (%s) -- %s", dossier.symbol, reason,
+            log.info("[SYNTHESIS] %s: vetoed (%s, synthesis rated %.2f/%.2f on an arithmetic score of "
+                     "%.3f) -- %s", dossier.symbol, reason, dossier.synthesis_confidence,
+                     dossier.synthesis_magnitude, dossier.pre_synthesis_score,
                      dossier.synthesis_note[:160])
-            dossier.synthesis_confidence = 0.0
-            dossier.synthesis_magnitude = 0.0
             dossier.confidence = 0.0
             dossier.magnitude = 0.0
             return True
 
-        dossier.synthesis_confidence = _clamp_unit(verdict.get("confidence"))
-        dossier.synthesis_magnitude = _clamp_unit(verdict.get("magnitude"))
         before = dossier.confidence * dossier.magnitude
         dossier.confidence = min(dossier.confidence, dossier.synthesis_confidence)
         dossier.magnitude = min(dossier.magnitude, dossier.synthesis_magnitude)
@@ -3308,6 +3520,136 @@ class Engine:
                 dossier.synthesis_catalyst[:120],
             )
         return True
+
+    def _synthesis_verdict_fresh(self, dossier: Dossier, now: datetime) -> bool:
+        """Whether a persisted verdict is still inside the window in which it
+        is honoured as a cap. Outside it there is nothing to invalidate --
+        the cap has already lapsed on its own."""
+        if not dossier.synthesis_at:
+            return False
+        try:
+            synth_at = datetime.fromisoformat(dossier.synthesis_at)
+        except (TypeError, ValueError):
+            return False
+        if synth_at.tzinfo is None:
+            synth_at = synth_at.replace(tzinfo=timezone.utc)
+        return (now - synth_at).total_seconds() / 3600.0 <= _SYNTHESIS_CAP_MAX_AGE_HOURS
+
+    async def _veto_refuted_by_price(self, dossier: Dossier) -> bool:
+        """Whether the tape has refuted an already-priced-in verdict.
+
+        The veto asserts something testable: the market has absorbed this, so
+        there is no residual move. A material move IN THE THESIS DIRECTION
+        after the verdict says otherwise -- whatever the market had absorbed,
+        it was not this thesis.
+
+        What this does NOT do is lift the cap and let the thesis fire. That
+        was the tempting version and it is wrong twice over. A favourable move
+        on a LONG means the price went UP, so the entry is more expensive, not
+        less -- and the entry gate measures drift from the still-earlier
+        inception baseline, so the very moves large enough to refute a verdict
+        are the ones it then refuses (12%, engine._try_open_from_signal). The
+        honest conclusion from a refuted verdict is not "enter now", it is
+        "this judgement was wrong, judge it again" -- so this feeds
+        re-synthesis, and a fresh whole-body verdict decides.
+
+        No price, or no baseline, returns False: the verdict stands."""
+        if not dossier.already_priced_in or dossier.synthesis_price is None:
+            return False
+        if dossier.direction not in ("LONG", "SHORT"):
+            return False
+        try:
+            bar = await self._price_bar(dossier.symbol)
+        except Exception:  # noqa: BLE001 - an unpriceable symbol leaves the verdict standing
+            log.exception("%s: could not price the synthesis-veto falsification check.", dossier.symbol)
+            return False
+        if bar is None or dossier.synthesis_price <= 0:
+            return False
+        drift = favorable_drift_pct(dossier.direction, dossier.synthesis_price, bar.close)
+        return drift >= _VETO_FALSIFICATION_DRIFT_PCT
+
+    def _resynthesis_budget_remaining(self, now: datetime) -> bool:
+        today = now.date().isoformat()
+        if self.resynthesis_state.get("date") != today:
+            self.resynthesis_state.set("date", today)
+            self.resynthesis_state.set("count", 0)
+        return int(self.resynthesis_state.get("count", 0) or 0) < _MAX_RESYNTHESIS_PER_DAY
+
+    def _spend_resynthesis_budget(self, now: datetime) -> None:
+        today = now.date().isoformat()
+        if self.resynthesis_state.get("date") != today:
+            self.resynthesis_state.set("date", today)
+            self.resynthesis_state.set("count", 0)
+        self.resynthesis_state.set("count", int(self.resynthesis_state.get("count", 0) or 0) + 1)
+
+    async def _maybe_resynthesize(self, dossier: Dossier, now: datetime) -> None:
+        """Re-judges a persisted verdict whose PREMISES have changed, on the
+        merge path, before that verdict is re-applied as a cap.
+
+        A synthesis verdict is a claim about a moment: a body of evidence
+        ("this is all there is") and a price ("the market has absorbed it").
+        Both move between daily passes, and until now neither could contradict
+        the verdict -- so a veto was re-asserted every day against whatever
+        arrived, and the only thing that could overturn it was another copy of
+        itself. That is not stickiness in the architecture: _decay_one calls
+        recompute_decay first, which rebuilds the score from raw evidence and
+        erases the previous day's zeroes, so the escape hatch has always
+        existed. It just never opened, because the verdict never changed.
+
+        Deliberately re-JUDGES rather than lifting the cap. Skipping the cap
+        on a stale verdict would fail open -- the thesis re-fires on raw
+        arithmetic, which is the exact bug _cap_with_synthesis was written to
+        stop. Here the cap stays in force until a real verdict replaces it,
+        and every path that cannot produce one (no budget, no price, no
+        synthesizer) leaves the old verdict standing."""
+        if self.synthesizer is None or not self._synthesis_verdict_fresh(dossier, now):
+            return
+
+        reasons = []
+        # An empty key set means the verdict predates this record, NOT that
+        # every current source is new. Without this, the first merge after
+        # deploying would read every pre-existing verdict as fully invalidated
+        # and spend the whole daily re-synthesis allowance on a migration
+        # artifact. Self-healing: the next daily pass records keys for every
+        # dossier, so this is a one-pass condition rather than a permanent
+        # exemption.
+        stale_evidence = bool(dossier.synthesis_keys) and (
+            len(slot_keys(dossier, now) - set(dossier.synthesis_keys)) >= _RESYNTHESIS_MIN_NEW_KEYS
+        )
+        if stale_evidence:
+            reasons.append("new independent source(s) since the verdict")
+        refuted_by_price = await self._veto_refuted_by_price(dossier)
+        if refuted_by_price:
+            reasons.append(
+                f"price moved >={_VETO_FALSIFICATION_DRIFT_PCT:.0f}% toward the thesis since the "
+                "already-priced-in verdict"
+            )
+        if not reasons:
+            return
+
+        if not self._resynthesis_budget_remaining(now):
+            self._warn_once(
+                f"resynthesis-cap:{now.date().isoformat()}",
+                f"Off-schedule re-synthesis daily cap reached ({_MAX_RESYNTHESIS_PER_DAY}) -- "
+                "invalidated verdicts stay in force until the next daily pass re-judges them.",
+            )
+            return
+
+        log.info("[SYNTHESIS] %s: verdict premises changed (%s) -- re-judging.",
+                 dossier.symbol, "; ".join(reasons))
+        self._spend_resynthesis_budget(now)
+        if not await self._apply_synthesis(dossier, now):
+            # No fresh verdict (below the synthesis floor, budget exhausted,
+            # or a transient failure). The old one stands and nothing is
+            # attributed -- no re-judgement actually happened.
+            return
+        # Stamped AFTER, and only on a verdict that actually replaced its
+        # predecessor: these say "the verdict now in force exists BECAUSE its
+        # premises were falsified", which is the row the forward record needs
+        # to bucket. Set before the call they would be cleared by it, since a
+        # fresh verdict re-opens both questions (see _apply_synthesis).
+        dossier.veto_falsified_by_price = refuted_by_price
+        dossier.synthesis_stale_evidence = stale_evidence
 
     def _cap_with_synthesis(self, dossier: Dossier, now: datetime) -> None:
         """Re-applies the LAST PERSISTED synthesis verdict as a cap on the
@@ -3330,16 +3672,14 @@ class Engine:
         than suppressing it forever, and a genuine direction flip is re-judged
         by the next decay pass within a day. No verdict, or a stale one, is a
         no-op -- identical to today's behaviour, so this can only ever lower a
-        score, never raise one."""
-        if not dossier.synthesis_at:
-            return
-        try:
-            synth_at = datetime.fromisoformat(dossier.synthesis_at)
-        except (TypeError, ValueError):
-            return
-        if synth_at.tzinfo is None:
-            synth_at = synth_at.replace(tzinfo=timezone.utc)
-        if (now - synth_at).total_seconds() / 3600.0 > _SYNTHESIS_CAP_MAX_AGE_HOURS:
+        score, never raise one.
+
+        Unconditional on the verdict's premises having changed: invalidation
+        is handled upstream by _maybe_resynthesize, which REPLACES a verdict
+        whose premises moved rather than skipping its cap. Skipping here would
+        fail open -- the thesis would re-fire on the raw arithmetic this
+        method exists to correct."""
+        if not self._synthesis_verdict_fresh(dossier, now):
             return
         if dossier.already_priced_in:
             dossier.confidence = 0.0
@@ -3379,7 +3719,9 @@ class Engine:
         with path.open("a") as f:
             for symbol in self.dossiers.all_symbols():
                 dossier = self.dossiers.load(symbol)
-                f.write(json.dumps(snapshot_dossier(dossier, snapshotted_at)) + "\n")
+                f.write(json.dumps(snapshot_dossier(
+                    dossier, snapshotted_at, self._required_sources(dossier),
+                )) + "\n")
                 written += 1
         if not written:
             log.warning(
@@ -3706,6 +4048,15 @@ class Engine:
             dossier.synthesis_note = ""
             dossier.synthesis_catalyst = ""
             dossier.distinct_fact_count = 0
+            # The verdict's premises and the attribution flags go with it --
+            # a cleared verdict must not leave behind a price baseline or a
+            # key set that a LATER verdict would be falsified against.
+            dossier.synthesis_price = None
+            dossier.synthesis_price_at = ""
+            dossier.synthesis_keys = []
+            dossier.pre_synthesis_score = 0.0
+            dossier.veto_falsified_by_price = False
+            dossier.synthesis_stale_evidence = False
             if had_episode:
                 self.dossiers.save(dossier)
                 reset += 1

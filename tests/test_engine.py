@@ -21,6 +21,7 @@ from smartboi.dossier import (
     Dossier,
     EvidenceRecord,
     merge_evidence,
+    recompute_decay,
 )
 from smartboi.engine import ECOSYSTEM_LINK_CONFIDENCE, Engine, is_common_equity
 from smartboi.universe import CompanySpec
@@ -2704,4 +2705,257 @@ async def test_the_daily_snapshot_records_the_synthesis_verdict(engine):
     assert row["already_priced_in"] is True
     assert row["synthesis_at"] != ""
     assert row["score"] == 0.0
-    assert row["scoring_version"] == 5  # the regime where score is the CAPPED number
+    # Pinned to the constant, not a literal: every regime from 4 onward
+    # records the CAPPED number, so what this asserts is that the snapshot
+    # stamps whatever regime produced the row -- not that it is any one of
+    # them. Pinning the literal meant a version bump failed this test for a
+    # reason unrelated to what it tests.
+    assert row["scoring_version"] == SCORING_VERSION
+
+
+# --- A synthesis verdict is a claim about a moment -- a price and a body of
+# evidence. Both move. Until SCORING_VERSION 6 neither could contradict it,
+# so `already_priced_in` was re-asserted daily against whatever arrived and
+# the only thing that could overturn it was another copy of itself. ---
+
+async def test_a_veto_records_what_synthesis_actually_thought(engine):
+    """The record used to carry 0.0/0.0 for every vetoed dossier, so a thesis
+    the pass rated 0.9-but-priced-in was indistinguishable from one it rated
+    0.05 -- permanently, for the most expensive pass in the system."""
+    engine.synthesizer = FakeSynthesizer(
+        default=synthesis(confidence=0.9, magnitude=0.8, already_priced_in=True))
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    before = dossier.confidence * dossier.magnitude
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    # The VETO's effect is unchanged -- the score is still zeroed...
+    assert dossier.confidence == 0.0
+    assert dossier.magnitude == 0.0
+    # ...but what the pass thought is no longer destroyed.
+    assert dossier.synthesis_confidence == 0.9
+    assert dossier.synthesis_magnitude == 0.8
+    assert dossier.pre_synthesis_score == pytest.approx(before)
+
+
+async def test_a_verdict_records_the_price_and_evidence_it_judged(engine):
+    engine.price_feed = FakePriceFeed({"FORM": 10.0})
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert dossier.synthesis_price == 10.0
+    assert dossier.synthesis_price_at != ""
+    assert len(dossier.synthesis_keys) == 2  # the two publishers behind the thesis
+
+
+async def test_a_price_that_refutes_the_veto_triggers_a_re_judgement(engine):
+    """The veto asserts the market has absorbed this. A move IN THE THESIS
+    DIRECTION after the verdict says otherwise -- so it is judged again."""
+    engine.price_feed = FakePriceFeed({"FORM": 10.0})
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+    assert dossier.synthesis_price == 10.0
+    calls_before = len(engine.synthesizer.calls)
+
+    engine.price_feed.prices["FORM"] = 11.0  # +10% on a LONG, past the 8% bar
+    # The merge path recomputes the arithmetic before re-judging; do the same
+    # here so the synthesis floor gate sees a live score rather than the
+    # veto's zeroes.
+    recompute_decay(dossier, datetime.now(timezone.utc))
+    await engine._maybe_resynthesize(dossier, datetime.now(timezone.utc))
+
+    assert len(engine.synthesizer.calls) == calls_before + 1, "a fresh verdict was requested"
+    assert dossier.veto_falsified_by_price is True, "attributed to the price falsification"
+
+
+async def test_a_price_move_the_wrong_way_leaves_the_veto_standing(engine):
+    """A LONG whose price FELL has not refuted 'already priced in' -- and the
+    entry is not one this system wants to take on that basis either."""
+    engine.price_feed = FakePriceFeed({"FORM": 10.0})
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+    calls_before = len(engine.synthesizer.calls)
+
+    engine.price_feed.prices["FORM"] = 8.0  # -20% on a LONG
+    await engine._maybe_resynthesize(dossier, datetime.now(timezone.utc))
+
+    assert len(engine.synthesizer.calls) == calls_before
+
+
+async def test_no_price_leaves_the_veto_standing(engine):
+    """The fail-safe direction: an unfalsifiable veto suppresses a thesis, it
+    never opens a trade."""
+    engine.price_feed = FakePriceFeed({})   # nothing priceable
+    engine.finnhub = None
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+    assert dossier.synthesis_price is None
+    calls_before = len(engine.synthesizer.calls)
+
+    await engine._maybe_resynthesize(dossier, datetime.now(timezone.utc))
+
+    assert len(engine.synthesizer.calls) == calls_before
+
+
+async def test_the_cap_is_replaced_by_a_fresh_verdict_never_merely_skipped(engine):
+    """Skipping the cap on a stale verdict would fail OPEN -- the thesis
+    re-fires on the raw arithmetic _cap_with_synthesis exists to correct. The
+    veto stays in force until a real verdict replaces it."""
+    engine.price_feed = FakePriceFeed({"FORM": 10.0})
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+    engine.dossiers.save(dossier)
+
+    # Budget spent, so no fresh verdict can be produced.
+    engine.resynthesis_state.set("date", datetime.now(timezone.utc).date().isoformat())
+    engine.resynthesis_state.set("count", 99)
+    engine.price_feed.prices["FORM"] = 11.0
+
+    reloaded = engine.dossiers.load("FORM")
+    recompute_decay(reloaded, datetime.now(timezone.utc))   # arithmetic restored
+    assert reloaded.confidence > 0
+    await engine._maybe_resynthesize(reloaded, datetime.now(timezone.utc))
+    engine._cap_with_synthesis(reloaded, datetime.now(timezone.utc))
+
+    assert reloaded.confidence == 0.0, "the veto must stand when it cannot be re-judged"
+
+
+async def test_two_new_independent_sources_invalidate_a_verdict(engine):
+    engine.price_feed = FakePriceFeed({"FORM": 10.0})
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+    engine.dossiers.save(dossier)
+    calls_before = len(engine.synthesizer.calls)
+
+    for i, source in enumerate(("ft.com", "wsj.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"n{i}", source_type="news",
+            source_name=source, url=f"https://y/{i}", headline=f"n{i}",
+            published_at="2026-07-23",
+        )
+
+    assert len(engine.synthesizer.calls) > calls_before
+
+
+async def test_one_new_source_is_ordinary_accumulation_not_invalidation(engine):
+    engine.price_feed = FakePriceFeed({"FORM": 10.0})
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+    engine.dossiers.save(dossier)
+    calls_before = len(engine.synthesizer.calls)
+
+    await engine._process_evidence(
+        origin_symbol="FORM", evidence_text="n", source_type="news",
+        source_name="ft.com", url="https://y/1", headline="n", published_at="2026-07-23",
+    )
+
+    assert len(engine.synthesizer.calls) == calls_before
+
+
+async def test_off_schedule_re_synthesis_is_capped_per_day(engine):
+    engine.price_feed = FakePriceFeed({"FORM": 10.0})
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+    now = datetime.now(timezone.utc)
+
+    engine.price_feed.prices["FORM"] = 11.0
+    for _ in range(12):
+        dossier.already_priced_in = True
+        dossier.synthesis_price = 10.0
+        await engine._maybe_resynthesize(dossier, now)
+
+    spent = int(engine.resynthesis_state.get("count", 0))
+    assert spent <= 5, f"re-synthesis ran {spent} times against a cap of 5"
+
+
+# --- 6-K is the one added form that arrives at a cadence capable of
+# manufacturing corroboration: direct EDGAR evidence keys independence on
+# form AND filing day, so a cross-filer pushing routine announcements would
+# mint a fresh independent-source slot with each one. ---
+
+def _filing(form, accession, filing_date="2026-08-07"):
+    from smartboi.edgar import FilingEvent
+
+    return FilingEvent(symbol="FORM", cik10="0000000001", form=form,
+                       filing_date=filing_date, accession_number=accession,
+                       primary_document="d.htm")
+
+
+async def test_a_second_6k_on_the_same_day_is_skipped(engine):
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+    for n in ("a1", "a2"):
+        engine.edgar_client.text_by_accession[n] = "material news"
+
+    await engine._process_filing("FORM", _filing("6-K", "a1"))
+    await engine._process_filing("FORM", _filing("6-K", "a2"))
+
+    dossier = engine.dossiers.load("FORM")
+    assert len(dossier.evidence) == 1, "the second 6-K must not mint a second slot"
+
+
+async def test_a_6k_on_a_new_filing_date_gets_a_fresh_allowance(engine):
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+    for n in ("b1", "b2"):
+        engine.edgar_client.text_by_accession[n] = "material news"
+
+    await engine._process_filing("FORM", _filing("6-K", "b1", "2026-08-07"))
+    await engine._process_filing("FORM", _filing("6-K", "b2", "2026-08-10"))
+
+    assert len(engine.dossiers.load("FORM").evidence) == 2
+
+
+async def test_the_cap_never_applies_to_other_forms(engine):
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+    for n in ("c1", "c2"):
+        engine.edgar_client.text_by_accession[n] = "material news"
+
+    await engine._process_filing("FORM", _filing("8-K", "c1"))
+    await engine._process_filing("FORM", _filing("10-Q", "c2"))
+
+    assert len(engine.dossiers.load("FORM").evidence) == 2
+
+
+async def test_a_failed_fetch_does_not_burn_the_6k_allowance(engine):
+    """The slot is spent only once the text is actually in hand. Consuming it
+    on a failed fetch would let the next poll -- which exists to retry exactly
+    that case -- find the day's allowance already gone."""
+    engine.updater.default = proposal(direction="LONG")
+    engine.skeptic.default = verdict(refuted=False)
+    engine.edgar_client.text_by_accession["d1"] = ""      # fetch fails
+    engine.edgar_client.text_by_accession["d2"] = "real"
+
+    await engine._process_filing("FORM", _filing("6-K", "d1"))
+    await engine._process_filing("FORM", _filing("6-K", "d2"))
+
+    assert len(engine.dossiers.load("FORM").evidence) == 1
+
+
+async def test_a_verdict_predating_the_key_record_is_not_read_as_fully_stale(engine):
+    """A verdict written before synthesis_keys existed carries an empty set.
+    Reading that as 'every current source is new' would invalidate every
+    pre-existing verdict on the first merge after deploying and spend the
+    whole daily allowance on a migration artifact."""
+    engine.price_feed = FakePriceFeed({"FORM": 10.0})
+    engine.synthesizer = FakeSynthesizer(default=synthesis(already_priced_in=True))
+    dossier = await _build_thesis(engine, confidence=0.5, magnitude=0.5)
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    dossier.synthesis_keys = []          # as an old dossier file deserializes
+    recompute_decay(dossier, datetime.now(timezone.utc))
+    calls_before = len(engine.synthesizer.calls)
+
+    await engine._maybe_resynthesize(dossier, datetime.now(timezone.utc))
+
+    assert len(engine.synthesizer.calls) == calls_before

@@ -587,7 +587,7 @@ def gather_universe_candidates(candidates: dict, accepted: dict) -> list[dict]:
     return rows
 
 
-def snapshot_dossier(d: Dossier, snapshotted_at: str) -> dict:
+def snapshot_dossier(d: Dossier, snapshotted_at: str, min_sources_required: int = 0) -> dict:
     """One row for the daily dossier-snapshot log (logs/dossier_snapshots.jsonl,
     see engine.py's _run_daily_snapshot) -- the raw material for eventually
     validating whether confidence*magnitude predicts forward returns,
@@ -595,7 +595,12 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str) -> dict:
     dossier once a day regardless of whether anything actually changed
     that day, so the resulting time series has no gaps to explain away --
     forward data can't be backfilled once a day is missed, so this is
-    deliberately unconditional rather than only logging on a change."""
+    deliberately unconditional rather than only logging on a change.
+
+    `min_sources_required` is passed in rather than re-derived here: the bar
+    depends on runtime settings this module has no access to, and computing it
+    from a second copy of the rule is how a row comes to report a bar the gate
+    never applied (see signals.required_sources). 0 means "not supplied"."""
     return {
         "snapshotted_at": snapshotted_at,
         # Which scoring logic produced these numbers (see
@@ -636,6 +641,26 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str) -> dict:
         "synthesis_magnitude": round(d.synthesis_magnitude, 4),
         "distinct_fact_count": d.distinct_fact_count,
         "already_priced_in": d.already_priced_in,
+        # The arithmetic score BEFORE synthesis capped or vetoed it. Without
+        # this a vetoed row records 0.000 for both numbers, so "0.9 confidence
+        # but priced in" and "0.05 and priced in" are the same row forever --
+        # and the veto's actual selectivity cannot be measured at all.
+        "pre_synthesis_score": round(d.pre_synthesis_score, 4),
+        "synthesis_price": d.synthesis_price,
+        # Which bar this dossier was actually held to, and the two flags that
+        # decide it (see signals.evaluate). A row that failed on sources reads
+        # as an ordinary low score without them.
+        "has_filing_evidence": d.has_filing_evidence,
+        "has_disclosed_link_evidence": d.has_disclosed_link_evidence,
+        "min_sources_required": min_sources_required,
+        # --- Per-mechanism attribution for SCORING_VERSION 6. Three changes
+        # in this version move scores in the same region and direction;
+        # version 5 bundled three behind one boundary and can no longer
+        # attribute an outcome to any of them. These make the bucketing a
+        # filter over the row rather than an inference about the release. ---
+        "veto_falsified_by_price": d.veto_falsified_by_price,
+        "synthesis_stale_evidence": d.synthesis_stale_evidence,
+        "ecosystem_slot_counted": d.ecosystem_slot_counted,
     }
 
 

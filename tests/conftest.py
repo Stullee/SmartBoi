@@ -45,3 +45,37 @@ def _inside_regular_trading_hours(monkeypatch):
     monkeypatch.setattr(
         smartboi.paper_journal, "is_regular_trading_hours", lambda now=None: True
     )
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "regsho_network: exercise RegShoClient.refresh itself (against a mock "
+        "transport) instead of having it stubbed out by _no_regsho_network.",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_regsho_network(request, monkeypatch):
+    """Stop the Reg SHO refresh from making real HTTP requests.
+
+    Same reasoning as the clock pin above, and the same reason it is autouse:
+    the threshold-list refresh hangs off the daily-pass dispatch gated on
+    is_trading_day, which the fixture above pins OPEN -- so every test that
+    drives a tick would otherwise reach out to nasdaqtrader.com. That makes
+    the suite slow, non-hermetic, and red on a machine with no egress, for a
+    reason unconnected to whatever the test is about.
+
+    Patched on the class rather than the engine attribute so it holds however
+    a test builds its engine. The client's own fetching and parsing are tested
+    directly against a mock transport in test_regsho.py, which opts out with
+    the `regsho_network` marker -- stubbing the method there would leave those
+    tests asserting against the stub."""
+    if request.node.get_closest_marker("regsho_network"):
+        return
+    from smartboi.regsho import RegShoClient
+
+    async def _no_refresh(self, today=None):
+        return False
+
+    monkeypatch.setattr(RegShoClient, "refresh", _no_refresh)

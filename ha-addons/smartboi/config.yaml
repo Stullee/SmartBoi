@@ -1,6 +1,6 @@
 ---
 name: SmartBoi (Evidence Synthesis, Paper-Only)
-version: "0.53.0"
+version: "0.54.0"
 slug: smartboi
 description: >-
   LLM-driven cross-company evidence synthesis for equity research: ingests
@@ -31,7 +31,9 @@ options:
   graph_refresh_symbols_per_day: 10
   enable_auto_supplier_research: true
   edgar_user_agent: ""
-  edgar_forms: "8-K,8-K/A,10-K,10-Q,4,SC 13D,SC 13D/A,424B5,424B3"
+  edgar_forms: "8-K,8-K/A,10-K,10-Q,4,SC 13D,SC 13D/A,424B5,424B3,NT 10-K,NT 10-Q,S-1,S-3,S-3/A,20-F,40-F,6-K,25,25-NSE,15-12B,15-12G"
+  max_6k_items_per_symbol_per_day: 1
+  enable_regsho: true
   edgar_poll_interval_sec: 900
   edgar_lookback_days: 14
   enable_news_ingestion: true
@@ -98,6 +100,8 @@ schema:
   enable_auto_supplier_research: bool
   edgar_user_agent: str
   edgar_forms: str
+  max_6k_items_per_symbol_per_day: int(0,20)
+  enable_regsho: bool
   edgar_poll_interval_sec: int(60,86400)
   edgar_lookback_days: int(1,90)
   enable_news_ingestion: bool
