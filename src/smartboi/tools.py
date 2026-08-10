@@ -555,10 +555,15 @@ def run_diagnostics(engine) -> str:
     # trades the point estimate alone reads as fact when it is noise, and the
     # interval width is exactly what says whether the record can be told apart
     # from the break-even hit rate below.
-    add(f"  closed (all generations): {stats.closed} (W{stats.wins}/L{stats.losses}/T{stats.timeouts}), "
-        f"win rate {stats.win_rate * 100:.0f}% "
+    add(f"  closed (all generations): {stats.closed} ({stats.wins}W/{stats.losses}L net of cost, "
+        f"{stats.timeouts} held to horizon), win rate {stats.win_rate * 100:.0f}% "
         f"(95% CI {stats.win_rate_ci_low * 100:.0f}-{stats.win_rate_ci_high * 100:.0f}%), "
         f"avg R {stats.avg_r:.2f}")
+    # By direction: a win is net-of-cost R>0, so a SHORT is no longer penalised
+    # by a 100%-take-profit target it could only reach at price 0.
+    if stats.closed_long or stats.closed_short:
+        add(f"    by direction: long {stats.win_rate_long * 100:.0f}% (n={stats.closed_long}) / "
+            f"short {stats.win_rate_short * 100:.0f}% (n={stats.closed_short})")
     # The all-time line above pools every strategy the record has ever run.
     # This splits it by generation so the CURRENT strategy is measured on its
     # own trades, not dragged by an old, abandoned config (see status.py).
@@ -573,7 +578,7 @@ def run_diagnostics(engine) -> str:
                     ver += f"-v{g.version_to}"
             tag = "  <- current" if g.is_current else ""
             if g.closed:
-                add(f"    {g.label}{ver}: {g.wins}W/{g.losses}L/{g.timeouts}T, win {g.win_rate * 100:.0f}% "
+                add(f"    {g.label}{ver}: {g.wins}W/{g.losses}L net of cost, win {g.win_rate * 100:.0f}% "
                     f"(CI {g.win_rate_ci_low * 100:.0f}-{g.win_rate_ci_high * 100:.0f}%), avg R {g.avg_r:+.2f}{tag}")
             else:
                 add(f"    {g.label}{ver}: no closed trades yet{tag}")
@@ -609,6 +614,8 @@ def run_diagnostics(engine) -> str:
             f"loss {econ.r_loss:+.2f}R, break-even win rate "
             f"{econ.breakeven_win_rate * 100:.0f}%, cost = {econ.cost_share_of_risk * 100:.0f}% of 1R")
     add("  ^^ break-even is the hit rate at which this grid nets zero AFTER costs, not 33%.")
+    add("     (it assumes a win is the +target and a loss the -stop; the win rate above counts ANY "
+        "net-of-cost profit as a win, so the two ratios are not directly comparable.)")
     if any(
         trade_economics(s.stop_loss_pct, s.take_profit_pct,
                         max(bps, s.transaction_cost_bps_per_side) * 2).breakeven_win_rate >= 0.55

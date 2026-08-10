@@ -29,6 +29,19 @@ class PaperTradeStats:
     # is never presented alone (see _wilson_interval, and the dashboard card).
     win_rate_ci_low: float = 0.0
     win_rate_ci_high: float = 0.0
+    # win_rate is the net-of-cost PROFITABLE rate: a closed trade is a win iff
+    # its realized R after costs is > 0, NOT iff it hit the take-profit target.
+    # That is the only direction-symmetric honest headline -- the shipped
+    # 100%/50% grid puts a SHORT's target at price 0 (unreachable), so a
+    # target-hit definition books every profitable short as a timeout and
+    # biases the rate against an entire, deliberately-included direction.
+    # `wins`/`losses` above follow the same net-of-cost sign; `timeouts` stays
+    # an EXIT-REASON overlay (held to horizon), which can itself be a win or a
+    # loss. Split by direction so the (now-fixed) asymmetry stays visible.
+    closed_long: int = 0
+    closed_short: int = 0
+    win_rate_long: float = 0.0
+    win_rate_short: float = 0.0
     avg_r: float = 0.0
     # Reported alongside net so the cost drag is visible rather than
     # implicit -- the gap between these two is the whole question of whether
@@ -429,17 +442,29 @@ def gather_paper_trade_stats(
                             max_concurrent_positions=max_concurrent_positions,
                             peak_concurrent=_peak_concurrent(rows))
     if rows:
-        stats.wins = sum(1 for r in rows if r.get("status") == "WIN")
-        stats.losses = sum(1 for r in rows if r.get("status") == "LOSS")
+        # A win is net-of-cost profit (realized R > 0), not a target hit -- so
+        # a profitable SHORT that can only ever TIMEOUT (its 100%-take-profit
+        # target sits at price 0) is correctly a win. losses is the complement;
+        # timeouts stays the exit-reason count (held to horizon), which now
+        # overlaps both (a timeout can be a win or a loss).
+        stats.wins = sum(1 for r in rows if (r.get("r_multiple") or 0.0) > 0)
+        stats.losses = stats.closed - stats.wins
         stats.timeouts = sum(1 for r in rows if r.get("status") == "TIMEOUT")
         gross = [r.get("r_multiple_gross") for r in rows if r.get("r_multiple_gross") is not None]
         stats.avg_r_gross = round(sum(gross) / len(gross), 3) if gross else 0.0
         stats.win_rate = stats.wins / stats.closed
-        # A win is a WIN against every closed trade (timeouts included, as in
-        # win_rate above), so the interval is over the same successes/trials.
+        # The interval is over the same successes/trials as win_rate (profitable
+        # trades out of all closed).
         low, high = _wilson_interval(stats.wins, stats.closed)
         stats.win_rate_ci_low = round(low, 4)
         stats.win_rate_ci_high = round(high, 4)
+        longs = [r for r in rows if r.get("direction") == "LONG"]
+        shorts = [r for r in rows if r.get("direction") == "SHORT"]
+        stats.closed_long, stats.closed_short = len(longs), len(shorts)
+        stats.win_rate_long = round(
+            sum(1 for r in longs if (r.get("r_multiple") or 0.0) > 0) / len(longs), 4) if longs else 0.0
+        stats.win_rate_short = round(
+            sum(1 for r in shorts if (r.get("r_multiple") or 0.0) > 0) / len(shorts), 4) if shorts else 0.0
         stats.avg_r = sum(r.get("r_multiple") or 0.0 for r in rows) / stats.closed
         stats.borrow_assumed = sum(1 for r in rows if r.get("assumes_borrow"))
         clean = [r.get("r_multiple") or 0.0 for r in rows if not r.get("assumes_borrow")]
@@ -456,8 +481,10 @@ def _generation_stats(
     legacy = key == ""
     is_current = bool(current_key) and key == current_key and not legacy
     closed = len(rows)
-    wins = sum(1 for r in rows if r.get("status") == "WIN")
-    losses = sum(1 for r in rows if r.get("status") == "LOSS")
+    # Net-of-cost basis, matching gather_paper_trade_stats: a win is realized
+    # R > 0, losses the complement, timeouts the exit-reason overlay.
+    wins = sum(1 for r in rows if (r.get("r_multiple") or 0.0) > 0)
+    losses = closed - wins
     timeouts = sum(1 for r in rows if r.get("status") == "TIMEOUT")
     win_rate = wins / closed if closed else 0.0
     low, high = _wilson_interval(wins, closed)

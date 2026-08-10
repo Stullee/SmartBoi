@@ -2385,11 +2385,18 @@ class Engine:
         return "handled"
 
     @staticmethod
-    def _validated_proposal(target_symbol: str, proposed: dict) -> dict | None:
+    def _validated_proposal(target_symbol: str, proposed: dict, max_horizon_days: int) -> dict | None:
         """Clamped, type-checked copy of a propose_update tool response, or
         None when a required field is missing/invalid -- Anthropic tool use
         does not hard-enforce the declared schema, and indexing a missing
-        field used to abort the entire poll cycle after the call was paid."""
+        field used to abort the entire poll cycle after the call was paid.
+
+        horizon_days is clamped to [1, max_horizon_days]: it previously had
+        only a floor, so a mis-scored horizon (a model returning 900) would
+        keep the item at full decay weight for YEARS -- staleness scales off
+        horizon_days (see dossier._stale_cutoff_days) -- quietly defeating the
+        decay guarantee. Nothing is predictive past the strategy's own max
+        hold, so that is the natural ceiling."""
         try:
             direction = proposed["direction"]
             if direction not in DIRECTIONS:
@@ -2399,7 +2406,7 @@ class Engine:
                 "direction": direction,
                 "magnitude": min(1.0, max(0.0, float(proposed["magnitude"]))),
                 "confidence": min(1.0, max(0.0, float(proposed["confidence"]))),
-                "horizon_days": max(1, int(proposed["horizon_days"])),
+                "horizon_days": min(max_horizon_days, max(1, int(proposed["horizon_days"]))),
                 "reasoning": str(proposed.get("reasoning") or ""),
             }
         except (KeyError, TypeError, ValueError) as exc:
@@ -2457,7 +2464,7 @@ class Engine:
             )
             if raw is None:
                 return "deferred"  # transient LLM failure or budget exhausted -- retry later
-            proposed = self._validated_proposal(target_symbol, raw)
+            proposed = self._validated_proposal(target_symbol, raw, self.settings.max_horizon_days)
             if proposed is None:
                 return self._mark_handled(proposal_key)  # malformed -- dropping is definitive
             if not proposed["is_new_information"]:
@@ -2638,6 +2645,15 @@ class Engine:
             # carries its episode key (signaled_at) and re-logs of one
             # episode can be collapsed downstream.
             dossier.status = "SIGNALED"
+            # A fresh episode gets a fresh grace period. entry_attempts gates
+            # _should_expire_unopened's first-look leniency, so a re-fire --
+            # notably a direction flip that still qualifies, which arrives here
+            # on the merge path -- must NOT inherit the prior episode's attempt
+            # count. Otherwise the flipped episode is born past its grace period
+            # and can be expired unseen by the next merge, the exact failure the
+            # grace period exists to prevent. The decay path already resets via
+            # _reset_to_active before re-firing; the merge path did not.
+            dossier.entry_attempts = 0
             await self._snapshot_signal_price(dossier)
             self.dossiers.save(dossier)
             # Pull the next price poll forward to the entry cadence rather
