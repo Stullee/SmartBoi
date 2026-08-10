@@ -152,13 +152,31 @@ def trade_economics(
     )
 
 
-def assumes_borrow(direction: str, market_cap_musd: float | None) -> bool:
-    """Whether a hypothetical SHORT rests on an unverified borrow: below
-    the borrow-risk cap (or with no cap known at all), shares may simply
-    not have been locatable, so the trade's P&L is conditional on an
-    assumption a real account might not have been able to satisfy."""
+def assumes_borrow(direction: str, market_cap_musd: float | None,
+                   on_threshold_list: bool | None = None) -> bool:
+    """Whether a hypothetical SHORT rests on an unverified borrow: shares may
+    simply not have been locatable, so the trade's P&L is conditional on an
+    assumption a real account might not have been able to satisfy.
+
+    Two answers, in order of quality:
+
+    - The Reg SHO threshold list (`on_threshold_list`), when one was fetched.
+      A name with five consecutive settlement days of persistent failures to
+      deliver is hard to borrow as an OBSERVED fact, not an inference. This is
+      the number the flag always wanted.
+    - The market-cap proxy, when no list is in hand. Below the borrow-risk cap
+      (or with no cap known at all), assume the borrow is unverified.
+
+    Note the asymmetry: presence on the list is decisive, absence from it is
+    NOT. The list names securities already failing to deliver, which is a
+    subset of what is hard to borrow -- a thin micro-cap can be entirely
+    unborrowable without anyone having failed on it. So absence falls through
+    to the proxy rather than clearing the flag, and the flag can only ever get
+    stricter than it was, never looser."""
     if direction != "SHORT":
         return False
+    if on_threshold_list:
+        return True
     return market_cap_musd is None or market_cap_musd < _BORROW_RISK_CAP_MUSD
 
 
@@ -404,6 +422,7 @@ class PaperTradeJournal:
         episode: str = "",
         magnitude: float = 0.0,
         synthesis: dict | None = None,
+        on_threshold_list: bool | None = None,
     ) -> PaperTrade:
         if direction == "LONG":
             stop_price = entry_price * (1 - stop_loss_pct / 100)
@@ -425,7 +444,7 @@ class PaperTradeJournal:
             citations=citations,
             cost_bps_round_trip=cost_bps_round_trip,
             market_cap_musd=market_cap_musd,
-            assumes_borrow=assumes_borrow(direction, market_cap_musd),
+            assumes_borrow=assumes_borrow(direction, market_cap_musd, on_threshold_list),
             position_value=position_value,
             strategy=strategy,
             episode=episode,

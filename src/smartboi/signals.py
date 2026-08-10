@@ -56,15 +56,19 @@ class SignalEvent:
     scoring_version: int = 0
 
 
-def evaluate(
+def required_sources(
     dossier: Dossier,
-    confidence_threshold: float,
     min_independent_sources: int,
     min_independent_sources_news_only: int | None = None,
-) -> SignalEvent | None:
-    if dossier.direction == "NONE":
-        return None
-    required_sources = min_independent_sources
+) -> int:
+    """The independent-source bar THIS dossier is actually held to.
+
+    One definition, called by everything that needs the number: the signal
+    gate itself, the below-bar diagnostic that explains a rejection, and the
+    daily snapshot that records what the row was measured against. It used to
+    be re-derived at each of those sites, so a row could report a bar the gate
+    had not applied."""
+    required = min_independent_sources
     primary_source_backing = dossier.has_filing_evidence or dossier.has_disclosed_link_evidence
     if min_independent_sources_news_only is not None and not primary_source_backing:
         # The elevated bar exists for ONE failure mode: two outlets
@@ -91,8 +95,22 @@ def evaluate(
         # is redundant when the event is an official guidance raise;
         # corroborating "is the link real" is what matters, and a filing
         # already did it.
-        required_sources = max(required_sources, min_independent_sources_news_only)
-    if dossier.independent_source_count < required_sources:
+        required = max(required, min_independent_sources_news_only)
+    return required
+
+
+def evaluate(
+    dossier: Dossier,
+    confidence_threshold: float,
+    min_independent_sources: int,
+    min_independent_sources_news_only: int | None = None,
+) -> SignalEvent | None:
+    if dossier.direction == "NONE":
+        return None
+    required = required_sources(
+        dossier, min_independent_sources, min_independent_sources_news_only,
+    )
+    if dossier.independent_source_count < required:
         return None
     if dossier.confidence * dossier.magnitude < confidence_threshold:
         return None
@@ -105,12 +123,12 @@ def evaluate(
         independent_source_count=dossier.independent_source_count,
         thesis_summary=dossier.thesis_summary,
         generated_at=datetime.now(timezone.utc).isoformat(),
-        # `required_sources`, not min_independent_sources: the news-only
+        # The RESOLVED bar, not min_independent_sources: the news-only
         # elevation above is part of the bar this row cleared, and stamping
         # the unelevated setting would misdescribe exactly the rows where
         # the distinction mattered.
         threshold_in_force=confidence_threshold,
-        min_sources_in_force=required_sources,
+        min_sources_in_force=required,
         scoring_version=SCORING_VERSION,
     )
 

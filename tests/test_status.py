@@ -525,3 +525,37 @@ def test_graph_health_works_with_no_engine_state(tmp_path):
 
     assert h["edges"] == 0 and h["tradeables"] == 0
     assert h["stalest_days"] is None and h["cycle_days"] is None
+
+
+def test_the_snapshot_carries_per_mechanism_attribution():
+    """SCORING_VERSION 6 lands three changes that all push scores up in the
+    same region. Version 5 bundled three behind one boundary and the resulting
+    series can no longer attribute an outcome to any of them; these columns
+    make the bucketing a filter over the row rather than an inference about
+    the release."""
+    from smartboi.dossier import Dossier
+
+    row = snapshot_dossier(
+        Dossier(symbol="INTT", direction="LONG", confidence=0.0, magnitude=0.0,
+                already_priced_in=True, synthesis_at="2026-08-09T00:00:00+00:00",
+                synthesis_confidence=0.9, synthesis_magnitude=0.8,
+                pre_synthesis_score=0.42, synthesis_price=12.5,
+                veto_falsified_by_price=True, ecosystem_slot_counted=True,
+                has_filing_evidence=False, has_disclosed_link_evidence=False),
+        "2026-08-10T00:00:00+00:00", min_sources_required=3,
+    )
+
+    # A vetoed row is no longer 0.000-and-nothing-else: what the pass thought,
+    # and what it capped, are both on the record.
+    assert row["score"] == 0.0
+    assert row["synthesis_confidence"] == 0.9
+    assert row["pre_synthesis_score"] == 0.42
+    assert row["synthesis_price"] == 12.5
+    # Which bar it was held to, and the flags that decided it.
+    assert row["min_sources_required"] == 3
+    assert row["has_filing_evidence"] is False
+    assert row["has_disclosed_link_evidence"] is False
+    # Which mechanism touched this row.
+    assert row["veto_falsified_by_price"] is True
+    assert row["ecosystem_slot_counted"] is True
+    assert row["synthesis_stale_evidence"] is False

@@ -61,7 +61,25 @@ that specific inefficiency, not to race anyone on speed:
    customer/supplier disclosures, Form 4 insider transactions parsed into
    readable summaries, SC 13D activist stakes, and 424B5 shelf takedowns
    (dilution -- the cleanest SHORT catalyst this universe offers; a system
-   that only reads good news is not a research system). See `edgar.py`.
+   that only reads good news is not a research system). Also **S-1/S-3**,
+   the shelf REGISTRATION weeks to months ahead of that takedown, so the
+   leading indicator sits alongside the confirming one; **NT 10-K/NT 10-Q**
+   late-filing notices, which skew hard toward thin caps and whose reaction
+   turns on the *reason given* (boilerplate reads negative, a specific
+   legitimate cause does not -- a judgement about prose, which is what the
+   LLM is there for); **Form 25/15**, ten days' notice of a delisting that
+   `_is_unknown_to_edgar` would otherwise only catch after SEC's ticker file
+   lags it; and **20-F/40-F/6-K** for foreign private issuers. That last one
+   closes a hole rather than adding a nicety: NVX files 20-F/6-K and nothing
+   else, so its dossier could never receive a single filing-evidence item --
+   while being a tradeable, and one of only two names still passing the
+   thin-coverage screen. It also appears in neither endpoint of any of the
+   1066 graph edges, so with no filings it had no evidence path at all. Same
+   for the anchors CAMT/TSM/ASML/MGA; TSMC files monthly net revenue on a
+   6-K. 6-K ingestion is capped per symbol per day
+   (`MAX_6K_ITEMS_PER_SYMBOL_PER_DAY`) because EDGAR independence keys on
+   form *and* filing day, so an unbounded cross-filer could corroborate
+   itself into a signal. See `edgar.py`.
 5. **Adversarial to itself, calibrated by directness** -- every proposed
    dossier update is reviewed by a second, skeptical LLM pass trying to
    refute it before it counts, but the bar differs deliberately for direct
@@ -519,10 +537,100 @@ Backing relaxes the elevated bar back to the normal one; it never drops
 below `MIN_INDEPENDENT_SOURCES`, so a single uncorroborated article can
 still never fire a signal.
 
+**A competitor edge does not grant backing.** The relaxation exists because
+a filing that states a link answers *"is the causal channel real"* from a
+primary source. A competitor disclosure does not answer that question:
+"KLA and Applied Materials name each other as competitors" is genuinely
+disclosed and is not a transmission channel the way a supply relationship
+is -- the news does not have to reach one through the other, and its SIGN
+is frequently inverted (a competitor's capacity loss is *good* news here,
+which is how the Tier 2 catalyst rubric already lists it). This matters
+because of the shape of the live graph: `competitor` is the largest edge
+class at **448 of 1066 edges**, and **375 of those sit at or above 0.85** --
+an 84% clearance rate against 75% for customer and 76% for supplier. The
+most numerous and most sign-ambiguous class was relaxing the bar more often
+than the channels that actually carry causation. Competitor evidence still
+propagates, still contributes mass, and still claims an independent source
+slot; it just stops buying the discount
+(`dossier.COMPETITOR_SATISFIES_DISCLOSED_LINK`).
+
+### Ecosystem associations get one collective slot
+
+Evidence arriving over a mere sector-membership association
+(`ECOSYSTEM_ASSOCIATION_CONFIDENCE`, 0.25 -- not a disclosed counterparty
+link) used to contribute mass but **no** independent source slot at all,
+to stop a correlated macro story fanned in from several anchors counting as
+several corroborations. That stopped the saturation bug and overshot: the
+stated design intent is that an ecosystem link *"can raise a thesis but can
+never single-handedly qualify one"*, and zero slots implements "cannot
+raise a thesis at all".
+
+The whole class now collapses to exactly **one** collective slot, keyed on
+the ecosystem rather than on the item, the origin, the publisher or the
+day. The accounting is `min(1, |eco|)` and is therefore constant in volume
+by construction -- thirty correlated macro items contribute exactly one
+slot, same as one does -- and one slot is still below
+`MIN_INDEPENDENT_SOURCES`, so it cannot qualify a dossier on its own. The
+tempting variant of one slot per distinct origin company was rejected:
+NVDA + AMAT + LRCX reporting a single capex story would be three origins
+and three slots, which is the saturation bug rebuilt with extra steps.
+
+This matters most for names with no graph edges at all. Thirteen universe
+symbols appear in neither endpoint of any of the 1066 edges (PLAB, INTT,
+KLIC, AEHR, PLPC, LMB, AGX, NVX, MVST, SLI, MLAB, HURC, CVLG), so the
+ecosystem edge is their *only* propagation path and it was worth nothing.
+
 This was found live. DCO sat at 17 agreeing evidence items, decay-weighted
 mass 8.88, **zero opposing**, a score 44% above threshold, over 0.85-0.95
 10-K-disclosed links to RTX/LMT/NOC -- and could not act, for want of a
 third journalist.
+
+## A synthesis verdict has to be falsifiable
+
+The daily whole-body pass can veto a thesis outright by declaring it
+`already_priced_in` -- the whole strategy is trading the lag *before* the
+market connects the dots, so a move that is over is not one to enter.
+
+That verdict asserts something testable, and until `SCORING_VERSION` 6
+nothing in the system could test it. No price was ever compared against it,
+and the evidence body it judged was never recorded, so the veto was
+re-asserted every day against whatever had arrived since and **the only
+thing that could overturn it was another copy of itself**. Live, 27 dossiers
+sat at exactly 0.000 on a verdict nothing could contradict.
+
+This is not architectural stickiness -- `_decay_one` calls `recompute_decay`
+first, which rebuilds the score from raw evidence and erases the previous
+day's zeroes, so the escape hatch has always existed. It just never opened,
+because the verdict never changed.
+
+So a verdict now records its own premises: the price at the moment it was
+rendered, the independence keys it read, and the arithmetic score it capped.
+On the merge path, two things invalidate it:
+
+- **The tape refutes it.** A move of 8%+ *in the thesis direction* since the
+  verdict says the market had not, in fact, absorbed this.
+- **The evidence body materially changed.** Two or more new independent
+  source slots since the verdict mean the whole-body pass never saw what it
+  is now capping.
+
+The invalidation counts **slots, not items**, which is what makes it
+ungameable: an ecosystem fan-out of thirty correlated macro items mints one
+slot no matter how many arrive, and three wire rewrites of one story mint
+one (with dedup dropping two before they arrive). Nothing that cannot move
+the signal bar can invalidate a verdict.
+
+**A refuted verdict is re-judged, never simply lifted.** This is the part
+worth being precise about, because lifting the cap is the tempting version
+and it is wrong twice over. A favourable move on a LONG means the price went
+*up*, so the entry is more expensive, not less -- and the entry gate measures
+drift from the still-earlier inception baseline, so the very moves large
+enough to refute a verdict are the ones it then refuses at 12%. Lifting the
+cap would also fail *open*: the thesis re-fires on the raw arithmetic that
+`_cap_with_synthesis` exists to correct. So the old verdict stays in force
+until a fresh whole-body pass replaces it, and every path that cannot produce
+one -- no price, no budget, below the synthesis floor -- leaves it standing.
+Off-schedule re-synthesis is capped at 5 calls/day (~$0.50) so a heavy merge
+day cannot starve the daily pass.
 
 ## Contested evidence
 
@@ -566,6 +674,22 @@ extra LLM cost, piggybacked on work the engine already does daily:
   and no changes get a data point, so the resulting series has no gaps to
   explain away). Written by `engine.py`'s `_run_daily_snapshot`, piggybacked
   on the existing daily decay pass. See `status.py`'s `snapshot_dossier`.
+
+  The row also carries what the score *means*: the synthesis verdict behind
+  it, the **pre-veto arithmetic score**, the bar the dossier was actually
+  held to (`min_sources_required` plus the two backing flags that decide
+  it), and a flag per scoring mechanism. The pre-veto score matters more
+  than it sounds -- a vetoed row used to record `0.000` for both the raw and
+  the capped number, so a thesis the whole-body pass rated 0.9-but-priced-in
+  was indistinguishable from one it rated 0.05, permanently, for the most
+  expensive pass in the system.
+- **`logs/decisions.jsonl`** -- now also records a `below_bar` row for every
+  dossier the signal gate refused on the daily pass, and `below_bar_on_merge`
+  when fresh evidence still failed to clear it, each with the numbers
+  (`_below_bar_reason`). The reason a dossier did *not* qualify used to be
+  computed at exactly one moment -- expiry -- and discarded everywhere else,
+  so "which gate is binding, on how many names, by how much" had no data
+  behind it at all.
 - **`logs/price_marks.jsonl`** -- a daily closing-ish price for every
   tradeable (non-anchor) universe symbol, piggybacked on the existing 6h IB
   price poll. Written by `engine.py`'s `_run_daily_price_marks`.
@@ -824,7 +948,15 @@ Transaction costs are market-cap-bucketed per trade (50bp/side above $1B,
 150bp $300M-$1B, 300bp below, middle bucket when no cap source is
 reachable; `TRANSACTION_COST_BPS_PER_SIDE` acts as a floor under all
 buckets) -- a flat figure understated friction exactly where this strategy
-hunts. SHORTs in sub-$500M/unknown-cap names are flagged `assumes_borrow`
-(routinely hard-to-borrow; a fill a real account could not have located
-shares for is not a fill) and the dashboard reports avg R with and without
-them.
+hunts. SHORTs are flagged `assumes_borrow` when a real account might not
+have located shares (a fill it could not have made is not a fill), and the
+dashboard reports avg R with and without them. The flag now prefers an
+**observable** over a proxy: FINRA/Nasdaq's Reg SHO threshold securities
+list (free, no auth, one text file per settlement day) names securities
+with persistent failures to deliver, which is the closest thing to a public
+daily statement that a name is genuinely hard to borrow. Presence on the
+list is decisive; absence is *not*, and falls back to the old sub-$500M/
+unknown-cap rule -- the list names securities already failing to deliver,
+a subset of what is hard to borrow, so a thin micro-cap can be unborrowable
+with nobody having failed on it. The flag can therefore only get stricter
+than it was, never looser. Set `ENABLE_REGSHO=false` to skip the fetch.

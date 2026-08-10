@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from smartboi.config import Settings
 from smartboi.dossier import (
     ECOSYSTEM_ASSOCIATION_CONFIDENCE,
     Dossier,
@@ -564,38 +565,44 @@ def _ecosystem(origin, source_name, evidence_id, magnitude=0.3, confidence=0.6):
     return record
 
 
-def test_ecosystem_association_items_add_mass_but_not_independent_sources():
-    """A correlated sector story fanned in from several anchors is one macro
-    fact, not several corroborations. Ecosystem-association items must feed
-    mass (direction, contest, magnitude base) but never mint an independent
-    source slot -- otherwise pure fan-out lifts the corroboration bonuses and
-    saturates the score (AUDIT-2026-08-FOLLOWUP HIGH-3)."""
+def test_ecosystem_association_fanout_is_constant_in_volume():
+    """A correlated sector story fanned in from several anchors is ONE macro
+    fact. The class collapses to exactly one collective slot, so the count is
+    invariant to how many items, origins or publishers arrive -- which is what
+    keeps pure fan-out from lifting the corroboration bonuses and saturating
+    the score (AUDIT-2026-08-FOLLOWUP HIGH-3)."""
     dossier = Dossier(symbol="DCO")
     merge_evidence(dossier, _propagated("LMT", "Yahoo", "e0"), now=NOW)  # disclosed edge (0.9)
-    base_sources = dossier.independent_source_count
-    base_conf, base_mag = dossier.confidence, dossier.magnitude
+    merge_evidence(dossier, _ecosystem("ECO0", "Yahoo", "x0"), now=NOW)
+    one_eco_sources = dossier.independent_source_count
+    one_eco_conf, one_eco_mag = dossier.confidence, dossier.magnitude
     base_mass = dossier.mass_agree
 
-    for i in range(6):
-        merge_evidence(dossier, _ecosystem(f"ECO{i}", "Yahoo", f"x{i}"), now=NOW)
+    # Five more ecosystem items, all distinct origins AND distinct publishers.
+    for i in range(1, 6):
+        merge_evidence(dossier, _ecosystem(f"ECO{i}", f"Pub{i}", f"x{i}"), now=NOW)
 
-    assert base_sources == 1
-    assert dossier.independent_source_count == 1          # no new slots from fan-out
-    assert dossier.confidence == pytest.approx(base_conf)  # so no corroboration lift
-    assert dossier.magnitude == pytest.approx(base_mag)
-    assert dossier.mass_agree > base_mass                  # but they DO contribute mass
+    assert one_eco_sources == 2                            # 1 disclosed + 1 collective eco slot
+    assert dossier.independent_source_count == 2           # UNCHANGED by 5x the volume
+    assert dossier.confidence == pytest.approx(one_eco_conf)   # so no corroboration lift
+    assert dossier.magnitude == pytest.approx(one_eco_mag)
+    assert dossier.mass_agree > base_mass                  # but they DO still contribute mass
+    assert dossier.ecosystem_slot_counted is True
 
 
-def test_pure_ecosystem_fanout_mints_no_independent_sources():
-    """Eight ecosystem items from distinct anchors resolve a direction (mass)
-    but corroborate zero independent sources -- so a dossier built purely from
-    sector fan-out can never clear the multi-source signal bar."""
+def test_pure_ecosystem_fanout_cannot_single_handedly_qualify():
+    """Eight ecosystem items from distinct anchors resolve a direction and earn
+    the class its ONE slot -- which is below min_independent_sources, so a
+    dossier built purely from sector fan-out still cannot clear the signal
+    bar on its own. 'Can raise a thesis, can never single-handedly qualify
+    one' is the stated design intent; one slot implements it, zero did not."""
     dossier = Dossier(symbol="DCO")
     for i in range(8):
         merge_evidence(dossier, _ecosystem(f"ECO{i}", "Yahoo", f"x{i}"), now=NOW)
 
     assert dossier.direction == "LONG"
-    assert dossier.independent_source_count == 0
+    assert dossier.independent_source_count == 1
+    assert dossier.independent_source_count < Settings().min_independent_sources
 
 
 def test_different_counterparties_are_independent_even_from_one_publisher():
@@ -695,3 +702,54 @@ def test_magnitude_corroboration_is_bounded_past_the_doublings_cap():
 
     assert _mag(8) == pytest.approx(0.4875)
     assert _mag(16) == pytest.approx(_mag(8))  # bounded: no growth past the cap
+
+
+# --- A competitor edge corroborates that two firms COMPETE, not that news
+# transmits from one to the other. On the live graph it is the largest edge
+# class (448 of 1066) with 84% at or above DISCLOSED_LINK_CONFIDENCE -- a
+# higher clearance rate than customer (75%) or supplier (76%) -- so the most
+# numerous and most sign-ambiguous class was relaxing the corroboration bar
+# more often than the channels that actually carry causation. ---
+
+def _typed(origin, rel_type, source_name, evidence_id, confidence=0.95):
+    record = _propagated(origin, source_name, evidence_id)
+    record.relationship_confidence = confidence
+    record.relationship_type = rel_type
+    return record
+
+
+def test_a_competitor_edge_does_not_buy_the_corroboration_discount():
+    dossier = Dossier(symbol="KLAC")
+    merge_evidence(dossier, _typed("AMAT", "competitor", "Yahoo", "c1"), now=NOW)
+
+    assert dossier.independent_source_count == 1, "it still claims a source slot"
+    assert dossier.has_disclosed_link_evidence is False, "but not the discount"
+
+
+def test_customer_and_supplier_edges_still_buy_it():
+    for rel_type in ("customer", "supplier"):
+        dossier = Dossier(symbol="DCO")
+        merge_evidence(dossier, _typed("LMT", rel_type, "Yahoo", "d1"), now=NOW)
+        assert dossier.has_disclosed_link_evidence is True, rel_type
+
+
+def test_a_record_predating_the_field_keeps_the_old_behaviour():
+    """Historical evidence carries no relationship_type. Treating it as
+    'unknown, so excluded' would silently re-score the existing record --
+    exactly what SCORING_VERSION exists to prevent."""
+    dossier = Dossier(symbol="DCO")
+    record = _propagated("LMT", "Yahoo", "old")   # relationship_type defaults to ""
+    assert record.relationship_type == ""
+    merge_evidence(dossier, record, now=NOW)
+
+    assert dossier.has_disclosed_link_evidence is True
+
+
+def test_a_competitor_edge_alongside_a_customer_edge_still_qualifies():
+    """The flag is 'any agreeing item over a transmitting link', so one
+    competitor item cannot revoke what a customer item established."""
+    dossier = Dossier(symbol="DCO")
+    merge_evidence(dossier, _typed("AMAT", "competitor", "Yahoo", "c1"), now=NOW)
+    merge_evidence(dossier, _typed("LMT", "customer", "Reuters", "d1"), now=NOW)
+
+    assert dossier.has_disclosed_link_evidence is True

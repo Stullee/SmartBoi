@@ -315,6 +315,7 @@ _DIAGNOSTIC_SETTINGS = (
     "edgar_poll_interval_sec", "news_poll_interval_sec", "price_poll_interval_sec",
     "signal_entry_poll_interval_sec",
     "enable_edgar_ingestion", "enable_news_ingestion", "edgar_forms",
+    "max_6k_items_per_symbol_per_day", "enable_regsho",
     "edgar_lookback_days", "news_lookback_days", "enable_universe_autoscreen",
     "universe_min_market_cap_musd", "universe_max_market_cap_musd",
     "universe_max_analyst_count", "universe_screen_interval_days",

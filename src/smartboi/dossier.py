@@ -65,6 +65,16 @@ class EvidenceRecord:
     # is measurable instead of overwritten and lost.
     proposed_confidence: float | None = None
     proposed_magnitude: float | None = None
+    # Which KIND of graph edge this item arrived over ("customer" /
+    # "supplier" / "competitor" / "regulator"), empty for direct evidence and
+    # for records written before this field existed. Carried because
+    # relationship_confidence alone cannot answer whether a link is a causal
+    # TRANSMISSION CHANNEL: the live graph is 42% competitor edges (448 of
+    # 1066) with 84% of them at or above DISCLOSED_LINK_CONFIDENCE -- a
+    # higher clearance rate than customer (75%) or supplier (76%) -- so the
+    # most numerous and most sign-ambiguous class was also the one most
+    # likely to relax the corroboration bar. See has_disclosed_link_evidence.
+    relationship_type: str = ""
 
 
 @dataclass
@@ -153,6 +163,39 @@ class Dossier:
     already_priced_in: bool = False
     synthesis_note: str = ""
     synthesis_catalyst: str = ""
+    # --- What the verdict above was judged AGAINST, so it can be falsified
+    # rather than merely re-asserted. A verdict is a claim about a moment: a
+    # price ("the market has absorbed this") and a body of evidence ("this is
+    # all there is"). Both move. Without a record of either, the claim is
+    # unfalsifiable by construction -- which is what it was. ---
+    #
+    # The price at the instant the verdict was rendered (engine._price_bar,
+    # same IB-then-Finnhub fallback the inception baseline uses). None when
+    # no source could price the symbol, which leaves the verdict standing --
+    # the fail-safe direction.
+    synthesis_price: float | None = None
+    synthesis_price_at: str = ""
+    # The independence_key values present when the verdict was rendered.
+    # Compared against the current set to detect that the evidence BODY has
+    # materially changed since -- counting KEYS, not items, so an
+    # ecosystem-association fan-out (which mints one collective slot, and
+    # previously none) cannot manufacture invalidation. See
+    # engine._synthesis_premises_changed.
+    synthesis_keys: list[str] = field(default_factory=list)
+    # The arithmetic score (confidence * magnitude) as it stood BEFORE the
+    # synthesis verdict capped or vetoed it. Every vetoed row recorded 0.000
+    # for both the raw and the capped number, so a thesis the whole-body pass
+    # rated 0.9-but-priced-in was indistinguishable from one it rated 0.05,
+    # permanently and for the most expensive pass in the system.
+    pre_synthesis_score: float = 0.0
+    # --- Per-row attribution flags. Three changes in this scoring version
+    # move scores in the same region and the same direction; recorded per
+    # dossier so the forward-return series can be bucketed by WHICH
+    # mechanism touched a row, instead of pooling them behind one version
+    # boundary the way SCORING_VERSION 5 had to. ---
+    veto_falsified_by_price: bool = False
+    synthesis_stale_evidence: bool = False
+    ecosystem_slot_counted: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -215,6 +258,58 @@ _MIN_STALE_DAYS = 14
 # passing-mention links ("Google Drive is integrated with FedEx Office",
 # an indirect JV competitor) sit at 0.30-0.65.
 DISCLOSED_LINK_CONFIDENCE = 0.85
+
+def _keys_of(contributing: list[EvidenceRecord]) -> set[str]:
+    """The independent-source slots a set of contributing evidence claims --
+    the single definition of that accounting, so nothing can drift from it."""
+    return {
+        _ECOSYSTEM_SLOT_KEY if is_ecosystem_association(e) else independence_key(e)
+        for e in contributing
+    }
+
+
+def slot_keys(dossier: Dossier, now: datetime) -> set[str]:
+    """The dossier's current independent-source slots, recomputed from raw
+    evidence exactly as _aggregate counts them.
+
+    Exists so the synthesis-invalidation trigger (engine._maybe_resynthesize)
+    can ask "has the evidence BODY materially changed since the verdict" in
+    the same currency the signal bar is denominated in. Counting keys rather
+    than items is what makes that trigger ungameable: an ecosystem fan-out of
+    thirty correlated macro items mints one key no matter how many arrive, and
+    three wire rewrites of one story mint one key (with dedup dropping two
+    before they ever get here). Nothing that cannot move the signal bar can
+    invalidate a verdict."""
+    agreeing = [
+        e for e in dossier.evidence
+        if e.direction == dossier.direction and not evidence_is_stale(e, now)
+    ]
+    weighted = [(e, evidence_weight(e, now)) for e in agreeing]
+    contributing = [e for e, w in weighted if e.confidence * w >= MIN_SOURCE_CONTRIBUTION]
+    return _keys_of(contributing)
+
+
+def _link_type_corroborates(record: EvidenceRecord) -> bool:
+    """Whether this item's LINK TYPE can satisfy the disclosed-link
+    corroboration relaxation. Everything but a competitor edge can; a record
+    with no recorded type (direct evidence, or written before the field
+    existed) is unaffected."""
+    if COMPETITOR_SATISFIES_DISCLOSED_LINK:
+        return True
+    return record.relationship_type != "competitor"
+
+
+def is_ecosystem_association(record: EvidenceRecord) -> bool:
+    """Whether this item arrived over a mere sector-membership association
+    rather than a disclosed counterparty link -- the class that collapses to
+    one collective slot (see _ECOSYSTEM_SLOT_KEY).
+
+    Direct evidence (relationship_confidence is None) is never in this class,
+    and neither is propagation over a genuinely disclosed edge."""
+    return (record.is_propagated
+            and record.relationship_confidence is not None
+            and record.relationship_confidence <= ECOSYSTEM_ASSOCIATION_CONFIDENCE)
+
 
 def independence_key(record: EvidenceRecord) -> str:
     """What makes two evidence items INDEPENDENT corroboration of each other
@@ -332,6 +427,50 @@ MAX_CORROBORATION_DOUBLINGS = MAX_CONFIDENCE_CORROBORATION_BONUS / CONFIDENCE_CO
 # score. See AUDIT-2026-08-FOLLOWUP HIGH-3 / A2.
 ECOSYSTEM_ASSOCIATION_CONFIDENCE = 0.25
 
+# The single slot the whole ecosystem-association class collapses to (see
+# _aggregate). A sentinel rather than a real key: independence_key never
+# emits a leading NUL, so this can never collide with a publisher, an origin
+# symbol or an EDGAR form/day pair.
+#
+# One, not zero, and not one-per-origin. An ecosystem link IS one real piece
+# of information -- "this sector is repricing" -- and the honest accounting
+# of one piece of information is one slot. Zero (the previous rule) states
+# that it cannot raise a thesis at all, which contradicts the stated design
+# intent that it "can raise a thesis but can never single-handedly qualify
+# one"; one slot restores exactly that, since 1 < min_independent_sources.
+# One-per-origin was considered and rejected: NVDA, AMAT and LRCX reporting
+# one capex story would be three origins and three slots, which is the
+# fan-out saturation bug rebuilt with extra steps. The class contributes
+# min(1, |eco|) and is therefore constant in volume by construction --
+# doubling the item count, the origin count, the publisher count or the day
+# count changes nothing.
+_ECOSYSTEM_SLOT_KEY = "\x00ecosystem-association"
+
+# Whether a COMPETITOR edge satisfies the disclosed-link corroboration
+# relaxation (has_disclosed_link_evidence). It does not.
+#
+# The relaxation exists because a primary filing that states a link answers
+# "is the causal channel real" with a primary source, so demanding a third
+# journalist to re-answer it means waiting until the market has made the
+# connection itself. A competitor disclosure does not answer that question.
+# "KLA and Applied Materials name each other as competitors" is a genuinely
+# disclosed fact, but it is not a transmission channel the way a supply
+# relationship is -- the news does not have to reach one through the other,
+# and its SIGN is frequently inverted (a competitor's capacity loss is good
+# news here, which is why the Tier 2 rubric lists it that way).
+#
+# Measured on the live graph: competitor is the largest edge class at 448 of
+# 1066, and 375 of those sit at or above DISCLOSED_LINK_CONFIDENCE. So the
+# most numerous and most sign-ambiguous class was relaxing the bar from three
+# sources to two more often than customer or supplier edges were. Competitor
+# evidence still propagates, still contributes mass, and still claims an
+# independent SOURCE slot -- it just stops buying the corroboration discount.
+#
+# Records written before relationship_type existed carry "" and are treated
+# as unknown, which keeps the old behaviour for historical evidence rather
+# than silently re-scoring it.
+COMPETITOR_SATISFIES_DISCLOSED_LINK = False
+
 # Bumped whenever a change alters how confidence/magnitude are computed from
 # the same evidence. Stamped onto every daily dossier snapshot so the
 # forward-validation record can be split at the boundary instead of silently
@@ -360,7 +499,29 @@ ECOSYSTEM_ASSOCIATION_CONFIDENCE = 0.25
 #     numbers a merge-driven snapshot records.
 # Forward data cannot be backfilled and old rows must never be re-scored, so
 # splitting at this boundary is the only honest option.
-SCORING_VERSION = 5
+#
+# 6: four changes, three of which push scores UP in the same region near the
+# signal bar. Version 5 bundled three changes behind one boundary and the
+# resulting series can no longer attribute an outcome to any one of them;
+# that is not repeatable, so this version ships per-row attribution flags
+# alongside the changes (Dossier.veto_falsified_by_price /
+# synthesis_stale_evidence / ecosystem_slot_counted) and records the
+# pre-veto arithmetic score. Bucketing v6 rows by mechanism is a filter over
+# the snapshot, not an inference.
+#   - ecosystem-association evidence now claims ONE collective slot instead
+#     of none (_ECOSYSTEM_SLOT_KEY), so a name whose only propagation path is
+#     the sector edge stops sitting at a permanent structural zero;
+#   - a competitor edge no longer satisfies the disclosed-link corroboration
+#     relaxation (COMPETITOR_SATISFIES_DISCLOSED_LINK), which RAISES the bar
+#     from two sources to three for competitor-only dossiers -- the one
+#     change here that tightens rather than loosens;
+#   - an already-priced-in verdict is now falsifiable by price and by a
+#     materially changed evidence body, and a falsified verdict is re-judged
+#     rather than re-asserted (engine._maybe_resynthesize);
+#   - EDGAR ingestion covers 20-F/40-F/6-K, NT 10-K/NT 10-Q, S-1/S-3 and the
+#     delisting forms, so filing evidence now reaches foreign private issuers
+#     that could previously never produce a single filing item.
+SCORING_VERSION = 6
 # Weight an evidence item keeps right at its stale cutoff, before being
 # excluded entirely -- never fully zero a moment before exclusion, since
 # aged corroboration is still weak signal that a persistent theme existed.
@@ -530,13 +691,17 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     # off this count via _corroboration_doublings) and let pure fan-out mass
     # cross the signal bar. Direct evidence (relationship_confidence is None)
     # and propagation over a genuinely disclosed edge are unaffected.
-    slot_bearing = [
-        e for e in contributing
-        if not (e.is_propagated
-                and e.relationship_confidence is not None
-                and e.relationship_confidence <= ECOSYSTEM_ASSOCIATION_CONFIDENCE)
-    ]
-    dossier.independent_source_count = len({independence_key(e) for e in slot_bearing})
+    # ...but it is not worth NOTHING either, which is what excluding it
+    # outright made it worth. The whole class -- every item, every origin,
+    # every publisher, every day -- now collapses to exactly one collective
+    # slot (_ECOSYSTEM_SLOT_KEY). That is the honest accounting of one piece
+    # of information, and it is constant in volume by construction, so the
+    # fan-out saturation this exclusion was written to stop remains stopped:
+    # thirty correlated macro items still contribute exactly one slot, and it
+    # still cannot single-handedly qualify a dossier.
+    keys = _keys_of(contributing)
+    dossier.ecosystem_slot_counted = _ECOSYSTEM_SLOT_KEY in keys
+    dossier.independent_source_count = len(keys)
     # Gated on LINK quality as well as source type. Any filing set this flag,
     # including one propagated over an ECOSYSTEM edge -- an industry-level
     # association at 0.25 confidence, not a disclosed relationship. That
@@ -550,8 +715,13 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
              or e.relationship_confidence >= DISCLOSED_LINK_CONFIDENCE)
         for e in agreeing
     )
+    # Competitor edges are excluded here (see
+    # COMPETITOR_SATISFIES_DISCLOSED_LINK) -- they corroborate that two firms
+    # compete, not that news transmits from one to the other.
     dossier.has_disclosed_link_evidence = any(
-        (e.relationship_confidence or 0.0) >= DISCLOSED_LINK_CONFIDENCE for e in agreeing
+        (e.relationship_confidence or 0.0) >= DISCLOSED_LINK_CONFIDENCE
+        and _link_type_corroborates(e)
+        for e in agreeing
     )
     # The base thesis is ONE item's decay-scaled confidence and magnitude,
     # chosen jointly. These used to be independent maxima over the whole

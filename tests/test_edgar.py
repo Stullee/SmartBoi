@@ -398,3 +398,41 @@ async def test_fetch_evidence_text_is_unchanged_when_there_are_no_exhibits(tmp_p
     }, tmp_path)
     filing = FilingEvent("DCO", "0000029669", "10-Q", "2026-07-28", "0000029669-26-000012", "d8k.htm")
     assert await client.fetch_evidence_text(filing) == "cover page only"
+
+
+def test_the_foreign_private_issuer_forms_are_ingested():
+    """NVX files 20-F/6-K and nothing else, so without these its dossier can
+    never receive a single filing-evidence item -- while being a tradeable,
+    and one of only two names still passing the thin-coverage screen. Verified
+    against the live graph: NVX appears in neither endpoint of any of the 1066
+    edges, so with no filings it had no evidence path at all."""
+    from smartboi.config import Settings
+
+    forms = Settings(_env_file=None).edgar_forms_set
+    assert {"20-F", "40-F", "6-K"} <= forms
+
+
+def test_the_late_filing_and_shelf_registration_forms_are_ingested():
+    from smartboi.config import Settings
+
+    forms = Settings(_env_file=None).edgar_forms_set
+    assert {"NT 10-K", "NT 10-Q"} <= forms, "the late-filing SHORT catalyst"
+    assert {"S-1", "S-3"} <= forms, "the shelf ahead of the 424B5 takedown"
+
+
+def test_the_delisting_forms_are_ingested():
+    """_is_unknown_to_edgar only prunes a symbol once SEC's ticker file drops
+    it, which lags the delisting. A Form 25 is ten days' notice."""
+    from smartboi.config import Settings
+
+    forms = Settings(_env_file=None).edgar_forms_set
+    assert {"25", "25-NSE", "15-12B", "15-12G"} <= forms
+
+
+def test_s_3asr_is_not_ingested():
+    """Automatic shelf registration by a well-known seasoned issuer -- routine
+    and uninformative, and by definition filed by companies too large to be
+    this universe's dilution story."""
+    from smartboi.config import Settings
+
+    assert "S-3ASR" not in Settings(_env_file=None).edgar_forms_set
