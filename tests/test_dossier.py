@@ -378,6 +378,30 @@ def test_losing_side_filing_does_not_set_the_flag():
     assert dossier.has_filing_evidence is False
 
 
+def test_distinct_edgar_filings_on_different_days_corroborate():
+    """Two separate filing EVENTS (different dates) are distinct primary
+    disclosures and count as two independent sources. They used to collapse to
+    one slot per form ('SEC EDGAR (8-K)'), capping a filings-only thesis at
+    roughly one source per form type."""
+    dossier = Dossier(symbol="DCO")
+    merge_evidence(dossier, _evidence(evidence_id="f1", source_name="SEC EDGAR (8-K)",
+                                      published_at="2026-07-18T00:00:00+00:00"), now=NOW)
+    merge_evidence(dossier, _evidence(evidence_id="f2", source_name="SEC EDGAR (8-K)",
+                                      published_at="2026-07-20T00:00:00+00:00"), now=NOW)
+    assert dossier.independent_source_count == 2
+
+
+def test_edgar_filings_on_the_same_day_stay_one_source():
+    """Multiple parts of ONE filing event (same date) are not independent
+    corroboration -- the anti-double-count is preserved at day granularity."""
+    dossier = Dossier(symbol="DCO")
+    merge_evidence(dossier, _evidence(evidence_id="f1", source_name="SEC EDGAR (8-K)",
+                                      published_at="2026-07-20T00:00:00+00:00"), now=NOW)
+    merge_evidence(dossier, _evidence(evidence_id="f2", source_name="SEC EDGAR (8-K)",
+                                      published_at="2026-07-20T09:30:00+00:00"), now=NOW)
+    assert dossier.independent_source_count == 1
+
+
 # --- Disclosed-link backing: whether the CAUSAL LINK behind a piece of
 # propagated evidence came from a primary filing disclosure. Drives the
 # corroboration bar in signals.evaluate. ---

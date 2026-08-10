@@ -2518,6 +2518,11 @@ class Engine:
             proposed_magnitude=proposed["magnitude"],
         )
         merge_evidence(dossier, record)
+        # Snapshot the price the instant the thesis first points somewhere
+        # tradeable, so the entry gate can later measure how much of the
+        # favourable move already happened WHILE corroboration accumulated
+        # (see _capture_inception and the drift guard in _try_open_from_signal).
+        await self._capture_inception(dossier)
         # Re-apply the last whole-body synthesis verdict as a cap: a merge
         # recomputes the arithmetic from scratch and would otherwise erase a
         # veto/trim the daily pass had applied, letting a synthesis-blocked
@@ -2701,6 +2706,35 @@ class Engine:
         except Exception:  # noqa: BLE001 - a missing baseline just disables the drift check for this signal
             log.exception("%s: could not snapshot signal-time price.", dossier.symbol)
 
+    async def _capture_inception(self, dossier: Dossier) -> None:
+        """Snapshots the price the moment a thesis first points somewhere
+        tradeable (or flips to a new direction), so the entry-gate drift guard
+        can measure the favourable move that ALREADY happened while
+        corroboration accumulated -- not just since the signal fired.
+
+        Measured live over 91 fires: the median had already moved ~3-5% in its
+        favour before firing, and ~1 in 5 had moved >12% (the guard's own bar)
+        pre-fire -- invisible to a signal-time baseline. Captured once per
+        direction run (a flip re-captures); cleared when a signal expires
+        (_reset_to_active) so each fresh accumulation window measures its own
+        start. Graceful: no reachable price just leaves it unset, and the guard
+        falls back to signaled_price."""
+        if dossier.direction not in ("LONG", "SHORT"):
+            return
+        if dossier.inception_at and dossier.inception_direction == dossier.direction:
+            return
+        try:
+            if self.price_feed is not None:
+                await self.price_feed.ensure_connected()
+            bar = await self._price_bar(dossier.symbol)
+        except Exception:  # noqa: BLE001 - a missing baseline just disables the pre-signal drift check
+            log.exception("%s: could not snapshot inception price.", dossier.symbol)
+            return
+        if bar is not None:
+            dossier.inception_price = bar.close
+            dossier.inception_at = datetime.now(timezone.utc).isoformat()
+            dossier.inception_direction = dossier.direction
+
     def _reset_to_active(self, dossier: Dossier) -> None:
         dossier.status = "ACTIVE"
         dossier.signaled_at = ""
@@ -2708,6 +2742,12 @@ class Engine:
         dossier.signaled_direction = ""
         dossier.drift_alert_sent = False
         dossier.entry_attempts = 0
+        # Cleared so the next episode measures its own accumulation window from
+        # scratch: a fresh thesis re-captures its inception on the next
+        # directional merge (see _capture_inception).
+        dossier.inception_price = None
+        dossier.inception_at = ""
+        dossier.inception_direction = ""
 
     def _should_expire_unopened(self, dossier: Dossier) -> bool:
         """Whether a SIGNALED-but-unopened dossier that no longer clears the
@@ -2875,16 +2915,28 @@ class Engine:
                 )
             return
 
-        if dossier.signaled_price is not None:
-            drift = favorable_drift_pct(dossier.direction, dossier.signaled_price, price)
+        # Prefer the thesis-INCEPTION baseline over the signal-fire one. A
+        # signal fires only after corroboration accumulates over days, by which
+        # time much of the favourable move can already be gone: measured live,
+        # ~1 in 5 fires had already moved >12% (this very threshold) before
+        # firing, invisible to a fire-time baseline. inception_price is snapped
+        # when the thesis first pointed this direction (see _capture_inception),
+        # so this measures the TOTAL move since the thesis began, not just since
+        # it fired. Falls back to signaled_price when no inception was captured.
+        baseline = dossier.signaled_price
+        since = "the signal fired"
+        if dossier.inception_price is not None and dossier.inception_direction == dossier.direction:
+            baseline, since = dossier.inception_price, "the thesis began forming"
+        if baseline is not None:
+            drift = favorable_drift_pct(dossier.direction, baseline, price)
             if drift >= self.settings.max_favorable_drift_pct:
                 if not dossier.drift_alert_sent:
                     dossier.drift_alert_sent = True
                     self.dossiers.save(dossier)
                     log.info(
-                        "[SIGNAL] %s: price already moved %.1f%% favorably since the signal fired "
+                        "[SIGNAL] %s: price already moved %.1f%% favorably since %s "
                         "at $%.2f (now $%.2f) -- likely already priced in, skipping entry.",
-                        symbol, drift, dossier.signaled_price, price,
+                        symbol, drift, since, baseline, price,
                     )
                     # Once per episode (same gate as the alert): the price
                     # at skip time is what lets the event study ask whether
@@ -2892,15 +2944,15 @@ class Engine:
                     self._record_decision(
                         "drift_skip", symbol, dossier.direction, dossier.signaled_at,
                         price=price,
-                        reason=f"drifted {drift:.1f}% favorably from {dossier.signaled_price:.2f}",
+                        reason=f"drifted {drift:.1f}% favorably from {baseline:.2f} (since {since})",
                     )
                     await self.alerts.send(
                         "signal_stale",
                         f"{symbol}: likely already priced in",
-                        f"Price moved {drift:.1f}% in the favorable direction since the signal fired "
-                        f"at ${dossier.signaled_price:.2f} (now ${price:.2f}) -- skipping entry to avoid "
+                        f"Price moved {drift:.1f}% in the favorable direction since {since} "
+                        f"at ${baseline:.2f} (now ${price:.2f}) -- skipping entry to avoid "
                         "chasing a move that may already be over.",
-                        {"symbol": symbol, "drift_pct": drift, "signaled_price": dossier.signaled_price, "current_price": price},
+                        {"symbol": symbol, "drift_pct": drift, "baseline_price": baseline, "current_price": price},
                     )
                 if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
                     self._expire_signal(dossier, f"price drifted {drift:.1f}% before an entry could be confirmed",
@@ -3641,6 +3693,9 @@ class Engine:
             dossier.signaled_direction = ""
             dossier.drift_alert_sent = False
             dossier.entry_attempts = 0
+            dossier.inception_price = None
+            dossier.inception_at = ""
+            dossier.inception_direction = ""
             # Stale synthesis verdicts are cleared too, so a v4 veto can't cap a
             # v5 score through the merge path's freshness window (see
             # _cap_with_synthesis) before the daily pass re-synthesizes.

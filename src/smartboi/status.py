@@ -612,6 +612,12 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str) -> dict:
         "score": round(d.confidence * d.magnitude, 4),
         "independent_source_count": d.independent_source_count,
         "status": d.status,
+        # The thesis-inception price baseline (see engine._capture_inception):
+        # snapped when the thesis first turned directional, so joined against
+        # price_marks it shows how much of the favourable move happened BEFORE
+        # the signal fired -- the pre-signal drift the entry guard now acts on.
+        "inception_price": d.inception_price,
+        "inception_at": d.inception_at,
         # The synthesis verdict behind the score above.
         #
         # `score` is the CAPPED number once synthesis has run (see engine's

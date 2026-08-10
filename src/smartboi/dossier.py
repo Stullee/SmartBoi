@@ -87,6 +87,16 @@ class Dossier:
     signaled_at: str = ""
     signaled_price: float | None = None
     signaled_direction: str = ""
+    # Price the moment the thesis FIRST pointed this direction (see
+    # engine._capture_inception) -- the earlier baseline the entry-gate drift
+    # guard prefers over signaled_price. Corroboration accumulates over days,
+    # so measuring "are we too late" only from signal-fire misses the move that
+    # happened WHILE we waited. Re-captured on a direction flip; cleared when a
+    # signal expires; None when no price feed was reachable at inception (the
+    # guard then falls back to signaled_price).
+    inception_price: float | None = None
+    inception_at: str = ""
+    inception_direction: str = ""
     drift_alert_sent: bool = False
     # How many times the entry gate has actually evaluated THIS episode (see
     # engine._try_open_from_signal). Reset with the rest of the episode
@@ -237,6 +247,17 @@ def independence_key(record: EvidenceRecord) -> str:
     stop being counted as one fact."""
     if record.is_propagated and record.origin_symbol:
         return f"{record.origin_symbol}|{record.source_name}"
+    # Direct EDGAR filings were collapsed to one slot per FORM ("SEC EDGAR
+    # (8-K)"), so two distinct filing EVENTS -- a contract award in one filing,
+    # a guidance cut in another -- could never corroborate each other, capping
+    # a filings-only thesis at roughly one source per form type. Distinguish by
+    # filing DAY: different filings (different dates) are different events;
+    # multiple parts of one filing (same date) stay collapsed, and dedup
+    # already drops a re-ingested filing before it reaches here. Only direct
+    # EDGAR evidence -- news still keys on the publisher alone.
+    if record.source_name.startswith("SEC EDGAR"):
+        day = (record.published_at or "")[:10]
+        return f"{record.source_name}|{day}" if day else record.source_name
     return record.source_name
 
 

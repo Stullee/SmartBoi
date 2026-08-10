@@ -1842,6 +1842,57 @@ async def test_the_skeptic_adjustment_replaces_the_proposed_values(engine):
     assert (rec.proposed_confidence, rec.proposed_magnitude) == (0.9, 0.9)  # pre-skeptic kept
 
 
+async def test_inception_price_is_captured_when_the_thesis_first_turns_directional(engine):
+    """The pre-signal baseline is snapped the moment the thesis first points
+    somewhere tradeable -- well before it fires -- so the entry gate can later
+    measure the move that happened WHILE corroboration accumulated."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.6, confidence=0.7, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.7, adjusted_magnitude=0.6)
+
+    await engine._process_evidence(
+        origin_symbol="FORM", evidence_text="e", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h", published_at="2026-07-23",
+    )
+
+    d = engine.dossiers.load("FORM")
+    assert d.direction == "LONG" and d.status == "ACTIVE"   # directional but not yet signaled
+    assert d.inception_price == 10.0 and d.inception_direction == "LONG"
+
+
+async def test_the_drift_guard_measures_from_inception_not_just_fire(engine):
+    """If the price already ran up while the thesis accumulated, the entry gate
+    skips -- even when nothing drifted between fire and entry. The fire-time
+    baseline alone would have opened into a move that was already gone."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    await _signal_form(engine)                    # SIGNALED LONG
+    dossier = engine.dossiers.load("FORM")
+    # The move happened during accumulation: inception low, fired after the run-up.
+    dossier.inception_price, dossier.inception_direction = 10.0, "LONG"
+    dossier.signaled_price = 11.5                 # fire -> now will be flat
+    engine.dossiers.save(dossier)
+    engine.price_feed.prices["FORM"] = 11.5       # 0% drift from the fire baseline...
+
+    await engine._try_open_from_signal("FORM", dossier)
+
+    # ...but +15% from inception (>5% fixture bar) -> skipped, not opened.
+    assert not engine.journal.has_open("FORM")
+
+
+async def test_inception_is_cleared_when_a_signal_expires(engine):
+    """Each fresh episode measures its own accumulation window, so an expiry
+    clears the inception baseline for the next thesis to re-capture."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    await _signal_form(engine)
+    dossier = engine.dossiers.load("FORM")
+    assert dossier.inception_price is not None     # captured during accumulation
+
+    engine._reset_to_active(dossier)
+
+    assert dossier.inception_price is None and dossier.inception_at == ""
+    assert dossier.inception_direction == ""
+
+
 async def test_the_decay_pass_respects_the_grace_period(engine):
     engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
     await _signal_form(engine)
