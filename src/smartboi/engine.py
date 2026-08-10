@@ -229,6 +229,28 @@ def _non_common_reason(symbol: str) -> str:
     return ""
 
 
+# The minimum confidence a disclosed relationship must carry to count as a
+# real connection during a connectivity reconcile (see
+# Engine.reconcile_universe_connectivity). The growth candidates a tradeable's
+# own 10-K discloses sit well above this; the floor only keeps a sub-threshold
+# passing mention from being treated as a propagation path worth polling a
+# whole company's news for.
+_CONNECTED_GROWTH_MIN_CONFIDENCE = 0.5
+
+
+def _anchor_equity_ok(symbol: str) -> bool:
+    """Whether a symbol is acceptable as an ANCHOR -- looser than
+    is_common_equity, which gates TRADEABLE accepts.
+
+    An anchor never becomes a trade; it exists only to propagate its news
+    along disclosed edges. So an OTC ADR or foreign ordinary (Advantest's
+    ATEYY, Infineon's IFNNY) is a perfectly good anchor and is allowed here,
+    even though is_common_equity blocks it for tradeables. What stays out is a
+    preferred series or share class (a hyphen/dot ticker like SCE-PM): a
+    securitization/financing vehicle with no company-level news of its own."""
+    return "-" not in symbol and "." not in symbol
+
+
 def _clamp_unit(value, default: float = 0.0) -> float:
     """A model-supplied 0-1 number, clamped. Tool schemas declare min/max but
     Anthropic tool use does not hard-enforce them, so an out-of-range value
@@ -658,6 +680,27 @@ class Engine:
                          from_symbol, symbol, rel_type, _clamped_confidence(p.get("confidence")),
                          str(p.get("description") or "")[:70])
         return added
+
+    def _tradeable_links(self, entry: dict) -> list[tuple[str, str, float]]:
+        """The disclosed edges from a CURRENT tradeable that this candidate's
+        pending edges would write into the graph the moment it is accepted
+        (see _promote_pending_edges). Non-empty means the candidate lands
+        CONNECTED -- its news reaches a real analysis target.
+
+        Only a pending edge whose from_symbol is tradeable RIGHT NOW counts:
+        an edge from another anchor makes an anchor->anchor link, which still
+        resolves to zero dossiers (see gather_coverage), so it does not make
+        the candidate worth polling. This is the predicate the connectivity
+        reconcile and the gated anchor auto-accept both decide on."""
+        tradeables = {c.symbol for c in self.universe if not c.signal_source_only}
+        links = set()
+        for p in entry.get("pending_edges") or []:
+            frm = p.get("from_symbol") or ""
+            rel = p.get("rel_type") or ""
+            conf = _clamped_confidence(p.get("confidence"))
+            if frm in tradeables and rel in REL_TYPES and conf >= _CONNECTED_GROWTH_MIN_CONFIDENCE:
+                links.add((frm, rel, round(conf, 2)))
+        return sorted(links)
 
     def _warn_once(self, key: str, message: str) -> None:
         if key in self._warned:
@@ -1769,6 +1812,20 @@ class Engine:
 
             if recommendation == "anchor":
                 if not self.settings.auto_accept_anchors:
+                    continue
+                # Connectivity gate: only auto-accept an anchor that lands
+                # CONNECTED to a tradeable. An anchor with no such edge is inert
+                # by construction (its news reaches no dossier), and
+                # unconditional anchor accepts are exactly what grew the
+                # 221-inert-anchor board (AUDIT-2026-08 A2). The same predicate
+                # the on-demand connectivity reconcile decides on -- that path
+                # additionally applies the equity/name-match filters, since it
+                # is a curated (dry-run-reviewed) growth; here the anchor bar
+                # stays deliberately liberal on everything except connectivity.
+                # Left pending, not blocked, on a miss: a tradeable may disclose
+                # the same name later, and then it qualifies. auto_accept_anchors
+                # is off by default, so this only bites if it is re-enabled.
+                if not self._tradeable_links(entry):
                     continue
             else:
                 if not self.settings.auto_accept_tradeables:
@@ -3416,6 +3473,123 @@ class Engine:
         log.warning("[UNIVERSE] Reset %d runtime-accepted symbol(s): %s. Universe is back to the curated list.",
                     len(removed), ", ".join(removed) or "none")
         return {"removed": removed, "universe_size": len(self.universe)}
+
+    async def reconcile_universe_connectivity(self, apply: bool = False) -> dict:
+        """One connectivity reconcile of the ANCHOR set: GROW with candidates
+        that will land connected to a tradeable, PRUNE runtime-accepted anchors
+        that are inert.
+
+        The board this exists for: 221 of 322 anchors carried no edge to any
+        tradeable (AUDIT-2026-08 A2), because auto-accept added anchors with no
+        connectivity requirement and hand-editing accepted_candidates.json adds
+        a symbol without ever running _promote_pending_edges. An inert anchor is
+        pure cost -- its news resolves to zero analysis targets and is discarded
+        unread (see gather_coverage).
+
+        GROW: accept every discovered candidate that (a) has a resolved ticker
+        not already in the universe, (b) carries a disclosed edge from a CURRENT
+        tradeable (_tradeable_links -- so accept_candidate's promotion lands it
+        live, not inert), (c) is anchorable equity (_anchor_equity_ok -- ADRs
+        fine, preferred/share classes out), and (d) whose ticker verifies
+        against the disclosed name in SEC's filer list (the Advantest->ATRO
+        misresolution guard, now applied to anchors too). Accepting as an anchor
+        writes its tradeable edge into the graph.
+
+        PRUNE: drop every RUNTIME-ACCEPTED anchor with no edge to any tradeable.
+        Curated DEFAULT_UNIVERSE anchors are never removed here -- a runtime
+        pass cannot durably delete a code-seeded symbol (it returns next
+        restart), and dropping a curated giant like NVDA is an editorial call.
+        Inert seed anchors are REPORTED (inert_seed_anchors) for a human to
+        remove from universe.py, not touched.
+
+        apply=False is a dry run: it computes and returns exactly what it would
+        do -- including the live SEC name-match checks, so the preview is real
+        -- without mutating anything. Runs on the event loop, like the other
+        universe mutators, because it reads/writes state the polling coroutines
+        touch between awaits."""
+        known = set(self.symbol_list)
+
+        # --- GROW: candidates that land connected ---
+        to_add: list[dict] = []
+        add_skipped: list[dict] = []
+        for entry in list(self.candidates.data.values()):
+            ticker = (entry.get("ticker") or "").upper()
+            if not ticker or ticker in known or ticker in self.accepted_candidates.data:
+                continue
+            links = self._tradeable_links(entry)
+            if not links:
+                continue  # anchor-only disclosure (or sub-floor): would land inert
+            if not _anchor_equity_ok(ticker):
+                add_skipped.append({"symbol": ticker,
+                                    "reason": _non_common_reason(ticker) or "not anchorable equity"})
+                continue
+            if self.edgar_client is not None and not await self.edgar_client.name_matches_ticker(
+                    entry.get("name") or "", ticker):
+                add_skipped.append({"symbol": ticker,
+                                    "reason": f"name {entry.get('name')!r} does not match {ticker} "
+                                              "in SEC's filer list"})
+                continue
+            ecosystem = guess_ecosystem(entry.get("related_to") or [], self.spec_by_symbol)
+            to_add.append({
+                "symbol": ticker,
+                "name": entry.get("name") or ticker,
+                "ecosystem": ecosystem if ecosystem not in ("?", "") else "accepted",
+                "links": [f"{frm}:{rel}({conf:.2f})" for frm, rel, conf in links],
+            })
+
+        added: list[str] = []
+        if apply:
+            for a in to_add:
+                spec = self.accept_candidate(a["symbol"], "anchor", source="connected")
+                added.append(spec.symbol)
+
+        # --- PRUNE: runtime-accepted anchors with no edge to a tradeable ---
+        tradeables = {c.symbol for c in self.universe if not c.signal_source_only}
+        adj: dict[str, set[str]] = {}
+        for r in self.graph.relationships:
+            adj.setdefault(r.from_symbol, set()).add(r.to_symbol)
+            adj.setdefault(r.to_symbol, set()).add(r.from_symbol)
+        inert_accepted, inert_seed = [], []
+        for c in self.universe:
+            if not c.signal_source_only:
+                continue  # a tradeable is never inert in this sense
+            if adj.get(c.symbol, set()) & tradeables:
+                continue  # live: reaches at least one tradeable
+            (inert_accepted if c.symbol in self.accepted_candidates.data else inert_seed).append(c.symbol)
+
+        pruned: list[str] = []
+        if apply and inert_accepted:
+            for symbol in inert_accepted:
+                self.accepted_candidates.delete(symbol)
+            pruned = sorted(inert_accepted)
+            # Rebuild the live universe from the curated base + the surviving
+            # accepted set, exactly like reset_accepted_candidates, so the
+            # in-memory universe and spec index match what the next restart
+            # would load. Grown anchors persist -- accept_candidate wrote them
+            # into accepted_candidates above.
+            self.universe = list(self.settings.universe)
+            self._apply_accepted_candidates()
+            self.spec_by_symbol = spec_by_symbol(self.universe)
+            self._archive_orphaned_dossiers()
+
+        log.warning(
+            "[UNIVERSE] Connectivity reconcile (%s): %s %d connected anchor(s), %s %d inert accepted "
+            "anchor(s); %d curated seed anchor(s) inert (reported, not touched).",
+            "APPLIED" if apply else "dry-run",
+            "added" if apply else "would add", len(added if apply else to_add),
+            "pruned" if apply else "would prune", len(pruned if apply else inert_accepted),
+            len(inert_seed),
+        )
+        return {
+            "applied": apply,
+            "added": sorted(added) if apply else None,
+            "would_add": to_add,
+            "pruned": pruned if apply else None,
+            "would_prune": sorted(inert_accepted),
+            "inert_seed_anchors": sorted(inert_seed),
+            "add_skipped": add_skipped,
+            "universe_size": len(self.symbol_list),
+        }
 
     def reset_runtime_state(self) -> dict:
         """Starts a clean measurement window. Archives every OPEN paper trade

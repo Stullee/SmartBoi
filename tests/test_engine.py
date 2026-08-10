@@ -370,6 +370,110 @@ async def test_candidate_recheck_recommends_anchor_for_large_cap(engine):
     assert engine.candidates.get("ZZZZ")["recommended_as"] == "anchor"
 
 
+# --- Connectivity reconcile: grow only with anchors that land connected to a
+# tradeable, prune runtime-accepted anchors that reach none (see
+# Engine.reconcile_universe_connectivity). ---
+
+def _connected_candidate(engine, ticker, from_symbol, rel="customer", conf=0.9, **extra):
+    """A discovered candidate whose pending edge is disclosed BY `from_symbol`,
+    so accepting it replays that edge into the graph (see _promote_pending_edges).
+    Disclosed by a tradeable => lands connected; by an anchor => still inert."""
+    entry = {
+        "name": f"{ticker} Inc", "ticker": ticker,
+        "related_to": [from_symbol], "rel_types": [rel],
+        "description": "", "sources": [], "seen_count": 1,
+        "pending_edges": [{"from_symbol": from_symbol, "rel_type": rel,
+                           "description": "disclosed", "confidence": conf, "source": "u"}],
+    }
+    entry.update(extra)
+    engine.candidates.set(ticker, entry)
+    return entry
+
+
+async def test_reconcile_grows_connected_anchor_and_promotes_its_edge(engine):
+    """A candidate disclosed by a tradeable (FORM) is accepted as an anchor and
+    lands CONNECTED: its edge enters the graph and it is classified into the
+    discovering tradeable's ecosystem, not the inert 'accepted' bucket."""
+    _connected_candidate(engine, "NEWCO", from_symbol="FORM")
+
+    result = await engine.reconcile_universe_connectivity(apply=True)
+
+    assert "NEWCO" in result["added"]
+    assert engine.spec_by_symbol["NEWCO"].signal_source_only is True  # an anchor
+    assert engine.spec_by_symbol["NEWCO"].ecosystem == engine.spec_by_symbol["FORM"].ecosystem
+    assert any(r.from_symbol == "FORM" and r.to_symbol == "NEWCO"
+               for r in engine.graph.relationships)
+
+
+async def test_reconcile_skips_a_candidate_disclosed_only_by_an_anchor(engine):
+    """INTC is an anchor here, so a candidate it alone discloses would make an
+    anchor->anchor edge -- still inert. It must not be grown."""
+    _connected_candidate(engine, "ANCHORONLY", from_symbol="INTC", rel="competitor")
+
+    result = await engine.reconcile_universe_connectivity(apply=True)
+
+    assert "ANCHORONLY" not in (result["added"] or [])
+    assert "ANCHORONLY" not in engine.spec_by_symbol
+
+
+async def test_reconcile_skips_preferred_and_name_mismatch(engine):
+    """A preferred/share-class ticker is not anchorable equity; a ticker whose
+    SEC name doesn't verify is a misresolution. Both are reported, not grown."""
+    _connected_candidate(engine, "SCE-PM", from_symbol="FORM")
+    _connected_candidate(engine, "WRONG", from_symbol="FORM", name="Totally Different Co")
+    engine.edgar_client.name_matches = False  # every name-match check fails
+
+    result = await engine.reconcile_universe_connectivity(apply=True)
+
+    assert result["added"] == []
+    skipped = {s["symbol"] for s in result["add_skipped"]}
+    assert "SCE-PM" in skipped and "WRONG" in skipped
+
+
+async def test_reconcile_prunes_inert_accepted_anchor_but_keeps_curated_seed(engine):
+    """An inert runtime-accepted anchor is removed; an inert curated seed anchor
+    (INTC, from anchor_symbols) is reported but never deleted."""
+    engine.accept_candidate("DEADWT", "anchor", source="auto")  # no edges -> inert
+    assert "DEADWT" in engine.spec_by_symbol
+
+    result = await engine.reconcile_universe_connectivity(apply=True)
+
+    assert "DEADWT" in result["pruned"]
+    assert "DEADWT" not in engine.spec_by_symbol
+    assert "DEADWT" not in engine.accepted_candidates.data
+    assert "INTC" in result["inert_seed_anchors"]
+    assert "INTC" in engine.spec_by_symbol  # curated seed is kept
+
+
+async def test_reconcile_dry_run_reports_without_mutating(engine):
+    _connected_candidate(engine, "NEWCO", from_symbol="FORM")
+    before = set(engine.spec_by_symbol)
+
+    result = await engine.reconcile_universe_connectivity(apply=False)
+
+    assert result["applied"] is False
+    assert [a["symbol"] for a in result["would_add"]] == ["NEWCO"]
+    assert set(engine.spec_by_symbol) == before
+    assert "NEWCO" not in engine.accepted_candidates.data
+    assert not any(r.to_symbol == "NEWCO" for r in engine.graph.relationships)
+
+
+async def test_auto_accept_anchor_requires_a_tradeable_connection(engine):
+    """The safe gate: with anchor auto-accept ON, only a candidate that lands
+    connected to a tradeable is accepted; one disclosed solely by an anchor is
+    left pending -- the flood that built the 221-inert board can't recur."""
+    engine.settings.enable_auto_accept_candidates = True
+    engine.settings.auto_accept_anchors = True
+    _connected_candidate(engine, "REAL", from_symbol="FORM", recommended_as="anchor")
+    _connected_candidate(engine, "FANOUT", from_symbol="INTC", rel="competitor",
+                         recommended_as="anchor")
+
+    await engine._auto_accept_candidates()
+
+    assert "REAL" in engine.spec_by_symbol
+    assert "FANOUT" not in engine.spec_by_symbol
+
+
 async def test_candidate_recheck_refreshes_recommendation_for_accepted_candidates(engine):
     # Accepted symbols must KEEP getting recommendation refreshes: the
     # reconcile pass (demote a trade target that now screens as an anchor)
