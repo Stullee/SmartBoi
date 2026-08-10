@@ -69,7 +69,8 @@ class RegShoClient:
         if response.status_code == 404:
             return None  # not published for that day -- walk further back
         if response.status_code >= 400:
-            log.warning("Reg SHO returned %d for %s", response.status_code, url)
+            log.warning("[REGSHO] HTTP %d for %s -- body starts: %s",
+                        response.status_code, url, response.text[:160])
             return None
         return response
 
@@ -105,24 +106,42 @@ class RegShoClient:
         (clearing it) would silently flip every short back to the cap proxy on
         one bad fetch."""
         today = today or datetime.now(timezone.utc).date()
+        # What was actually tried, so a failure is diagnosable from the log.
+        # Without this the only output was "not found in the last 6 days",
+        # which cannot distinguish a wrong URL from a blocked host from a file
+        # that genuinely is not published -- three problems with three
+        # different fixes. Confirmed live: 48 consecutive failures said
+        # nothing about which URL or which status.
+        attempts: list[str] = []
         for back in range(_MAX_LOOKBACK_DAYS):
             day = today - timedelta(days=back)
             if day.weekday() >= 5:
                 continue  # no settlement file on weekends
-            response = await self._get(_URL_TEMPLATE.format(yyyymmdd=day.strftime("%Y%m%d")))
+            url = _URL_TEMPLATE.format(yyyymmdd=day.strftime("%Y%m%d"))
+            response = await self._get(url)
             if response is None:
+                attempts.append(f"{url} -> no response/404")
                 continue
             symbols = self._parse(response.text)
             if not symbols:
+                # A 200 that parses to nothing is the most misleading failure
+                # of the three: the host is up, the URL is right, and the
+                # FORMAT changed. The body prefix is what says so.
+                attempts.append(
+                    f"{url} -> HTTP 200 but 0 symbols parsed; body starts: "
+                    f"{response.text[:160]!r}"
+                )
                 continue
             self._symbols = symbols
             self._as_of = day.isoformat()
-            log.info("[REGSHO] Loaded %d threshold securities as of %s.", len(symbols), self._as_of)
+            log.info("[REGSHO] Loaded %d threshold securities as of %s (%s).",
+                     len(symbols), self._as_of, url)
             return True
         log.warning(
-            "Reg SHO: no threshold list found in the last %d day(s) -- keeping the previous list "
-            "(%d symbol(s), as of %s). Borrow flags fall back to the market-cap proxy for names "
-            "not on it.", _MAX_LOOKBACK_DAYS, len(self._symbols), self._as_of or "never",
+            "[REGSHO] No threshold list found in the last %d day(s) -- keeping the previous list "
+            "(%d symbol(s), as of %s). Borrow flags fall back to the market-cap proxy. Tried:\n  %s",
+            _MAX_LOOKBACK_DAYS, len(self._symbols), self._as_of or "never",
+            "\n  ".join(attempts) or "(no business days in range)",
         )
         return False
 

@@ -245,3 +245,26 @@ def test_a_search_hit_is_frozen():
     hit = SearchHit(adsh="x", cik="y", company="Z CORP (Z)", form="10-K", filing_date="2025-01-01")
     with pytest.raises(dataclasses.FrozenInstanceError):
         hit.adsh = "other"  # type: ignore[misc]
+
+
+def test_a_hit_carries_the_document_filename_needed_to_fetch_it():
+    """Regression, found live. The archive URL is
+    <archives>/<cik>/<accession>/<primary_document>, so a hit without its
+    document filename builds a DIRECTORY url that always 404s -- which made
+    the proximity pass unable to fetch anything and therefore made the whole
+    search yield zero candidates no matter what EFTS returned."""
+    hits = parse_hits(_PAYLOAD)
+
+    assert hits[0].document == "ichr-20250101.htm"
+    assert hits[1].document == "ucap-20250630.htm"
+
+
+def test_a_filing_built_from_a_hit_has_a_fetchable_url():
+    from smartboi.edgar import EdgarClient
+
+    hit = parse_hits(_PAYLOAD)[0]
+    filing = EdgarClient.filing_from_hit(None, hit)   # pure mapping, no client state
+
+    assert filing.primary_document == "ichr-20250101.htm"
+    assert filing.document_url.endswith("/1050915/000105091525000012/ichr-20250101.htm")
+    assert not filing.document_url.endswith("/")
