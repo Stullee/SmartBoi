@@ -94,6 +94,13 @@ DATA_DIR = Path("data")
 # the Gateway restarting daily, or simply not being up yet, shouldn't cost
 # most of a day of price marks.
 IB_RETRY_GAP_SEC = 900
+# How long to wait before retrying a failed Reg SHO refresh. The threshold
+# list publishes once per settlement day, so a failure means the file is not
+# there yet (or the host is unreachable) -- neither of which resolves in
+# seconds. Hourly is frequent enough to pick the file up the same day and
+# slow enough that a persistent failure is a handful of requests, not
+# hundreds.
+REGSHO_RETRY_GAP_SEC = 3600
 # Evidence time-decay is a slow-moving correction, not a live signal --
 # recomputing it once a day is plenty (see _run_decay_pass). It runs off the
 # same persisted daily schedule as the snapshot passes below rather than a
@@ -466,6 +473,9 @@ class Engine:
         # requests that dedupe to nothing, not a cost worth persisting for.
         self._last_fedreg_poll: float | None = None
         self._last_dod_poll: float | None = None
+        # Backoff after a failed Reg SHO refresh -- see the retry_after gate
+        # in _tick for why a bare "not done yet" retries every 30 seconds.
+        self._regsho_retry_after: float = 0.0
         self._retry_state = JsonState(DATA_DIR / "retry_state.json")
         self._load_retry_state()
 
@@ -1232,12 +1242,26 @@ class Engine:
             else:
                 self._price_marks_retry_after = time.monotonic() + IB_RETRY_GAP_SEC
         # One plain-text file a day, free and unauthenticated, refreshed on
-        # trading days only (the list is published per SETTLEMENT day). A
-        # failure leaves the previous list in place and is not marked done, so
-        # the next tick retries.
-        if self.regsho is not None and is_trading_day() and self._daily_pass_due("regsho"):
+        # trading days only (the list is published per SETTLEMENT day).
+        #
+        # The retry_after gate is load-bearing, not belt-and-braces. A failure
+        # deliberately does NOT mark the pass done (so it is retried rather
+        # than skipped for the day), and _daily_pass_due therefore stays true
+        # -- which without a backoff means a retry on EVERY tick. Measured
+        # live at 0.54.0: 48 attempts in 27 minutes, each walking back six
+        # days, i.e. a few hundred requests an hour at nasdaqtrader.com for a
+        # file that publishes once. Same shape, and the same fix, as
+        # _price_marks_retry_after.
+        if (
+            self.regsho is not None
+            and is_trading_day()
+            and now >= self._regsho_retry_after
+            and self._daily_pass_due("regsho")
+        ):
             if await self.regsho.refresh():
                 self._mark_daily_pass_done("regsho")
+            else:
+                self._regsho_retry_after = now + REGSHO_RETRY_GAP_SEC
         if self.fedreg is not None and self._due(
             self._last_fedreg_poll, self.settings.federal_register_poll_interval_sec, now
         ):

@@ -267,7 +267,15 @@ class FederalRegisterClient:
         if payload is None:
             return []
         docs = parse_documents(payload)
-        log.info("[FEDREG] %s: %d document(s) since %s.", search.key, len(docs), since)
+        # The API's OWN count alongside what was parsed. Without it, "0
+        # document(s)" is ambiguous between "the search genuinely matched
+        # nothing" and "the response came back in a shape parse_documents
+        # rejected" -- and those need opposite fixes (widen the search vs fix
+        # the parser). Confirmed live: five searches all reported 0 and the
+        # log could not say which of the two it was.
+        reported = payload.get("count") if isinstance(payload, dict) else None
+        log.info("[FEDREG] %s: %d document(s) parsed since %s (API reported count=%s).",
+                 search.key, len(docs), since, reported if reported is not None else "absent")
         return docs
 
     async def aclose(self) -> None:

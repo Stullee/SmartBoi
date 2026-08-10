@@ -345,14 +345,21 @@ class EdgarClient:
     def filing_from_hit(self, hit, symbol: str = "") -> FilingEvent:
         """A SearchHit -> the FilingEvent shape fetch_text already knows how
         to read, so the proximity pass reuses the existing document fetch
-        rather than growing a second one."""
+        rather than growing a second one.
+
+        `primary_document` MUST carry the hit's document filename. document_url
+        is built as <archives>/<cik>/<accession>/<primary_document>, so an
+        empty one produces a directory URL that always 404s -- which silently
+        made the proximity pass unable to fetch anything at all, and therefore
+        made the whole search yield zero candidates no matter what EFTS
+        returned. That is exactly why SearchHit carries `document`."""
         return FilingEvent(
             symbol=symbol or hit.ticker or hit.name,
             cik10=hit.cik,
             form=hit.form,
             filing_date=hit.filing_date,
             accession_number=hit.adsh,
-            primary_document="",
+            primary_document=hit.document,
         )
 
     async def _ticker_map(self) -> tuple[dict[str, str], dict[str, str]]:

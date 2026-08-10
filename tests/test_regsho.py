@@ -137,3 +137,35 @@ def test_absence_from_the_list_falls_back_to_the_proxy_rather_than_clearing():
 
 def test_longs_never_assume_a_borrow():
     assert assumes_borrow("LONG", 50.0, on_threshold_list=True) is False
+
+
+@pytest.mark.regsho_network
+@pytest.mark.asyncio
+async def test_a_failure_reports_every_url_it_tried(caplog):
+    """Regression, found live: 48 consecutive failures logged only 'not found
+    in the last 6 days', which cannot distinguish a wrong URL from a blocked
+    host from a file that genuinely is not published -- three problems with
+    three different fixes."""
+    import logging
+
+    client = _client(lambda request: httpx.Response(404))
+    with caplog.at_level(logging.WARNING):
+        assert await client.refresh(today=date(2026, 8, 7)) is False
+
+    assert "nasdaqth20260807.txt" in caplog.text
+    assert "nasdaqth20260806.txt" in caplog.text
+
+
+@pytest.mark.regsho_network
+@pytest.mark.asyncio
+async def test_a_200_that_parses_to_nothing_says_so_with_the_body(caplog):
+    """The most misleading of the three failures: host up, URL right, FORMAT
+    changed. Only the body prefix distinguishes it from a 404."""
+    import logging
+
+    client = _client(lambda request: httpx.Response(200, text="<html>Maintenance</html>"))
+    with caplog.at_level(logging.WARNING):
+        assert await client.refresh(today=date(2026, 8, 7)) is False
+
+    assert "0 symbols parsed" in caplog.text
+    assert "Maintenance" in caplog.text
