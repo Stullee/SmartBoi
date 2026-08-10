@@ -80,6 +80,50 @@ that specific inefficiency, not to race anyone on speed:
    (`MAX_6K_ITEMS_PER_SYMBOL_PER_DAY`) because EDGAR independence keys on
    form *and* filing day, so an unbounded cross-filer could corroborate
    itself into a signal. See `edgar.py`.
+4b. **Primary sources that are not filings** -- two feeds where the
+   government is the publisher, so the evidence cannot be two outlets
+   rewording one wire story:
+
+   - **DoD daily contract announcements** (`dod_contracts.py`, war.gov, free):
+     every award at or above the DFARS 205.303 threshold, published ~5pm ET
+     each business day. Chosen over USASpending/FPDS for a hard reason: DoD
+     awards are withheld from those for **90 days**, ~6x past the 14-day floor
+     in `evidence_is_stale`, so that evidence would be *born aged out*.
+     (FPDS-NG's ATOM feed no longer exists either — FPDS.gov was decommissioned
+     in 2026 and folded into SAM.gov.)
+
+     The hard part is name matching, not fetching. Announcements use legal
+     entity names — "Ducommun LaBarge Technologies Inc." → DCO, "Vertex
+     Aerospace LLC" → V2X — and **"Vertex" alone collides with Vertex
+     Pharmaceuticals**. So matching is whole-word, case-insensitive, against a
+     hand-reviewed alias table and nothing else: no fuzzy matching, no
+     substrings. A banned-alias list lives in code rather than in a comment so
+     that adding a dangerous one fails a test rather than a live dossier. The
+     announcement text is passed through **verbatim**, because many "awards"
+     are IDIQ ceilings or modifications rather than new revenue and the
+     difference lives in the wording — summarising it would destroy exactly
+     what the skeptic needs to catch it. Anchor awards are gated on a value
+     floor (default $100M); a tradeable's own award never is, since $12M is
+     material to a $90M-cap company in a way the same award to Lockheed isn't.
+
+   - **Federal Register** (`federal_register.py`, free, no key): a handful of
+     hand-curated searches, never the feed — ~200 documents publish per
+     business day and watching that broadly is a disqualifying firehose. Each
+     search was written against a specific checkable claim: wind-tower AD/CVD
+     proceedings name **BWEN** as a Wind Tower Trade Coalition member; EPA AIM
+     Act HFC allowance notices are entity-specific and drive **HDSN**'s
+     refrigerant economics; BIS Entity List actions reach **AOSL**; export
+     controls and FMVSS reach two whole ecosystems.
+
+     A rule is not a company, so propagation runs from synthetic regulator
+     origins (BIS, EPA, ITC, NHTSA) over hand-seeded `regulator` edges. Those
+     are **deliberately kept out of the universe** — registering them as
+     members would put "BIS" into the EDGAR poll, the news poll and the screen
+     — and the edges are seeded at 0.60–0.80, below
+     `DISCLOSED_LINK_CONFIDENCE`, so a sector-wide rule can raise a thesis but
+     never buys the corroboration discount a quantified customer disclosure
+     earns.
+
 5. **Adversarial to itself, calibrated by directness** -- every proposed
    dossier update is reviewed by a second, skeptical LLM pass trying to
    refute it before it counts, but the bar differs deliberately for direct

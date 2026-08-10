@@ -3061,3 +3061,112 @@ async def test_no_hits_is_reported_not_raised(engine):
     report = await run_edgar_supplier_search(engine)   # must not raise
 
     assert "no hits" in report.lower()
+
+
+# --- Federal Register: a rule is not a company, so propagation runs from a
+# synthetic regulator origin. The contract that matters is that the regulator
+# is an ORIGIN ONLY -- it must never gain a dossier, never be polled, never
+# be screened, and never buy the corroboration discount. ---
+
+def _fedreg_engine(tmp_path, monkeypatch, **overrides):
+    from smartboi.universe import CompanySpec
+
+    settings = Settings(
+        _env_file=None, symbols="BWEN,HDSN", anchor_symbols="",
+        enable_relationship_backfill=False, enable_universe_autoscreen=False,
+        enable_dashboard=False, enable_federal_register=True, **overrides,
+    )
+    monkeypatch.chdir(tmp_path)
+    e = Engine(settings)
+    e.universe = [
+        CompanySpec("BWEN", "Broadwind", "grid_datacenter"),
+        CompanySpec("HDSN", "Hudson Technologies", "industrial_machinery"),
+    ]
+    e.spec_by_symbol = {c.symbol: c for c in e.universe}
+    return e
+
+
+def test_a_regulator_is_never_a_universe_member(tmp_path, monkeypatch):
+    """Registering BIS/EPA as universe members would put them into the EDGAR
+    poll, the news poll, the screen and every count -- they are not filers and
+    have no market in them."""
+    from smartboi.federal_register import REGULATOR_SYMBOLS
+
+    engine = _fedreg_engine(tmp_path, monkeypatch)
+
+    for regulator in REGULATOR_SYMBOLS:
+        assert regulator not in engine.symbol_list
+        assert regulator not in engine.spec_by_symbol
+
+
+def test_regulator_edges_are_seeded_below_the_disclosed_link_bar(tmp_path, monkeypatch):
+    from smartboi.dossier import DISCLOSED_LINK_CONFIDENCE
+
+    engine = _fedreg_engine(tmp_path, monkeypatch)
+    engine._seed_regulator_edges()
+
+    seeded = [r for r in engine.graph.relationships if r.source == "regulator seed"]
+    assert seeded, "no regulator edges were seeded"
+    assert all(r.rel_type == "regulator" for r in seeded)
+    assert all(r.confidence < DISCLOSED_LINK_CONFIDENCE for r in seeded), (
+        "a sector-wide rule must never buy the corroboration discount"
+    )
+
+
+def test_a_regulator_edge_points_at_the_regulator(tmp_path, monkeypatch):
+    """rel_type describes what to_symbol IS to from_symbol, so the regulator
+    is the TARGET. Backwards it reads as 'BWEN is a regulator of ITC', and
+    that text goes to the dossier updater and the skeptic."""
+    engine = _fedreg_engine(tmp_path, monkeypatch)
+    engine._seed_regulator_edges()
+
+    edge = next(r for r in engine.graph.relationships
+                if r.source == "regulator seed" and r.from_symbol == "BWEN")
+    assert edge.to_symbol == "ITC"
+    assert "is a regulator of BWEN" in edge.description
+
+
+async def test_a_regulatory_document_reaches_the_company_not_the_regulator(tmp_path, monkeypatch):
+    engine = _fedreg_engine(tmp_path, monkeypatch)
+    engine.updater = FakeUpdater(default=proposal(direction="SHORT"))
+    engine.skeptic = FakeSkeptic(default=verdict(refuted=False))
+    engine._seed_regulator_edges()
+
+    await engine._process_evidence(
+        origin_symbol="ITC", evidence_text="AD/CVD final results on wind towers.",
+        source_type="regulatory", source_name="Federal Register (ITC/wind-towers-adcvd)",
+        url="https://x/1", headline="Wind towers AD/CVD", published_at="2026-08-07",
+    )
+
+    assert engine.dossiers.load("BWEN").evidence, "the rule must reach the company"
+    assert not engine.dossiers.load("ITC").evidence, "there is no thesis about a regulator"
+
+
+async def test_two_proceedings_by_one_agency_are_two_sources(tmp_path, monkeypatch):
+    """The search key is part of the source name, so one agency running two
+    unrelated rulemakings is two facts rather than one restated. Collapsing
+    them would cap a regulatory thesis at one source per agency forever."""
+    from smartboi.dossier import independence_key
+
+    from smartboi.universe import CompanySpec
+
+    engine = _fedreg_engine(tmp_path, monkeypatch)
+    # AOSL is what the BIS searches actually reach -- entity-list names it
+    # directly and semi-export-controls reaches its ecosystem.
+    engine.universe.append(CompanySpec("AOSL", "Alpha and Omega", "semi_equipment"))
+    engine.spec_by_symbol = {c.symbol: c for c in engine.universe}
+    engine.updater = FakeUpdater(default=proposal(direction="SHORT"))
+    engine.skeptic = FakeSkeptic(default=verdict(refuted=False))
+    engine._seed_regulator_edges()
+
+    for key in ("entity-list", "semi-export-controls"):
+        await engine._process_evidence(
+            origin_symbol="BIS", evidence_text=f"rule {key}", source_type="regulatory",
+            source_name=f"Federal Register (BIS/{key})", url=f"https://x/{key}",
+            headline=key, published_at="2026-08-07",
+        )
+
+    records = engine.dossiers.load("AOSL").evidence
+    assert len(records) == 2, "both proceedings must reach the company"
+    keys = {independence_key(r) for r in records}
+    assert len(keys) == 2, "and count as two independent sources, not one agency"

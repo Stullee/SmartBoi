@@ -29,6 +29,7 @@ edgar_lookback_days) -- an item still unscored when it ages out is dropped."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -53,7 +54,13 @@ from smartboi.dossier import (
     recompute_decay,
     slot_keys,
 )
+from smartboi.dod_contracts import DodContractsClient, awards_from_page, business_days_back
 from smartboi.edgar import EdgarClient, FilingEvent
+from smartboi.federal_register import (
+    CURATED_SEARCHES,
+    REGULATOR_SYMBOLS,
+    FederalRegisterClient,
+)
 from smartboi.graph import REL_TYPES, RelationshipExtractor, RelationshipGraph, Relationship
 from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal, cost_bps_per_side_for_cap
@@ -454,6 +461,11 @@ class Engine:
         # was re-proposed and a nondeterministic second skeptic run could
         # ACCEPT what the first had refuted. Persisting closes that door and
         # also spares the re-paid propose_update on a mid-flight restart.
+        # Federal Register poll clock. Process-local like the news/EDGAR
+        # polls: a restart re-reading a 3-day window is a handful of cheap
+        # requests that dedupe to nothing, not a cost worth persisting for.
+        self._last_fedreg_poll: float | None = None
+        self._last_dod_poll: float | None = None
         self._retry_state = JsonState(DATA_DIR / "retry_state.json")
         self._load_retry_state()
 
@@ -470,6 +482,20 @@ class Engine:
         # (see paper_journal.assumes_borrow).
         self.regsho: RegShoClient | None = (
             RegShoClient() if settings.enable_regsho else None
+        )
+        # Also free and unauthenticated. Scoped to a handful of hand-written
+        # searches -- the Federal Register publishes ~200 documents a business
+        # day and watching it broadly is a disqualifying firehose.
+        self.fedreg: FederalRegisterClient | None = (
+            FederalRegisterClient(user_agent=settings.edgar_user_agent or "SmartBoi")
+            if settings.enable_federal_register else None
+        )
+        # DoD daily contract announcements. Free, no auth, ~0-3 matched items
+        # per business day once the value floor and the alias table have had
+        # their say.
+        self.dod: DodContractsClient | None = (
+            DodContractsClient(user_agent=settings.edgar_user_agent or "SmartBoi")
+            if settings.enable_dod_contracts else None
         )
 
         self._warned: set[str] = set()
@@ -792,6 +818,48 @@ class Engine:
             self.model_state.set("changed_at", datetime.now(timezone.utc).isoformat())
         self.model_state.set("models", current)
 
+    def _seed_regulator_edges(self) -> None:
+        """Hand-seeded `regulator` edges from each pseudo-member to the
+        companies its curated searches declare.
+
+        Seeded at 0.60-0.80, deliberately BELOW dossier.DISCLOSED_LINK_CONFIDENCE
+        (0.85). A sector-wide rule can raise a thesis but must never buy the
+        corroboration discount a quantified customer disclosure earns: "the EPA
+        set HFC allowances" is real and material, and it is not evidence that
+        some other item about the company is independently corroborated.
+
+        Targeted searches seed a little higher than ecosystem-wide ones for the
+        obvious reason -- a proceeding that names the company is a tighter
+        causal link than a rule that moves its whole sector."""
+        if not self.settings.enable_federal_register:
+            return
+        known = set(self.symbol_list)
+        now = datetime.now(timezone.utc).isoformat()
+        for search in CURATED_SEARCHES:
+            targets = list(search.targets)
+            if search.ecosystem:
+                targets += [c.symbol for c in self.universe
+                            if c.ecosystem == search.ecosystem and not c.signal_source_only]
+            for target in targets:
+                if target not in known or target == search.regulator:
+                    continue
+                # Direction follows the graph's convention: rel_type describes
+                # what to_symbol IS to from_symbol (see graph.Relationship), so
+                # the REGULATOR is the target of the edge, not its source.
+                # Reachability is unaffected either way -- linked_symbols walks
+                # both directions -- but the description text is read by the
+                # dossier updater and the skeptic, and a backwards edge reads
+                # as "AOSL is a regulator of BIS".
+                self.graph.add(Relationship(
+                    target, search.regulator, "regulator",
+                    f"{search.regulator} ({REGULATOR_SYMBOLS.get(search.regulator, '')}) is a "
+                    f"regulator of {target}: actions matching '{search.term}' bear on it. "
+                    f"{search.note}",
+                    "regulator seed",
+                    0.80 if target in search.targets else 0.60,
+                    now,
+                ))
+
     def _seed_graph(self) -> None:
         """Seeds the well-documented DEFAULT_UNIVERSE relationships
         (SEED_RELATIONSHIPS) -- but only the ones where BOTH companies are
@@ -813,6 +881,7 @@ class Engine:
     async def start(self) -> None:
         self._check_model_provenance()
         self._seed_graph()
+        self._seed_regulator_edges()
         # Repairs acceptances written before the ecosystem was persisted (see
         # _apply_accepted_candidates). Runs here rather than in __init__ so it
         # resolves against the seeded graph and the fully-built universe.
@@ -1169,6 +1238,16 @@ class Engine:
         if self.regsho is not None and is_trading_day() and self._daily_pass_due("regsho"):
             if await self.regsho.refresh():
                 self._mark_daily_pass_done("regsho")
+        if self.fedreg is not None and self._due(
+            self._last_fedreg_poll, self.settings.federal_register_poll_interval_sec, now
+        ):
+            self._last_fedreg_poll = now
+            await self._poll_federal_register()
+        if self.dod is not None and self._due(
+            self._last_dod_poll, self.settings.dod_poll_interval_sec, now
+        ):
+            self._last_dod_poll = now
+            await self._poll_dod_contracts()
         if (
             self.edgar_client is not None
             and self._due(self._last_candidate_recheck, CANDIDATE_RECHECK_INTERVAL_SEC, now)
@@ -1313,6 +1392,112 @@ class Engine:
                 "remove it from universe.py / SYMBOLS if it is genuinely delisted.",
             )
         return True
+
+    async def _poll_dod_contracts(self) -> None:
+        """One pass over the last few business days of DoD announcements.
+
+        Deduped per (day, symbol, award) so an overlapping lookback re-reads a
+        page without re-scoring what it already found. Direct evidence: an
+        award to Ducommun IS news about Ducommun, so it goes to that dossier
+        rather than propagating from anywhere -- which also means it needs no
+        graph edge to be useful, and reaches names the graph has never linked.
+
+        Logged with the matched alias on every item. The alias table is the
+        one part of this that can be quietly wrong, and "which rule matched"
+        is the only thing that makes a bad match diagnosable from a log."""
+        if self.dod is None:
+            return
+        universe = set(self.symbol_list)
+        anchors = {c.symbol for c in self.universe if c.signal_source_only}
+        for day in business_days_back(self.settings.dod_lookback_days):
+            try:
+                page = await self.dod.fetch_day(day)
+            except Exception:  # noqa: BLE001 - one bad day must not stop the rest
+                log.exception("[DOD] %s: fetch failed", day)
+                continue
+            if not page:
+                continue
+            awards = awards_from_page(
+                page, universe, day.isoformat(), anchors=anchors,
+                value_floor=self.settings.dod_anchor_value_floor_usd,
+            )
+            log.info("[DOD] %s: %d announcement(s) matched a universe company.",
+                     day, len(awards))
+            for award in awards:
+                # hashlib, NOT hash(): str hashing is salted per process, so
+                # a built-in hash would change on every restart and re-score
+                # every award the engine had already read.
+                digest = hashlib.sha1(award.text.encode("utf-8")).hexdigest()[:16]
+                fingerprint = f"dod:{day.isoformat()}:{award.symbol}:{digest}"
+                if self.dedup.is_duplicate(fingerprint):
+                    continue
+                log.info("[DOD] %s: %s matched via alias %r, value=%s",
+                         day, award.symbol, award.matched_alias,
+                         f"${award.value_usd:,.0f}" if award.value_usd else "unparsed")
+                try:
+                    handled = await self._process_evidence(
+                        origin_symbol=award.symbol,
+                        evidence_text=award.evidence_text,
+                        source_type="contract_award",
+                        source_name="DoD Contract Announcements",
+                        url=f"https://www.war.gov/News/Contracts/Contract/Article/{day.isoformat()}/",
+                        headline=f"{award.symbol}: DoD contract award announced {day.isoformat()}",
+                        published_at=day.isoformat(),
+                    )
+                except Exception:  # noqa: BLE001 - one bad award must not abort the pass
+                    log.exception("[DOD] %s: processing the %s award failed", day, award.symbol)
+                    continue
+                if handled:
+                    self.dedup.register(fingerprint, "war.gov")
+
+    async def _poll_federal_register(self) -> None:
+        """One pass over the curated regulatory searches.
+
+        Each matched document is scored against the dossiers its search
+        declares, propagating from the issuing body's pseudo-member over a
+        seeded `regulator` edge. Deduped on document_number so overlapping
+        lookback windows re-read the same rule without re-scoring it.
+
+        Logged verbosely on purpose: this is the pass most likely to be
+        diagnosed from a deployment's logs rather than from a test, since the
+        API response shape cannot be exercised offline."""
+        if self.fedreg is None:
+            return
+        for search in CURATED_SEARCHES:
+            try:
+                documents = await self.fedreg.fetch(
+                    search, lookback_days=self.settings.federal_register_lookback_days,
+                )
+            except Exception:  # noqa: BLE001 - one bad search must not stop the rest
+                log.exception("[FEDREG] %s: search failed", search.key)
+                continue
+            for doc in documents:
+                fingerprint = f"fedreg:{doc.document_number}"
+                if self.dedup.is_duplicate(fingerprint):
+                    continue
+                log.info("[FEDREG] %s: scoring %s (%s) -- %s",
+                         search.key, doc.document_number, doc.doc_type, doc.title[:120])
+                try:
+                    handled = await self._process_evidence(
+                        origin_symbol=search.regulator,
+                        evidence_text=doc.evidence_text,
+                        source_type="regulatory",
+                        # The issuing agency AND the search key, so two
+                        # different EPA proceedings are two sources rather than
+                        # collapsing onto one "EPA" slot -- the independence
+                        # key is the source name for direct evidence, and one
+                        # agency running two unrelated rulemakings is two
+                        # facts, not one restated.
+                        source_name=f"Federal Register ({search.regulator}/{search.key})",
+                        url=doc.url,
+                        headline=doc.title[:300],
+                        published_at=doc.publication_date,
+                    )
+                except Exception:  # noqa: BLE001 - one bad document must not abort the pass
+                    log.exception("[FEDREG] %s: processing %s failed", search.key, doc.document_number)
+                    continue
+                if handled:
+                    self.dedup.register(fingerprint, "federalregister.gov")
 
     def _6k_count(self, symbol: str, filing_date: str) -> int:
         """How many 6-Ks this symbol has already had ingested for this filing
@@ -2313,7 +2498,13 @@ class Engine:
         ecosystem_keys: set[str] = set()  # of those, the ones on the ecosystem limiter
 
         origin_spec = self.spec_by_symbol.get(origin_symbol)
-        if origin_spec is None or not origin_spec.signal_source_only:
+        # A regulator is an ORIGIN ONLY -- there is no such thing as a thesis
+        # about the EPA. It is deliberately NOT a universe member (that would
+        # put "BIS" into the EDGAR poll, the news poll, the screen and every
+        # count), so origin_spec is None for it and the signal_source_only
+        # check below cannot be what protects it. This is.
+        is_regulator = origin_symbol in REGULATOR_SYMBOLS
+        if not is_regulator and (origin_spec is None or not origin_spec.signal_source_only):
             targets.append((origin_symbol, "", None, ""))
 
         now = time.monotonic()

@@ -34,6 +34,13 @@ options:
   edgar_forms: "8-K,8-K/A,10-K,10-Q,4,SC 13D,SC 13D/A,424B5,424B3,NT 10-K,NT 10-Q,S-1,S-3,S-3/A,20-F,40-F,6-K,25,25-NSE,15-12B,15-12G"
   max_6k_items_per_symbol_per_day: 1
   enable_regsho: true
+  enable_federal_register: true
+  federal_register_lookback_days: 3
+  federal_register_poll_interval_sec: 21600
+  enable_dod_contracts: true
+  dod_lookback_days: 3
+  dod_poll_interval_sec: 21600
+  dod_anchor_value_floor_usd: 100000000.0
   edgar_poll_interval_sec: 900
   edgar_lookback_days: 14
   enable_news_ingestion: true
@@ -102,6 +109,13 @@ schema:
   edgar_forms: str
   max_6k_items_per_symbol_per_day: int(0,20)
   enable_regsho: bool
+  enable_federal_register: bool
+  federal_register_lookback_days: int(1,30)
+  federal_register_poll_interval_sec: int(3600,604800)
+  enable_dod_contracts: bool
+  dod_lookback_days: int(1,30)
+  dod_poll_interval_sec: int(3600,604800)
+  dod_anchor_value_floor_usd: float(0,100000000000)
   edgar_poll_interval_sec: int(60,86400)
   edgar_lookback_days: int(1,90)
   enable_news_ingestion: bool
