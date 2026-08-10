@@ -2959,3 +2959,105 @@ async def test_a_verdict_predating_the_key_record_is_not_read_as_fully_stale(eng
     await engine._maybe_resynthesize(dossier, datetime.now(timezone.utc))
 
     assert len(engine.synthesizer.calls) == calls_before
+
+
+# --- EDGAR full-text search: the same safety-critical NEGATIVE property web
+# research has, for a stricter reason. A full-text hit is not a disclosure
+# ABOUT the anchor -- it is a third party's filing that happens to mention
+# it. Routed to evidence it would score one company's 10-K against another
+# company's dossier. Candidates only. ---
+
+def _hit(adsh="0001050915-25-000012", company="ICHOR HOLDINGS, LTD. (ICHR)"):
+    from smartboi.edgar_search import SearchHit
+
+    return SearchHit(adsh=adsh, cik="0001050915", company=company, form="10-K",
+                     filing_date="2025-02-14", document="ichr-20250101.htm")
+
+
+def _anchor_spec(engine):
+    """The anchor run_edgar_supplier_search will pick first."""
+    return next(c for c in engine.universe if c.signal_source_only and (c.name or "").strip())
+
+
+async def test_edgar_search_writes_candidates_and_never_an_edge(engine):
+    from smartboi.tools import run_edgar_supplier_search
+
+    anchor = _anchor_spec(engine)
+    edges_before = len(engine.graph.relationships)
+    engine.edgar_client.search_hits_by_anchor[anchor.name] = [_hit()]
+    engine.edgar_client.text_by_accession["0001050915-25-000012"] = (
+        f"{anchor.name}, our largest customer, accounted for 22% of net sales."
+    )
+
+    report = await run_edgar_supplier_search(engine)
+
+    assert len(engine.graph.relationships) == edges_before, "a hit must never mint an edge"
+    assert engine.candidates.data, "but it must produce a candidate"
+    entry = next(iter(engine.candidates.data.values()))
+    assert entry.get("researched_only") is True
+    assert not entry.get("pending_edges")
+    assert "candidate" in report.lower()
+
+
+async def test_edgar_search_does_not_inflate_seen_count(engine):
+    """seen_count gates auto-accept as a TRADE TARGET at
+    auto_accept_min_seen_count. It counts independent filing DISCLOSURES of a
+    relationship, not sightings of a name in a search index."""
+    from smartboi.tools import run_edgar_supplier_search
+
+    anchor = _anchor_spec(engine)
+    engine.edgar_client.search_hits_by_anchor[anchor.name] = [_hit()]
+    engine.edgar_client.text_by_accession["0001050915-25-000012"] = (
+        f"{anchor.name} accounted for 22% of net sales."
+    )
+
+    await run_edgar_supplier_search(engine)
+    first = next(iter(engine.candidates.data.values())).get("seen_count")
+    await run_edgar_supplier_search(engine)
+    second = next(iter(engine.candidates.data.values())).get("seen_count")
+
+    assert first == second == 1
+
+
+async def test_a_hit_without_a_concentration_disclosure_is_dropped(engine):
+    """Document-level AND over-matches by construction; the local proximity
+    pass is what makes a hit a lead rather than a coincidence."""
+    from smartboi.tools import run_edgar_supplier_search
+
+    anchor = _anchor_spec(engine)
+    engine.edgar_client.search_hits_by_anchor[anchor.name] = [_hit()]
+    engine.edgar_client.text_by_accession["0001050915-25-000012"] = (
+        f"We compete with {anchor.name} in several markets." + " filler." * 500
+    )
+
+    await run_edgar_supplier_search(engine)
+
+    assert not engine.candidates.data
+
+
+async def test_a_hit_on_a_symbol_already_held_is_skipped(engine):
+    """If the filer is already in the universe, _poll_edgar has fetched that
+    filing and run extraction on it already -- the hit adds nothing and the
+    fetch is pure waste."""
+    from smartboi.tools import run_edgar_supplier_search
+
+    anchor = _anchor_spec(engine)
+    engine.edgar_client.search_hits_by_anchor[anchor.name] = [
+        _hit(company="FORMFACTOR INC (FORM)")
+    ]
+    engine.edgar_client.text_by_accession["0001050915-25-000012"] = (
+        f"{anchor.name} accounted for 22% of net sales."
+    )
+
+    await run_edgar_supplier_search(engine)
+
+    assert engine.edgar_client.fetched == [], "a name already in the universe must not be fetched"
+    assert not engine.candidates.data
+
+
+async def test_no_hits_is_reported_not_raised(engine):
+    from smartboi.tools import run_edgar_supplier_search
+
+    report = await run_edgar_supplier_search(engine)   # must not raise
+
+    assert "no hits" in report.lower()

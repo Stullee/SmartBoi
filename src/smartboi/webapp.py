@@ -37,6 +37,7 @@ from smartboi.tools import (
     run_exit_analysis,
     run_forward_returns,
     run_screen,
+    run_edgar_supplier_search,
     run_supplier_research,
 )
 from smartboi.status import (
@@ -435,6 +436,7 @@ _INDEX_HTML = """<!doctype html>
       <button class="tbtn" id="btn-event-study">Signal event study</button>
       <button class="tbtn" id="btn-exit-analysis">Exit analysis</button>
       <button class="tbtn" id="btn-research">Research anchor suppliers (web)</button>
+      <button class="tbtn" id="btn-edgar-search">Search EDGAR for anchor suppliers</button>
       <button class="tbtn" id="btn-diagnostics">Diagnostics bundle</button>
       <button class="tbtn" id="btn-rebuild-graph">Rebuild relationship graph</button>
       <button class="tbtn" id="btn-reconcile-preview">Anchor reconcile (dry run)</button>
@@ -515,6 +517,10 @@ el("btn-diagnostics").addEventListener("click", function(){ runTool("tools/diagn
 el("btn-research").addEventListener("click", function(){
   if (!confirm("Research the 10 most inert anchors for small-cap suppliers? This spends LLM budget (web search plus one call per anchor) and can take a few minutes. It adds universe CANDIDATES for your review; it never adds a symbol or a relationship edge.")) return;
   runTool("tools/supplier-research", {}, this);
+});
+el("btn-edgar-search").addEventListener("click", function(){
+  if (!confirm("Ask EDGAR full-text search which OTHER filers disclose revenue concentration on the 5 most inert anchors? No LLM spend -- SEC requests only -- but it fetches a handful of filings and can take a couple of minutes. It adds universe CANDIDATES for your review; it never adds a symbol or a relationship edge.")) return;
+  runTool("tools/edgar-search", {}, this);
 });
 el("btn-rebuild-graph").addEventListener("click", function(){
   if (!confirm("Re-extract relationships from every tradeable's latest 10-K? Additive only -- edges are deduped, so this can never remove an edge or touch a dossier, trade or log. Costs about one LLM call per tradeable symbol. Runs in the background over the next few polling ticks.")) return;
@@ -1156,6 +1162,21 @@ def create_app(engine) -> web.Application:
 
         return await _run_tool(run)
 
+    async def handle_tool_edgar_search(request: web.Request) -> web.Response:
+        """Asks EDGAR which OTHER filers name each anchor
+        (smartboi.tools.run_edgar_supplier_search).
+
+        Same candidate-only discipline as web research, for a stricter
+        reason: a full-text hit is not a disclosure ABOUT the anchor at all,
+        it is a third party's filing that happens to mention it. Route it to
+        evidence and the system would be scoring one company's 10-K against
+        another company's dossier. Candidates only; the edge is created later
+        from the accepted symbol's own filings, or not at all."""
+        async def run() -> str:
+            return await run_edgar_supplier_search(engine)
+
+        return await _run_tool(run)
+
     async def handle_tool_forward_returns(request: web.Request) -> web.Response:
         """Runs the forward-return analysis (smartboi.tools.run_forward_returns)
         over the captured snapshot/price logs. Pure file reads -- no network,
@@ -1268,6 +1289,7 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/candidates/accept", handle_accept_candidate)
     app.router.add_post("/api/tools/screen", handle_tool_screen)
     app.router.add_post("/api/tools/supplier-research", handle_tool_supplier_research)
+    app.router.add_post("/api/tools/edgar-search", handle_tool_edgar_search)
     app.router.add_post("/api/tools/forward-returns", handle_tool_forward_returns)
     app.router.add_post("/api/tools/event-study", handle_tool_event_study)
     app.router.add_post("/api/tools/exit-analysis", handle_tool_exit_analysis)

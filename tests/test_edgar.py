@@ -1,7 +1,11 @@
+import asyncio
+
 import httpx
+import pytest
 
 from smartboi.edgar import (
     EIGHT_K_ITEMS,
+    _RETRYABLE_STATUS,
     EdgarClient,
     FilingEvent,
     describe_8k_items,
@@ -436,3 +440,76 @@ def test_s_3asr_is_not_ingested():
     from smartboi.config import Settings
 
     assert "S-3ASR" not in Settings(_env_file=None).edgar_forms_set
+
+
+# --- Which SEC responses are transient. The classic two are 429 and 503, but
+# SEC's hosts do not answer overload uniformly: efts.sec.gov (full-text
+# search) answers rate-exceeded with 403 and returns sporadic 500s under
+# load. Both used to reach raise_for_status directly, so a throttled request
+# was indistinguishable from a permanent refusal and its data was dropped. ---
+
+async def _no_sleep(seconds):
+    """Backoff is real seconds; the suite must not spend them."""
+    return None
+
+
+@pytest.mark.parametrize("status", [403, 429, 500, 503])
+@pytest.mark.asyncio
+async def test_a_transient_sec_status_is_retried_not_raised(status, tmp_path, monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(status)
+        if len(attempts) < 2:
+            return httpx.Response(status)
+        return httpx.Response(200, json={"ok": True})
+
+    client = EdgarClient("SmartBoi test test@example.com", tmp_path / "cik.json")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    response = await client._throttled_get("https://efts.sec.gov/LATEST/search-index?q=x")
+
+    assert response.status_code == 200
+    assert len(attempts) == 2, f"{status} should have been retried once"
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_refusal_still_raises_after_the_retries(tmp_path, monkeypatch):
+    """403 is retried rather than treated as fatal, so a genuinely permanent
+    one (a malformed User-Agent, which SEC does enforce) costs three attempts
+    and then raises exactly as before. That is the cheap direction of the
+    trade: treating a throttle as permanent silently loses data."""
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(403)
+
+    client = EdgarClient("SmartBoi test test@example.com", tmp_path / "cik.json")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await client._throttled_get("https://efts.sec.gov/LATEST/search-index?q=x")
+    assert len(attempts) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_404_is_never_retried(tmp_path, monkeypatch):
+    """A missing document is an answer, not a hiccup -- retrying it three
+    times with backoff would make every absent filing cost seconds."""
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(404)
+
+    client = EdgarClient("SmartBoi test test@example.com", tmp_path / "cik.json")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await client._throttled_get("https://www.sec.gov/nope")
+    assert len(attempts) == 1
+    assert 404 not in _RETRYABLE_STATUS

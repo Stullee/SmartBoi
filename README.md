@@ -216,6 +216,30 @@ company's most recent 10-K regardless of age
 (`ENABLE_RELATIONSHIP_BACKFILL`), so the graph populates immediately
 instead of over a year of annual filings.
 
+Two dashboard buttons attack the same starvation from the other end, and
+both write **candidates only, never a graph edge**. "Research anchor
+suppliers (web)" uses a web-search-backed Claude call (`research.py`).
+"Search EDGAR for anchor suppliers" (`edgar_search.py`) uses EDGAR's own
+full-text search to ask **which other filers name this anchor** — a supplier
+disclosing "Applied Materials accounted for 22% of net sales" is making
+exactly the disclosure the anchor never would, and full-text search is the
+only mechanism that surfaces it. No LLM spend; SEC requests only.
+
+A full-text hit produces **zero evidence**, and that is the argument rather
+than a limitation: if the filer is already in the universe, `_poll_edgar`
+has already fetched that 10-K and extracted from it; if it isn't, there is
+no dossier to write to. A hit is a lead about *where to look*. It also never
+increments `seen_count`, which gates auto-accept as a trade target and is
+meant to count filing disclosures, not sightings of a name in a search index.
+
+EFTS has no proximity operator (quoted phrases and implicit AND only), so
+document-level AND over-matches — a 10-K can name the anchor in Item 1 and
+say "of our net sales" forty pages later. A local regex proximity pass over
+the fetched text decides which hits are real, and the candidate carries the
+**raw sentence verbatim** rather than a verdict: an IDIQ ceiling, a
+historical figure and a live concentration disclosure all match the same
+phrases, and only the actual words tell them apart.
+
 When a filing discloses a relationship to a company OUTSIDE the universe,
 it's recorded as a **universe candidate** (`data/universe_candidates.json`,
 shown on the dashboard, webhook-alerted on first discovery) -- a proposal

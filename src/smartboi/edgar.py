@@ -27,12 +27,25 @@ _SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik10}.json"
 # polling a few dozen symbols every hour never gets remotely close, but this
 # still spaces requests out rather than bursting all of them at once.
 _REQUEST_GAP_SEC = 0.3
-# Retry a transient SEC response (429 rate-limit, 503 maintenance) with
-# backoff before giving up, mirroring the Finnhub client. Without this a
-# momentary SEC hiccup dropped that filing for the poll -- recovered next
-# cycle (the fingerprint stays unregistered), but a first-ever run during an
-# SEC blip had nothing cached to fall back on.
+# Retry a transient SEC response with backoff before giving up, mirroring the
+# Finnhub client. Without this a momentary SEC hiccup dropped that filing for
+# the poll -- recovered next cycle (the fingerprint stays unregistered), but a
+# first-ever run during an SEC blip had nothing cached to fall back on.
 _MAX_ATTEMPTS = 3
+# 429 rate-limit and 503 maintenance are the classic two. 403 and 500 are here
+# because SEC's hosts do not answer overload uniformly: the full-text search
+# host (efts.sec.gov) answers a rate-exceeded request with 403 rather than 429,
+# and returns sporadic 500s under load. Both were previously passed straight to
+# raise_for_status, so a rate-limited search looked identical to a permanent
+# refusal and its results were silently dropped rather than retried.
+#
+# 403 is deliberately retried rather than treated as fatal. A genuine
+# permanent 403 -- a malformed User-Agent, which SEC does enforce -- costs
+# three attempts and then raises exactly as before, so the only price of
+# treating it as transient is a few seconds on a request that was going to
+# fail anyway. The reverse error, treating a throttle as permanent, silently
+# loses data.
+_RETRYABLE_STATUS = frozenset({403, 429, 500, 503})
 # The ticker->CIK map gains new listings (IPOs, ticker changes) over time; a
 # cache that never expires would leave those unresolvable forever ("no CIK
 # found") on a long-lived deployment.
@@ -292,15 +305,55 @@ class EdgarClient:
                 await asyncio.sleep(wait)
             self._last_request = time.monotonic()
             response = await self._client.get(url)
-            if response.status_code not in (429, 503):
+            if response.status_code not in _RETRYABLE_STATUS:
                 response.raise_for_status()
                 return response
             retry_after = float(response.headers.get("Retry-After") or 0)
             delay = max(retry_after, 2.0 * (attempt + 1))
             log.warning("SEC EDGAR returned %d -- backing off %.0fs.", response.status_code, delay)
             await asyncio.sleep(delay)
-        response.raise_for_status()  # still 429/503 after retries -> raise to the caller
+        response.raise_for_status()  # still retryable after N attempts -> raise to the caller
         return response
+
+    async def full_text_search(self, anchor_name: str, forms: str = "10-K",
+                               date_from: str = "") -> list:
+        """Which OTHER filers name this anchor -- see edgar_search.py for why
+        that is the only mechanism that inverts the disclosure asymmetry.
+
+        Returns deduped SearchHits, or [] on any failure. Never raises: this
+        feeds candidate discovery, which is a nice-to-have, and a search
+        outage must not be able to interrupt a poll that is doing real work.
+
+        Uses the same throttle and retry set as every other SEC call. The
+        retry set matters more here than anywhere else -- efts.sec.gov answers
+        rate-exceeded with 403 rather than 429, so before _RETRYABLE_STATUS
+        included it a throttled search was indistinguishable from a permanent
+        refusal and its hits were silently dropped."""
+        from smartboi.edgar_search import parse_hits, search_url
+
+        try:
+            response = await self._throttled_get(search_url(anchor_name, forms, date_from))
+        except Exception:  # noqa: BLE001 - a failed lead search is never worth a raise
+            log.exception("EDGAR full-text search failed for %r", anchor_name)
+            return []
+        try:
+            return parse_hits(response.json())
+        except ValueError:
+            log.warning("EDGAR full-text search returned a non-JSON body for %r.", anchor_name)
+            return []
+
+    def filing_from_hit(self, hit, symbol: str = "") -> FilingEvent:
+        """A SearchHit -> the FilingEvent shape fetch_text already knows how
+        to read, so the proximity pass reuses the existing document fetch
+        rather than growing a second one."""
+        return FilingEvent(
+            symbol=symbol or hit.ticker or hit.name,
+            cik10=hit.cik,
+            form=hit.form,
+            filing_date=hit.filing_date,
+            accession_number=hit.adsh,
+            primary_document="",
+        )
 
     async def _ticker_map(self) -> tuple[dict[str, str], dict[str, str]]:
         """Returns (ticker -> CIK10, normalized_name -> ticker) -- both
