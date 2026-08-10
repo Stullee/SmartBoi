@@ -84,15 +84,31 @@ that specific inefficiency, not to race anyone on speed:
    government is the publisher, so the evidence cannot be two outlets
    rewording one wire story:
 
-   - **DoD daily contract announcements** (`dod_contracts.py`, war.gov, free):
-     every award at or above the DFARS 205.303 threshold, published ~5pm ET
-     each business day. Chosen over USASpending/FPDS for a hard reason: DoD
-     awards are withheld from those for **90 days**, ~6x past the 14-day floor
-     in `evidence_is_stale`, so that evidence would be *born aged out*.
-     (FPDS-NG's ATOM feed no longer exists either — FPDS.gov was decommissioned
-     in 2026 and folded into SAM.gov.)
+   - **DoD daily contract announcements** (`dod_contracts.py`) — **built and
+     switched off**, because war.gov turned out to be closed to automated
+     clients. Measured live 2026-08-10: every HTML path returns `403` from
+     Akamai's bot manager (the listing *and* individual articles), and the one
+     open endpoint — the RSS feed at `ContentType=400` — carries a fixed
+     boilerplate description ("Today's Department of War contracts valued at
+     $7.5 million or more are now live on War.gov.") with no award text and no
+     company names. The awards exist only in the article body, which is
+     blocked. Reaching them would mean impersonating a browser to defeat a bot
+     manager, which this system does not do.
 
-     The hard part is name matching, not fetching. Announcements use legal
+     No substitute clears the freshness bar either: USASpending, FPDS and
+     SAM's award API all sit behind DoD's **90-day publication hold**, ~6×
+     past the 14-day floor in `evidence_is_stale`, so their evidence is born
+     aged out — which is exactly why war.gov was chosen over them to begin
+     with. One route is still open and untested: reading the article bodies
+     from the **Wayback Machine** — a public archive with a documented API and
+     no bot manager, where a 1–3 day lag sits comfortably inside the same
+     14-day floor that disqualified the 90-day APIs. The RSS feed already
+     hands over the exact article URL, so archive coverage is the only
+     unknown. The parsing layer is kept and still tested, since the expensive
+     part is the hand-reviewed alias table and the award semantics rather than
+     the fetch. What follows describes that layer.
+
+     The hard part was never fetching. Announcements use legal
      entity names — "Ducommun LaBarge Technologies Inc." → DCO, "Vertex
      Aerospace LLC" → V2X — and **"Vertex" alone collides with Vertex
      Pharmaceuticals**. So matching is whole-word, case-insensitive, against a

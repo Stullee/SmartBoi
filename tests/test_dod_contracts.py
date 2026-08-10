@@ -256,3 +256,30 @@ def test_business_days_back_skips_weekends():
     days = business_days_back(3, today=date(2026, 8, 10))   # a Monday
 
     assert days == [date(2026, 8, 10), date(2026, 8, 7), date(2026, 8, 6)]
+
+
+def test_dod_ingestion_is_off_by_default_because_war_gov_blocks_automation():
+    """Pins the 2026-08-10 finding so it cannot be quietly undone.
+
+    Every HTML path on war.gov returns 403 from Akamai's bot manager -- the
+    listing AND individual articles -- and the only open endpoint, the RSS
+    feed, carries a fixed boilerplate description with no award text and no
+    company names. There is no route to the data short of defeating a bot
+    manager, and every substitute (USASpending / FPDS / SAM) sits behind DoD's
+    90-day hold, which is ~6x past evidence_is_stale's floor.
+
+    Turning this back on without a working fetch route just resumes 12 failed
+    requests a day. See the module docstring for the full transcript."""
+    from smartboi.config import Settings
+
+    assert Settings(_env_file=None).enable_dod_contracts is False
+
+
+def test_the_parsing_layer_is_kept_working_for_the_day_a_route_exists():
+    """The reason this module survives being switched off: the expensive part
+    is the hand-reviewed alias table and the award semantics, not the fetch.
+    If war.gov ever opens an automated route this is a fetch-layer change."""
+    awards = awards_from_page(_DCO, _UNIVERSE, "2026-08-07")
+
+    assert [a.symbol for a in awards] == ["DCO"]
+    assert awards[0].value_usd == 14_500_000.0

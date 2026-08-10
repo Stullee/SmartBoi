@@ -211,7 +211,25 @@ class Settings(BaseSettings):
     # day. Chosen over USASpending/FPDS because DoD awards are withheld from
     # those for 90 days -- ~6x past dossier.evidence_is_stale's 14-day floor,
     # so that evidence would be born aged out.
-    enable_dod_contracts: bool = True
+    #
+    # OFF BY DEFAULT: war.gov is unreachable to any automated client. Measured
+    # live 2026-08-10 -- see dod_contracts.py's "WHY THIS IS OFF" section for
+    # the full transcript. In short: Akamai returns 403 for every HTML path
+    # (both the listing and individual articles), the RSS feed is the only
+    # open endpoint, and its description field is a fixed boilerplate sentence
+    # carrying no award text and no company names. There is no route to the
+    # data that does not involve defeating a bot manager, and the alternatives
+    # (USASpending / FPDS / SAM) all sit behind DoD's 90-day publication hold,
+    # ~6x past evidence_is_stale's floor, so their evidence is born aged out.
+    #
+    # Off pending a working FETCH ROUTE, not abandoned: reading the article
+    # bodies from the Wayback Machine is still open (a public archive with a
+    # documented API, no bot manager, and a 1-3 day lag that sits comfortably
+    # inside the 14-day staleness floor the 90-day APIs failed). The parsing
+    # module and its tests are kept and still pass -- the alias table, value
+    # floor and verbatim pass-through are correct and cost nothing dormant, so
+    # the day a route exists this is a fetch-layer change and a settings flip.
+    enable_dod_contracts: bool = False
     dod_lookback_days: int = 3
     dod_poll_interval_sec: int = 21600
     # Awards below this are not scored for an ANCHOR. LMT/RTX/NOC/GD/BA appear

@@ -1,6 +1,55 @@
 """DoD daily contract announcements -- every award at or above the DFARS
 205.303 threshold, published ~5pm ET each business day.
 
+WHY THIS IS OFF (enable_dod_contracts defaults to False)
+--------------------------------------------------------
+war.gov is closed to automated clients. Measured live 2026-08-10, in this
+order, so nobody has to re-derive it:
+
+  GET /News/Contracts/                            -> 403, server: AkamaiGHost
+  GET /News/.../Story/Article/4540596/...         -> 403, server: AkamaiGHost
+  GET /DesktopModules/ArticleCS/RSS.ashx?...      -> 200, text/xml
+
+So every HTML path is denied by Akamai's bot manager -- the listing AND
+individual articles -- while the RSS endpoint is open. That is the site
+stating a policy: consume the feed, not the pages.
+
+The feed cannot carry this. ContentType=400 is the Contracts channel
+("Contracts - U.S. Dept. of War"), and its item description is a fixed
+boilerplate sentence:
+
+    "Today's Department of War contracts valued at $7.5 million or more are
+     now live on War.gov."
+
+Identical every day. No award text, no dollar values, no company names --
+nothing an alias can match and nothing a thesis can use. The awards exist
+only in the article body, which is 403.
+
+Getting the article body from war.gov directly would mean impersonating a
+browser to defeat a bot manager, which is not something this system does.
+
+The API substitutes do not work either: USASpending, FPDS and SAM's award API
+all sit behind DoD's 90-day publication hold -- ~6x past the 14-day floor in
+dossier.evidence_is_stale -- so evidence from them is born aged out, which is
+the whole reason war.gov was chosen over them in the first place. (FPDS-NG's
+ATOM feed is separately gone: FPDS.gov was decommissioned in 2026 and folded
+into SAM.gov.)
+
+STILL OPEN: reading the article bodies from the Wayback Machine. That is not
+circumvention -- it is a public archive with a documented API, reading a
+public record, with no bot manager in front of it -- and the freshness maths
+works, since a 1-3 day archive lag is comfortably inside the 14-day staleness
+floor that killed the 90-day APIs. The RSS feed already hands over the exact
+article URL in <link>, so archive coverage is the only unknown. If it is
+there, this becomes a fetch-layer change plus a settings flip and everything
+below is reused as-is. Untested at the time of writing.
+
+Everything below is kept and still tested. The alias table, the value floor
+and the verbatim pass-through are correct and cost nothing while dormant, so
+if war.gov ever opens an automated route this becomes a fetch-layer change
+plus a settings flip rather than a rewrite. The known-good feed URL is
+recorded in _RSS_URL for exactly that day.
+
 WHY THIS AND NOT USASPENDING. DoD awards are withheld from
 FPDS/USASpending/SAM for 90 days. That is ~6x past the 14-day floor in
 `dossier.evidence_is_stale`, so evidence sourced there would be born aged
@@ -42,6 +91,12 @@ import httpx
 log = logging.getLogger(__name__)
 
 _BASE_URL = "https://www.war.gov/News/Contracts/"
+# The one war.gov endpoint that answers an automated client (200, text/xml).
+# ContentType=400 is the Contracts channel; Site=945 is war.gov. Recorded
+# because it was expensive to find and because it is the starting point for
+# any future attempt -- not used today, since its description field carries
+# only boilerplate (see "WHY THIS IS OFF" above).
+_RSS_URL = "https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?ContentType=400&Site=945&max=10"
 _TIMEOUT_SEC = 25.0
 
 # Awards below this dollar value are not scored for an ANCHOR. The big primes
