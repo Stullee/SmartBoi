@@ -502,14 +502,19 @@ class Settings(BaseSettings):
     # entry. Nothing here can place an order; this only widens what is
     # watched (see webapp.py's accept endpoint for the same reasoning).
     enable_auto_accept_candidates: bool = True
-    # Anchors and tradeables are deliberately NOT held to the same bar. An
-    # anchor can never become a trade (signal_source_only), so the worst case
-    # is some wasted LLM spend, and the upside is large: it turns a dead-end
-    # candidate into a live propagation source, which is the mechanism the
-    # whole strategy runs on. A tradeable can produce signals and paper
-    # trades, so it additionally requires a verified name match and repeat
-    # disclosure (see engine.py's _auto_accept_candidates).
-    auto_accept_anchors: bool = True
+    # Anchors and tradeables are held to different bars, but BOTH now require a
+    # real connection. A tradeable additionally requires a verified name match
+    # and repeat disclosure (it can open trades); an anchor requires only that
+    # accepting it lands it CONNECTED to a tradeable -- i.e. the disclosure that
+    # discovered it came from a tradeable, so _promote_pending_edges writes a
+    # live edge (see engine.py's _auto_accept_candidates and _tradeable_links).
+    # That connectivity gate is why this can default OFF without losing good
+    # additions: the earlier "anchors are liberal, worst case is wasted spend"
+    # stance is exactly what grew a 322-anchor universe with 221 inert members
+    # whose news reached nothing (AUDIT-2026-08 A2). Turn it back on freely --
+    # the gate makes a re-flood impossible -- or grow on demand from the
+    # dashboard's connectivity reconcile.
+    auto_accept_anchors: bool = False
     auto_accept_tradeables: bool = True
     # How many times a candidate must have been disclosed across filings
     # before it can be auto-accepted as TRADEABLE -- one throwaway mention in

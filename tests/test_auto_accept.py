@@ -33,6 +33,10 @@ def engine(tmp_path, monkeypatch):
     settings = Settings(
         _env_file=None, symbols="DCO", anchor_symbols="RTX",
         enable_dashboard=False, enable_universe_autoscreen=False,
+        # Anchor auto-accept now ships OFF (the connectivity gate makes it safe
+        # to re-enable, but off is the safe default). This file exercises the
+        # accept path, so turn it on explicitly.
+        auto_accept_anchors=True,
     )
     e = Engine(settings)
     e.edgar_client = FakeEdgarClient()
@@ -46,7 +50,9 @@ async def test_anchor_recommendation_is_auto_accepted(engine):
     """Anchors are held to the liberal bar: they can never become a trade,
     so the downside is wasted LLM spend and the upside is a live
     propagation source."""
-    engine.candidates.set("ZZZZ", _candidate(recommended_as="anchor", seen_count=1))
+    entry = _candidate(recommended_as="anchor", seen_count=1)
+    entry["pending_edges"] = _pending()  # disclosed by DCO (a tradeable) -> lands connected
+    engine.candidates.set("ZZZZ", entry)
     await engine._auto_accept_candidates()
     assert engine.spec_by_symbol["ZZZZ"].signal_source_only is True
 
@@ -86,9 +92,12 @@ async def test_tradeable_is_blocked_when_the_ticker_name_does_not_verify(engine)
 
 
 async def test_anchor_is_not_blocked_by_an_unverified_name(engine):
-    """The name check gates TRADEABLES only -- deliberately asymmetric."""
+    """The name check gates TRADEABLES only -- anchor auto-accept stays liberal
+    on the name (its only bar is connectivity to a tradeable)."""
     engine.edgar_client.name_matches = False
-    engine.candidates.set("ZZZZ", _candidate(recommended_as="anchor"))
+    entry = _candidate(recommended_as="anchor")
+    entry["pending_edges"] = _pending()  # connected, so it reaches the anchor gate
+    engine.candidates.set("ZZZZ", entry)
     await engine._auto_accept_candidates()
     assert engine.spec_by_symbol["ZZZZ"].signal_source_only is True
 
@@ -146,7 +155,9 @@ async def test_disabled_by_config(engine):
 async def test_tradeables_can_be_disabled_independently_of_anchors(engine):
     engine.settings.auto_accept_tradeables = False
     engine.candidates.set("TRAD", _candidate(ticker="TRAD"))
-    engine.candidates.set("ANCH", _candidate(ticker="ANCH", recommended_as="anchor"))
+    anch = _candidate(ticker="ANCH", recommended_as="anchor")
+    anch["pending_edges"] = _pending()  # connected, so anchor auto-accept takes it
+    engine.candidates.set("ANCH", anch)
     await engine._auto_accept_candidates()
     assert "TRAD" not in engine.spec_by_symbol
     assert "ANCH" in engine.spec_by_symbol
@@ -306,7 +317,9 @@ async def test_a_symbol_edgar_does_not_know_is_dropped_on_the_next_poll(engine, 
     a literal "NULL" logged a CIK warning once an hour, forever."""
     from smartboi.dossier import Dossier
 
-    engine.candidates.set("BMWYY", _candidate(ticker="BMWYY", recommended_as="anchor"))
+    bmw = _candidate(ticker="BMWYY", recommended_as="anchor")
+    bmw["pending_edges"] = _pending()  # connected, so anchor auto-accept takes it
+    engine.candidates.set("BMWYY", bmw)
     await engine._auto_accept_candidates()
     assert "BMWYY" in engine.spec_by_symbol
     engine.dossiers.save(Dossier(symbol="BMWYY"))
@@ -557,6 +570,7 @@ async def test_a_lender_candidate_is_blocked_retroactively(engine):
 async def test_a_genuine_commercial_candidate_is_untouched(engine):
     entry = _candidate(name="General Motors", ticker="GMX", recommended_as="anchor")
     entry["description"] = "General Motors accounted for approximately 25% of total revenues in 2025."
+    entry["pending_edges"] = _pending()  # a real disclosed edge -> lands connected
     engine.candidates.set("GMX", entry)
 
     await engine._auto_accept_candidates()

@@ -437,6 +437,8 @@ _INDEX_HTML = """<!doctype html>
       <button class="tbtn" id="btn-research">Research anchor suppliers (web)</button>
       <button class="tbtn" id="btn-diagnostics">Diagnostics bundle</button>
       <button class="tbtn" id="btn-rebuild-graph">Rebuild relationship graph</button>
+      <button class="tbtn" id="btn-reconcile-preview">Anchor reconcile (dry run)</button>
+      <button class="tbtn danger" id="btn-reconcile-apply">Apply anchor reconcile</button>
       <button class="tbtn danger" id="btn-reset">Reset added symbols</button>
       <button class="tbtn danger" id="btn-reset-runtime">Reset signals &amp; trades</button>
     </div>
@@ -444,8 +446,10 @@ _INDEX_HTML = """<!doctype html>
       already-persisted state (forward returns, the signal event study, the exit analysis of the closed ledger).
       <b>Research anchor suppliers</b> runs web searches to find small-cap counterparties of your anchors and writes
       universe candidates only. The diagnostics bundle is safe to paste &mdash; credentials and personal data are omitted
-      and log lines scrubbed. <b>Reset added symbols</b> removes every runtime-added symbol and archives the orphaned
-      dossiers; it asks first.</div>
+      and log lines scrubbed. <b>Anchor reconcile</b> grows the universe with candidates that land connected to a
+      tradeable and prunes runtime-accepted anchors that reach none; the dry run previews, <b>Apply</b> asks first and
+      never removes curated seed anchors. <b>Reset added symbols</b> removes every runtime-added symbol and archives the
+      orphaned dossiers; it asks first.</div>
     <div class="tout-actions" id="tool-output-actions" style="display:none"><button class="tbtn" id="btn-copy-output">Copy report</button></div>
     <pre class="tout" id="tool-output" style="display:none"></pre>
   </div></div>
@@ -538,6 +542,33 @@ el("btn-reset-runtime").addEventListener("click", function(){
       out.textContent = res.error ? ("Error: " + res.error) : ("Archived " + res.archived_open_trades.length + " open trade(s): " + (res.archived_open_trades.join(", ") || "none") + ". Reset " + res.dossiers_reset + " dossier(s) to ACTIVE.");
       refresh();
     }).catch(function(err){ out.textContent = "Failed: " + err; });
+});
+function runReconcile(apply){
+  var out = el("tool-output"); showToolOutput();
+  out.textContent = apply ? "Applying anchor reconcile..." : "Computing anchor reconcile (dry run)...";
+  fetch(API_BASE + "universe/reconcile-connectivity", { method:"POST", headers:POST_HEADERS, body: JSON.stringify({apply:apply}) })
+    .then(function(r){ return r.json(); }).then(function(res){
+      if (res.error){ out.textContent = "Error: " + res.error; return; }
+      var addList = apply ? res.added : res.would_add.map(function(a){ return a.symbol; });
+      var prList  = apply ? res.pruned : res.would_prune;
+      var lines = [(apply ? "APPLIED" : "DRY RUN") + " -- universe now " + res.universe_size + " symbols.", ""];
+      lines.push((apply ? "Added " : "Would add ") + addList.length + " connected anchor(s):");
+      res.would_add.forEach(function(a){ lines.push("  + " + a.symbol + " [" + a.ecosystem + "]  <- " + a.links.join(", ") + "  (" + a.name + ")"); });
+      lines.push("");
+      lines.push((apply ? "Pruned " : "Would prune ") + prList.length + " inert accepted anchor(s): " + (prList.join(", ") || "none"));
+      if (res.add_skipped && res.add_skipped.length){
+        lines.push("", "Skipped " + res.add_skipped.length + " connected-but-unfit candidate(s):");
+        res.add_skipped.forEach(function(s){ lines.push("  ~ " + s.symbol + ": " + s.reason); });
+      }
+      lines.push("", res.inert_seed_anchors.length + " curated DEFAULT_UNIVERSE anchor(s) inert (kept -- edit universe.py to drop): " + (res.inert_seed_anchors.join(", ") || "none"));
+      out.textContent = lines.join(String.fromCharCode(10));
+      refresh();
+    }).catch(function(err){ out.textContent = "Failed: " + err; });
+}
+el("btn-reconcile-preview").addEventListener("click", function(){ runReconcile(false); });
+el("btn-reconcile-apply").addEventListener("click", function(){
+  if (!confirm("Apply the anchor connectivity reconcile? This ACCEPTS connected candidates as anchors (writing their disclosed tradeable edges into the graph) and REMOVES runtime-accepted anchors that reach no tradeable. Curated DEFAULT_UNIVERSE anchors are never removed. Run the dry run first to preview.")) return;
+  runReconcile(true);
 });
 document.getElementById("btn-copy-output").addEventListener("click", function(){ copyToolOutput(this); });
 
@@ -1216,6 +1247,20 @@ def create_app(engine) -> web.Application:
         result = engine.rebuild_relationship_graph()
         return web.json_response({"ok": True, **result})
 
+    async def handle_reconcile_connectivity(request: web.Request) -> web.Response:
+        """Connectivity reconcile of the anchor set: grow with candidates that
+        land connected to a tradeable, prune runtime-accepted anchors that are
+        inert (see engine.reconcile_universe_connectivity). POST {"apply":true}
+        to mutate; the default ({} / apply omitted) is a dry run that returns
+        exactly what it would do. Runs on the event loop like the other
+        universe mutators."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        result = await engine.reconcile_universe_connectivity(apply=bool(body.get("apply")))
+        return web.json_response({"ok": True, **result})
+
     app = web.Application(middlewares=[_require_csrf_header])
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_status)
@@ -1229,6 +1274,7 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/universe/reset-accepted", handle_reset_accepted)
     app.router.add_post("/api/runtime/reset", handle_reset_runtime)
     app.router.add_post("/api/universe/rebuild-graph", handle_rebuild_graph)
+    app.router.add_post("/api/universe/reconcile-connectivity", handle_reconcile_connectivity)
     return app
 
 

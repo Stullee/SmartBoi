@@ -80,7 +80,7 @@ options:
   universe_max_market_cap_musd: 5000.0
   universe_max_analyst_count: 10
   enable_auto_accept_candidates: true
-  auto_accept_anchors: true
+  auto_accept_anchors: false
   auto_accept_tradeables: true
   auto_accept_min_seen_count: 2
   auto_accept_max_per_day: 20
