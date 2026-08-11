@@ -38,6 +38,7 @@ from smartboi.tools import (
     run_forward_returns,
     run_screen,
     run_edgar_supplier_search,
+    run_graph_maintenance,
     run_supplier_research,
 )
 from smartboi.status import (
@@ -435,6 +436,8 @@ _INDEX_HTML = """<!doctype html>
       <button class="tbtn" id="btn-analyze">Forward-return report</button>
       <button class="tbtn" id="btn-event-study">Signal event study</button>
       <button class="tbtn" id="btn-exit-analysis">Exit analysis</button>
+      <button class="tbtn" id="btn-graph-maint">Graph maintenance (dry run)</button>
+      <button class="tbtn danger" id="btn-graph-maint-apply">Apply graph maintenance</button>
       <button class="tbtn" id="btn-research">Research anchor suppliers (web)</button>
       <button class="tbtn" id="btn-edgar-search">Search EDGAR for anchor suppliers</button>
       <button class="tbtn" id="btn-diagnostics">Diagnostics bundle</button>
@@ -514,6 +517,13 @@ el("btn-analyze").addEventListener("click", function(){ runTool("tools/forward-r
 el("btn-event-study").addEventListener("click", function(){ runTool("tools/event-study", {}, this); });
 el("btn-exit-analysis").addEventListener("click", function(){ runTool("tools/exit-analysis", {}, this); });
 el("btn-diagnostics").addEventListener("click", function(){ runTool("tools/diagnostics", {}, this); });
+el("btn-graph-maint").addEventListener("click", function(){
+  runTool("tools/graph-maintenance", {apply:false}, this);
+});
+el("btn-graph-maint-apply").addEventListener("click", function(){
+  if (!confirm("Apply graph maintenance? This QUARANTINES symbols the audit found structurally unfit to hold (delisted, not common equity, misresolved, or a financing relationship) and applies the anchor connectivity reconcile. Nothing is deleted -- quarantined symbols keep their row and their reason in data/quarantined_symbols.json and can be restored by hand. A symbol with an OPEN paper trade is never touched. Run the dry run first to see exactly what it would do.")) return;
+  runTool("tools/graph-maintenance", {apply:true}, this);
+});
 el("btn-research").addEventListener("click", function(){
   if (!confirm("Research the 10 most inert anchors for small-cap suppliers? This spends LLM budget (web search plus one call per anchor) and can take a few minutes. It adds universe CANDIDATES for your review; it never adds a symbol or a relationship edge.")) return;
   runTool("tools/supplier-research", {}, this);
@@ -766,9 +776,30 @@ function renderGraphHealth(d){
     return '<div class="gen"><div class="gen-name"><b>'+r[0]+'</b></div><div class="mono" style="text-align:right;color:var(--muted)">'+r[1]+
       '</div><div class="mono" style="text-align:right">'+r[2]+"</div></div>";
   }).join("");
+  // The correctness half of graph health. Everything above asks whether the
+  // graph is BIG enough; the audit asks whether what is already in it is
+  // RIGHT -- a delisted shell or a bond fund accepted as a trade target is
+  // polled hourly and accrues spend against a thesis that cannot exist.
+  var a=g.audit, aud;
+  if(!a){
+    aud='<div class="note" style="margin-top:9px">Universe audit has not run yet &mdash; it runs daily and on the <b>Graph maintenance</b> button.</div>';
+  } else {
+    var kinds=Object.keys(a.by_kind||{}).sort(function(x,y){return a.by_kind[y]-a.by_kind[x];}).map(function(k){
+      return '<span class="lc">'+esc(k.replace(/_/g," "))+' <b class="mono">'+a.by_kind[k]+"</b></span>";
+    }).join("");
+    var act=a.actionable||0;
+    aud='<div class="k" style="margin-top:14px">Universe audit'+
+      '<span class="hint" style="float:right;font-weight:400">'+ago(g.audit_age_days)+"</span></div>"+
+      '<div class="big mono" style="color:'+(act?"var(--warn)":"var(--muted)")+'">'+act+
+        '<span class="u"> need a decision</span></div>'+
+      (a.symbols_at_fault&&a.symbols_at_fault.length
+        ? '<div class="mono" style="margin-top:4px;opacity:0.85">'+a.symbols_at_fault.map(esc).join(" ")+"</div>":"")+
+      '<div class="catleg" style="grid-template-columns:1fr 1fr;margin-top:8px">'+kinds+"</div>"+
+      (act?'<div class="note" style="margin-top:8px">Press <b>Graph maintenance (dry run)</b> for the evidence behind each one. Applying quarantines them &mdash; nothing is deleted, and a symbol with an open trade is never touched.</div>':"");
+  }
   el("ghMaint").innerHTML='<div class="k">Maintenance</div>'+
     '<div class="gens" style="margin-top:6px">'+rows+"</div>"+
-    '<div class="note" style="margin-top:9px">The graph only grows two ways: filings (annual/quarterly) and web research. The rolling pass re-reads the least-recently-extracted names <b>against the current universe</b> &mdash; extraction only writes an edge when the counterparty is already a member, so re-reading is what fills holes left when the universe was smaller.</div>';
+    '<div class="note" style="margin-top:9px">The graph only grows two ways: filings (annual/quarterly) and web research. The rolling pass re-reads the least-recently-extracted names <b>against the current universe</b> &mdash; extraction only writes an edge when the counterparty is already a member, so re-reading is what fills holes left when the universe was smaller.</div>'+aud;
 }
 
 function renderLadder(d){
@@ -1037,6 +1068,7 @@ async def _status_payload(engine) -> dict:
             researched_anchor_count=len(researched_anchors(engine.candidates, engine.research_state)),
             refresh_per_day=(settings.graph_refresh_symbols_per_day
                              if settings.enable_graph_refresh else 0),
+            audit=engine.audit_state.get("last"),
         ),
         "open_paper_trades": open_trades,
         "closed_paper_trades": closed_trades,
@@ -1177,6 +1209,29 @@ def create_app(engine) -> web.Application:
 
         return await _run_tool(run)
 
+    async def handle_tool_graph_maintenance(request: web.Request) -> web.Response:
+        """Audit, clean and grow the graph in one fixed sequence
+        (smartboi.tools.run_graph_maintenance).
+
+        The order is the point -- growing before cleaning re-admits the symbol
+        just removed -- which is why this replaces pressing four buttons in the
+        right order. `apply` gates only the destructive half: without it the
+        audit and the (candidate-only) search still run and the clean and
+        reconcile report what they would do.
+
+        Quarantine never deletes and never touches a symbol with an open paper
+        trade, so even the apply path cannot strand a position."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        apply = bool(body.get("apply"))
+
+        async def run() -> str:
+            return await run_graph_maintenance(engine, apply=apply)
+
+        return await _run_tool(run)
+
     async def handle_tool_forward_returns(request: web.Request) -> web.Response:
         """Runs the forward-return analysis (smartboi.tools.run_forward_returns)
         over the captured snapshot/price logs. Pure file reads -- no network,
@@ -1290,6 +1345,7 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/tools/screen", handle_tool_screen)
     app.router.add_post("/api/tools/supplier-research", handle_tool_supplier_research)
     app.router.add_post("/api/tools/edgar-search", handle_tool_edgar_search)
+    app.router.add_post("/api/tools/graph-maintenance", handle_tool_graph_maintenance)
     app.router.add_post("/api/tools/forward-returns", handle_tool_forward_returns)
     app.router.add_post("/api/tools/event-study", handle_tool_event_study)
     app.router.add_post("/api/tools/exit-analysis", handle_tool_exit_analysis)

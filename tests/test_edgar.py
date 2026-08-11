@@ -222,6 +222,51 @@ async def test_name_matches_ticker_rejects_an_empty_name():
     assert await client.name_matches_ticker("", "ATRO") is False
 
 
+# --- The prefix allowance must not swallow a different KIND of security ---
+# Because normalize_company_name strips legal suffixes, a name that survives
+# as a single token is a bare brand word, and an unrestricted prefix match
+# lets it claim any registered title starting with that word. Measured live:
+# "PGIM, Inc." (a Note Purchase Agreement counterparty, disclosed by TSCO)
+# resolved to GHY -- a closed-end BOND FUND -- and was auto-accepted as a
+# tradeable equity. See edgar.boilerplate_only_prefix.
+
+@pytest.mark.parametrize("disclosed, registered", [
+    # The live failure, and its own family.
+    ("PGIM, Inc.", "PGIM High Yield Bond Fund, Inc."),
+    ("Eagle", "Eagle Capital Growth Fund, Inc."),
+    # The collision dod_contracts.py's docstring warns about by name.
+    ("Vertex", "Vertex Aerospace LLC"),
+    # A shared first word is not a shared company.
+    ("Total S.A.", "Total System Services"),
+])
+async def test_name_matches_ticker_rejects_an_identifying_remainder(disclosed, registered):
+    client = _StubbedNameMap({normalize_company_name(registered): "XXXX"})
+    assert await client.name_matches_ticker(disclosed, "XXXX") is False
+
+
+@pytest.mark.parametrize("disclosed, registered", [
+    # The case the prefix allowance exists for, in both directions.
+    ("ASML", "ASML Holding N.V."),
+    ("ASML Holding N.V.", "ASML"),
+    ("Boeing", "The Boeing Company"),
+    ("Applied Materials", "Applied Materials, Inc."),
+])
+async def test_name_matches_ticker_still_allows_boilerplate_only_differences(disclosed, registered):
+    client = _StubbedNameMap({normalize_company_name(registered): "XXXX"})
+    assert await client.name_matches_ticker(disclosed, "XXXX") is True
+
+
+async def test_find_ticker_by_name_refuses_a_fund_with_a_matching_first_word(tmp_path):
+    """The resolver half of the same guard: GHY must not be findable from
+    "PGIM, Inc." at all, not merely rejected once something proposes it."""
+    cache_path = await _seed_cache(tmp_path, [("GHY", "PGIM High Yield Bond Fund, Inc.")])
+    client = EdgarClient("test test@example.com", cache_path)
+    try:
+        assert await client.find_ticker_by_name("PGIM, Inc.") is None
+    finally:
+        await client.aclose()
+
+
 # --- 8-K item codes: the cheapest high-signal metadata EDGAR offers, and it
 # was being discarded. "Item 1.01 Entry into a Material Definitive
 # Agreement" is a contract win; "Item 5.02 Departure of Directors" is

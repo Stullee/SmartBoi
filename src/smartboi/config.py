@@ -143,6 +143,37 @@ class Settings(BaseSettings):
     # Already-researched anchors are skipped, so the pass works through the
     # anchor list and then costs nothing until new anchors are added.
     enable_auto_supplier_research: bool = True
+    # Runs the EDGAR full-text search automatically, most-inert anchors
+    # first, instead of only when someone presses the dashboard button.
+    #
+    # Same failure as enable_auto_supplier_research above, and the same fix:
+    # the pass was written, wired to a button, and then never scheduled, so
+    # it contributed nothing. That is a costlier omission here than there,
+    # because this is the cheapest mechanism in the system that is
+    # size-selected in the direction the strategy needs. It does not read an
+    # anchor's filings hoping a supplier is named; it asks EDGAR which OTHER
+    # filers name the anchor, and a filer disclosing "X accounted for 22% of
+    # net sales" is by construction small enough for X to be material to it.
+    # The hit also arrives with a ticker SEC itself supplies, so it never
+    # passes through name->ticker resolution.
+    #
+    # Free (no LLM call at all -- the proximity test is a regex over fetched
+    # filing text) and rate-limited only by EDGAR's own request spacing.
+    # Candidates only, never an edge: see edgar_search.py.
+    enable_auto_edgar_search: bool = True
+    # Anchors searched per run. The original 5 was sized for an operator
+    # waiting on a button click; on a daily schedule it is the throughput of
+    # the only growth mechanism pointed the right way, and 5/day over ~320
+    # anchors is a 64-DAY rotation -- slower than the annual filings it is
+    # meant to front-run.
+    #
+    # The real cost is small enough that the old cap was leaving the graph
+    # starved for nothing: one EFTS search plus at most MAX_HITS_PER_QUERY (10)
+    # document fetches per anchor, at EDGAR's 0.3s spacing, is ~3 seconds of
+    # wall clock and ZERO tokens. 25/day is ~80 seconds and rotates the anchor
+    # list in under a fortnight. Raise it further if the graph is the
+    # bottleneck; the ceiling is politeness to EDGAR, not budget.
+    edgar_search_anchors_per_run: int = 25
     # Widened beyond the original 8-K/10-K/10-Q/4. The forms filter is
     # applied CLIENT-SIDE to a submissions payload that is fetched whole
     # regardless, so adding a form type costs zero extra HTTP requests --

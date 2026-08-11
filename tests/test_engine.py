@@ -406,6 +406,161 @@ async def test_reconcile_grows_connected_anchor_and_promotes_its_edge(engine):
                for r in engine.graph.relationships)
 
 
+# --- Graph maintenance: quarantine is removal from the live universe, never
+# deletion, and never of something holding an open position. ---
+
+def _finding(kind, subject, actionable=True, blocked=""):
+    from smartboi.graph_audit import Finding
+
+    return Finding(kind, subject, "because", actionable, blocked)
+
+
+async def test_quarantine_dry_run_reports_without_mutating(engine):
+    from smartboi.graph_audit import KIND_DEAD_LISTING
+
+    engine.accept_candidate("DEADCO", "anchor", source="auto")
+    findings = [_finding(KIND_DEAD_LISTING, "DEADCO")]
+
+    result = engine.quarantine_from_findings(findings, apply=False)
+
+    assert result["applied"] is False
+    assert [r["symbol"] for r in result["would_quarantine"]] == ["DEADCO"]
+    assert "DEADCO" in engine.spec_by_symbol
+    assert not engine.quarantine.data
+
+
+async def test_quarantine_removes_from_the_universe_but_keeps_the_row(engine):
+    from smartboi.graph_audit import KIND_DEAD_LISTING
+
+    engine.accept_candidate("DEADCO", "anchor", source="auto")
+    findings = [_finding(KIND_DEAD_LISTING, "DEADCO")]
+
+    result = engine.quarantine_from_findings(findings, apply=True)
+
+    assert result["quarantined"] == ["DEADCO"]
+    assert "DEADCO" not in engine.spec_by_symbol          # out of the live universe
+    assert "DEADCO" not in engine.accepted_candidates.data
+    row = engine.quarantine.get("DEADCO")                 # but recoverable, with the reason
+    assert row["was"]["as"] == "anchor"
+    assert any(KIND_DEAD_LISTING in r for r in row["reasons"])
+
+
+async def test_quarantine_never_acts_on_a_non_actionable_finding(engine):
+    from smartboi.graph_audit import KIND_DEAD_LISTING
+
+    engine.accept_candidate("DEADCO", "anchor", source="auto")
+    findings = [_finding(KIND_DEAD_LISTING, "DEADCO", actionable=False,
+                         blocked="has an OPEN paper trade")]
+
+    result = engine.quarantine_from_findings(findings, apply=True)
+
+    assert result["would_quarantine"] == []
+    assert "DEADCO" in engine.spec_by_symbol
+
+
+async def test_a_quarantined_symbol_is_not_re_accepted(engine):
+    """Without this the next auto-accept re-adds it from the same candidate row
+    and the clean undoes itself on a schedule."""
+    from smartboi.graph_audit import KIND_DEAD_LISTING
+
+    engine.settings.enable_auto_accept_candidates = True
+    engine.settings.auto_accept_anchors = True
+    engine.candidates.set("ZOMBI", {
+        "name": "Zombi Inc", "ticker": "ZOMBI", "related_to": ["FORM"],
+        "rel_types": ["customer"], "description": "", "sources": [], "seen_count": 3,
+        "recommended_as": "anchor", "recommendation_reason": "big",
+        "pending_edges": [{"from_symbol": "FORM", "rel_type": "customer",
+                           "description": "d", "confidence": 0.9, "source": "u"}],
+    })
+    engine.accept_candidate("ZOMBI", "anchor", source="auto")
+    engine.quarantine_from_findings([_finding(KIND_DEAD_LISTING, "ZOMBI")], apply=True)
+    assert "ZOMBI" not in engine.spec_by_symbol
+
+    await engine._auto_accept_candidates()
+
+    assert "ZOMBI" not in engine.spec_by_symbol
+    result = await engine.reconcile_universe_connectivity(apply=True)
+    assert "ZOMBI" not in (result["added"] or [])
+
+
+async def test_audit_skips_the_liveness_check_when_sec_is_unreachable(engine, monkeypatch):
+    """An unreachable SEC must never read as "the whole universe is delisted"."""
+    from smartboi.graph_audit import KIND_DEAD_LISTING
+
+    async def no_map():
+        return None
+
+    monkeypatch.setattr(engine.edgar_client, "live_tickers", no_map, raising=False)
+    engine.accept_candidate("DEADCO", "anchor", source="auto")
+
+    findings = await engine.audit_universe()
+
+    assert KIND_DEAD_LISTING not in {f.kind for f in findings}
+
+
+async def test_graph_maintenance_dry_run_changes_nothing(engine, monkeypatch):
+    from smartboi.tools import run_graph_maintenance
+
+    async def no_map():
+        return None
+
+    monkeypatch.setattr(engine.edgar_client, "live_tickers", no_map, raising=False)
+    engine.accept_candidate("KEEPME", "anchor", source="auto")
+    before = set(engine.spec_by_symbol)
+
+    report = await run_graph_maintenance(engine, apply=False)
+
+    assert "DRY RUN" in report
+    assert set(engine.spec_by_symbol) == before
+    assert not engine.quarantine.data
+    # The five steps must all be present and in order -- growing before
+    # cleaning would re-admit what was just removed.
+    for step in ("1. AUDIT", "2. CLEAN", "3. RESOLVE", "4. DISCOVER", "5. CONNECT"):
+        assert step in report
+
+
+async def test_reconcile_grows_a_tradeable_candidate_as_tradeable(engine):
+    """The GROW arm used to hardcode "anchor", which permanently converted a
+    candidate that screens TRADEABLE -- _auto_accept_candidates skips anything
+    already accepted, and no promote-to-tradeable path exists anywhere. A
+    connectivity tool must not spend the scarcest thing in the universe."""
+    _connected_candidate(engine, "SMALLCO", from_symbol="FORM",
+                         recommended_as="tradeable",
+                         recommendation_reason="market cap $200M fits the profile")
+
+    result = await engine.reconcile_universe_connectivity(apply=True)
+
+    assert "SMALLCO" in result["added"]
+    assert engine.spec_by_symbol["SMALLCO"].signal_source_only is False  # a tradeable
+    assert engine.accepted_candidates.get("SMALLCO")["as"] == "tradeable"
+
+
+async def test_reconcile_grows_an_otc_adr_as_an_anchor_even_if_screened_tradeable(engine):
+    """The arm's own filter (_anchor_equity_ok) is LOOSER than is_common_equity:
+    it admits OTC ADRs, which accept_candidate rejects as tradeables by raising.
+    Passing one through as "tradeable" would abort the apply loop partway and
+    leave the reconcile half-applied, so it degrades to anchor instead."""
+    _connected_candidate(engine, "ADRXY", from_symbol="FORM",
+                         recommended_as="tradeable",
+                         recommendation_reason="market cap $200M fits the profile")
+
+    result = await engine.reconcile_universe_connectivity(apply=True)
+
+    assert "ADRXY" in result["added"]
+    assert engine.spec_by_symbol["ADRXY"].signal_source_only is True  # anchor, not tradeable
+
+
+async def test_reconcile_still_grows_an_unscreened_candidate_as_an_anchor(engine):
+    """No recommendation is the normal state for a fresh candidate. Unvetted
+    must stay anchor -- the conservative direction."""
+    _connected_candidate(engine, "NOREC", from_symbol="FORM")
+
+    result = await engine.reconcile_universe_connectivity(apply=True)
+
+    assert "NOREC" in result["added"]
+    assert engine.spec_by_symbol["NOREC"].signal_source_only is True
+
+
 async def test_reconcile_skips_a_candidate_disclosed_only_by_an_anchor(engine):
     """INTC is an anchor here, so a candidate it alone discloses would make an
     anchor->anchor edge -- still inert. It must not be grown."""
@@ -2579,6 +2734,55 @@ async def test_auto_supplier_research_failure_never_kills_the_tick(engine, monke
     assert not engine._daily_pass_due("supplier_research")
 
 
+# --- The EDGAR full-text search on a schedule. It was written, wired to a
+# dashboard button, and then never scheduled -- the same omission that had
+# left supplier research at $0.00 spent. It is the cheapest mechanism in the
+# system that is size-selected toward small counterparties. ---
+
+async def test_auto_edgar_search_runs_daily_from_the_tick(engine, monkeypatch):
+    calls = []
+
+    async def fake_search(_engine):
+        calls.append(1)
+        return "EDGAR full-text supplier search\n"
+
+    monkeypatch.setattr("smartboi.tools.run_edgar_supplier_search", fake_search)
+    engine.settings.enable_auto_edgar_search = True
+    engine.settings.enable_auto_supplier_research = False
+
+    await engine._tick()
+    assert calls == [1]
+    assert not engine._daily_pass_due("edgar_search")
+
+    # A second tick the same day must not re-run it.
+    await engine._tick()
+    assert calls == [1]
+
+
+async def test_auto_edgar_search_failure_never_kills_the_tick(engine, monkeypatch):
+    async def boom(_engine):
+        raise RuntimeError("EFTS exploded")
+
+    monkeypatch.setattr("smartboi.tools.run_edgar_supplier_search", boom)
+    engine.settings.enable_auto_edgar_search = True
+    engine.settings.enable_auto_supplier_research = False
+
+    await engine._tick()   # must not raise
+
+    assert not engine._daily_pass_due("edgar_search")
+
+
+async def test_auto_edgar_search_is_skipped_when_disabled(engine, monkeypatch):
+    async def fail(_engine):
+        raise AssertionError("must not run when the flag is off")
+
+    monkeypatch.setattr("smartboi.tools.run_edgar_supplier_search", fail)
+    engine.settings.enable_auto_edgar_search = False
+    engine.settings.enable_auto_supplier_research = False
+
+    await engine._tick()   # must not raise
+
+
 # --- Invariant: seen_count counts FILINGS, not extraction passes. It gates
 # tradeable auto-accept and means "disclosed across filings", so re-reading
 # one filing must never manufacture repeat disclosure. 0.47.0's rolling
@@ -3017,6 +3221,29 @@ async def test_edgar_search_does_not_inflate_seen_count(engine):
     second = next(iter(engine.candidates.data.values())).get("seen_count")
 
     assert first == second == 1
+
+
+async def test_edgar_search_rotates_through_anchors_instead_of_repeating(engine):
+    """Selection is deterministic (inertness, ecosystem, symbol), so on a daily
+    schedule an unrotated pass would re-search the same first anchors forever
+    and never reach the rest -- the trap research.researched_anchors documents.
+    The marker is written even when a search returns nothing, because the
+    REQUEST is what was spent."""
+    from smartboi.tools import run_edgar_supplier_search
+
+    first = _anchor_spec(engine)
+    named_anchors = {c.symbol for c in engine.universe
+                     if c.signal_source_only and (c.name or "").strip()}
+
+    await run_edgar_supplier_search(engine)
+    searched = set(engine.edgar_search_state.data)
+    assert first.symbol in searched, "a no-hit anchor must still be marked"
+
+    # Everything reachable in one run is now marked, so the next run has
+    # nothing left rather than starting the same list over.
+    report = await run_edgar_supplier_search(engine)
+    assert searched == named_anchors
+    assert "already been searched" in report
 
 
 async def test_a_hit_without_a_concentration_disclosure_is_dropped(engine):
