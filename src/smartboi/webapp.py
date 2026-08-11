@@ -564,11 +564,40 @@ el("btn-analyze").addEventListener("click", function(){ runTool("tools/forward-r
 el("btn-event-study").addEventListener("click", function(){ runTool("tools/event-study", {}, this); });
 el("btn-exit-analysis").addEventListener("click", function(){ runTool("tools/exit-analysis", {}, this); });
 el("btn-diagnostics").addEventListener("click", function(){ runTool("tools/diagnostics", {}, this); });
-// A plain navigation, not runTool: the response is a zip for the browser to
-// download, not text for the output pane. Ingress-relative like every other
-// URL here (see API_BASE) so it works behind Home Assistant's proxy.
+// Not runTool (the response is a zip, not text for the output pane) and not a
+// plain navigation either: this is a POST so it carries the CSRF header, which
+// a navigation cannot. Fetch it, then hand the blob to a synthetic link.
 el("btn-full-diagnostics").addEventListener("click", function(){
-  window.location.href = API_BASE + "tools/full-diagnostics";
+  var btn = this, label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Collecting...";
+  function done(msg){ btn.disabled = false; btn.textContent = msg || label; }
+  fetch(API_BASE + "tools/full-diagnostics", { method:"POST", headers:POST_HEADERS, body:"{}" })
+    .then(function(r){
+      if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || r.status); });
+      // Plain string scanning, not a regex: a /filename="..."/ literal trips
+      // the unterminated-string guard in test_webapp_html, which cannot parse
+      // regex literals and should not be loosened to try.
+      var name = "smartboi-diagnostics.zip";
+      var cd = r.headers.get("Content-Disposition") || "";
+      var at = cd.indexOf("filename=");
+      if (at >= 0) {
+        var rest = cd.slice(at + 9);
+        if (rest.charAt(0) === '"') { rest = rest.slice(1, rest.indexOf('"', 1)); }
+        if (rest) name = rest;
+      }
+      return r.blob().then(function(b){ return { blob:b, name:name }; });
+    })
+    .then(function(res){
+      var url = URL.createObjectURL(res.blob);
+      var a = document.createElement("a");
+      a.href = url; a.download = res.name;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      // Revoked on a delay: Safari cancels an in-flight download if the
+      // object URL is released the instant after click().
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 30000);
+      done();
+    })
+    .catch(function(e){ showErr("Full diagnostics failed: " + e.message); done(); });
 });
 el("btn-graph-maint").addEventListener("click", function(){
   runTool("tools/graph-maintenance", {apply:false}, this);
@@ -1635,7 +1664,17 @@ def create_app(engine) -> web.Application:
         periodic_pass_state.json and the dossiers -- each fetched by hand from
         the Home Assistant share, over several rounds. This is that, in one
         click. No .env and no /data/options.json: the archive leaves the
-        machine, and nothing in it is worth the API keys."""
+        machine, and nothing in it is worth the API keys.
+
+        POST, unlike its read-only siblings, and the reason is the payload
+        rather than the side effect (there is none). The CSRF guard exempts
+        GET on the stated grounds that "every GET here is a pure read with no
+        side effect" -- true of this one too, but that rule was written when
+        the richest GET was a status payload, and the dashboard binds 0.0.0.0
+        with no auth of its own (see the module header). This endpoint hands
+        back every dossier, the whole graph, the entire trade record and the
+        logs, so it gets the same protection as the endpoints that change
+        things, not the one the auto-refresh poll gets."""
         try:
             payload = await asyncio.to_thread(collect_full_diagnostics, engine)
         except Exception as exc:  # noqa: BLE001 - a failed download must not kill the dashboard
@@ -1712,9 +1751,7 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/tools/event-study", handle_tool_event_study)
     app.router.add_post("/api/tools/exit-analysis", handle_tool_exit_analysis)
     app.router.add_post("/api/tools/diagnostics", handle_tool_diagnostics)
-    # GET, not POST like its siblings: this one returns a file the browser
-    # downloads, so it has to be reachable as a plain link/navigation.
-    app.router.add_get("/api/tools/full-diagnostics", handle_tool_full_diagnostics)
+    app.router.add_post("/api/tools/full-diagnostics", handle_tool_full_diagnostics)
     app.router.add_post("/api/universe/reset-accepted", handle_reset_accepted)
     app.router.add_post("/api/runtime/reset", handle_reset_runtime)
     app.router.add_post("/api/universe/rebuild-graph", handle_rebuild_graph)

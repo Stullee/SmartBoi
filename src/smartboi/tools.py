@@ -632,16 +632,18 @@ def _ago(stamp: str, now: datetime) -> str:
     return f"{hours}h {rem // 60}m"
 
 
-def _restarts_last_24h(log_dir: Path, now: datetime) -> int:
+def _restarts_last_24h(records: list[list[str]], now: datetime) -> int:
     """Startup banners in the last 24h, counted from the log rather than a
-    process counter -- which could not survive the restarts it is counting."""
+    process counter -- which could not survive the restarts it is counting.
+
+    String comparison on the timestamp is safe rather than lazy: the format is
+    fixed-width "%Y-%m-%d %H:%M:%S", so lexicographic order IS chronological
+    order."""
     cutoff = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-    count = 0
-    for record in _read_log_records(log_dir):
-        head = record[0]
-        if "=== SmartBoi version=" in head and head[:19] >= cutoff:
-            count += 1
-    return count
+    return sum(
+        1 for record in records
+        if "=== SmartBoi version=" in record[0] and record[0][:19] >= cutoff
+    )
 
 
 def _log_paths(log_dir: Path) -> list[Path]:
@@ -685,17 +687,14 @@ def _read_log_records(log_dir: Path) -> list[list[str]]:
     return records
 
 
-def _recent_log_problems(log_dir: Path, webhook_url: str = "") -> list[str]:
+def _recent_log_problems(records: list[list[str]], webhook_url: str = "") -> list[str]:
     """The tail of WARNING/ERROR records from the log and its rotations,
     continuation lines included.
 
     Run through redact_token because a logged exception can carry a Finnhub
     request URL, which has the API key in its query string -- this bundle is
     meant to be pasted somewhere."""
-    problems = [
-        rec for rec in _read_log_records(log_dir)
-        if "| WARNING" in rec[0] or "| ERROR" in rec[0]
-    ]
+    problems = [rec for rec in records if "| WARNING" in rec[0] or "| ERROR" in rec[0]]
     out: list[str] = []
     for record in problems[-MAX_LOG_LINES:]:
         kept = record[:1 + MAX_LOG_CONTINUATION_LINES]
@@ -714,7 +713,7 @@ def _recent_log_problems(log_dir: Path, webhook_url: str = "") -> list[str]:
     return [redact_url(webhook_url, ln) for ln in out]
 
 
-def _log_problem_histogram(log_dir: Path, webhook_url: str = "") -> list[str]:
+def _log_problem_histogram(records: list[list[str]], webhook_url: str = "") -> list[str]:
     """WARNING/ERROR counts by logger and message shape, across the whole
     retained log history.
 
@@ -729,7 +728,7 @@ def _log_problem_histogram(log_dir: Path, webhook_url: str = "") -> list[str]:
     The shape is the message with its variable head stripped (symbols, ids,
     numbers), so one repeated failure aggregates into one row with a count."""
     counts: dict[tuple[str, str], int] = {}
-    for record in _read_log_records(log_dir):
+    for record in records:
         head = record[0]
         if "| WARNING" not in head and "| ERROR" not in head:
             continue
@@ -764,13 +763,33 @@ def _message_shape(message: str) -> str:
     runs are collapsed; a long quoted string is usually the message itself
     rather than a varying value."""
     message = _LEADING_SUBJECT.sub("", message.strip())
-    message = _SHORT_QUOTED.sub("'?'", message)
-    return _DIGIT_RUN.sub("#", message)[:110]
+    message = _QUOTED_SPAN.sub(_collapse_short_quote, message)
+    return _DIGIT_RUN.sub("#", message)[:MAX_SHAPE_CHARS]
+
+
+def _collapse_short_quote(match: re.Match) -> str:
+    """Replace a short quoted value with a placeholder, keeping long ones.
+
+    Matching EVERY quoted span and deciding per match, rather than matching
+    only short ones directly: a `'[^']{0,12}'` pattern skips a long span's
+    opening quote and then pairs that span's CLOSING quote with the next
+    span's opening one, so `'invalid_request_error', 'message'` came out as
+    `'invalid_request_error'?'message'?` -- the delimiters eaten and the
+    shape harder to read than the raw message. Consuming long spans whole
+    keeps the scanner aligned to real quote pairs."""
+    inner = match.group(0)[1:-1]
+    return "'?'" if len(inner) <= 12 else match.group(0)
 
 
 _LEADING_SUBJECT = re.compile(r"^\[?[A-Z0-9][A-Z0-9.\-]{0,9}\]?: ")
 _DIGIT_RUN = re.compile(r"\d+")
-_SHORT_QUOTED = re.compile(r"'[^']{0,12}'")
+_QUOTED_SPAN = re.compile(r"'[^']*'")
+# Long enough to keep the CAUSE of a structured API error, which is at the end
+# of the message and not the start. At 110 the busiest row in a real bundle
+# read "dossier update proposal failed: Error code: # - {...'invalid_request_
+# error'..." and stopped -- 11,893 failures reported without ever saying that
+# the credit balance was exhausted.
+MAX_SHAPE_CHARS = 180
 
 
 # --- The full file bundle -------------------------------------------------
@@ -943,7 +962,12 @@ def run_diagnostics(engine) -> str:
     # restart count comes from the log rather than a counter, so it survives
     # the restarts it is counting.
     add(f"started_at   : {engine.started_at} ({_ago(engine.started_at, now)} ago)")
-    restarts = _restarts_last_24h(Path(s.log_dir), now)
+    # Read ONCE and shared by the three consumers below (restart count, the
+    # tail, the histogram). The retained history is up to six 5MB files, so
+    # re-reading and re-splitting it per section was triple the work and
+    # triple the peak memory for identical output.
+    log_records = _read_log_records(Path(s.log_dir))
+    restarts = _restarts_last_24h(log_records, now)
     add(f"restarts/24h : {restarts}"
         + ("  <-- restarting repeatedly; treat the state below as unsettled" if restarts > 8 else ""))
 
@@ -1344,7 +1368,7 @@ def run_diagnostics(engine) -> str:
     else:
         add("  no pass has run yet")
 
-    problems = _recent_log_problems(log_dir, s.alert_webhook_url)
+    problems = _recent_log_problems(log_records, s.alert_webhook_url)
     add(f"\n--- Recent warnings/errors (last {MAX_LOG_LINES} messages) ---")
     for line in problems:
         add(f"  {line}")
@@ -1356,7 +1380,7 @@ def run_diagnostics(engine) -> str:
     # invisible to it -- 11,893 billing failures in one morning (rotated out
     # of the live file entirely) and 243 whole-universe price failures, while
     # the visible 40 lines were hourly Reg SHO and DoD repeats.
-    histogram = _log_problem_histogram(log_dir, s.alert_webhook_url)
+    histogram = _log_problem_histogram(log_records, s.alert_webhook_url)
     add("\n--- Warning/error counts across the whole retained log ---")
     for line in histogram:
         add(line)

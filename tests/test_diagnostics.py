@@ -408,3 +408,37 @@ def test_the_full_bundle_survives_a_broken_summary(engine, monkeypatch):
     zf = _bundle(engine)
     assert "MANIFEST.txt" in zf.namelist()
     assert b"boom" in zf.read("diagnostics.txt")
+
+
+def test_the_message_shape_keeps_long_quoted_spans_intact():
+    """A `'[^']{0,12}'` pattern skips a LONG span's opening quote and then
+    pairs that span's closing quote with the next span's opening one, so
+    `'invalid_request_error', 'message'` came out as
+    `'invalid_request_error'?'message'?` -- delimiters eaten, shape less
+    readable than the raw message."""
+    from smartboi.tools import _message_shape
+
+    shape = _message_shape(
+        "dossier update proposal failed: Error code: 400 - {'type': 'error', 'error': "
+        "{'type': 'invalid_request_error', 'message': 'Your credit balance is too low.'}}"
+    )
+
+    assert "'invalid_request_error'" in shape      # long span kept whole
+    assert "'invalid_request_error'?" not in shape  # and not mid-paired
+    assert "'?'" in shape                           # short values still collapse
+    # The CAUSE lives at the END of a structured API error, so it must survive
+    # truncation: 11,893 failures were reported without ever saying why.
+    assert "credit balance is too low" in shape
+
+
+def test_the_message_shape_collapses_one_bug_into_one_row():
+    """The per-character extraction failure interpolates the offending
+    character with %r, which spread 7,618 occurrences of ONE bug across
+    twenty-odd rows -- ('a'), ('b'), ('c') -- each looking minor."""
+    from smartboi.tools import _message_shape
+
+    shapes = {
+        _message_shape(f"MPWR: relationship extraction returned a non-object entry ({c!r}) -- skipping it.")
+        for c in "abcdefg\"\n,"
+    }
+    assert len(shapes) == 1

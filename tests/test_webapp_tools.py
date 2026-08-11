@@ -322,3 +322,37 @@ async def test_status_reads_each_dossier_from_disk_once(engine):
 
     assert loads, "the payload should have read some dossiers"
     assert len(loads) == len(set(loads)), f"a dossier was re-read from disk: {loads}"
+
+
+# --- The full diagnostics download ---------------------------------------
+
+
+async def test_the_full_diagnostics_download_returns_a_real_zip(engine):
+    import io
+    import zipfile
+
+    async with _client(engine) as client:
+        response = await client.post("/api/tools/full-diagnostics", json={})
+
+        assert response.status == 200
+        assert response.headers["Content-Type"] == "application/zip"
+        assert "attachment; filename=" in response.headers["Content-Disposition"]
+        archive = zipfile.ZipFile(io.BytesIO(await response.read()))
+        assert archive.testzip() is None
+        assert "MANIFEST.txt" in archive.namelist()
+        assert "diagnostics.txt" in archive.namelist()
+
+
+async def test_the_full_diagnostics_download_requires_the_csrf_header():
+    """POST, unlike its read-only siblings, and for the payload rather than a
+    side effect. The CSRF guard exempts GET on the grounds that every GET is a
+    pure read -- true of this one, but that rule was written when the richest
+    GET was a status payload, and the dashboard binds 0.0.0.0 with no auth of
+    its own. This endpoint hands back every dossier, the whole graph, the
+    trade record and the logs."""
+    settings = Settings(_env_file=None, symbols="DCO", anchor_symbols="RTX",
+                        enable_dashboard=False, enable_universe_autoscreen=False)
+    bare = Engine(settings)
+    async with TestClient(TestServer(create_app(bare))) as client:  # no header
+        response = await client.post("/api/tools/full-diagnostics", json={})
+        assert response.status == 403
