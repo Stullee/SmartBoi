@@ -946,7 +946,7 @@ function drawWire(now){
   // edges
   WIRE.edges.forEach(function(e){ var pa=WIRE.pos[e[0]],pb=WIRE.pos[e[1]]; if(!pa||!pb) return;
     var isHot=hot[e[0]+">"+e[1]], col=tok(gvColorTok(e[2]));
-    ctx.globalAlpha=isHot?0.95:0.22; ctx.strokeStyle=col; ctx.lineWidth=Math.max(0.6,(0.6+e[3]*2.2))*s*(isHot?1.3:1);
+    ctx.globalAlpha=isHot?0.95:0.34; ctx.strokeStyle=col; ctx.lineWidth=Math.max(0.6,(0.6+e[3]*2.2))*s*(isHot?1.3:1);
     if(!GC[e[2]]) ctx.setLineDash([3.2*s,4.5*s]); else ctx.setLineDash([]);
     ctx.beginPath(); ctx.moveTo(pa.x*s,pa.y*s); ctx.lineTo(pb.x*s,pb.y*s); ctx.stroke();
   });
@@ -985,8 +985,13 @@ function drawWire(now){
     // relationship carried it.
     if(n.kind==="unlinked"){ ctx.save(); ctx.setLineDash([3*s,3*s]); ctx.lineWidth=1.5*s;
       ctx.strokeStyle=tok("--warn"); ctx.beginPath(); ctx.arc(x,y,r+4.5*s,0,7); ctx.stroke(); ctx.restore(); }
+    // Every label sits ABOVE its node, anchors included. Printing the anchor's
+    // name inside the disc put --gn-txt (a token tuned for the panel ground) on
+    // --gn-anchor grey: 2.6:1 in dark and 3.1:1 in light, against the 4.5:1 that
+    // 11px bold text needs to be legible. Above the disc the same text reads
+    // 15:1 and up, and it no longer paints over the edges passing behind it.
     ctx.fillStyle=tok("--gn-txt"); ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.font="700 "+(11*s)+"px -apple-system,sans-serif";
-    ctx.fillText(n.id, x, n.kind==="anchor"?y:y-r-6*s);
+    ctx.fillText(n.id, x, y-r-6*s);
     if(n.kind!=="anchor"&&n.score!=null&&r>9*s){ ctx.fillStyle=tok("--gn-stroke"); ctx.font="700 "+(8*s)+"px ui-monospace,monospace"; ctx.fillText(n.score.toFixed(2),x,y); }
   });
   // ...and say it in words when that is the name currently being shown, so a
