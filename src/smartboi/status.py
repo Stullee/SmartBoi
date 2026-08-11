@@ -287,6 +287,39 @@ def _days_since(stamp: str) -> float | None:
     return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
 
 
+def _disconnected_reasons(symbols: set[str], candidates: dict | None) -> dict[str, dict]:
+    """For each edge-less tradeable, what extraction actually found for it.
+
+    Three states, and only one of them is a hole the rolling refresh can
+    close:
+      - `found` 0        : its filings have not produced a counterparty yet.
+                           A refresh may genuinely help.
+      - `found` > 0, `resolvable` 0 : extraction worked and every counterparty
+                           was unlisted, foreign or the company's own
+                           subsidiary. A refresh finds the same names again.
+      - `resolvable` > 0 : the counterparties exist and have tickers; they are
+                           waiting to be ACCEPTED into the universe, which is
+                           a click, not a re-read.
+    """
+    out: dict[str, dict] = {}
+    for symbol in sorted(symbols):
+        rows = [
+            (name, row) for name, row in (candidates or {}).items()
+            if symbol in (row.get("related_to") or [])
+        ]
+        resolvable = [n for n, r in rows if (r.get("ticker") or "").strip()]
+        out[symbol] = {
+            "found": len(rows),
+            "resolvable": len(resolvable),
+            # Named, because "0 resolvable" is a fact an operator can only act
+            # on by seeing WHICH companies -- a foreign listing is a different
+            # decision from a law firm.
+            "examples": [n[:48] for n, _ in rows[:4]],
+            "resolvable_examples": resolvable[:4],
+        }
+    return out
+
+
 def gather_graph_health(
     graph: RelationshipGraph,
     universe,
@@ -297,6 +330,7 @@ def gather_graph_health(
     researched_anchor_count: int = 0,
     refresh_per_day: int = 0,
     audit: dict | None = None,
+    candidates: dict | None = None,
 ) -> dict:
     """Health and maintenance state of the relationship graph -- the numbers
     that say whether the mechanism the whole strategy runs on is actually
@@ -385,6 +419,18 @@ def gather_graph_health(
         "disconnected": disconnected[:40],
         "disconnected_with_thesis": len(with_thesis),
         "disconnected_with_thesis_symbols": sorted(with_thesis)[:40],
+        # WHY each of those has no edge, which decides whether anything can
+        # be done about it. Both the dashboard and the bundle used to assert
+        # that the rolling refresh "closes exactly these holes", and for the
+        # five names carrying this flag live that was simply false: extraction
+        # had already run on all five and found 42 counterparties between
+        # them, of which ZERO resolved to a ticker -- own subsidiaries
+        # (Hurco Automation Ltd), auditors and law firms (now filtered at
+        # extraction), and foreign or private customers (IVECO, Higer Bus,
+        # J.A.P. Industria) that EDGAR will never know. Re-reading those
+        # filings finds the same names again, forever. A warning that
+        # promises a fix that cannot arrive is worse than no warning.
+        "disconnected_reasons": _disconnected_reasons(with_thesis, candidates),
         "anchors": len(anchors),
         "anchors_live": len(live_anchors),
         "anchors_inert": len(anchors) - len(live_anchors),

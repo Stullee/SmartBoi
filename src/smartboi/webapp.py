@@ -832,11 +832,30 @@ function renderGraphHealth(d){
       ({customer:"cust",supplier:"supp",competitor:"comp",regulator:"reg"}[k]||"eco")+')"></span>'+esc(k)+
       ' <b class="mono">'+g.edges_by_type[k]+"</b></span>";
   }).join("");
+  // Per symbol, not one blanket sentence. This used to promise that "the
+  // rolling refresh re-reads filings against the current universe to close
+  // exactly these holes", which was false for every name that carried the
+  // flag: extraction had already run on all of them and found only own
+  // subsidiaries, auditors, and foreign or private customers. A re-read
+  // returns the same names forever, so the advice sent the operator to wait
+  // for a fix that could not arrive.
+  var reasons = g.disconnected_reasons || {};
+  var why = Object.keys(reasons).map(function(sym){
+    var r = reasons[sym], line;
+    if (!r.found) line = "no counterparty extracted yet &mdash; a refresh may close this one";
+    else if (r.resolvable) line = r.resolvable+" with a ticker waiting to be accepted: "+
+      (r.resolvable_examples||[]).join(", ");
+    else line = "extraction found "+r.found+", none resolvable: "+(r.examples||[]).join(", ");
+    return '<div class="mono" style="margin-top:4px;opacity:0.85"><b>'+sym+"</b> &mdash; "+line+"</div>";
+  }).join("");
+  var stuck = Object.keys(reasons).some(function(s){
+    return reasons[s].found && !reasons[s].resolvable; });
   var warn = g.disconnected_with_thesis
     ? '<div class="regime"><span>&#9873;</span><span><b>'+g.disconnected_with_thesis+
-      '</b> tradeable(s) carry a thesis with <b>no graph edge at all</b> &mdash; their dossier came only from their own filings, so the cross-company mechanism never fired for them. The rolling refresh re-reads filings against the current universe to close exactly these holes.'+
-      (g.disconnected_with_thesis_symbols&&g.disconnected_with_thesis_symbols.length
-        ? '<div class="mono" style="margin-top:5px;opacity:0.85">'+g.disconnected_with_thesis_symbols.join(" ")+"</div>":"")+
+      '</b> tradeable(s) carry a thesis with <b>no graph edge at all</b> &mdash; their dossier came only from their own filings, so the cross-company mechanism never fired for them.'+
+      (stuck ? " Unlisted, foreign or private counterparties cannot become edges, so those names are permanently direct-only: they still trade on their own filings, but the graph is not going to reach them." : "")+
+      (why ? why : (g.disconnected_with_thesis_symbols&&g.disconnected_with_thesis_symbols.length
+        ? '<div class="mono" style="margin-top:5px;opacity:0.85">'+g.disconnected_with_thesis_symbols.join(" ")+"</div>":""))+
       "</span></div>" : "";
   el("ghStats").innerHTML='<div class="k">Relationship graph</div>'+
     '<div class="big mono">'+g.edges+'<span class="u"> edges</span></div>'+
@@ -1420,6 +1439,7 @@ async def _status_payload(engine) -> dict:
             refresh_per_day=(settings.graph_refresh_symbols_per_day
                              if settings.enable_graph_refresh else 0),
             audit=engine.audit_state.get("last"),
+            candidates=engine.candidates.data,
         ),
         "open_paper_trades": open_trades,
         "closed_paper_trades": closed_trades,

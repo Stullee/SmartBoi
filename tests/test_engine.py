@@ -3614,3 +3614,56 @@ async def test_the_synthesis_floor_gate_reads_the_uncapped_arithmetic(engine):
     await engine._apply_synthesis(dossier, now)
 
     assert engine.synthesizer.calls, "the pass that set the cap must still be reachable under it"
+
+
+# --- Counterparties that can never be a propagation channel ---------------
+
+
+@pytest.mark.parametrize("symbol,name", [
+    # Live: all ten counterparties extraction found for HURC were its own
+    # subsidiaries or its auditor, which is why it carries a thesis and no
+    # graph edge -- the extraction worked and produced nothing usable.
+    ("HURC", "HURCO AUTOMATION, LTD."),
+    ("HURC", "HURCO MANUFACTURING LIMITED"),
+    ("HURC", "DELOITTE & TOUCHE LLP"),
+    ("PLPC", "ERNST & YOUNG LLP"),
+    ("PLPC", "BAKER & HOSTETLER LLP"),
+    ("PLPC", "PNC EQUIPMENT FINANCE LLC"),
+])
+def test_noise_counterparties_are_dropped(symbol, name, tmp_path, monkeypatch):
+    """An auditor, a law firm, a financing arm and the company's own
+    subsidiary are all disclosed relationships, and none is a channel news
+    travels down. The existing lender filter reads the DESCRIPTION, so an
+    audit engagement -- disclosed without a word like 'credit facility' --
+    went straight through it."""
+    monkeypatch.chdir(tmp_path)
+    engine = Engine(Settings(_env_file=None, enable_dashboard=False,
+                             enable_universe_autoscreen=False))
+    rel = {"counterparty_name": name, "rel_type": "supplier", "description": ""}
+
+    assert engine._is_professional_services(rel) or engine._is_self_reference(symbol, rel)
+
+
+@pytest.mark.parametrize("symbol,name", [
+    # Real supply-chain counterparties, including the ones that are foreign
+    # or private. Those cannot become edges either, but for a different
+    # reason -- and this filter must never be what removes them, or it would
+    # be hiding the finding instead of cleaning it up.
+    ("MVST", "IVECO"),
+    ("MVST", "HIGER BUS"),
+    ("PLPC", "J.A.P. INDUSTRIA DE MATERIAIS PARA TELEFONIA LTD"),
+    ("CVLG", "TRANSPORT ENTERPRISE LEASING, LLC"),
+    ("DCO", "RTX CORPORATION"),
+    ("UCTT", "APPLIED MATERIALS INC"),
+    ("THRM", "LEAR CORPORATION"),
+    # An operating company whose name merely contains a financial word.
+    ("DCO", "CAPITAL SENIOR LIVING CORP"),
+])
+def test_real_counterparties_survive_the_filters(symbol, name, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    engine = Engine(Settings(_env_file=None, enable_dashboard=False,
+                             enable_universe_autoscreen=False))
+    rel = {"counterparty_name": name, "rel_type": "customer", "description": ""}
+
+    assert not engine._is_professional_services(rel)
+    assert not engine._is_self_reference(symbol, rel)

@@ -32,6 +32,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
@@ -178,6 +179,49 @@ _LENDER_PHRASES = (
     "line of credit", "loan agreement", "promissory note", "notes payable",
     "bank facilit", "financing agreement", "mortgage", "borrower",
 )
+
+# Counterparties whose NAME alone disqualifies them, whatever the disclosure
+# says. The lender filter above reads the description and therefore only
+# catches a relationship disclosed in credit language; an audit engagement or
+# a legal-services note is disclosed without any of those words and sailed
+# straight through. Live: PLPC's four extracted counterparties were Ernst &
+# Young, Baker & Hostetler, PNC Equipment Finance and one Brazilian
+# manufacturer -- three of four were professional services, and PLPC ended up
+# carrying a thesis with no graph edge at all.
+#
+# Anchored on word boundaries and, for the generic tokens, on a trailing
+# entity form: a bare "BANK" substring would swallow legitimate operating
+# companies, and this list must never cost a real supply-chain edge to
+# remove noise.
+_PROFESSIONAL_SERVICES_RE = re.compile(
+    r"\b("
+    r"LLP|L\.L\.P|"
+    r"DELOITTE|ERNST\s*&\s*YOUNG|KPMG|PRICEWATERHOUSE|PWC|GRANT\s+THORNTON|BDO|MARCUM|"
+    r"RSM\s+US|CROWE|MOSS\s+ADAMS|BAKER\s+TILLY|"
+    r"BAKER\s*&\s*HOSTETLER|JONES\s+DAY|LATHAM\s*&|SKADDEN|WACHTELL|SULLIVAN\s*&\s*CROMWELL|"
+    r"EQUIPMENT\s+FINANCE|CAPITAL\s+FINANCE|COMMERCIAL\s+FINANCE|TRUST\s+COMPANY"
+    r")\b",
+    re.I,
+)
+
+# Entity-form suffixes stripped before comparing a counterparty's name to the
+# filing company's own, so "Hurco Companies" and "HURCO AUTOMATION, LTD."
+# compare on the part that actually identifies the group.
+_ENTITY_FORMS = frozenset({
+    "INC", "INCORPORATED", "CORP", "CORPORATION", "CO", "COMPANY", "COMPANIES",
+    "LTD", "LIMITED", "LLC", "LP", "PLC", "AG", "SA", "NV", "GMBH", "AB", "AS",
+    "HOLDINGS", "HOLDING", "GROUP", "INTERNATIONAL", "TECHNOLOGIES", "TECHNOLOGY",
+})
+
+
+def _company_name_stem(name: str) -> str:
+    """The first significant word of a company name, uppercased -- what a
+    subsidiary inherits from its parent and an entity form does not carry."""
+    for word in re.split(r"[^A-Za-z0-9]+", (name or "").upper()):
+        if word and word not in _ENTITY_FORMS:
+            return word
+    return ""
+
 
 # Phrases that mark an extracted "relationship" as coming from an EXECUTIVE
 # BIOGRAPHY rather than a business dealing. 8-K item 5.02 officer
@@ -1753,6 +1797,20 @@ class Engine:
                     symbol, rel.get("counterparty_name"),
                 )
                 continue
+            if self._is_professional_services(rel):
+                log.info(
+                    "%s: dropping professional-services relationship to %s (an auditor, law firm "
+                    "or financing arm is a vendor, not a channel news travels down).",
+                    symbol, rel.get("counterparty_name"),
+                )
+                continue
+            if self._is_self_reference(symbol, rel):
+                log.info(
+                    "%s: dropping self-referential relationship to %s (the company's own "
+                    "subsidiary or trading name is not a counterparty).",
+                    symbol, rel.get("counterparty_name"),
+                )
+                continue
             if self._is_biography_relationship(rel):
                 log.info(
                     "%s: dropping biography-derived relationship to %s (an executive's former "
@@ -1837,6 +1895,52 @@ class Engine:
             return False
         text = f"{rel.get('description', '')} {rel.get('quote', '')}".lower()
         return any(phrase in text for phrase in _LENDER_PHRASES)
+
+    @staticmethod
+    def _is_professional_services(rel: dict) -> bool:
+        """Whether the counterparty is an auditor, law firm or financing arm.
+
+        Keyed on the NAME, unlike the lender filter above, which reads the
+        description. That distinction is the whole point: an audit engagement
+        is disclosed without ever using a word like "credit facility", so the
+        description-based filter never sees it. Measured live -- of the four
+        counterparties extraction found for PLPC, three were Ernst & Young,
+        Baker & Hostetler and PNC Equipment Finance, and all three survived
+        every existing filter.
+
+        Applied to every rel_type. A law firm cannot be a supply-chain
+        channel in either direction, and the mislabelling is arbitrary: the
+        same disclosure produced "supplier" for Deloitte and "customer" for
+        others."""
+        name = (rel.get("counterparty_name") or "").upper()
+        return bool(name) and bool(_PROFESSIONAL_SERVICES_RE.search(name))
+
+    def _is_self_reference(self, symbol: str, rel: dict) -> bool:
+        """Whether the "counterparty" is the filing company itself, or one of
+        its own subsidiaries or trading names.
+
+        A 10-K names its own subsidiaries constantly, and extraction labels
+        them supplier/customer because that is literally what an intercompany
+        relationship looks like on the page. Live: all ten counterparties
+        found for HURC were Hurco Automation Ltd, Hurco Manufacturing Ltd and
+        the like, which is why HURC carries a thesis and no graph edge -- the
+        extraction worked and produced nothing that could ever propagate.
+
+        Matched on the registered name rather than the ticker, since a
+        subsidiary shares the parent's NAME and never its symbol. The
+        comparison is on the first significant word, which is what a
+        subsidiary inherits ("Hurco Companies" -> "HURCO AUTOMATION LTD")."""
+        name = (rel.get("counterparty_name") or "").strip().upper()
+        if not name:
+            return False
+        spec = self.spec_by_symbol.get(symbol)
+        own = [symbol.upper()]
+        if spec is not None and spec.name:
+            stem = _company_name_stem(spec.name)
+            if stem:
+                own.append(stem)
+        candidate_stem = _company_name_stem(name)
+        return any(o and (candidate_stem == o or name.startswith(f"{o} ")) for o in own)
 
     @staticmethod
     def _is_biography_relationship(rel: dict) -> bool:

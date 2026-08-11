@@ -1308,6 +1308,7 @@ def run_diagnostics(engine) -> str:
         last_research=engine.periodic_state.get("supplier_research", "") or "",
         researched_anchor_count=len(researched_anchors(engine.candidates, engine.research_state)),
         refresh_per_day=(s.graph_refresh_symbols_per_day if s.enable_graph_refresh else 0),
+        candidates=engine.candidates.data,
     )
     add("\n--- Graph health (the mechanism the whole strategy runs on) ---")
     add(f"  edges: {gh['edges']} ({', '.join(f'{k} {v}' for k, v in gh['edges_by_type'].items()) or '-'})")
@@ -1318,6 +1319,26 @@ def run_diagnostics(engine) -> str:
             f"{' '.join(gh['disconnected_with_thesis_symbols'])}")
         add("     ^^ their dossier came only from their own filings -- the cross-company mechanism "
             "never fired for them.")
+        # Per symbol, because the three states below need three different
+        # responses and the old blanket advice ("the rolling refresh closes
+        # exactly these holes") was wrong for every name that actually
+        # carried the flag.
+        for sym, why in (gh.get("disconnected_reasons") or {}).items():
+            found, resolvable = why.get("found", 0), why.get("resolvable", 0)
+            if not found:
+                add(f"     {sym:6} no counterparty extracted yet -- the rolling refresh may close this one.")
+            elif resolvable:
+                add(f"     {sym:6} {resolvable} counterpart(y/ies) WITH a ticker are waiting to be "
+                    f"accepted: {', '.join(why.get('resolvable_examples') or [])}")
+            else:
+                add(f"     {sym:6} extraction found {found} counterpart(y/ies), NONE resolvable to a "
+                    f"ticker: {', '.join(why.get('examples') or [])}")
+        if any(w.get("found") and not w.get("resolvable")
+               for w in (gh.get("disconnected_reasons") or {}).values()):
+            add("     ^^ a re-read finds those same names again. Unlisted, foreign or private")
+            add("        counterparties cannot become edges, so those names are permanently")
+            add("        direct-only: they still trade on their own filings, but the graph is")
+            add("        not going to reach them.")
     add(f"  anchors linked to a tradeable: {gh['anchors_live']}/{gh['anchors']} "
         f"({gh['anchors_inert']} inert -- their news reaches nothing)")
     stalest = gh["stalest_days"]
