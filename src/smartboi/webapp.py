@@ -864,7 +864,18 @@ function renderDetail(d){
 // updateWire(data). Signals flow as pulses from the signaled tradeable out to
 // its graph neighbours; the active ticker item lights its path.
 // ===========================================================================
-var WIRE = { nodes:[], edges:[], pos:{}, byId:{}, feed:[], activeKey:"", t0:0, laid:false, layoutKey:"" };
+var WIRE = { nodes:[], edges:[], pos:{}, byId:{}, feed:[], activeKey:"", t0:0, laid:false, layoutKey:"", dirty:true };
+
+// The stylesheet has always honoured prefers-reduced-motion for the two CSS
+// pulse dots; the animation that actually moves -- travelling pulses, a beating
+// selection ring, a full canvas repaint 60 times a second -- never consulted it.
+// Under the preference the wire now holds still: no auto-advancing ticker (an
+// auto-rotating list is the exact pattern the preference exists to stop),
+// no travelling dots, and a selection ring at a fixed phase. Clicking a feed
+// row still moves the selection, so nothing becomes unreachable.
+var RMQ = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+var REDUCED = !!(RMQ && RMQ.matches);
+if (RMQ && RMQ.addEventListener) RMQ.addEventListener("change", function(e){ REDUCED = e.matches; WIRE.dirty = true; });
 var cv, ctx, dpr=Math.max(1,Math.min(2,window.devicePixelRatio||1)), cw=700, ch=460, scale=1, VW=1000, VH=560;
 
 var TCK = {};
@@ -937,6 +948,17 @@ function activeIndex(){
 }
 function activeSig(){ var i=activeIndex(); return i<0?(WIRE.feed[0]||null):WIRE.feed[i]; }
 function sigEdges(sym){ return WIRE.edges.filter(function(e){ return e[0]===sym||e[1]===sym; }); }
+// Whether anything on the canvas is actually in motion this frame. Only the
+// pulses and the selection ring ever move, and both need a selected node with
+// at least one edge to travel along -- so a wire showing an unconnected signal,
+// or no signal at all, has nothing to redraw and is left alone until something
+// marks it dirty. This is the difference between a dashboard left open on a
+// wall repainting 60 times a second forever and repainting when there is news.
+function wireAnimating(){
+  if(REDUCED) return false;
+  var sig=activeSig();
+  return !!(sig && WIRE.pos[sig.symbol] && sigEdges(sig.symbol).length);
+}
 
 function drawWire(now){
   if(!ctx) return;
@@ -958,7 +980,7 @@ function drawWire(now){
   // covered tradeable, accumulates as evidence, and eventually crosses the
   // conviction bar. Running the dots outward drew the opposite claim -- a
   // small-cap broadcasting at the giants that actually fed it.
-  if(hotSym){ var pn=WIRE.pos[hotSym]; sigEdges(hotSym).forEach(function(e){ var other=e[0]===hotSym?e[1]:e[0], po=WIRE.pos[other]; if(!pn||!po) return;
+  if(hotSym && !REDUCED){ var pn=WIRE.pos[hotSym]; sigEdges(hotSym).forEach(function(e){ var other=e[0]===hotSym?e[1]:e[0], po=WIRE.pos[other]; if(!pn||!po) return;
     var col=tok(gvColorTok(e[2]));
     for(var k=0;k<3;k++){ var t=((now/1200)+k/3)%1, px=(po.x+(pn.x-po.x)*t)*s, py=(po.y+(pn.y-po.y)*t)*s, al=Math.sin(t*Math.PI);
       ctx.globalAlpha=al; ctx.fillStyle=col; ctx.shadowColor=col; ctx.shadowBlur=8*s; ctx.beginPath(); ctx.arc(px,py,3*s,0,7); ctx.fill(); }
@@ -968,7 +990,7 @@ function drawWire(now){
     var isHot=(n.id===hotSym);
     // The selection ring clears the unlinked marker below rather than beating
     // through it -- two rings at the same radius read as one smeared ring.
-    if(isHot){ var beat=0.5+0.5*Math.sin(now/260), gap=(n.kind==="unlinked"?9.5:4);
+    if(isHot){ var beat=REDUCED?0.5:(0.5+0.5*Math.sin(now/260)), gap=(n.kind==="unlinked"?9.5:4);
       ctx.globalAlpha=0.9; ctx.strokeStyle=tok(gvFill(n)); ctx.lineWidth=2;
       ctx.beginPath(); ctx.arc(x,y,r+(gap+beat*5)*s,0,7); ctx.stroke(); ctx.globalAlpha=1; ctx.shadowColor=tok(gvFill(n)); ctx.shadowBlur=(8+beat*10)*s; }
     // An `external` node is a graph endpoint that is not a universe member at
@@ -1007,8 +1029,11 @@ function drawWire(now){
   }
 }
 
+// Setting canvas.width/height CLEARS the canvas, so a resize must always be
+// followed by a repaint -- with the idle skip in frame() a still wire would
+// otherwise stay blank until the next signal.
 function resizeWire(){ if(!cv) return; cw=cv.parentNode.clientWidth; ch=Math.round(cw*VH/VW); if(ch>520){ch=520;} scale=cw/VW;
-  cv.width=Math.round(cw*dpr); cv.height=Math.round(ch*dpr); cv.style.height=ch+"px"; }
+  cv.width=Math.round(cw*dpr); cv.height=Math.round(ch*dpr); cv.style.height=ch+"px"; WIRE.dirty=true; }
 
 function renderFeed(scrollToActive){
   var s=WIRE.feed; el("feedCount").textContent=s.length+(s.length===1?" signal":" signals");
@@ -1019,7 +1044,7 @@ function renderFeed(scrollToActive){
       '</span></div><div class="ev-body">'+esc(x.thesis_summary)+"</div></button>";
   }).join("");
   Array.prototype.forEach.call(el("feed").querySelectorAll(".ev"),function(b){ b.addEventListener("click",function(){
-    WIRE.activeKey=sigKeyOf(WIRE.feed[+b.dataset.i]); WIRE.t0=performance.now(); renderFeed(true); }); });
+    WIRE.activeKey=sigKeyOf(WIRE.feed[+b.dataset.i]); WIRE.t0=performance.now(); WIRE.dirty=true; renderFeed(true); }); });
   // The list holds ~4 rows and the ticker walks all 25, so from the fifth item
   // on the canvas was pulsing a name whose feed row was below the fold. Done on
   // every selection CHANGE but never on a plain re-render: a refresh landing
@@ -1107,6 +1132,7 @@ function updateWire(d){
   // at all. A legend that describes a channel that cannot occur and omits two
   // that do is worse than none: the panel's whole claim is that the mechanism
   // can be read off it.
+  WIRE.dirty=true;
   el("wireLeg").innerHTML='<span class="gl"><i class="gl-l" style="background:var(--gc-cust)"></i>customer</span>'+
     '<span class="gl"><i class="gl-l" style="background:var(--gc-supp)"></i>supplier</span>'+
     '<span class="gl"><i class="gl-l" style="background:var(--gc-comp)"></i>competitor</span>'+
@@ -1159,17 +1185,21 @@ function renderAll(d){
 
 function frame(now){
   var s=WIRE.feed;
-  if(s.length && now-WIRE.t0>4800){
+  if(!REDUCED && s.length && now-WIRE.t0>4800){
     var i=activeIndex();
-    WIRE.activeKey=sigKeyOf(s[(i<0?0:i+1)%s.length]); WIRE.t0=now; renderFeed(true);
+    WIRE.activeKey=sigKeyOf(s[(i<0?0:i+1)%s.length]); WIRE.t0=now; WIRE.dirty=true; renderFeed(true);
   }
-  drawWire(now); requestAnimationFrame(frame);
+  // The rAF chain keeps ticking (an empty callback costs nothing, and a loop
+  // that stops has to be restarted correctly from six places -- a missed one
+  // leaves a permanently frozen canvas); it is the REPAINT that is skipped.
+  if(WIRE.dirty || wireAnimating()){ drawWire(now); WIRE.dirty=false; }
+  requestAnimationFrame(frame);
 }
 
 // theme toggle (2-state, seeded from OS)
 (function(){ var root=document.documentElement, btn=el("tgl");
   var dark=!!(window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches);
-  function apply(){ root.setAttribute("data-theme",dark?"dark":"light"); btn.textContent=dark?"☾ Dark":"☀ Light"; refreshTokens(); }
+  function apply(){ root.setAttribute("data-theme",dark?"dark":"light"); btn.textContent=dark?"☾ Dark":"☀ Light"; refreshTokens(); WIRE.dirty=true; }
   btn.addEventListener("click",function(){ dark=!dark; apply(); }); apply();
 })();
 
