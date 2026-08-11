@@ -568,3 +568,59 @@ def test_an_oversized_file_is_declined_before_it_is_read(engine, tmp_path, monke
     # archive path used to do before consulting it: raw text, redacted copy
     # and encoded measurement, all resident before the size was looked at.
     assert opened.count("smartboi.log") <= 1
+
+
+def _labelled_dossier(engine, symbol, labels):
+    from smartboi.dossier import Dossier, EvidenceRecord, merge_evidence
+
+    d = Dossier(symbol=symbol)
+    for n, label in enumerate(labels):
+        merge_evidence(d, EvidenceRecord(
+            f"{symbol}-{n}", "news", f"outlet{n}.com", "u", "h", "2026-08-10", "MSFT", True, "note",
+            "LONG", 0.5, 0.6, 20, "reason", "skeptic",
+            relationship_confidence=0.95, fact_key=label,
+        ))
+    engine.dossiers.save(d)
+    return d
+
+
+def test_the_bundle_reports_whether_fact_labelling_is_working(engine):
+    """The per-fact independence mechanism rests on the model assigning a
+    label and REUSING it. A model that quietly stops doing either degrades
+    scoring back to per-channel counting with no error raised anywhere."""
+    _labelled_dossier(engine, "BWEN", ["ai capex q2", "ai capex q2", "ai capex q2"])
+
+    report = run_diagnostics(engine)
+
+    assert "Fact labelling" in report
+    assert "evidence items      : 3" in report
+    assert "carrying a label    : 3" in report
+    assert "distinct facts      : 1" in report
+    assert "3.0 item(s) per fact" in report
+
+
+def test_the_bundle_warns_when_labels_collapse_nothing(engine):
+    """One fact per item means the labels are doing no work -- either the
+    evidence really is that diverse, or the model is paraphrasing instead of
+    reusing, and a high source count should not be trusted until you know
+    which."""
+    _labelled_dossier(engine, "DCO", ["fact a", "fact b", "fact c"])
+
+    assert "the labels are not collapsing anything" in run_diagnostics(engine)
+
+
+def test_the_bundle_warns_when_most_evidence_predates_labelling(engine):
+    """A board that is a mix of labelled and unlabelled evidence is scoring
+    under two different rules at once, and that has to be stated."""
+    from smartboi.dossier import Dossier, EvidenceRecord, merge_evidence
+
+    d = Dossier(symbol="OLD")
+    for n in range(4):
+        merge_evidence(d, EvidenceRecord(
+            f"o{n}", "news", f"p{n}.com", "u", "h", "2026-08-10", "OLD", False, "",
+            "LONG", 0.5, 0.6, 20, "r", "s",
+        ))
+    engine.dossiers.save(d)
+    _labelled_dossier(engine, "NEW", ["one fact"])
+
+    assert "score under the OLD per-channel rules" in run_diagnostics(engine)

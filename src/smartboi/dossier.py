@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,21 @@ class EvidenceRecord:
     reasoning: str
     skeptic_note: str
     relationship_confidence: float | None = None  # the graph edge's own extracted confidence; None when not propagated
+    # A short canonical label for the UNDERLYING EVENT this item reports --
+    # the thing that happened, not the article about it. Assigned per item by
+    # the updater, which is shown the labels already on the dossier so it
+    # reuses one when the event is the same.
+    #
+    # This exists because no metadata field can tell corroboration from
+    # repetition, and the difference is the whole strategy. Measured on the
+    # live board: DCO's evidence arrived from RTX, LMT and NOC -- three
+    # defense_tier2 anchors, one window, which the whole-body pass read as
+    # SEVEN OR EIGHT distinct facts. BWEN's arrived from MSFT, META and EQIX
+    # -- three grid_datacenter anchors, one window, which the same pass read
+    # as essentially ONE. Publisher, origin symbol, ecosystem, date and edge
+    # type are identical in shape across those two cases. Only the fact
+    # separates them, so the fact has to be recorded.
+    fact_key: str = ""
     # The exact model snapshots that produced this record. Forward-only
     # testing is this system's core validity claim (README point 7), and it
     # has one fragile edge: an LLM whose training corpus covers the period
@@ -348,6 +364,45 @@ def is_ecosystem_association(record: EvidenceRecord) -> bool:
             and record.relationship_confidence <= ECOSYSTEM_ASSOCIATION_CONFIDENCE)
 
 
+_FACT_KEY_NOISE = re.compile(r"[^a-z0-9 ]+")
+_FACT_KEY_SPACE = re.compile(r"\s+")
+# Long enough to keep a distinguishing label ("lmt sentinel contract award"),
+# short enough that a model appending a clause cannot mint a second slot for
+# the same event.
+MAX_FACT_KEY_CHARS = 60
+# How many existing labels to show the updater. Bounded because this rides on
+# every per-item call, which is the highest-volume prompt in the system; a
+# dossier carrying more distinct facts than this is already far past the
+# corroboration ceiling, so the tail cannot change a score.
+MAX_LISTED_FACT_KEYS = 25
+
+
+def normalized_fact_key(raw: str) -> str:
+    """Fold a model-written fact label to a comparable form.
+
+    The whole mechanism turns on two items reporting one event getting the
+    SAME key, so trivial variation must not mint a second slot: case,
+    punctuation, doubled spaces and a trailing clause are all things a model
+    varies between calls without meaning anything by it. The updater is also
+    shown the keys already on the dossier (see propose_update), which is the
+    primary defence -- this is the backstop for when it paraphrases one."""
+    folded = _FACT_KEY_NOISE.sub(" ", raw.strip().lower())
+    return _FACT_KEY_SPACE.sub(" ", folded).strip()[:MAX_FACT_KEY_CHARS].strip()
+
+
+def fact_keys_on(dossier: Dossier, now: datetime | None = None) -> list[str]:
+    """The distinct fact labels already carried by this dossier's non-stale
+    evidence, newest first -- what the updater is shown so it can reuse one
+    rather than inventing a synonym."""
+    now = now or datetime.now(timezone.utc)
+    seen: dict[str, None] = {}
+    for record in reversed(dossier.evidence):
+        if not record.fact_key or evidence_is_stale(record, now):
+            continue
+        seen.setdefault(normalized_fact_key(record.fact_key), None)
+    return [k for k in seen if k]
+
+
 def independence_key(record: EvidenceRecord) -> str:
     """What makes two evidence items INDEPENDENT corroboration of each other
     -- the unit `independent_source_count` counts (see _aggregate).
@@ -376,7 +431,23 @@ def independence_key(record: EvidenceRecord) -> str:
     still in the key: two Yahoo articles about the same counterparty on the
     same day remain one source (and dedup drops the second before it ever
     gets here). What changes is only that facts about DIFFERENT companies
-    stop being counted as one fact."""
+    stop being counted as one fact.
+
+    ...which was right about DCO and wrong about the macro tape, and the fact
+    key below is what resolves it. Keying on the origin symbol says three
+    anchors are three facts, and on the live board that was true for DCO
+    (RTX/LMT/NOC -- the whole-body pass counted seven or eight distinct facts)
+    and false for BWEN (MSFT/META/EQIX -- the same pass counted one, because
+    all three were reporting the same quarter's AI capex). Both are
+    same-ecosystem, same-window, multi-anchor propagation over disclosed
+    edges: structurally identical in every field this function can see. So
+    when the scorer has named the underlying event, that name IS the unit of
+    independence, for direct and propagated evidence alike -- two articles
+    about one company's earnings are also one fact, which the publisher key
+    counted as two. Absent a fact key (evidence merged before this existed,
+    or a model that omitted it) the previous behaviour stands unchanged."""
+    if record.fact_key:
+        return f"fact:{normalized_fact_key(record.fact_key)}"
     if record.is_propagated and record.origin_symbol:
         return f"{record.origin_symbol}|{record.source_name}"
     # Direct EDGAR filings were collapsed to one slot per FORM ("SEC EDGAR
@@ -559,6 +630,29 @@ COMPETITOR_SATISFIES_DISCLOSED_LINK = False
 #     delisting forms, so filing evidence now reaches foreign private issuers
 #     that could previously never produce a single filing item.
 #
+# 8: independence is counted per FACT, not per channel
+# (EvidenceRecord.fact_key, assigned by the per-item updater and used by
+# independence_key). This moves the unit the whole score is built on, so rows
+# must split here.
+#
+# The two keys it replaces were each right about one case and wrong about the
+# other. Keying on the publisher collapsed DCO's seventeen items across RTX,
+# LMT and NOC to two sources, which capped the strategy. Keying on the origin
+# symbol -- v5's fix for that -- then counted BWEN's MSFT, META and EQIX items
+# as three independent corroborations when the whole-body pass read them as
+# ONE fact: the same quarter's AI capex, reported three times. Both cases are
+# same-ecosystem, same-window, multi-anchor propagation over disclosed edges,
+# identical in every field the key could see, so no metadata rule separates
+# them and the fact itself has to be recorded.
+#
+# Measured on three weeks of forward capture, this is where the money was:
+# benchmark-relative alpha at 5 days ran -0.15% / -0.40% / -3.17% / -1.69%
+# for score buckets below 0.65 and +1.80% at 0.65+, while RAW returns were
+# positive nearly everywhere -- the score was tracking a rising tape, and the
+# theses it inflated were the losing ones.
+#
+# Absent a fact key the previous behaviour is unchanged, so existing evidence
+# and any model that omits the field score exactly as they did under 7.
 # 7: the corroboration bonus is paid on distinct FACTS rather than distinct
 # channels wherever synthesis has said what that number is
 # (effective_corroboration_count), and the whole-body pass can now report
@@ -577,7 +671,7 @@ COMPETITOR_SATISFIES_DISCLOSED_LINK = False
 # same evidence. Routing those to the trim alone would have changed nothing --
 # none of the 23 clears the bar on its trimmed score either -- which is what
 # says the gap, not the routing, was the defect.
-SCORING_VERSION = 7
+SCORING_VERSION = 8
 
 # How long a persisted synthesis verdict is honoured -- as a cap on the merge
 # path (engine._cap_with_synthesis) and as the corroboration ceiling in
@@ -969,9 +1063,26 @@ _UPDATE_TOOL = {
                 "type": "integer", "minimum": 1, "maximum": 60,
                 "description": "Plausible number of days for this to be reflected in price, given how directly/indirectly it affects this company.",
             },
+            "fact_key": {
+                "type": "string",
+                "description": (
+                    "A short lowercase label for the UNDERLYING EVENT this item reports -- the "
+                    "thing that happened, not the article about it. Three or four words, no "
+                    "punctuation. Two items reporting the SAME event must get the SAME label, "
+                    "even when they are about different companies, from different publishers, "
+                    "or on different days: 'META raises capex', 'MSFT Q4 capex commentary' and "
+                    "'EQIX raises FY guidance' during one earnings season are all "
+                    "'ai datacenter capex q2 2026'. Two items reporting DIFFERENT events must "
+                    "get different labels, even when they are about the same company: a "
+                    "contract award and a guidance raise are 'lmt sentinel contract award' and "
+                    "'lmt fy guidance raise'. If a label in the list you were given already "
+                    "names this event, REUSE IT VERBATIM rather than writing a synonym."
+                ),
+            },
             "reasoning": {"type": "string", "description": "One or two sentences."},
         },
-        "required": ["is_new_information", "direction", "magnitude", "confidence", "horizon_days", "reasoning"],
+        "required": ["is_new_information", "direction", "magnitude", "confidence", "horizon_days",
+                     "fact_key", "reasoning"],
     },
 }
 
@@ -1138,11 +1249,23 @@ class DossierUpdater:
         # actually computable against the evidence's own published date rather
         # than the model silently anchoring "now" to its training cutoff (the
         # synthesizer already gets this; the two per-item graders did not).
+        # The labels already on this dossier, so the model reuses one instead
+        # of paraphrasing it. Normalisation is the backstop; this is the
+        # actual mechanism -- a closed vocabulary the model can see beats
+        # trying to fuzzy-match free text after the fact.
+        existing = fact_keys_on(dossier, now)
+        known_facts = (
+            "\n\nFacts already recorded on this dossier -- if this item reports one of them, "
+            "reuse its label VERBATIM as fact_key:\n"
+            + "\n".join(f"  - {k}" for k in existing[:MAX_LISTED_FACT_KEYS])
+            if existing else
+            "\n\nNo facts recorded on this dossier yet -- write the first fact_key."
+        )
         prompt = (
             f"Today: {now.date().isoformat()}\n"
             f"Company: {dossier.symbol}\n"
             f"Current thesis: {current}\n"
-            f"{propagation}{sector_note}\n\n"
+            f"{propagation}{sector_note}{known_facts}\n\n"
             f"New evidence:\n{evidence_text}"
         )
         try:

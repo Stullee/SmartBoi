@@ -1117,6 +1117,28 @@ def run_diagnostics(engine) -> str:
     # survived. A large and persistent ARITH/RATED gap is the finding: it
     # means the aggregate is counting one story many times, which is what
     # effective_corroboration_count now bounds.
+    # Whether the per-item fact labelling is actually happening. The whole
+    # per-fact independence mechanism rests on the model assigning a label and
+    # REUSING it rather than paraphrasing; a model that quietly stops doing
+    # either degrades scoring back to per-channel counting with no error
+    # raised anywhere. Two numbers say which: coverage (are items labelled at
+    # all) and the facts-to-items ratio (is it collapsing anything).
+    labelled = sum(d.get("labelled_evidence_count", 0) for d in dossiers)
+    items = sum(d.get("evidence_count", 0) for d in dossiers)
+    facts = sum(d.get("distinct_fact_keys", 0) for d in dossiers)
+    add("\n--- Fact labelling (independence is counted per fact, see SCORING_VERSION 8) ---")
+    add(f"  evidence items      : {items}")
+    add(f"  carrying a label    : {labelled}" + (f"  ({labelled / items * 100:.0f}%)" if items else ""))
+    add(f"  distinct facts      : {facts}"
+        + (f"  -- {labelled / facts:.1f} item(s) per fact" if facts else ""))
+    if items and labelled / items < 0.5:
+        add("  ^^ under half the evidence carries a label. Items merged before SCORING_VERSION 8")
+        add("     score under the OLD per-channel rules, so the board is currently a mix of both.")
+    elif facts and labelled / facts < 1.2:
+        add("  ^^ almost one fact per item: the labels are not collapsing anything. Either the")
+        add("     evidence really is that diverse, or the model is paraphrasing instead of")
+        add("     reusing a label -- check the dossiers before trusting a high source count.")
+
     judged = [d for d in dossiers if d.get("synthesis_at")]
     add(f"\n--- Synthesis verdicts ({len(judged)} of {len(dossiers)} dossier(s) judged) ---")
     if judged:

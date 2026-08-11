@@ -43,6 +43,7 @@ from smartboi.dedup import DedupIndex, fingerprint, source_domain
 from smartboi.edgar import _truncate_head_tail, describe_8k_items
 from smartboi.dossier import (
     DIRECTIONS,
+    MAX_FACT_KEY_CHARS,
     SCORING_VERSION,
     SYNTHESIS_CAP_MAX_AGE_HOURS,
     Dossier,
@@ -2957,6 +2958,12 @@ class Engine:
             magnitude=self._adjusted(verdict, "adjusted_magnitude", proposed["magnitude"]),
             confidence=self._adjusted(verdict, "adjusted_confidence", proposed["confidence"]),
             horizon_days=proposed["horizon_days"],
+            # Coerced defensively like every other read of raw tool output
+            # here: Anthropic tool use does not hard-enforce the schema, and
+            # a non-string here would poison the independence key rather than
+            # merely be missing. Absent or unusable falls back to the
+            # pre-fact-key behaviour (see independence_key).
+            fact_key=str(proposed.get("fact_key") or "")[:MAX_FACT_KEY_CHARS],
             reasoning=proposed["reasoning"],
             skeptic_note=str(verdict.get("reasoning") or ""),
             # The pre-skeptic numbers are kept so the skeptic pass's actual
