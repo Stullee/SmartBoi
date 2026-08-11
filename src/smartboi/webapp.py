@@ -15,6 +15,8 @@ directly create a trade (see handle_accept_candidate's docstring)."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
@@ -1273,9 +1275,41 @@ refresh(); setInterval(refresh, 10000);
 """
 
 
+class _CachedDossiers:
+    """One disk read per dossier per payload, instead of two or three.
+
+    Four gatherers below want dossiers, and each was calling `store.load()`
+    independently -- gather_dossiers over every symbol, gather_graph_stats over
+    every symbol that appears in the graph, gather_graph_health over the
+    disconnected ones. Each call is a file read plus a JSON parse, and every one
+    of them happens on the ENGINE'S OWN EVENT LOOP (see handle_status), every
+    10 seconds, per open browser tab. Measured on a small install: 38 loads for
+    19 dossiers on disk.
+
+    Deliberately a wrapper rather than a change to DossierStore: the cache must
+    live exactly as long as one payload. The store itself is shared with the
+    engine, which mutates dossiers between awaits -- caching there would hand
+    the polling loop a stale thesis, which is a correctness bug rather than a
+    slow dashboard. Read-only by construction: nothing here writes.
+    """
+
+    def __init__(self, store):
+        self._store = store
+        self._cache: dict = {}
+
+    def all_symbols(self) -> list[str]:
+        return self._store.all_symbols()
+
+    def load(self, symbol: str):
+        if symbol not in self._cache:
+            self._cache[symbol] = self._store.load(symbol)
+        return self._cache[symbol]
+
+
 async def _status_payload(engine) -> dict:
     settings = engine.settings
     log_dir = Path(settings.log_dir)
+    dossiers = _CachedDossiers(engine.dossiers)
     paper_stats, closed_trades = gather_paper_trade_stats(
         log_dir / "paper_trades.jsonl",
         settings.initial_trading_capital, settings.trading_currency,
@@ -1292,6 +1326,16 @@ async def _status_payload(engine) -> dict:
         row["unrealized_currency"] = t.unrealized_currency()
         open_trades.append(row)
 
+    graph = gather_graph_stats(engine.graph, engine.universe, dossiers)
+    # `by_symbol` is the per-filer grouping the ORIGINAL relationship tables
+    # rendered. The redesign replaced those tables with the Live Wire canvas,
+    # which reads only nodes/edges, and nothing on the page has touched the
+    # field since -- but it is the single largest thing in the payload: 24.7 KB
+    # of 66 KB, 37% of every 10-second refresh, serialized for no reader.
+    # gather_graph_stats still returns it (it is part of that function's
+    # contract and its tests); it just is not shipped to the browser.
+    graph.pop("by_symbol", None)
+
     return {
         "version": os.environ.get("SMARTBOI_VERSION", ""),
         "capabilities": {
@@ -1301,11 +1345,11 @@ async def _status_payload(engine) -> dict:
             "ib": engine.price_feed is not None,
         },
         "universe_size": len(engine.symbol_list),
-        "coverage": gather_coverage(engine.universe, engine.graph, engine.dossiers),
-        "dossiers": gather_dossiers(engine.dossiers),
-        "graph": gather_graph_stats(engine.graph, engine.universe, engine.dossiers),
+        "coverage": gather_coverage(engine.universe, engine.graph, dossiers),
+        "dossiers": gather_dossiers(dossiers),
+        "graph": graph,
         "graph_health": gather_graph_health(
-            engine.graph, engine.universe, engine.dossiers,
+            engine.graph, engine.universe, dossiers,
             backfill_state=engine.backfill_state.data,
             last_refresh=engine.periodic_state.get("graph_refresh", "") or "",
             last_research=engine.periodic_state.get("supplier_research", "") or "",
@@ -1341,7 +1385,23 @@ def create_app(engine) -> web.Application:
             log.exception("Dashboard status query failed")
             return web.json_response({"error": str(exc)}, status=500)
         log.debug("Dashboard: /api/status responded in %.2fs", time.monotonic() - start)
-        return web.json_response(data)
+        # The page polls this every 10 seconds forever, and between engine ticks
+        # the answer is usually byte-identical -- the payload carries no clock of
+        # its own, so an unchanged system really does serialize to the same
+        # bytes. An ETag turns those repeats into a 304 with no body: the
+        # browser serves fetch() the cached copy, so the JS needs no change at
+        # all, and a dashboard left open all day stops re-sending an unchanged
+        # graph over the LAN.
+        #
+        # Cache-Control: no-cache is the point -- it means "store it, but always
+        # revalidate", which is exactly this endpoint. Without it the browser
+        # would be free to serve a stale payload from cache without asking.
+        body = json.dumps(data).encode()
+        etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+        headers = {"ETag": etag, "Cache-Control": "no-cache"}
+        if request.headers.get("If-None-Match") == etag:
+            return web.Response(status=304, headers=headers)
+        return web.Response(body=body, content_type="application/json", headers=headers)
 
     async def handle_accept_candidate(request: web.Request) -> web.Response:
         """The dashboard's one-click Accept: adds a discovered universe
