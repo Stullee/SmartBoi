@@ -78,20 +78,56 @@ class RegShoClient:
     def _parse(text: str) -> set[str]:
         """Pipe-delimited, one header row, one trailing total row.
 
-        Columns: Date|Symbol|SecurityName|Market|RegSHOThresholdFlag|... The
-        symbol is column 1. Rows that do not split into at least two fields
-        (the header, the trailing record count) are skipped rather than
-        parsed, so a format tweak degrades to fewer symbols rather than to
-        garbage symbols."""
+        Columns, as actually published:
+
+            Symbol|Security Name|Market Category|Reg SHO Threshold Flag|Rule 3210|Filler
+            ACONW|ACLARION INC WT EXP|S|Y|N|
+
+        The symbol is column ZERO. This read `parts[1]` against a documented
+        `Date|Symbol|...` layout that the file does not have and, on the
+        evidence of the live logs, never had: column 1 is the security NAME,
+        which contains spaces, so every row failed the ticker-shape check
+        below and the parse returned the empty set for a perfectly good file
+        -- every day, silently falling every SHORT back to the market-cap
+        proxy. The two halves of the old code disagreed with each other and
+        that is what gives the game away: the header guard tests for the
+        literal "SYMBOL", which is the header's column-ZERO value, while the
+        index read column one.
+
+        It took the 0.55.1 per-URL diagnostic to see this at all, because the
+        symptom ("no threshold list found in the last 6 days") is identical
+        to a wrong URL and to a blocked host. Keep that diagnostic.
+
+        Rather than hardcode an index -- which is the thing that broke, and
+        which a fixture written from the same assumption as the code cannot
+        catch -- the column is LOCATED BY NAME from the header row, falling
+        back to column zero when there is no recognisable header. A file that
+        gains or loses a leading column now parses unchanged, and the failure
+        this replaces is not reachable from any column order.
+
+        Rows that do not split into at least three fields (the trailing
+        record-count / creation-time line) are skipped rather than parsed, so
+        a format tweak degrades to fewer symbols rather than to garbage
+        symbols."""
         symbols: set[str] = set()
+        index = 0
         for line in text.splitlines():
             parts = line.split("|")
             if len(parts) < 3:
                 continue
-            symbol = parts[1].strip().upper()
-            # The header row's second field is literally "Symbol"; a real
-            # ticker is alphanumeric with optional dot/dash class suffix.
-            if not symbol or symbol == "SYMBOL":
+            headings = [p.strip().upper() for p in parts]
+            if "SYMBOL" in headings:
+                # The header row. Everything after it is read at this index.
+                index = headings.index("SYMBOL")
+                continue
+            if index >= len(parts):
+                continue
+            symbol = parts[index].strip().upper()
+            # A real ticker is alphanumeric with an optional dot/dash class
+            # suffix -- this is what rejects a security NAME read out of the
+            # wrong column, and what rejected every row of a good file back
+            # when the index was wrong.
+            if not symbol:
                 continue
             if not all(c.isalnum() or c in ".-" for c in symbol):
                 continue

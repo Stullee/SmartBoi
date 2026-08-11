@@ -47,12 +47,15 @@ nothing else wants it, and is guaranteed whatever the capped categories
 cannot touch."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from smartboi.llm import cost_usd
+from smartboi.llm import cost_usd, permanent_failure_reason
 from smartboi.state import JsonState
+
+log = logging.getLogger(__name__)
 
 
 # The five callers, one per class that holds a UsageTracker. EXTRACTION and
@@ -82,6 +85,10 @@ class UsageSnapshot:
     daily_usd_budget: float = 0.0
     # {category: (usd, calls)} for everything that spent anything today.
     by_category: dict[str, tuple[float, int]] = field(default_factory=dict)
+    # Why LLM calls are halted for the rest of the UTC day, or "" when they
+    # are not. See UsageTracker.note_failure.
+    breaker_reason: str = ""
+    breaker_tripped_at: str = ""
 
 
 class UsageTracker:
@@ -134,6 +141,13 @@ class UsageTracker:
             self._state.set("usd_spent", 0.0)
             self._state.set("usd_by_category", {})
             self._state.set("calls_by_category", {})
+            # The breaker clears with the day, exactly like the budget. An
+            # account-level failure is not self-healing, but neither is it
+            # permanent -- somebody tops the balance up -- and UTC midnight is
+            # already this system's retry-everything boundary. Deferred, never
+            # discarded, the same contract an exhausted budget has.
+            self._state.set("breaker_reason", "")
+            self._state.set("breaker_tripped_at", "")
 
     def _reserved_elsewhere(self, category: str) -> float:
         """Dollars reserved by OTHER categories that they have not spent yet.
@@ -178,13 +192,63 @@ class UsageTracker:
         calls = (self._state.get("calls_by_category") or {}).get(category, 0)
         return usd, calls
 
+    def note_failure(self, exc: object, today: str | None = None) -> bool:
+        """Record an API failure; trip the breaker and return True when it is
+        an account-level one that retrying cannot fix.
+
+        Every LLM call site in this codebase catches broadly and returns None,
+        which the engine reads as "transient, retry later". That is right for
+        a rate limit and wrong for an exhausted balance, and the difference
+        showed up as 11,893 identical billing failures in two hours -- roughly
+        three requests a second against an error no retry could clear (see
+        llm.permanent_failure_reason). Nothing bounded it, because every
+        bounding mechanism in this system counts SUCCESSFUL calls: the budget
+        meters spend, and a failed call spends nothing, so a hard failure loop
+        is invisible to the one gate that could have stopped it.
+
+        Tripping is deliberately routed through the SAME gate the budget uses,
+        rather than a new check bolted onto each caller: all five call sites
+        already ask budget_remaining() before every request, so one change
+        covers extraction, dossier, skeptic, synthesis and research at once,
+        and no future call site can forget to consult it."""
+        reason = permanent_failure_reason(exc)
+        if not reason:
+            return False
+        today = today or self._today()
+        self._roll_if_new_day(today)
+        if self._state.get("breaker_reason"):
+            return True  # already open; don't re-log once per suppressed call
+        now = datetime.now(timezone.utc).isoformat()
+        self._state.update({"breaker_reason": reason, "breaker_tripped_at": now})
+        log.error(
+            "LLM circuit breaker OPEN: %s. Halting every Claude call until UTC midnight rather "
+            "than retrying an error that cannot succeed -- ingestion continues, evidence keeps "
+            "accruing, and nothing is scored until this is resolved. Original error: %s",
+            reason, exc,
+        )
+        return True
+
+    def breaker_reason(self, today: str | None = None) -> str:
+        """Why calls are halted, or "" when they are not. For the dashboard
+        and the diagnostics bundle -- an operator seeing zero LLM activity
+        needs this stated, not inferred from a spend of $0.
+
+        Takes `today` like every other method here rather than reading the
+        wall clock. As a bare property it rolled the day against the real
+        clock, which made READING a diagnostic mutate state: on the first read
+        after midnight it cleared the breaker and wrote to disk as a side
+        effect of being looked at."""
+        today = today or self._today()
+        self._roll_if_new_day(today)
+        return self._state.get("breaker_reason", "") or ""
+
     def budget_remaining(self, category: str = "", today: str | None = None) -> bool:
         """Whether the day still has room for a call in `category`.
 
-        Three gates, all of which must pass: the total call cap, the total
-        dollar cap, and this category's own share of each. Any one exhausted
-        defers the work until UTC midnight, exactly as the call cap alone
-        used to -- deferred, never discarded (see engine.py).
+        Four gates, all of which must pass: the circuit breaker, the total
+        call cap, the total dollar cap, and this category's own share of each.
+        Any one exhausted defers the work until UTC midnight, exactly as the
+        call cap alone used to -- deferred, never discarded (see engine.py).
 
         An empty category, or one with no configured share, is checked
         against the TOTALS only. That is not a loophole, it is the design:
@@ -193,6 +257,12 @@ class UsageTracker:
         categories cannot."""
         today = today or self._today()
         self._roll_if_new_day(today)
+        # Checked FIRST and for every category: an account-level failure is
+        # not category-specific, and a reserved category would otherwise sail
+        # past a gate that exists precisely to stop the request it is about
+        # to make.
+        if self._state.get("breaker_reason"):
+            return False
         # The total call cap, minus whatever other categories have RESERVED and
         # not yet spent -- mirrors the dollar gate below. Without this, a
         # reserved pass (synthesis) had its dollars protected but could still
@@ -266,4 +336,6 @@ class UsageTracker:
                 cat: (round(usd, 4), (self._state.get("calls_by_category") or {}).get(cat, 0))
                 for cat, usd in (self._state.get("usd_by_category") or {}).items()
             },
+            breaker_reason=self._state.get("breaker_reason", "") or "",
+            breaker_tripped_at=self._state.get("breaker_tripped_at", "") or "",
         )

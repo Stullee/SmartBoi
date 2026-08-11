@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from smartboi.graph import Relationship, RelationshipGraph
 
 
@@ -131,3 +133,71 @@ def test_a_corrupt_graph_file_is_quarantined_not_silently_wiped(tmp_path):
     # A subsequent add writes a clean file rather than clobbering the original.
     graph.add(_rel())
     assert len(RelationshipGraph(path).relationships) == 1
+
+
+# --- Extraction response shape -------------------------------------------
+
+
+class _ToolUseBlock:
+    type = "tool_use"
+
+    def __init__(self, payload):
+        self.input = payload
+
+
+class _Response:
+    def __init__(self, payload):
+        self.content = [_ToolUseBlock(payload)]
+        self.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
+
+
+class _Messages:
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def create(self, **_kwargs):
+        return _Response(self._payload)
+
+
+def _extractor(tmp_path, payload):
+    from smartboi.graph import RelationshipExtractor
+    from smartboi.usage import UsageTracker
+
+    extractor = RelationshipExtractor(
+        api_key="k", model="claude-haiku-4-5",
+        usage=UsageTracker(tmp_path / "usage.json", daily_call_budget=10),
+    )
+    extractor._client = SimpleNamespace(messages=_Messages(payload))
+    return extractor
+
+
+async def test_a_string_payload_is_discarded_once_not_walked_per_character(tmp_path, caplog):
+    """The tool schema says 'relationships' is an array. When the model hands
+    back a STRING instead, the caller's per-element loop walks it one
+    CHARACTER at a time and every character logs its own 'non-object entry'
+    warning -- 7,618 of them from three filings, live, which is both a log
+    storm and a completely illegible way to say the call produced nothing.
+    One bad element in a good list is a different failure; this is the
+    container being wrong, and it belongs where the contract is declared."""
+    extractor = _extractor(tmp_path, {"relationships": "customer|AAA|BBB"})
+
+    with caplog.at_level("WARNING"):
+        out = await extractor.extract("AAA", "8-K", "filing text", ["AAA", "BBB"])
+
+    assert out == []
+    assert len([r for r in caplog.records if "not a list" in r.getMessage()]) == 1
+
+
+async def test_a_well_formed_list_is_returned_untouched(tmp_path):
+    rels = [{"to_symbol": "BBB", "rel_type": "customer", "confidence": 0.9}]
+    extractor = _extractor(tmp_path, {"relationships": rels})
+
+    assert await extractor.extract("AAA", "8-K", "filing text", ["AAA", "BBB"]) == rels
+
+
+async def test_a_missing_relationships_key_is_an_empty_list_not_a_retry(tmp_path):
+    """[] means 'genuinely nothing found' and must not be confused with None,
+    which the engine treats as 'retry this filing later'."""
+    extractor = _extractor(tmp_path, {})
+
+    assert await extractor.extract("AAA", "8-K", "filing text", ["AAA"]) == []

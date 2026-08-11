@@ -214,6 +214,7 @@ class SupplierResearcher:
                     messages=messages,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad anchor must not stop the run
+                self._usage.note_failure(exc)
                 log.warning("%s: supplier research call failed: %s", anchor, exc)
                 return []
             self._usage.record(response.usage.input_tokens, response.usage.output_tokens,

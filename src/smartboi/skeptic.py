@@ -210,6 +210,7 @@ class Skeptic:
                 messages=[{"role": "user", "content": prompt}],
             )
         except Exception as exc:  # noqa: BLE001 - fail safe: nothing merges without a real verdict
+            self._usage.note_failure(exc)
             log.warning("Skeptic review failed (%s) -- will retry this evidence on a later poll.", exc)
             return None
         self._usage.record(response.usage.input_tokens, response.usage.output_tokens,

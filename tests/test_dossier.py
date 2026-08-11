@@ -797,3 +797,89 @@ def test_two_proceedings_by_one_agency_stay_independent():
         merge_evidence(dossier, record, now=NOW)
 
     assert dossier.independent_source_count == 2
+
+
+# --- Corroboration paid on facts, not channels (SCORING_VERSION 7) --------
+
+
+def _fanned_out_dossier(sources=8):
+    """One macro story arriving over `sources` distinct channels -- the exact
+    shape that produced a 0.94 arithmetic score on a body of evidence
+    synthesis rated at 0.12."""
+    dossier = Dossier(symbol="BWEN")
+    for n in range(sources):
+        merge_evidence(
+            dossier,
+            _evidence(source_name=f"outlet{n}.com", evidence_id=f"e{n}"),
+            now=NOW,
+        )
+    return dossier
+
+
+def test_corroboration_is_capped_by_the_distinct_fact_count():
+    """Twelve channels reporting one fact is one fact. The bonus is paid on
+    what synthesis counted, not on how many places it was republished."""
+    inflated = _fanned_out_dossier()
+    recompute_decay(inflated, NOW)
+
+    honest = _fanned_out_dossier()
+    honest.synthesis_at = NOW.isoformat()
+    honest.distinct_fact_count = 1
+    recompute_decay(honest, NOW)
+
+    assert honest.confidence < inflated.confidence
+    assert honest.magnitude < inflated.magnitude
+    # One fact earns no corroboration bonus at all: log2(1) == 0.
+    assert honest.confidence == pytest.approx(honest.evidence[0].confidence)
+
+
+def test_a_dossier_that_never_synthesised_keeps_its_full_corroboration():
+    """distinct_fact_count is 0 until a dossier reaches the synthesis floor.
+    Reading that as 'zero facts' would zero the corroboration of every
+    un-synthesised dossier in the system -- the opposite of the intent."""
+    never = _fanned_out_dossier()
+    assert never.distinct_fact_count == 0
+    recompute_decay(never, NOW)
+
+    baseline = _fanned_out_dossier()
+    recompute_decay(baseline, NOW)
+    assert never.confidence == pytest.approx(baseline.confidence)
+
+
+def test_a_stale_verdict_stops_capping_corroboration():
+    """Same lapse rule the merge-path cap has: once the daily pass stops
+    refreshing a dossier the ceiling lifts, rather than suppressing it
+    forever on a judgement nobody has revisited."""
+    stale = _fanned_out_dossier()
+    stale.synthesis_at = (NOW - timedelta(hours=48)).isoformat()
+    stale.distinct_fact_count = 1
+    recompute_decay(stale, NOW)
+
+    uncapped = _fanned_out_dossier()
+    recompute_decay(uncapped, NOW)
+    assert stale.confidence == pytest.approx(uncapped.confidence)
+
+
+def test_the_fact_count_can_only_cap_never_lift():
+    """Synthesis is allowed to veto and to trim, never to raise a score into
+    a trade. A fact count ABOVE the channel count must change nothing."""
+    generous = _fanned_out_dossier(sources=2)
+    generous.synthesis_at = NOW.isoformat()
+    generous.distinct_fact_count = 99
+    recompute_decay(generous, NOW)
+
+    baseline = _fanned_out_dossier(sources=2)
+    recompute_decay(baseline, NOW)
+    assert generous.confidence == pytest.approx(baseline.confidence)
+
+
+def test_the_source_count_gate_is_left_alone():
+    """Only the BONUS is paid on facts. independent_source_count still counts
+    disclosure channels, because the signal bar's corroboration gates were
+    written and tested against that meaning."""
+    capped = _fanned_out_dossier()
+    capped.synthesis_at = NOW.isoformat()
+    capped.distinct_fact_count = 1
+    recompute_decay(capped, NOW)
+
+    assert capped.independent_source_count == 8

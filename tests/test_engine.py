@@ -2327,6 +2327,49 @@ async def test_already_priced_in_is_a_veto(engine):
     assert dossier.already_priced_in is True
 
 
+async def test_redundant_evidence_trims_rather_than_vetoes(engine):
+    """Overlap is a claim about the EVIDENCE, not the price. Live, the model
+    answered the overlap question with the price flag on all 77 vetoes in
+    three days -- zeroing theses whose actual finding was 'one fact repeated
+    across seven counterparties', and arming a price-based falsification test
+    against a claim it had never made."""
+    engine.synthesizer = FakeSynthesizer(
+        default=synthesis(confidence=0.5, magnitude=0.35, redundant_evidence=True))
+    dossier = await _build_thesis(engine)
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert dossier.redundant_evidence is True
+    assert dossier.already_priced_in is False   # NOT the price claim
+    # Trimmed to what synthesis rated it, not zeroed.
+    assert dossier.confidence == pytest.approx(0.5)
+    assert dossier.magnitude == pytest.approx(0.35)
+
+
+async def test_redundant_evidence_does_not_arm_the_price_falsification(engine):
+    """_veto_refuted_by_price watches the tape for a move disproving 'the
+    market has absorbed this'. A duplication finding makes no such claim, so
+    it must not be put to that test."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(redundant_evidence=True))
+    dossier = await _build_thesis(engine)
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert await engine._veto_refuted_by_price(dossier) is False
+
+
+async def test_both_findings_at_once_still_vetoes(engine):
+    """Splitting the fields must not weaken the veto: evidence that is BOTH
+    redundant and already absorbed is still a thesis with nothing to trade."""
+    engine.synthesizer = FakeSynthesizer(
+        default=synthesis(already_priced_in=True, redundant_evidence=True))
+    dossier = await _build_thesis(engine)
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert dossier.confidence == 0.0
+    assert dossier.magnitude == 0.0
+
+
 async def test_a_direction_disagreement_is_a_veto(engine):
     engine.synthesizer = FakeSynthesizer(default=synthesis(direction="SHORT"))
     dossier = await _build_thesis(engine)  # arithmetic says LONG
@@ -3397,3 +3440,52 @@ async def test_two_proceedings_by_one_agency_are_two_sources(tmp_path, monkeypat
     assert len(records) == 2, "both proceedings must reach the company"
     keys = {independence_key(r) for r in records}
     assert len(keys) == 2, "and count as two independent sources, not one agency"
+
+
+
+# --- Startup warnings must be true ---------------------------------------
+
+
+class _FakePriceFeed:
+    """Stands in for ReadOnlyPriceFeed so start() makes no IB connection."""
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    async def ensure_connected(self):
+        return True
+
+
+async def test_the_ib_disabled_warning_does_not_fire_when_ib_is_enabled(monkeypatch, caplog, tmp_path):
+    """_has_price_source() is true for IB *or* Finnhub, so a bare `else` on it
+    fired on every startup with IB enabled and connected -- printing 'IB price
+    feed disabled ... until ENABLE_IB_PRICE_FEED=true' on a deployment where
+    it was already true, 15 startups out of 15, one line after CONNECTED. A
+    warning that prescribes a setting already in force sends whoever reads it
+    to check the one thing that was never wrong."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("smartboi.engine.ReadOnlyPriceFeed", _FakePriceFeed)
+    engine = Engine(Settings(_env_file=None, enable_dashboard=False,
+                             enable_universe_autoscreen=False,
+                             enable_ib_price_feed=True, finnhub_api_key="k"))
+
+    with caplog.at_level("WARNING"):
+        await engine.start()
+
+    assert "IB price feed disabled" not in caplog.text
+
+
+async def test_the_ib_disabled_warning_still_fires_when_ib_is_off(monkeypatch, caplog, tmp_path):
+    """Still worth saying when it is TRUE: a Finnhub-only deployment is a real
+    and supported configuration, and this is how an operator knows entries are
+    priced off quotes rather than IB."""
+    monkeypatch.chdir(tmp_path)
+    engine = Engine(Settings(_env_file=None, enable_dashboard=False,
+                             enable_universe_autoscreen=False,
+                             enable_ib_price_feed=False, finnhub_api_key="k"))
+
+    with caplog.at_level("WARNING"):
+        await engine.start()
+
+    assert "IB price feed disabled" in caplog.text
+    assert "ENABLE_IB_PRICE_FEED=true" in caplog.text

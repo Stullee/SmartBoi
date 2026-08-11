@@ -22,6 +22,7 @@ import os
 import re
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aiohttp import web
@@ -34,6 +35,7 @@ from smartboi.screen import (
     DEFAULT_MIN_CAP_MUSD as SCREEN_MIN_CAP_MUSD,
 )
 from smartboi.tools import (
+    collect_full_diagnostics,
     run_diagnostics,
     run_event_study,
     run_exit_analysis,
@@ -482,6 +484,7 @@ _INDEX_HTML = """<!doctype html>
       <button class="tbtn" id="btn-research">Research anchor suppliers (web)</button>
       <button class="tbtn" id="btn-edgar-search">Search EDGAR for anchor suppliers</button>
       <button class="tbtn" id="btn-diagnostics">Diagnostics bundle</button>
+      <button class="tbtn" id="btn-full-diagnostics">Download FULL diagnostics (.zip)</button>
       <button class="tbtn" id="btn-rebuild-graph">Rebuild relationship graph</button>
       <button class="tbtn" id="btn-reconcile-preview">Anchor reconcile (dry run)</button>
       <button class="tbtn danger" id="btn-reconcile-apply">Apply anchor reconcile</button>
@@ -492,7 +495,10 @@ _INDEX_HTML = """<!doctype html>
       already-persisted state (forward returns, the signal event study, the exit analysis of the closed ledger).
       <b>Research anchor suppliers</b> runs web searches to find small-cap counterparties of your anchors and writes
       universe candidates only. The diagnostics bundle is safe to paste &mdash; credentials and personal data are omitted
-      and log lines scrubbed. <b>Anchor reconcile</b> grows the universe with candidates that land connected to a
+      and log lines scrubbed. <b>Download FULL diagnostics</b> is that same bundle plus the actual runtime files
+      &mdash; logs including rotations, every capture log, the graph, the dossiers and the state files &mdash; as one
+      zip, scrubbed the same way and containing no configuration file. Use it when a summary is not enough to see
+      what is wrong. <b>Anchor reconcile</b> grows the universe with candidates that land connected to a
       tradeable and prunes runtime-accepted anchors that reach none; the dry run previews, <b>Apply</b> asks first and
       never removes curated seed anchors. <b>Reset added symbols</b> removes every runtime-added symbol and archives the
       orphaned dossiers; it asks first.</div>
@@ -558,6 +564,12 @@ el("btn-analyze").addEventListener("click", function(){ runTool("tools/forward-r
 el("btn-event-study").addEventListener("click", function(){ runTool("tools/event-study", {}, this); });
 el("btn-exit-analysis").addEventListener("click", function(){ runTool("tools/exit-analysis", {}, this); });
 el("btn-diagnostics").addEventListener("click", function(){ runTool("tools/diagnostics", {}, this); });
+// A plain navigation, not runTool: the response is a zip for the browser to
+// download, not text for the output pane. Ingress-relative like every other
+// URL here (see API_BASE) so it works behind Home Assistant's proxy.
+el("btn-full-diagnostics").addEventListener("click", function(){
+  window.location.href = API_BASE + "tools/full-diagnostics";
+});
 el("btn-graph-maint").addEventListener("click", function(){
   runTool("tools/graph-maintenance", {apply:false}, this);
 });
@@ -1613,6 +1625,30 @@ def create_app(engine) -> web.Application:
 
         return await _run_tool(run)
 
+    async def handle_tool_full_diagnostics(request: web.Request) -> web.Response:
+        """Every runtime file needed to diagnose this deployment remotely, as
+        one redacted zip download (smartboi.tools.collect_full_diagnostics).
+
+        The text bundle above is a summary, and a summary is what a NOVEL
+        problem hides in. Diagnosing the last round of failures here needed
+        the raw logs, signals.jsonl, paper_trades.jsonl,
+        periodic_pass_state.json and the dossiers -- each fetched by hand from
+        the Home Assistant share, over several rounds. This is that, in one
+        click. No .env and no /data/options.json: the archive leaves the
+        machine, and nothing in it is worth the API keys."""
+        try:
+            payload = await asyncio.to_thread(collect_full_diagnostics, engine)
+        except Exception as exc:  # noqa: BLE001 - a failed download must not kill the dashboard
+            log.exception("Full diagnostics bundle failed.")
+            return web.json_response({"error": redact_token(exc)}, status=500)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return web.Response(
+            body=payload,
+            content_type="application/zip",
+            headers={"Content-Disposition":
+                     f'attachment; filename="smartboi-diagnostics-{stamp}.zip"'},
+        )
+
     async def handle_reset_accepted(request: web.Request) -> web.Response:
         """Drops every runtime-accepted symbol, returning the universe to the
         curated list, and archives the dossiers that orphans (see
@@ -1676,6 +1712,9 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/tools/event-study", handle_tool_event_study)
     app.router.add_post("/api/tools/exit-analysis", handle_tool_exit_analysis)
     app.router.add_post("/api/tools/diagnostics", handle_tool_diagnostics)
+    # GET, not POST like its siblings: this one returns a file the browser
+    # downloads, so it has to be reachable as a plain link/navigation.
+    app.router.add_get("/api/tools/full-diagnostics", handle_tool_full_diagnostics)
     app.router.add_post("/api/universe/reset-accepted", handle_reset_accepted)
     app.router.add_post("/api/runtime/reset", handle_reset_runtime)
     app.router.add_post("/api/universe/rebuild-graph", handle_rebuild_graph)

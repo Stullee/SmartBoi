@@ -229,3 +229,182 @@ def test_the_bundle_reports_graph_health_and_maintenance(engine):
     assert "anchors linked to a tradeable:" in report
     assert "rolling refresh:" in report
     assert "anchors researched for suppliers:" in report
+
+
+# --- The bundle's own blind spots, each one a real misdiagnosis -----------
+
+
+def _write_log(tmp_path, name, text):
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / name).write_text(text)
+
+
+REGSHO_FAILURE = (
+    "2026-08-11 14:24:02 UTC | WARNING | smartboi.regsho | [REGSHO] No threshold list found "
+    "in the last 6 day(s) -- keeping the previous list (0 symbol(s), as of never). Borrow "
+    "flags fall back to the market-cap proxy. Tried:\n"
+    "  https://www.nasdaqtrader.com/dynamic/symdir/regsho/nasdaqth20260810.txt -> HTTP 200 "
+    "but 0 symbols parsed; body starts: 'Symbol|Security Name|Market Category'\n"
+)
+
+
+def test_a_multi_line_warning_keeps_its_payload(engine, tmp_path):
+    """The line filter kept the header and dropped every continuation, so the
+    bundle showed a bare 'Tried:' with all the URLs removed -- the diagnostic
+    written to explain a failure was invisible in the artifact that exists to
+    carry it, and Reg SHO was misdiagnosed as a dead integration for weeks
+    when the log said plainly that the PARSE, not the fetch, was at fault."""
+    _write_log(tmp_path, "smartboi.log", REGSHO_FAILURE)
+    report = run_diagnostics(engine)
+
+    assert "Tried:" in report
+    assert "nasdaqth20260810.txt" in report
+    assert "0 symbols parsed" in report
+
+
+def test_rotated_logs_are_read(engine, tmp_path):
+    """Reading only smartboi.log was self-defeating: a burst big enough to
+    matter is a burst big enough to ROTATE. 11,893 billing failures in two
+    hours had already rotated out by the time anyone looked, and the bundle
+    reported nothing unusual."""
+    _write_log(tmp_path, "smartboi.log.1",
+               "2026-08-09 07:00:00 UTC | WARNING | smartboi.dossier | AAA: dossier update "
+               "proposal failed: credit balance is too low\n")
+    _write_log(tmp_path, "smartboi.log",
+               "2026-08-11 14:00:00 UTC | WARNING | smartboi.regsho | [REGSHO] routine\n")
+    report = run_diagnostics(engine)
+
+    assert "credit balance is too low" in report
+
+
+def test_repeated_failures_are_counted_not_just_tailed(engine, tmp_path):
+    """A 40-line tail cannot show 11,893 of anything. The histogram collapses
+    a repeated failure to one counted row, so a storm is legible as a storm."""
+    _write_log(tmp_path, "smartboi.log", "".join(
+        f"2026-08-09 07:{n % 60:02d}:00 UTC | WARNING | smartboi.dossier | SYM{n}: dossier "
+        f"update proposal failed: credit balance is too low\n"
+        for n in range(500)
+    ))
+    report = run_diagnostics(engine)
+
+    assert "Warning/error counts across the whole retained log" in report
+    # Per-symbol subjects and digits are stripped, so all 500 collapse to ONE
+    # counted row rather than 500 shapes -- without that they would be no more
+    # legible than the tail they are meant to summarise.
+    assert "   500  WARNING smartboi.dossier" in report
+    assert report.count("credit balance is too low") < 50
+
+
+def test_uptime_and_restart_count_are_reported(engine, tmp_path):
+    """A two-hour-old build gets mistaken for a steady state without this."""
+    _write_log(tmp_path, "smartboi.log",
+               "2026-08-11 12:20:46 UTC | INFO    | smartboi.main | "
+               "=== SmartBoi version=0.57.0 commit=abc123 ===\n")
+    report = run_diagnostics(engine)
+
+    assert "started_at" in report
+    assert "restarts/24h" in report
+
+
+def test_the_daily_pass_schedule_is_reported(engine):
+    """The 12-hour drift between the two halves of the forward-return join
+    was only ever visible by reading periodic_pass_state.json by hand."""
+    engine.periodic_state.set("dossier_snapshot", "2026-08-10T16:00:51+00:00")
+    engine.periodic_state.set("price_marks", "2026-08-11T04:11:46+00:00")
+    report = run_diagnostics(engine)
+
+    assert "Daily pass schedule" in report
+    assert "dossier_snapshot" in report and "price_marks" in report
+
+
+def test_an_open_circuit_breaker_is_stated_not_inferred(engine):
+    """A halted system and an idle one both read as a low spend."""
+    engine.usage.note_failure(Exception("your credit balance is too low"))
+    report = run_diagnostics(engine)
+
+    assert "LLM CIRCUIT BREAKER OPEN" in report
+
+
+def test_an_empty_regsho_list_is_called_out(engine):
+    """ENABLED is a config echo. Reg SHO read ENABLED for the whole life of
+    the integration while holding zero symbols."""
+    assert engine.regsho is not None, "fixture must have Reg SHO wired for this to mean anything"
+    report = run_diagnostics(engine)
+    assert "0 symbol(s), as of never" in report
+    assert "market-cap borrow proxy" in report
+
+
+# --- The full file bundle -------------------------------------------------
+
+
+def _bundle(engine):
+    import io
+    import zipfile
+
+    from smartboi.tools import collect_full_diagnostics
+    return zipfile.ZipFile(io.BytesIO(collect_full_diagnostics(engine)))
+
+
+def test_the_full_bundle_carries_the_files_a_summary_cannot(engine, tmp_path):
+    """Each of these had to be fetched by hand, over several rounds, to
+    diagnose the last round of failures: the raw log (a storm that had
+    rotated away), signals.jsonl (a collapse in the firing RATE),
+    paper_trades.jsonl (which trades predate position sizing) and
+    periodic_pass_state.json (two passes drifting apart)."""
+    _write_log(tmp_path, "smartboi.log", "2026-08-11 14:00:00 UTC | WARNING | x | y\n")
+    _write_log(tmp_path, "smartboi.log.1", "2026-08-09 07:00:00 UTC | WARNING | x | old\n")
+    (tmp_path / "logs" / "signals.jsonl").write_text('{"symbol":"DCO"}\n')
+    engine.periodic_state.set("price_marks", "2026-08-11T04:11:46+00:00")
+
+    names = _bundle(engine).namelist()
+
+    assert "diagnostics.txt" in names
+    assert "MANIFEST.txt" in names
+    assert "logs/smartboi.log" in names
+    assert "logs/smartboi.log.1" in names          # rotations too
+    assert "logs/signals.jsonl" in names
+    assert "data/periodic_pass_state.json" in names
+
+
+def test_the_full_bundle_never_carries_a_credential(engine, tmp_path):
+    """It reaches the same places the pasteable bundle does and makes the
+    same promise, so it gets the same scrub -- at the same boundary."""
+    _write_log(tmp_path, "smartboi.log",
+               "2026-08-11 14:00:00 UTC | ERROR | smartboi.news | failed: "
+               "https://finnhub.io/api/v1/x?token=FINNHUB-LEAKED-KEY\n")
+    zf = _bundle(engine)
+
+    blob = b"".join(zf.read(n) for n in zf.namelist())
+    for fragment in (b"FINNHUB-LEAKED-KEY", b"sk-ant-", b"LEAKED-WEBHOOK-ID", b"real.person@"):
+        assert fragment not in blob
+    assert b"token=REDACTED" in blob
+
+
+def test_the_full_bundle_excludes_configuration_entirely(engine, tmp_path):
+    """No .env, no /data/options.json. Those hold the Anthropic and Finnhub
+    keys and the webhook URL, and nothing in this archive is worth them --
+    which is why both file lists are allow-lists rather than globs."""
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-NOPE\n")
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "options.json").write_text('{"anthropic_api_key":"sk-ant-NOPE"}')
+    (tmp_path / "data" / "graph.json.corrupt-20260809T060000Z").write_text('{"secret":"NOPE"}')
+
+    zf = _bundle(engine)
+    names = zf.namelist()
+
+    assert not any(".env" in n or "options.json" in n or "corrupt" in n for n in names)
+    assert b"sk-ant-NOPE" not in b"".join(zf.read(n) for n in names)
+
+
+def test_the_full_bundle_survives_a_broken_summary(engine, monkeypatch):
+    """The files are the point. A summary that raises must cost the summary,
+    not the archive -- the bundle is most needed exactly when something is
+    broken enough to break the report."""
+    import smartboi.tools as tools_module
+    monkeypatch.setattr(tools_module, "run_diagnostics",
+                        lambda _engine: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    zf = _bundle(engine)
+    assert "MANIFEST.txt" in zf.namelist()
+    assert b"boom" in zf.read("diagnostics.txt")

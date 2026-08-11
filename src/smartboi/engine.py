@@ -44,6 +44,7 @@ from smartboi.edgar import _truncate_head_tail, describe_8k_items
 from smartboi.dossier import (
     DIRECTIONS,
     SCORING_VERSION,
+    SYNTHESIS_CAP_MAX_AGE_HOURS,
     Dossier,
     DossierStore,
     DossierSynthesizer,
@@ -214,7 +215,11 @@ ECOSYSTEM_LINK_CONFIDENCE = 0.25
 # long enough that a merge between decay passes still honours the last
 # whole-body verdict, short enough that a stale verdict cannot suppress a
 # thesis indefinitely once the daily pass stops updating it.
-_SYNTHESIS_CAP_MAX_AGE_HOURS = 36.0
+#
+# Defined in dossier.py now that _aggregate honours the same window for the
+# corroboration ceiling; re-exported here under the existing private name so
+# the two cannot drift apart.
+_SYNTHESIS_CAP_MAX_AGE_HOURS = SYNTHESIS_CAP_MAX_AGE_HOURS
 
 # How many NEW independent-source slots must appear since a verdict was
 # rendered before its premises count as materially changed (see
@@ -370,6 +375,12 @@ class Engine:
         self.journal = PaperTradeJournal(log_dir / "paper_trades.jsonl")
         self.universe_screen_state = JsonState(DATA_DIR / "universe_screen_state.json")
         self.periodic_state = JsonState(DATA_DIR / "periodic_pass_state.json")
+        # Wall clock, not monotonic: this is for the operator reading a
+        # diagnostics bundle, and "how long has THIS build been up" is the
+        # context that decides whether the numbers below describe a steady
+        # state or the first few minutes of one. Deployments here restart
+        # several times a day.
+        self.started_at = datetime.now(timezone.utc).isoformat()
         self.backfill_state = JsonState(DATA_DIR / "relationship_backfill.json")
         self.candidates = JsonState(DATA_DIR / "universe_candidates.json")
         # Which anchors have HAD a supplier-research call, as opposed to
@@ -1008,12 +1019,21 @@ class Engine:
                 "-- signals will be detected and logged, but no paper trade can ever be OPENED or marked. "
                 "A Finnhub free-tier key alone is enough for the full paper-trade loop.",
             )
-        else:
+        elif not self.settings.enable_ib_price_feed:
+            # Gated on the SETTING, not merely on a price source existing.
+            # _has_price_source() is true for IB *or* Finnhub, so the bare
+            # `else` fired on every startup with IB enabled and connected --
+            # printing "IB price feed disabled ... until ENABLE_IB_PRICE_FEED=
+            # true" on a deployment where it was already true, immediately
+            # after the CONNECTED line, 15 startups out of 15. A warning that
+            # states the opposite of the truth and prescribes a setting
+            # already in force is worse than no warning: it sends whoever
+            # reads it to check the one thing that was never wrong.
             self._warn_once(
                 "ib",
                 "IB price feed disabled -- signals will be detected and logged (logs/signals.jsonl), "
-                "but no hypothetical position can be opened or marked to market until "
-                "ENABLE_IB_PRICE_FEED=true. This never places real orders (see prices.py).",
+                "and entries/marks fall back to Finnhub quotes. Set ENABLE_IB_PRICE_FEED=true for "
+                "IB pricing. This never places real orders (see prices.py).",
             )
 
         if self.alerts.enabled:
@@ -1232,7 +1252,16 @@ class Engine:
         # retried on the next tick instead of silently losing the day's
         # capture. Duplicate rows from a partial write are handled
         # downstream (dedup_snapshots / last-mark-wins), a lost day is not.
-        if self._daily_pass_due("dossier_snapshot"):
+        # Weekends are skipped here for the same reason they are skipped for
+        # price marks below, and this guard was missing while that one was
+        # present -- so the fix had been applied to exactly one side of a
+        # two-sided join. A snapshot row is only ever useful joined to a
+        # price mark for the same symbol and DATE (see status.snapshot_dossier
+        # and forward_returns), and the mark pass writes nothing on a
+        # Saturday. Measured live: 44-48 snapshot rows on each of 2026-08-01,
+        # -02, -08 and -09 with no mark to join, i.e. roughly two sevenths of
+        # the capture unjoinable by construction.
+        if is_trading_day() and self._daily_pass_due("dossier_snapshot"):
             # Gated on the return value, exactly like price marks below.
             # This used to call and mark unconditionally, so the comment
             # above described a property only ONE of the two passes had --
@@ -3768,6 +3797,7 @@ class Engine:
             )
             dossier.distinct_fact_count = 0
         dossier.already_priced_in = bool(verdict.get("already_priced_in"))
+        dossier.redundant_evidence = bool(verdict.get("redundant_evidence"))
         # What this verdict is a claim ABOUT, recorded so it can later be
         # falsified rather than merely re-asserted: the arithmetic it capped,
         # the evidence body it read, and the price it judged. All three are
@@ -3817,8 +3847,9 @@ class Engine:
         if after < before:
             log.info(
                 "[SYNTHESIS] %s: score trimmed %.3f -> %.3f (%d distinct fact(s) behind %d counted "
-                "source(s)) -- %s", dossier.symbol, before, after,
+                "source(s)%s) -- %s", dossier.symbol, before, after,
                 dossier.distinct_fact_count, dossier.independent_source_count,
+                ", redundant" if dossier.redundant_evidence else "",
                 dossier.synthesis_catalyst[:120],
             )
         return True

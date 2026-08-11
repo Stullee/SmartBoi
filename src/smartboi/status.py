@@ -124,6 +124,20 @@ def gather_dossiers(store: DossierStore) -> list[dict]:
                 "signaled_price": d.signaled_price,
                 "mass_agree": round(d.mass_agree, 3),
                 "mass_opposing": round(d.mass_opposing, 3),
+                # --- What the whole-body pass did to this row. Carried here
+                # because the dossier table showed a vetoed 0.000 and a
+                # decayed-to-zero 0.000 as the same thing, which made the one
+                # pass capable of stopping every trade in the system
+                # invisible in the only artifact an operator reads. Live, 22
+                # of 45 dossiers sat at exactly 0.000 with no way to tell
+                # from here which pass had put them there.
+                "synthesis_at": d.synthesis_at,
+                "pre_synthesis_score": round(d.pre_synthesis_score, 3),
+                "synthesis_confidence": round(d.synthesis_confidence, 3),
+                "synthesis_magnitude": round(d.synthesis_magnitude, 3),
+                "distinct_fact_count": d.distinct_fact_count,
+                "already_priced_in": d.already_priced_in,
+                "redundant_evidence": d.redundant_evidence,
             }
         )
     rows.sort(key=lambda r: (r["confidence"] * r["magnitude"]), reverse=True)

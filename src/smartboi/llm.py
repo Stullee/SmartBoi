@@ -135,6 +135,46 @@ def cacheable_system(prompt: str) -> list[dict]:
     return [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}]
 
 
+# Substrings that identify an ACCOUNT-level API failure -- one that every
+# subsequent call will hit identically, no matter the prompt, until a human
+# changes something outside this process.
+#
+# This distinction is load-bearing and its absence was expensive. Every call
+# site here wraps the API in `except Exception` and returns None, which the
+# engine correctly reads as "transient, retry later" -- correct for a 429, a
+# 529 or a dropped connection, and catastrophic for a billing failure, which
+# is neither transient nor retryable. Measured live on 2026-08-09: 11,893
+# identical "Your credit balance is too low" failures between 06:00 and 08:00
+# UTC, 10,102 of them inside a single hour, roughly three requests a second
+# against an error that could not succeed until someone topped up an account.
+#
+# Matched on message text rather than exception type on purpose: the SDK
+# raises the same BadRequestError class for a malformed tool schema (a genuine
+# per-request bug that must NOT halt the day) as for an exhausted balance, so
+# the type alone cannot tell them apart. Anything not listed here stays
+# transient, which is the safe direction -- a missed classification costs
+# retries, an over-eager one silently stops the system for a day.
+_PERMANENT_API_FAILURES: tuple[tuple[str, str], ...] = (
+    ("credit balance is too low", "the Anthropic credit balance is exhausted"),
+    ("billing", "an Anthropic billing problem"),
+    ("authentication_error", "the Anthropic API key was rejected"),
+    ("invalid x-api-key", "the Anthropic API key is invalid"),
+    ("permission_error", "this Anthropic API key lacks permission for the configured model"),
+)
+
+
+def permanent_failure_reason(exc: object) -> str:
+    """A human-readable reason when `exc` is an account-level failure that
+    retrying cannot fix, or "" when it is an ordinary transient error.
+
+    See _PERMANENT_API_FAILURES for why this is matched on text."""
+    text = str(exc).lower()
+    for needle, reason in _PERMANENT_API_FAILURES:
+        if needle in text:
+            return reason
+    return ""
+
+
 def first_tool_use(response) -> dict | None:
     """The first tool_use block's input, or None.
 

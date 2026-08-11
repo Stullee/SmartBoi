@@ -317,3 +317,98 @@ def test_a_spent_call_reservation_no_longer_holds_calls_back(tmp_path):
 
     assert u.snapshot().calls == 10
     assert not u.budget_remaining(CAT_DOSSIER)  # only the total cap binds now
+
+
+# --- The LLM circuit breaker ---------------------------------------------
+#
+# All five call sites already gate on budget_remaining(), so the breaker is
+# tested through that gate rather than through each caller.
+
+
+class _BillingError(Exception):
+    """The shape the Anthropic SDK actually raises -- the message is the only
+    thing distinguishing this from a malformed-request BadRequestError, which
+    is why the classifier matches on text."""
+
+
+def test_a_billing_failure_halts_every_category(tmp_path):
+    """Measured live: 11,893 identical 'credit balance is too low' failures in
+    two hours, because a failed call spends nothing and the budget -- the only
+    gate -- meters spend."""
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=5000, daily_usd_budget=10.0)
+    exc = _BillingError(
+        "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+        "'message': 'Your credit balance is too low to access the Anthropic API.'}}"
+    )
+
+    assert u.note_failure(exc, today="2026-08-09") is True
+    for category in (CAT_DOSSIER, CAT_SYNTHESIS, CAT_EXTRACTION, CAT_RESEARCH):
+        assert not u.budget_remaining(category, today="2026-08-09")
+    assert "credit balance" in u.snapshot(today="2026-08-09").breaker_reason
+
+
+def test_a_transient_failure_does_not_halt_anything(tmp_path):
+    """A rate limit, an overloaded server or a dropped connection is exactly
+    what the retry loop is for. Over-tripping would stop the system for a day
+    on an error that clears in seconds."""
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=5000)
+    for exc in (
+        _BillingError("Error code: 429 - {'type': 'rate_limit_error'}"),
+        _BillingError("Error code: 529 - {'type': 'overloaded_error'}"),
+        _BillingError("peer closed connection without sending complete message body"),
+        # A genuine per-request bug: same HTTP status and same exception class
+        # as the billing failure, and it must NOT halt the day.
+        _BillingError("Error code: 400 - {'type': 'invalid_request_error', "
+                      "'message': 'tools.0.custom.input_schema: Extra inputs are not permitted'}"),
+    ):
+        assert u.note_failure(exc, today="2026-08-09") is False
+    assert u.budget_remaining(CAT_DOSSIER, today="2026-08-09")
+    assert u.snapshot(today="2026-08-09").breaker_reason == ""
+
+
+def test_the_breaker_clears_at_utc_midnight(tmp_path):
+    """Deferred, never discarded -- the same contract an exhausted budget has.
+    Somebody tops the balance up, and UTC midnight is already this system's
+    retry-everything boundary."""
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=5000)
+    u.note_failure(_BillingError("your credit balance is too low"), today="2026-08-09")
+    assert not u.budget_remaining(CAT_DOSSIER, today="2026-08-09")
+
+    assert u.budget_remaining(CAT_DOSSIER, today="2026-08-10")
+    assert u.snapshot(today="2026-08-10").breaker_reason == ""
+
+
+def test_the_breaker_survives_a_restart_within_the_same_day(tmp_path):
+    """Persisted with the counters. A breaker that reset on restart would be
+    no breaker at all in a Home Assistant deployment that restarts several
+    times a day."""
+    path = tmp_path / "u.json"
+    UsageTracker(path, daily_call_budget=5000).note_failure(
+        _BillingError("your credit balance is too low"), today="2026-08-09")
+
+    revived = UsageTracker(path, daily_call_budget=5000)
+    assert not revived.budget_remaining(CAT_DOSSIER, today="2026-08-09")
+    assert revived.breaker_reason(today="2026-08-09")
+
+
+def test_reading_the_breaker_reason_does_not_clear_it(tmp_path):
+    """breaker_reason takes `today` like everything else here. As a bare
+    property it rolled the day against the wall clock, so merely rendering the
+    diagnostics bundle could clear the breaker and write to disk."""
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=5000)
+    u.note_failure(_BillingError("your credit balance is too low"), today="2026-08-09")
+
+    for _ in range(3):
+        assert u.breaker_reason(today="2026-08-09")
+    assert not u.budget_remaining(CAT_DOSSIER, today="2026-08-09")
+
+
+def test_the_breaker_logs_once_not_once_per_suppressed_call(tmp_path, caplog):
+    """The failure being fixed is a log storm; a breaker that logged on every
+    suppressed call would reproduce it in a different colour."""
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=5000)
+    exc = _BillingError("your credit balance is too low")
+    with caplog.at_level("ERROR"):
+        for _ in range(50):
+            u.note_failure(exc, today="2026-08-09")
+    assert sum("circuit breaker OPEN" in r.message for r in caplog.records) == 1

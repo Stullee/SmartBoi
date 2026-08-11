@@ -161,6 +161,25 @@ class Dossier:
     # Whether the market has plainly already made this connection. The whole
     # strategy is trading the lag BEFORE it does, so this is a veto.
     already_priced_in: bool = False
+    # Whether the evidence body collapses to far fewer facts than items --
+    # the overlap finding, held SEPARATELY from already_priced_in.
+    #
+    # They were one field, and the conflation was doing real damage. Across
+    # three live days every one of 77 vetoes came back "already priced in",
+    # and the verdict text was overwhelmingly about duplication rather than
+    # about the market: "one fact repeated across seven counterparties",
+    # "nearly all 50 items reduce to one restated macro fact". Those are two
+    # different claims with two different remedies -- overlap means the
+    # arithmetic overcounted and should be TRIMMED to the honest number,
+    # while priced-in means the move is gone and there is nothing to trade.
+    #
+    # Keeping them apart matters most for falsification. already_priced_in
+    # arms _veto_refuted_by_price, which watches the tape for a move that
+    # would disprove "the market has absorbed this". Stamped on a duplication
+    # finding, that test is checking a hypothesis the model never advanced --
+    # which is why, against those 77 vetoes, the re-judge path fired exactly
+    # once in three days.
+    redundant_evidence: bool = False
     synthesis_note: str = ""
     synthesis_catalyst: str = ""
     # --- What the verdict above was judged AGAINST, so it can be falsified
@@ -521,7 +540,32 @@ COMPETITOR_SATISFIES_DISCLOSED_LINK = False
 #   - EDGAR ingestion covers 20-F/40-F/6-K, NT 10-K/NT 10-Q, S-1/S-3 and the
 #     delisting forms, so filing evidence now reaches foreign private issuers
 #     that could previously never produce a single filing item.
-SCORING_VERSION = 6
+#
+# 7: the corroboration bonus is paid on distinct FACTS rather than distinct
+# channels wherever synthesis has said what that number is
+# (effective_corroboration_count), and the whole-body pass can now report
+# overlap WITHOUT vetoing (Dossier.redundant_evidence). Both move scores in
+# the high region the forward-return question is asked about, and they move
+# them in opposite directions -- the first trims inflated corroboration down,
+# the second stops a duplication finding from zeroing a thesis outright -- so
+# rows must split at this boundary rather than pool with v6.
+#
+# The measurement that forced it: across three live days the whole-body pass
+# returned 77 vetoes and 2 trims, every veto reading "already priced in" while
+# its own text described duplication ("nearly all 50 items reduce to one
+# restated macro fact"). 22 of 45 dossiers sat at exactly 0.000, no position
+# opened for four days, and on the 23 verdicts whose numbers survive in the
+# log the arithmetic ran a median 12.4x hot against what synthesis rated the
+# same evidence. Routing those to the trim alone would have changed nothing --
+# none of the 23 clears the bar on its trimmed score either -- which is what
+# says the gap, not the routing, was the defect.
+SCORING_VERSION = 7
+
+# How long a persisted synthesis verdict is honoured -- as a cap on the merge
+# path (engine._cap_with_synthesis) and as the corroboration ceiling in
+# _aggregate. Lives here rather than in engine because scoring now depends on
+# it, and two copies of a freshness window is how they drift apart.
+SYNTHESIS_CAP_MAX_AGE_HOURS = 36.0
 # Weight an evidence item keeps right at its stale cutoff, before being
 # excluded entirely -- never fully zero a moment before exclusion, since
 # aged corroboration is still weak signal that a persistent theme existed.
@@ -572,6 +616,58 @@ def evidence_weight(record: EvidenceRecord, now: datetime) -> float:
         return _DECAY_FLOOR
     fraction = (age - horizon) / (cutoff - horizon)
     return 1.0 - fraction * (1.0 - _DECAY_FLOOR)
+
+
+def _synthesis_verdict_fresh(dossier: Dossier, now: datetime) -> bool:
+    """Whether the persisted whole-body verdict is recent enough to be
+    honoured. Outside the window there is nothing to honour -- the cap has
+    lapsed on its own, and the next daily pass re-judges."""
+    if not dossier.synthesis_at:
+        return False
+    try:
+        synth_at = datetime.fromisoformat(dossier.synthesis_at)
+    except (TypeError, ValueError):
+        return False
+    if synth_at.tzinfo is None:
+        synth_at = synth_at.replace(tzinfo=timezone.utc)
+    return (now - synth_at).total_seconds() / 3600.0 <= SYNTHESIS_CAP_MAX_AGE_HOURS
+
+
+def effective_corroboration_count(dossier: Dossier, now: datetime) -> int:
+    """How many corroborating facts the bonuses may be paid on.
+
+    `independent_source_count` counts distinct DISCLOSURE CHANNELS -- separate
+    publishers, separate filing forms, separate origin symbols. That is the
+    right unit for the signal bar's "was this seen in more than one place",
+    and it is the wrong unit for "how much does this corroborate", because
+    five outlets and seven counterparties reacting to one hyperscaler capex
+    announcement are one fact seen twelve ways.
+
+    Synthesis already computes the right number and the system already stores
+    it: distinct_fact_count is persisted, stamped onto every paper trade and
+    rendered in status -- and never once consulted by a score. Meanwhile the
+    two passes disagreed by a median factor of 12.4x across 23 live verdicts
+    (arithmetic median 0.709 against a synthesised 0.054), and the veto was
+    absorbing the entire difference. This is the arithmetic meeting synthesis
+    partway instead: the corroboration BONUS is paid on facts, not channels.
+
+    Deliberately narrow:
+
+    - Only the bonus is capped. `independent_source_count` itself is left
+      alone, so the source-count gates (min_independent_sources and the
+      news-only bar) keep the tested meaning they were written with.
+    - Only with a FRESH verdict, and only a positive count. A dossier that
+      never reached the synthesis floor carries distinct_fact_count 0, and
+      treating that as "zero facts" would zero the corroboration of every
+      un-synthesised dossier in the system -- the opposite of the intent.
+    - A cap, never a lift, matching every other thing synthesis is allowed to
+      do to a score."""
+    counted = dossier.independent_source_count
+    if not _synthesis_verdict_fresh(dossier, now):
+        return counted
+    if dossier.distinct_fact_count <= 0:
+        return counted
+    return min(counted, dossier.distinct_fact_count)
 
 
 def _corroboration_doublings(independent_source_count: int) -> float:
@@ -738,7 +834,11 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     # confidence bonus exactly -- min(0.25, 0.10*doublings) == 0.10 *
     # min(doublings, 2.5) -- while newly bounding the magnitude multiplier,
     # which previously grew without limit in the source count.
-    doublings = min(_corroboration_doublings(dossier.independent_source_count),
+    # Paid on distinct FACTS where synthesis has told us what that number is,
+    # otherwise on distinct channels exactly as before. See
+    # effective_corroboration_count -- this is the one line that stops the
+    # arithmetic manufacturing a 0.94 out of one restated macro story.
+    doublings = min(_corroboration_doublings(effective_corroboration_count(dossier, now)),
                     MAX_CORROBORATION_DOUBLINGS)
     corroboration_bonus = CONFIDENCE_CORROBORATION_STEP * doublings
     raw_confidence = min(1.0, base_confidence + corroboration_bonus)
@@ -1020,6 +1120,11 @@ class DossierUpdater:
                 messages=[{"role": "user", "content": prompt}],
             )
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the ingestion loop
+            # An account-level failure trips the shared breaker so the next
+            # caller is refused before it reaches the network -- this is the
+            # highest-volume call site in the system and the one that logged
+            # 11,893 identical billing failures in two hours.
+            self._usage.note_failure(exc)
             log.warning("%s: dossier update proposal failed: %s", dossier.symbol, exc)
             return None
         self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
@@ -1064,10 +1169,24 @@ _SYNTHESIS_TOOL = {
             "already_priced_in": {
                 "type": "boolean",
                 "description": (
-                    "True if the market has plainly already absorbed this -- the evidence is old, "
-                    "the story was widely covered when it broke, or it merely confirms what was "
-                    "already known. The whole strategy is trading the lag BEFORE the market "
-                    "connects the dots, so a thesis the market has already connected is not one."
+                    "True ONLY if the market has plainly already absorbed this -- the evidence is "
+                    "old, the story was widely covered when it broke, or it merely confirms what "
+                    "was already known. The whole strategy is trading the lag BEFORE the market "
+                    "connects the dots, so a thesis the market has already connected is not one. "
+                    "This is a claim about the PRICE, and it is checked against the tape later: "
+                    "do not set it merely because the evidence is thin or repetitive -- that is "
+                    "redundant_evidence, a different finding with a different consequence."
+                ),
+            },
+            "redundant_evidence": {
+                "type": "boolean",
+                "description": (
+                    "True if this file collapses to far fewer facts than it has items -- one "
+                    "story restated across many outlets or many counterparties. This is a claim "
+                    "about the EVIDENCE, not the price. It does not veto the thesis; it says the "
+                    "arithmetic overcounted, and your confidence/magnitude are then used as the "
+                    "honest ceiling. Set this, not already_priced_in, when the problem is that "
+                    "the corroboration is illusory."
                 ),
             },
             "strongest_catalyst": {
@@ -1078,7 +1197,8 @@ _SYNTHESIS_TOOL = {
         },
         "required": [
             "direction", "distinct_fact_count", "confidence", "magnitude",
-            "horizon_days", "already_priced_in", "strongest_catalyst", "thesis",
+            "horizon_days", "already_priced_in", "redundant_evidence",
+            "strongest_catalyst", "thesis",
         ],
     },
 }
@@ -1092,7 +1212,9 @@ _SYNTHESIS_SYSTEM_PROMPT = (
     "1. OVERLAP. Items were scored one at a time, so the same underlying fact scored several "
     "times looks like several corroborating facts. Count DISTINCT facts, not items. This is "
     "the most important judgement you make -- an accumulation of one story restated is not a "
-    "corroborated thesis, and treating it as one is how a system talks itself into a trade.\n"
+    "corroborated thesis, and treating it as one is how a system talks itself into a trade. "
+    "When you find it, say so via redundant_evidence and let your confidence and magnitude be "
+    "the honest ceiling; distinct_fact_count is then what the corroboration is actually worth.\n"
     "2. COHERENCE. Do these facts describe one consistent story, or unrelated fragments that "
     "happen to point the same way? A supplier winning a contract, that supplier's customer "
     "guiding capex up, and an insider buying is a coherent thesis. Three unrelated mild "
@@ -1101,6 +1223,11 @@ _SYNTHESIS_SYSTEM_PROMPT = (
     "already made this connection? The entire strategy is trading the lag before it does. Say "
     "so plainly via already_priced_in -- it costs nothing to skip a move that is over, and a "
     "great deal to enter one.\n\n"
+    "Keep (1) and (3) separate. Thin, repetitive evidence is redundant_evidence. A move the "
+    "market has already made is already_priced_in. They have different consequences -- the "
+    "first trims the score to what you rate it, the second stops the thesis outright and is "
+    "later checked against the tape -- so answering the overlap question with the price flag "
+    "both overstates what you found and puts it to a test you did not intend.\n\n"
     + _CATALYST_RUBRIC +
     "\n\nBe willing to conclude the evidence does NOT support a position: direction NONE, or a "
     "confidence well below the individual items'. That is a real and useful answer. Be equally "
@@ -1196,6 +1323,7 @@ class DossierSynthesizer:
                 messages=[{"role": "user", "content": prompt}],
             )
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the decay pass
+            self._usage.note_failure(exc)
             log.warning("%s: synthesis failed: %s", dossier.symbol, exc)
             return None
         self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
