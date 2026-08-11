@@ -316,6 +316,7 @@ _INDEX_HTML = """<!doctype html>
   .gl { display:inline-flex; align-items:center; gap:5px; }
   .gl-l { width:15px; height:3px; border-radius:2px; }
   .gl-d { width:9px; height:9px; border-radius:50%; }
+  .gl-d.none { width:11px; height:11px; background:transparent; border:1.5px dashed var(--warn); }
 
   details.more { margin-top:14px; }
   details.more > summary { cursor:pointer; list-style:none; font-size:12px; color:var(--accent);
@@ -866,7 +867,7 @@ var cv, ctx, dpr=Math.max(1,Math.min(2,window.devicePixelRatio||1)), cw=700, ch=
 
 var TCK = {};
 function tok(name){ return TCK[name] !== undefined ? TCK[name] : getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
-function refreshTokens(){ ["--gc-cust","--gc-supp","--gc-comp","--gc-reg","--gc-eco","--gn-anchor","--pos","--neg","--faint","--gn-stroke","--gn-txt"]
+function refreshTokens(){ ["--gc-cust","--gc-supp","--gc-comp","--gc-reg","--gc-eco","--gn-anchor","--pos","--neg","--faint","--gn-stroke","--gn-txt","--warn"]
   .forEach(function(k){ TCK[k]=getComputedStyle(document.documentElement).getPropertyValue(k).trim(); }); }
 function gvColorTok(type){ return {customer:"--gc-cust",supplier:"--gc-supp",competitor:"--gc-comp",regulator:"--gc-reg"}[type]||"--gc-eco"; }
 function gvR(n){ if(n.kind==="anchor") return 13; if(n.score!=null) return 6+n.score*10; return 6; }
@@ -917,14 +918,34 @@ function drawWire(now){
   // nodes
   WIRE.nodes.forEach(function(n){ var p=WIRE.pos[n.id]; if(!p) return; var x=p.x*s,y=p.y*s,r=gvR(n)*s;
     var isHot=(n.id===hotSym);
-    if(isHot){ var beat=0.5+0.5*Math.sin(now/260); ctx.globalAlpha=0.9; ctx.strokeStyle=tok(gvFill(n)); ctx.lineWidth=2;
-      ctx.beginPath(); ctx.arc(x,y,r+(4+beat*5)*s,0,7); ctx.stroke(); ctx.globalAlpha=1; ctx.shadowColor=tok(gvFill(n)); ctx.shadowBlur=(8+beat*10)*s; }
+    // The selection ring clears the unlinked marker below rather than beating
+    // through it -- two rings at the same radius read as one smeared ring.
+    if(isHot){ var beat=0.5+0.5*Math.sin(now/260), gap=(n.kind==="unlinked"?9.5:4);
+      ctx.globalAlpha=0.9; ctx.strokeStyle=tok(gvFill(n)); ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(x,y,r+(gap+beat*5)*s,0,7); ctx.stroke(); ctx.globalAlpha=1; ctx.shadowColor=tok(gvFill(n)); ctx.shadowBlur=(8+beat*10)*s; }
     ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fillStyle=tok(gvFill(n)); ctx.globalAlpha=n.kind==="anchor"?0.92:1; ctx.fill(); ctx.globalAlpha=1;
     ctx.shadowBlur=0; ctx.lineWidth=1.5*s; ctx.strokeStyle=tok("--gn-stroke"); ctx.stroke();
+    // A signal with no disclosed path is MARKED, not merely drawn alone -- an
+    // isolated dot reads as a layout accident, a dashed warning ring reads as the
+    // statement it is: this thesis came from the company's own filings and no
+    // relationship carried it.
+    if(n.kind==="unlinked"){ ctx.save(); ctx.setLineDash([3*s,3*s]); ctx.lineWidth=1.5*s;
+      ctx.strokeStyle=tok("--warn"); ctx.beginPath(); ctx.arc(x,y,r+4.5*s,0,7); ctx.stroke(); ctx.restore(); }
     ctx.fillStyle=tok("--gn-txt"); ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.font="700 "+(11*s)+"px -apple-system,sans-serif";
     ctx.fillText(n.id, x, n.kind==="anchor"?y:y-r-6*s);
     if(n.kind!=="anchor"&&n.score!=null&&r>9*s){ ctx.fillStyle=tok("--gn-stroke"); ctx.font="700 "+(8*s)+"px ui-monospace,monospace"; ctx.fillText(n.score.toFixed(2),x,y); }
   });
+  // ...and say it in words when that is the name currently being shown, so a
+  // canvas with nothing moving on it is explained rather than just empty.
+  if(hotSym){
+    var hn=null; WIRE.nodes.forEach(function(n){ if(n.id===hotSym) hn=n; });
+    var hp=WIRE.pos[hotSym];
+    if(hn&&hp&&hn.kind==="unlinked"){
+      ctx.fillStyle=tok("--warn"); ctx.textAlign="center"; ctx.textBaseline="top";
+      ctx.font="600 "+(10*s)+"px -apple-system,sans-serif";
+      ctx.fillText("no disclosed path \\u2014 own filings only", hp.x*s, hp.y*s+(gvR(hn)+9)*s);
+    }
+  }
 }
 
 function resizeWire(){ if(!cv) return; cw=cv.parentNode.clientWidth; ch=Math.round(cw*VH/VW); if(ch>520){ch=520;} scale=cw/VW;
@@ -962,7 +983,31 @@ function focusGraph(g){
     fnodes=fnodes.slice(0,52);
   }
   var ids={}; fnodes.forEach(function(n){ ids[n.id]=1; });
-  return { nodes:fnodes, edges:edges.filter(function(e){ return ids[e[0]]&&ids[e[1]]; }), total:nodes.length };
+  // A signalled tradeable with NO graph edge has no node in the payload at all:
+  // status.gather_graph_stats builds its node list purely from edge endpoints, so
+  // a name that reaches nothing is simply absent, and filtering `nodes` above can
+  // only ever drop it. Synthesizing it here is not cosmetic. That is exactly the
+  // population gather_graph_health counts as `disconnected_with_thesis` and warns
+  // about two bands down ("their dossier came only from their own filings, so the
+  // cross-company mechanism never fired for them") -- the case an operator most
+  // needs to see, because it is the one where this system's whole premise did not
+  // hold. Without a node the wire went silent precisely when the ticker reached
+  // one: no dot, no pulse, and -- having no hot edges either -- a frozen canvas
+  // with nothing to explain it.
+  //
+  // Appended AFTER the trim above on purpose: a name that actually fired must
+  // never be dropped for being poorly connected, which is the one property that
+  // guarantees it loses a degree-ranked cut. Built from the signal row itself,
+  // which already carries the direction and both factors of the score.
+  var unlinked=0;
+  (data.recent_signals||[]).forEach(function(s){
+    if(!s.symbol || ids[s.symbol]) return;
+    ids[s.symbol]=1; unlinked++;
+    fnodes.push({ id:s.symbol, kind:"unlinked", dir:s.direction, name:"", sector:"",
+      score:(s.confidence!=null&&s.magnitude!=null)?Math.round(s.confidence*s.magnitude*1000)/1000:null });
+  });
+  return { nodes:fnodes, edges:edges.filter(function(e){ return ids[e[0]]&&ids[e[1]]; }),
+           total:nodes.length+unlinked, unlinked:unlinked };
 }
 
 function updateWire(d){
@@ -976,6 +1021,9 @@ function updateWire(d){
     '<span class="gl"><i class="gl-d" style="background:var(--gn-anchor)"></i>anchor</span>'+
     '<span class="gl"><i class="gl-d" style="background:var(--pos)"></i>long</span>'+
     '<span class="gl"><i class="gl-d" style="background:var(--neg)"></i>short</span>'+
+    // Only keyed when one is actually on screen -- a legend entry for something
+    // that is not being drawn is the defect this panel already had once.
+    (f.unlinked?'<span class="gl"><i class="gl-d none"></i>no disclosed path</span>':"")+
     '<span class="gl" style="margin-left:auto;color:var(--faint)">'+f.nodes.length+' of '+f.total+' names &middot; thesis + the anchors feeding them</span>';
   renderFeed();
 }
@@ -988,7 +1036,11 @@ function updateWire(d){
     if(ev.clientX<rect.left||ev.clientX>rect.right||ev.clientY<rect.top||ev.clientY>rect.bottom){ tip.style.opacity="0"; return; }
     var n=nodeAt(ev.clientX-rect.left,ev.clientY-rect.top);
     if(!n){ tip.style.opacity="0"; cv.style.cursor="default"; return; } cv.style.cursor="pointer";
-    var thesis=n.kind==="anchor"?"anchor &middot; news source":(n.score!=null?((n.dir==="LONG"?"long":n.dir==="SHORT"?"short":"no")+" thesis, score "+n.score.toFixed(2)):"no thesis yet");
+    function dirWord(x){ return x.dir==="LONG"?"long":(x.dir==="SHORT"?"short":"no"); }
+    var thesis = n.kind==="anchor" ? "anchor &middot; news source"
+      : n.kind==="unlinked" ? (dirWord(n)+" thesis, score "+(n.score!=null?n.score.toFixed(2):"&ndash;")+
+          " &mdash; signalled with NO disclosed relationship path; this one came from its own filings")
+      : (n.score!=null?(dirWord(n)+" thesis, score "+n.score.toFixed(2)):"no thesis yet");
     var name=n.name||"", info=DESC[n.id]||n.sector||"";
     tip.innerHTML='<div class="h">'+n.id+(name?' &middot; '+esc(name):"")+"</div>"+(info?'<div class="d">'+esc(info)+"</div>":"")+'<div class="d">'+thesis+"</div>";
     tip.style.opacity="1"; tip.style.left=(ev.clientX+14)+"px"; tip.style.top=(ev.clientY+12)+"px";
