@@ -294,7 +294,10 @@ _INDEX_HTML = """<!doctype html>
   .ev-top { display:flex; align-items:center; gap:7px; margin-bottom:3px; }
   .ev-sym { font-size:12px; font-weight:700; }
   .ev-time { font-size:10px; color:var(--faint); margin-left:auto; }
-  .ev-body { font-size:11.5px; color:var(--muted); line-height:1.35; max-height:2.7em; overflow:hidden; }
+  /* A real clamp: max-height + overflow:hidden cut the thesis mid-word with no
+     ellipsis, so a truncated summary read as a complete sentence that stopped. */
+  .ev-body { font-size:11.5px; color:var(--muted); line-height:1.35; overflow:hidden;
+             display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
 
   .phead { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--line-soft); }
   .phead h2 { font-size:13px; margin:0; font-weight:600; letter-spacing:-0.005em; }
@@ -342,6 +345,11 @@ _INDEX_HTML = """<!doctype html>
   .stale { color:var(--warn); }
   .fresh { color:var(--faint); }
 
+  /* Emitted by renderGraphHealth (edge-type counts, audit kinds). Undefined
+     until now, so the swatches had no size and the rows did not lay out. */
+  .catleg { display:grid; gap:6px 12px; margin-top:9px; font-size:11.5px; color:var(--muted); }
+  .lc { display:inline-flex; align-items:center; gap:6px; }
+  .lc-dot { width:8px; height:8px; border-radius:50%; flex:none; }
   .gviz-leg { display:flex; flex-wrap:wrap; gap:8px 14px; padding:10px 15px; border-top:1px solid var(--line-soft); font-size:11px; color:var(--muted); }
   .gl { display:inline-flex; align-items:center; gap:5px; }
   .gl-l { width:15px; height:3px; border-radius:2px; }
@@ -894,7 +902,7 @@ function renderDetail(d){
 // updateWire(data). Signals flow as pulses from the signaled tradeable out to
 // its graph neighbours; the active ticker item lights its path.
 // ===========================================================================
-var WIRE = { nodes:[], edges:[], pos:{}, byId:{}, feed:[], activeKey:"", t0:0, laid:false, layoutKey:"", dirty:true };
+var WIRE = { nodes:[], edges:[], pos:{}, feed:[], activeKey:"", t0:0, layoutKey:"", dirty:true };
 
 // The stylesheet has always honoured prefers-reduced-motion for the two CSS
 // pulse dots; the animation that actually moves -- travelling pulses, a beating
@@ -938,7 +946,7 @@ function layoutWire(){
   for(var pass=0;pass<9;pass++) for(i=0;i<nodes.length;i++) for(j=i+1;j<nodes.length;j++){ var qa=pos[nodes[i].id],qb=pos[nodes[j].id];
     var ex=qb.x-qa.x,ey=qb.y-qa.y,ed=Math.sqrt(ex*ex+ey*ey)+0.01,need=gvR(nodes[i])+gvR(nodes[j])+13;
     if(ed<need){ var pu=(need-ed)/2,nx=ex/ed,ny=ey/ed; qa.x-=nx*pu;qa.y-=ny*pu;qb.x+=nx*pu;qb.y+=ny*pu; } }
-  WIRE.pos=pos; WIRE.laid=true;
+  WIRE.pos=pos;
 }
 
 // ---- the feed's derived list ----------------------------------------------
@@ -1075,7 +1083,17 @@ function drawWire(now){
 // Setting canvas.width/height CLEARS the canvas, so a resize must always be
 // followed by a repaint -- with the idle skip in frame() a still wire would
 // otherwise stay blank until the next signal.
-function resizeWire(){ if(!cv) return; cw=cv.parentNode.clientWidth; ch=Math.round(cw*VH/VW); if(ch>520){ch=520;} scale=cw/VW;
+function resizeWire(){ if(!cv) return;
+  // devicePixelRatio is re-read rather than sampled once at load: a window
+  // dragged to a different-density display keeps its old backing store and
+  // renders soft until something else forces a resize.
+  var d=Math.max(1,Math.min(2,window.devicePixelRatio||1));
+  var w=cv.parentNode.clientWidth, h=Math.round(w*VH/VW); if(h>520){h=520;}
+  // Idempotent, because the observer below can be triggered by this function's
+  // own effect on the panel's height -- and re-assigning canvas.width clears
+  // the bitmap, so a non-guarded version would repaint in a loop.
+  if(w===cw && h===ch && d===dpr) return;
+  dpr=d; cw=w; ch=h; scale=cw/VW;
   cv.width=Math.round(cw*dpr); cv.height=Math.round(ch*dpr); cv.style.height=ch+"px"; WIRE.dirty=true; }
 
 function renderFeed(scrollToActive){
@@ -1229,7 +1247,7 @@ function updateWire(d){
           " &mdash; signalled with NO disclosed relationship path; this one came from its own filings")
       : (n.score!=null?(dirWord(n)+" thesis, score "+n.score.toFixed(2)):"no thesis yet");
     var name=n.name||"", info=DESC[n.id]||n.sector||"";
-    tip.innerHTML='<div class="h">'+n.id+(name?' &middot; '+esc(name):"")+"</div>"+(info?'<div class="d">'+esc(info)+"</div>":"")+'<div class="d">'+thesis+"</div>";
+    tip.innerHTML='<div class="h">'+esc(n.id)+(name?' &middot; '+esc(name):"")+"</div>"+(info?'<div class="d">'+esc(info)+"</div>":"")+'<div class="d">'+thesis+"</div>";
     tip.style.opacity="1"; tip.style.left=(ev.clientX+14)+"px"; tip.style.top=(ev.clientY+12)+"px";
   });
 })();
@@ -1266,6 +1284,10 @@ function frame(now){
 
 cv=el("wireCanvas"); ctx=cv.getContext("2d");
 window.addEventListener("resize",function(){ resizeWire(); });
+// A window resize is not the only thing that changes this panel's width: the
+// legend wrapping to a second line, the grid stacking at a breakpoint, or the
+// "Full detail" section opening all resize it with the window untouched.
+if(window.ResizeObserver){ new ResizeObserver(function(){ resizeWire(); }).observe(cv.parentNode); }
 refreshTokens(); resizeWire(); WIRE.t0=(window.performance&&performance.now)?performance.now():0; requestAnimationFrame(frame);
 refresh(); setInterval(refresh, 10000);
 </script>
