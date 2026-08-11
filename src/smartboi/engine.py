@@ -3984,14 +3984,25 @@ class Engine:
             )
             return
 
-        log.info("[SYNTHESIS] %s: verdict premises changed (%s) -- re-judging.",
-                 dossier.symbol, "; ".join(reasons))
-        self._spend_resynthesis_budget(now)
         if not await self._apply_synthesis(dossier, now):
             # No fresh verdict (below the synthesis floor, budget exhausted,
             # or a transient failure). The old one stands and nothing is
             # attributed -- no re-judgement actually happened.
+            #
+            # So nothing is SPENT either. The slot used to be consumed before
+            # this call, and _apply_synthesis declines for free at three
+            # points before it reaches the API: no synthesizer, a direction
+            # that is not LONG/SHORT, and the floor gate. A dossier sitting
+            # below the floor with permanently-changed premises therefore
+            # burned the whole day's off-schedule allowance a slot at a time
+            # without a single Opus call -- and the cap exists to bound
+            # SPEND, so an attempt that costs nothing must not count against
+            # it. The announcement moves down here with the spend, for the
+            # same reason: it claimed a re-judgement that had not happened.
             return
+        self._spend_resynthesis_budget(now)
+        log.info("[SYNTHESIS] %s: verdict premises changed (%s) -- re-judged.",
+                 dossier.symbol, "; ".join(reasons))
         # Stamped AFTER, and only on a verdict that actually replaced its
         # predecessor: these say "the verdict now in force exists BECAUSE its
         # premises were falsified", which is the row the forward record needs

@@ -523,3 +523,48 @@ def test_the_no_opens_alarm_fires_when_it_is_actually_true(engine):
     ])
 
     assert "nothing has OPENED" in run_diagnostics(engine)
+
+
+def test_the_message_shape_collapses_a_tagged_per_symbol_warning():
+    """This codebase logs "[PAPER] %s: ..." and "[UNIVERSE] %s dropped: ..."
+    with the symbol as the only varying part. The subject strip could not see
+    past the tag, so every symbol got its own histogram row -- the same
+    fragmentation the quoted-value collapse was added to fix, one layer out.
+    The tag itself stays: it is constant across repetitions and says which
+    pass logged the line."""
+    from smartboi.tools import _message_shape
+
+    shapes = {
+        _message_shape(f"[PAPER] {sym}: closing at the horizon on a stale mark (last price 1.20)")
+        for sym in ("MPWR", "AAPL", "BRK.A")
+    }
+    assert len(shapes) == 1
+    assert shapes.pop().startswith("[PAPER] closing at the horizon")
+
+
+def test_an_oversized_file_is_declined_before_it_is_read(engine, tmp_path, monkeypatch):
+    """The cap was consulted only after read_text() had already materialised
+    the file (three times over, counting the redacted copy and the encoded
+    measurement), so it could not prevent the out-of-memory it exists for."""
+    import smartboi.tools as tools_module
+
+    monkeypatch.setattr(tools_module, "MAX_BUNDLE_BYTES", 1024)
+    _write_log(tmp_path, "smartboi.log", "2026-08-11 14:00:00 UTC | WARNING | x | y\n" * 500)
+    opened = []
+    real_read = tools_module.Path.read_text
+
+    def spy(self, *a, **k):
+        opened.append(self.name)
+        return real_read(self, *a, **k)
+    monkeypatch.setattr(tools_module.Path, "read_text", spy)
+
+    archive = _bundle(engine)
+
+    assert "logs/smartboi.log" not in archive.namelist()
+    assert b"exceed the" in archive.read("MANIFEST.txt")
+    # Read at most once -- by run_diagnostics building the summary, which
+    # streams the tail and the histogram out of it and needs the file either
+    # way. What the cap now prevents is the SECOND materialisation the
+    # archive path used to do before consulting it: raw text, redacted copy
+    # and encoded measurement, all resident before the size was looked at.
+    assert opened.count("smartboi.log") <= 1

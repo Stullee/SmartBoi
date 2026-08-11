@@ -807,7 +807,18 @@ def _message_shape(message: str) -> str:
     ('b'), ('c') -- each looking like a minor separate annoyance. Only short
     runs are collapsed; a long quoted string is usually the message itself
     rather than a varying value."""
-    message = _LEADING_SUBJECT.sub("", message.strip())
+    # A bracketed tag is peeled off first and put back afterwards: it is
+    # constant across repetitions and says which pass logged the line, so it
+    # belongs in the shape -- but while it is in front, the subject strip
+    # cannot see the symbol behind it. This codebase logs "[PAPER] %s: ..."
+    # and "[UNIVERSE] %s dropped: ..." with the symbol as the only varying
+    # part, and every one of those was getting its own histogram row.
+    tag = ""
+    message = message.strip()
+    tag_match = _LEADING_TAG.match(message)
+    if tag_match:
+        tag, message = tag_match.group(0), message[tag_match.end():]
+    message = tag + _LEADING_SUBJECT.sub("", message)
     message = _QUOTED_SPAN.sub(_collapse_short_quote, message)
     return _DIGIT_RUN.sub("#", message)[:MAX_SHAPE_CHARS]
 
@@ -826,6 +837,7 @@ def _collapse_short_quote(match: re.Match) -> str:
     return "'?'" if len(inner) <= 12 else match.group(0)
 
 
+_LEADING_TAG = re.compile(r"^\[[A-Za-z][A-Za-z0-9_. -]{0,15}\] ")
 _LEADING_SUBJECT = re.compile(r"^\[?[A-Z0-9][A-Z0-9.\-]{0,9}\]?: ")
 _DIGIT_RUN = re.compile(r"\d+")
 _QUOTED_SPAN = re.compile(r"'[^']*'")
@@ -923,6 +935,24 @@ def collect_full_diagnostics(engine) -> bytes:
 
     def store(zf: zipfile.ZipFile, arcname: str, path: Path) -> None:
         nonlocal budget
+        # Size checked from the DIRECTORY ENTRY, before the file is opened.
+        # Checking after read_text() meant the cap was consulted once three
+        # full copies of the file were already resident (raw, redacted, and
+        # the encoded measurement), so a runaway log would have caused
+        # precisely the out-of-memory the cap is here to prevent, and only
+        # then been declined. st_size is bytes and the budget is bytes, so
+        # this over-counts only for multi-byte characters -- in the
+        # conservative direction.
+        try:
+            on_disk = path.stat().st_size
+        except OSError as exc:
+            manifest.append(f"  SKIPPED  {arcname}  ({exc})")
+            return
+        if on_disk > budget:
+            manifest.append(
+                f"  SKIPPED  {arcname}  ({on_disk:,} bytes would exceed the "
+                f"{MAX_BUNDLE_BYTES // 1024 // 1024}MB bundle cap)")
+            return
         try:
             raw = path.read_text(errors="replace")
         except OSError as exc:
@@ -930,9 +960,6 @@ def collect_full_diagnostics(engine) -> bytes:
             return
         text = _redact_text(raw, webhook)
         size = len(text.encode("utf-8", "replace"))
-        if size > budget:
-            manifest.append(f"  SKIPPED  {arcname}  (would exceed the {MAX_BUNDLE_BYTES // 1024 // 1024}MB cap)")
-            return
         budget -= size
         zf.writestr(arcname, text)
         manifest.append(f"  {size:>10,}  {arcname}")

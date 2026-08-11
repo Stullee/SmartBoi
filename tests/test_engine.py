@@ -3545,3 +3545,39 @@ async def test_the_daily_snapshot_still_runs_on_a_trading_day(engine, monkeypatc
     await engine._tick()
 
     assert calls == [1]
+
+
+async def test_a_free_refusal_does_not_spend_the_resynthesis_slot(engine):
+    """_apply_synthesis declines for free at three points before it reaches
+    the API -- no synthesizer, a non-directional dossier, and the floor gate.
+    The slot used to be spent before that call, so a dossier sitting below
+    the floor with permanently-changed premises burned the whole day's
+    off-schedule allowance without a single Opus call. The cap bounds SPEND,
+    so an attempt that costs nothing must not count against it."""
+    engine.synthesizer = None  # the cheapest of the three free refusals
+    dossier = await _build_thesis(engine)
+    dossier.already_priced_in = True
+    dossier.synthesis_at = datetime.now(timezone.utc).isoformat()
+    dossier.synthesis_price = 10.0
+    engine._price_bar = _returns_bar(20.0)  # refutes the veto, so premises HAVE changed
+
+    before = int(engine.resynthesis_state.get("count", 0) or 0)
+    await engine._maybe_resynthesize(dossier, datetime.now(timezone.utc))
+
+    assert int(engine.resynthesis_state.get("count", 0) or 0) == before
+
+
+async def test_a_real_re_judgement_does_spend_the_slot(engine):
+    """The cap has to still bind, or removing the false spend would just have
+    removed the bound."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(confidence=0.9, magnitude=0.9))
+    dossier = await _build_thesis(engine)
+    dossier.already_priced_in = True
+    dossier.synthesis_at = datetime.now(timezone.utc).isoformat()
+    dossier.synthesis_price = 10.0
+    engine._price_bar = _returns_bar(20.0)
+
+    before = int(engine.resynthesis_state.get("count", 0) or 0)
+    await engine._maybe_resynthesize(dossier, datetime.now(timezone.utc))
+
+    assert int(engine.resynthesis_state.get("count", 0) or 0) == before + 1
