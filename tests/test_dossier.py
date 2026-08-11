@@ -922,3 +922,117 @@ def test_the_uncapped_arithmetic_is_recorded_even_with_no_verdict():
     recompute_decay(dossier, NOW)
 
     assert dossier.arithmetic_score == pytest.approx(dossier.confidence * dossier.magnitude)
+
+
+# --- Independence counted per fact, not per channel (SCORING_VERSION 8) ---
+
+
+def _from_anchor(origin, source_name, fact_key="", evidence_id=None):
+    r = _evidence(source_name=source_name, evidence_id=evidence_id or f"{origin}-{source_name}")
+    return EvidenceRecord(**{**r.__dict__, "origin_symbol": origin, "is_propagated": True,
+                             "relationship_confidence": 0.95, "fact_key": fact_key})
+
+
+def _scored(records):
+    d = Dossier(symbol="X")
+    for r in records:
+        merge_evidence(d, r, now=NOW)
+    recompute_decay(d, NOW)
+    return d
+
+
+def test_three_anchors_reporting_one_event_count_as_one_source():
+    """BWEN, live: MSFT, META and EQIX items over disclosed edges in one
+    window, which the whole-body pass read as essentially ONE fact -- the same
+    quarter's AI capex, reported three times. The origin-symbol key counted
+    three independent corroborations."""
+    d = _scored([
+        _from_anchor("MSFT", "Yahoo", "ai datacenter capex q2 2026"),
+        _from_anchor("META", "Benzinga", "ai datacenter capex q2 2026"),
+        _from_anchor("EQIX", "SeekingAlpha", "ai datacenter capex q2 2026"),
+    ])
+    assert d.independent_source_count == 1
+
+
+def test_three_anchors_reporting_three_events_still_count_as_three():
+    """DCO, live: RTX, LMT and NOC over disclosed edges in one window, which
+    the same pass read as SEVEN OR EIGHT distinct facts. Structurally
+    identical to the case above in every field a key can see -- so the fix
+    must not collapse it. This is the regression v5 was written to prevent."""
+    d = _scored([
+        _from_anchor("RTX", "Yahoo", "rtx fy guidance raise"),
+        _from_anchor("LMT", "Yahoo", "lmt sentinel contract award"),
+        _from_anchor("NOC", "Yahoo", "noc missile production surge"),
+    ])
+    assert d.independent_source_count == 3
+
+
+def test_two_publishers_on_one_company_event_are_one_fact():
+    """The publisher key counted these as two. A company's earnings reported
+    by Yahoo and by Benzinga is one event."""
+    d = _scored([
+        _evidence(source_name="Yahoo", evidence_id="a"),
+        _evidence(source_name="Benzinga", evidence_id="b"),
+    ])
+    assert d.independent_source_count == 2  # no fact key: unchanged behaviour
+
+    labelled = _scored([
+        EvidenceRecord(**{**_evidence(source_name="Yahoo", evidence_id="a").__dict__,
+                          "fact_key": "x q2 earnings beat"}),
+        EvidenceRecord(**{**_evidence(source_name="Benzinga", evidence_id="b").__dict__,
+                          "fact_key": "x q2 earnings beat"}),
+    ])
+    assert labelled.independent_source_count == 1
+
+
+def test_a_paraphrased_label_still_collapses():
+    """The updater is shown the existing labels and told to reuse them, which
+    is the real mechanism -- but normalisation is the backstop for when it
+    varies case, punctuation or a trailing clause."""
+    d = _scored([
+        _from_anchor("MSFT", "Yahoo", "AI Datacenter Capex, Q2 2026"),
+        _from_anchor("META", "Benzinga", "ai datacenter capex  q2 2026"),
+        _from_anchor("EQIX", "CNBC", "ai datacenter capex q2 2026!"),
+    ])
+    assert d.independent_source_count == 1
+
+
+def test_evidence_without_a_fact_key_scores_exactly_as_before():
+    """Existing dossiers were merged before this field existed, and a model
+    can omit it. Both must score under the previous rules rather than
+    collapsing to a single slot."""
+    d = _scored([
+        _from_anchor("RTX", "Yahoo"),
+        _from_anchor("LMT", "Yahoo"),
+        _from_anchor("NOC", "Benzinga"),
+    ])
+    assert d.independent_source_count == 3
+
+
+def test_the_updater_is_shown_the_labels_already_on_the_dossier():
+    """A closed vocabulary the model can see beats fuzzy-matching free text
+    afterwards, so the existing labels have to reach the prompt."""
+    from smartboi.dossier import fact_keys_on
+
+    d = _scored([
+        _from_anchor("MSFT", "Yahoo", "AI Datacenter Capex Q2 2026"),
+        _from_anchor("LMT", "Yahoo", "lmt sentinel contract award"),
+    ])
+    keys = fact_keys_on(d, NOW)
+    assert "ai datacenter capex q2 2026" in keys
+    assert "lmt sentinel contract award" in keys
+
+
+def test_stale_evidence_does_not_keep_offering_its_label():
+    """A label whose evidence has aged out is not a fact the dossier still
+    holds, and offering it would invite the model to re-attach new evidence
+    to a dead event."""
+    from datetime import timedelta
+
+    from smartboi.dossier import fact_keys_on
+
+    old = _from_anchor("MSFT", "Yahoo", "ai datacenter capex q1 2026")
+    old = EvidenceRecord(**{**old.__dict__,
+                            "published_at": (NOW - timedelta(days=400)).isoformat()})
+    d = _scored([old])
+    assert fact_keys_on(d, NOW) == []

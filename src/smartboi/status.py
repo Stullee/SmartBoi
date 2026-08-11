@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from smartboi.config import strategy_key
-from smartboi.dossier import SCORING_VERSION, Dossier, DossierStore
+from smartboi.dossier import SCORING_VERSION, Dossier, DossierStore, normalized_fact_key
 from smartboi.graph import RelationshipGraph
 
 
@@ -124,6 +124,16 @@ def gather_dossiers(store: DossierStore) -> list[dict]:
                 "signaled_price": d.signaled_price,
                 "mass_agree": round(d.mass_agree, 3),
                 "mass_opposing": round(d.mass_opposing, 3),
+                # How many of this dossier's items carry a fact label, and how
+                # many distinct labels that is. The whole per-fact
+                # independence mechanism rests on the model reusing a label
+                # rather than paraphrasing it, and a model that quietly stops
+                # doing so degrades scoring back to per-channel counting with
+                # no error anywhere -- so it has to be visible.
+                "labelled_evidence_count": sum(1 for e in d.evidence if e.fact_key),
+                "distinct_fact_keys": len({
+                    normalized_fact_key(e.fact_key) for e in d.evidence if e.fact_key
+                }),
                 # --- What the whole-body pass did to this row. Carried here
                 # because the dossier table showed a vetoed 0.000 and a
                 # decayed-to-zero 0.000 as the same thing, which made the one
