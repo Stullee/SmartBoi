@@ -388,7 +388,7 @@ _INDEX_HTML = """<!doctype html>
 
 <div class="rail">
   <div class="rail-in">
-    <div class="brand"><b>SmartBoi</b><span class="v mono" id="ver">v0.44.0</span><span class="paper">paper-only</span></div>
+    <div class="brand"><b>SmartBoi</b><span class="v mono" id="ver">dev</span><span class="paper">paper-only</span></div>
     <div class="caps" id="caps"></div>
     <div class="rail-right">
       <span class="updated"><span class="live"></span>updated <span id="upd" class="mono">just now</span></span>
