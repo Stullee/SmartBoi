@@ -27,7 +27,7 @@ from pathlib import Path
 
 from smartboi.news import redact_token, redact_url
 from smartboi.paper_journal import cost_buckets, trade_economics
-from smartboi.usage import CATEGORIES
+from smartboi.usage import CAT_RESEARCH, CATEGORIES
 from smartboi.status import (
     gather_dossiers,
     gather_graph_health,
@@ -184,11 +184,32 @@ async def run_supplier_research(engine) -> str:
                 engine.settings.universe_min_market_cap_musd,
                 engine.settings.universe_max_market_cap_musd,
             )
+            # None means NO REQUEST WENT OUT -- the budget is gone, the
+            # circuit breaker is open, or the call itself failed. Nothing was
+            # spent and nothing was learned, so the anchor must stay unmarked
+            # and the run must stop: the gate that refused this one refuses
+            # every anchor behind it, and marking them all would retire the
+            # entire list permanently in a single run. Nothing expires
+            # anchor_research.json, so that is not recoverable.
+            if found is None:
+                # Appended to the report's not-researched list rather than
+                # counted separately: an operator reading the report needs the
+                # SYMBOLS that still need doing, and these are in exactly the
+                # same state as the ones the per-run cap deferred.
+                unattempted = [s.symbol for s in selected[len(results):]]
+                skipped.extend(unattempted)
+                log.info("Supplier research stopped after %d anchor(s): %s. %d anchor(s) left "
+                         "unmarked for a later run.",
+                         len(results),
+                         engine.usage.deferral_reason(CAT_RESEARCH) or "the call failed",
+                         len(unattempted))
+                break
             results.append((spec.symbol, found))
             # Marked BEFORE the merge and regardless of what came back: the
             # call is what costs money, so the call is what has to be
             # recorded. Gating this on `found` meant a legitimate empty
-            # result was re-billed on every subsequent run, forever.
+            # result was re-billed on every subsequent run, forever. [] still
+            # means exactly that -- billed, and genuinely empty.
             engine.research_state.set(
                 spec.symbol,
                 {"researched_at": datetime.now(timezone.utc).isoformat(), "found": len(found)},
