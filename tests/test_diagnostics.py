@@ -624,3 +624,56 @@ def test_the_bundle_warns_when_most_evidence_predates_labelling(engine):
     _labelled_dossier(engine, "NEW", ["one fact"])
 
     assert "score under the OLD per-channel rules" in run_diagnostics(engine)
+
+
+def test_an_edgeless_tradeable_reports_why_rather_than_promising_a_refresh(engine):
+    """Both the bundle and the dashboard asserted that "the rolling refresh
+    re-reads filings against the current universe to close exactly these
+    holes". For the five names carrying this flag live that was false:
+    extraction had already run on all five and found 42 counterparties
+    between them, of which ZERO resolved to a ticker. A re-read finds the
+    same names again, forever."""
+    from smartboi.dossier import Dossier, EvidenceRecord, merge_evidence
+
+    d = Dossier(symbol="PLPC")
+    merge_evidence(d, EvidenceRecord(
+        "e1", "8-K", "SEC EDGAR (8-K)", "u", "h", "2026-08-10", "PLPC", False, "",
+        "LONG", 0.8, 0.8, 20, "r", "s",
+    ))
+    engine.dossiers.save(d)
+    engine.candidates.set("J.A.P. INDUSTRIA DE MATERIAIS", {
+        "name": "J.A.P. INDUSTRIA DE MATERIAIS", "ticker": "",
+        "related_to": ["PLPC"], "rel_types": ["customer"],
+    })
+
+    report = run_diagnostics(engine)
+
+    assert "no graph edge at all" in report
+    assert "NONE resolvable to a ticker" in report
+    assert "J.A.P. INDUSTRIA" in report
+    assert "permanently" in report and "direct-only" in report
+    # The claim that is no longer made.
+    assert "close exactly these holes" not in report
+
+
+def test_an_edgeless_tradeable_with_a_resolvable_counterparty_says_so_instead(engine):
+    """The three states need three different responses: nothing extracted
+    yet (a refresh may help), extracted but unresolvable (nothing will help),
+    and extracted WITH a ticker (a click, not a re-read)."""
+    from smartboi.dossier import Dossier, EvidenceRecord, merge_evidence
+
+    d = Dossier(symbol="CVLG")
+    merge_evidence(d, EvidenceRecord(
+        "e1", "8-K", "SEC EDGAR (8-K)", "u", "h", "2026-08-10", "CVLG", False, "",
+        "LONG", 0.8, 0.8, 20, "r", "s",
+    ))
+    engine.dossiers.save(d)
+    engine.candidates.set("SOME LISTED CUSTOMER", {
+        "name": "SOME LISTED CUSTOMER", "ticker": "SLC",
+        "related_to": ["CVLG"], "rel_types": ["customer"],
+    })
+
+    report = run_diagnostics(engine)
+
+    assert "waiting to be accepted" in report
+    assert "SOME LISTED CUSTOMER" in report
