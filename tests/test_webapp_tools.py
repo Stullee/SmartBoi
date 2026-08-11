@@ -251,3 +251,74 @@ async def test_rebuild_graph_leaves_anchors_alone(engine):
         body = await (await client.post("/api/universe/rebuild-graph", json={})).json()
 
     assert "RTX" not in body["symbols"]
+
+
+# --- GET /api/status: the 10-second poll every open tab runs forever ---
+
+async def test_status_revalidates_instead_of_resending_an_unchanged_payload(engine):
+    """The page polls this every 10s for as long as it is open, and between
+    engine ticks the answer is usually byte-identical. Without a validator that
+    is tens of megabytes an hour, per tab, of a graph that changes when a filing
+    is read."""
+    async with _client(engine) as client:
+        first = await client.get("/api/status")
+        etag = first.headers["ETag"]
+        assert first.status == 200
+        assert first.headers["Cache-Control"] == "no-cache"
+
+        second = await client.get("/api/status", headers={"If-None-Match": etag})
+        assert second.status == 304
+        assert await second.read() == b""
+
+
+async def test_status_etag_changes_when_the_state_does(engine):
+    """The half that matters: a validator that never changes serves a stale
+    dashboard forever."""
+    from smartboi.graph import Relationship
+
+    async with _client(engine) as client:
+        etag = (await client.get("/api/status")).headers["ETag"]
+        engine.graph.add(Relationship("DCO", "RTX", "customer", "d", "s", 0.9, "2026-07-29"))
+        after = await client.get("/api/status", headers={"If-None-Match": etag})
+
+    assert after.status == 200
+    assert after.headers["ETag"] != etag
+
+
+async def test_status_ships_the_graph_the_page_actually_reads(engine):
+    """`by_symbol` fed the original relationship tables, which the redesign
+    replaced with the canvas. It was 37% of the payload and no reader was left.
+    nodes/edges -- what the Live Wire draws -- must still be there."""
+    async with _client(engine) as client:
+        body = await (await client.get("/api/status")).json()
+
+    assert "by_symbol" not in body["graph"]
+    assert "nodes" in body["graph"] and "edges" in body["graph"]
+    assert "edge_count" in body["graph"]
+
+
+async def test_status_reads_each_dossier_from_disk_once(engine):
+    """Four gatherers want dossiers and each used to load them independently --
+    a file read plus a JSON parse each, on the engine's own event loop, every
+    10 seconds, per open tab."""
+    from smartboi.dossier import Dossier
+
+    for symbol in ("DCO", "RTX"):
+        engine.dossiers.save(Dossier(symbol=symbol, direction="LONG", confidence=0.8, magnitude=0.7))
+
+    loads: list[str] = []
+    original = type(engine.dossiers).load
+
+    def counting_load(self, symbol):
+        loads.append(symbol)
+        return original(self, symbol)
+
+    type(engine.dossiers).load = counting_load
+    try:
+        async with _client(engine) as client:
+            assert (await client.get("/api/status")).status == 200
+    finally:
+        type(engine.dossiers).load = original
+
+    assert loads, "the payload should have read some dossiers"
+    assert len(loads) == len(set(loads)), f"a dossier was re-read from disk: {loads}"

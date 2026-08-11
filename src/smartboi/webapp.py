@@ -15,6 +15,8 @@ directly create a trade (see handle_accept_candidate's docstring)."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
@@ -189,6 +191,13 @@ _INDEX_HTML = """<!doctype html>
   .eyebrow::after { content:""; flex:1; height:1px; background:var(--line-soft); }
 
   .grid { display:grid; gap:14px; }
+  /* A grid item defaults to min-width:auto, i.e. it refuses to shrink below
+     its own min-content -- which is what pushed the whole PAGE into a
+     horizontal scroll on a phone even though every grid here collapses to
+     one column. The panels that hold wide content already wrap it in
+     .scroll, so they can shrink safely. */
+  .grid > * { min-width:0; }
+  .phead { flex-wrap:wrap; gap:4px 10px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); }
   .pad { padding:15px 17px; }
 
@@ -251,6 +260,11 @@ _INDEX_HTML = """<!doctype html>
   /* live wire */
   .wire { grid-template-columns:1fr 320px; align-items:stretch; }
   @media (max-width:860px){ .wire{ grid-template-columns:1fr; } }
+  /* Below this the canvas is ~348x195: 4.5px nodes and 3.8px labels, under a
+     legend that renders at full CSS size -- the caption is legible and the
+     thing it captions is not. The feed carries the panel instead; it holds
+     the same signals, in the same order, with the thesis text readable. */
+  @media (max-width:620px){ .wire .stagewrap{ display:none; } }
   .stagewrap { position:relative; overflow:hidden; }
   canvas#wireCanvas { display:block; width:100%; height:460px; }
   .tip { position:fixed; pointer-events:none; background:var(--ink); color:var(--ground); font-size:0.74rem;
@@ -263,20 +277,39 @@ _INDEX_HTML = """<!doctype html>
   .feed-h .t { font-size:12px; font-weight:600; }
   .feed-h .dotlive { width:7px; height:7px; border-radius:50%; background:var(--pos); animation:pulse 2s infinite; }
   .feed-h .c { margin-left:auto; font-size:10.5px; color:var(--faint); }
-  .feed-list { overflow-y:auto; padding:6px; max-height:404px; }
+  /* flex-basis:0 so this contributes NOTHING to the panel's natural height --
+     the canvas panel alone sets the row height and the list then fills whatever
+     the stretch gives it. A fixed 404px left ~74px of dead space under the last
+     row; sizing to content instead just moved that space to the other panel.
+     Once the grid has stacked there is no canvas to match, so it sizes to its
+     content, capped against the viewport. */
+  .feed-list { overflow-y:auto; padding:6px; flex:1 1 0; min-height:0; }
+  @media (max-width:860px){ .feed-list{ flex:0 1 auto; max-height:70vh; } }
   .ev { display:block; width:100%; text-align:left; font:inherit; cursor:pointer; border:1px solid transparent;
         background:transparent; color:var(--ink); border-radius:9px; padding:9px 10px; }
   .ev:hover { background:var(--panel-hi); }
   .ev.on { background:var(--panel-hi); border-color:var(--line); }
+  .ev-empty { padding:16px 12px; font-size:12px; color:var(--faint); }
+  .feed-h .dotlive.idle { background:var(--faint); animation:none; }
   .ev-top { display:flex; align-items:center; gap:7px; margin-bottom:3px; }
   .ev-sym { font-size:12px; font-weight:700; }
   .ev-time { font-size:10px; color:var(--faint); margin-left:auto; }
-  .ev-body { font-size:11.5px; color:var(--muted); line-height:1.35; max-height:2.7em; overflow:hidden; }
+  /* A real clamp: max-height + overflow:hidden cut the thesis mid-word with no
+     ellipsis, so a truncated summary read as a complete sentence that stopped. */
+  .ev-body { font-size:11.5px; color:var(--muted); line-height:1.35; overflow:hidden;
+             display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
 
   .phead { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--line-soft); }
   .phead h2 { font-size:13px; margin:0; font-weight:600; letter-spacing:-0.005em; }
   .phead .hint { font-size:11px; color:var(--muted); }
 
+  /* These two were inline styles, which no media query can override -- so the
+     page scrolled sideways at phone width (body 572px against a 390px
+     viewport) because a two-column grid could not shrink below the funnel's
+     min-content. */
+  .act { grid-template-columns:1.4fr 1fr; align-items:start; }
+  .ghgrid { grid-template-columns:1fr 1fr; align-items:start; }
+  @media (max-width:900px){ .act, .ghgrid { grid-template-columns:1fr; } }
   .work { grid-template-columns:1.3fr 1fr; align-items:start; }
   @media (max-width:900px){ .work{ grid-template-columns:1fr; } }
 
@@ -312,10 +345,18 @@ _INDEX_HTML = """<!doctype html>
   .stale { color:var(--warn); }
   .fresh { color:var(--faint); }
 
+  /* Emitted by renderGraphHealth (edge-type counts, audit kinds). Undefined
+     until now, so the swatches had no size and the rows did not lay out. */
+  .catleg { display:grid; gap:6px 12px; margin-top:9px; font-size:11.5px; color:var(--muted); }
+  .lc { display:inline-flex; align-items:center; gap:6px; }
+  .lc-dot { width:8px; height:8px; border-radius:50%; flex:none; }
   .gviz-leg { display:flex; flex-wrap:wrap; gap:8px 14px; padding:10px 15px; border-top:1px solid var(--line-soft); font-size:11px; color:var(--muted); }
   .gl { display:inline-flex; align-items:center; gap:5px; }
   .gl-l { width:15px; height:3px; border-radius:2px; }
   .gl-d { width:9px; height:9px; border-radius:50%; }
+  .gl-d.none { width:11px; height:11px; background:transparent; border:1.5px dashed var(--warn); }
+  .gl-d.small { width:7px; height:7px; }
+  .gl-d.hollow { background:transparent; border:1.5px solid var(--faint); }
 
   details.more { margin-top:14px; }
   details.more > summary { cursor:pointer; list-style:none; font-size:12px; color:var(--accent);
@@ -372,7 +413,7 @@ _INDEX_HTML = """<!doctype html>
   <div class="grid"><div class="panel pad" id="genrec"></div></div>
 
   <div class="eyebrow">Universe activation &amp; budget</div>
-  <div class="grid" style="grid-template-columns:1.4fr 1fr; align-items:start;" id="act">
+  <div class="grid act" id="act">
     <div class="panel pad"><div class="funnel" id="funnel"></div></div>
     <div class="panel pad" id="budget"></div>
   </div>
@@ -381,13 +422,13 @@ _INDEX_HTML = """<!doctype html>
   <div class="grid wire">
     <div class="panel stagewrap"><canvas id="wireCanvas"></canvas><div class="gviz-leg" id="wireLeg"></div></div>
     <div class="panel feed">
-      <div class="feed-h"><span class="dotlive"></span><span class="t">Live wire</span><span class="c" id="feedCount"></span></div>
+      <div class="feed-h"><span class="dotlive" id="feedDot"></span><span class="t">Live wire</span><span class="c" id="feedCount"></span></div>
       <div class="feed-list" id="feed"></div>
     </div>
   </div>
 
   <div class="eyebrow">Graph health &amp; maintenance</div>
-  <div class="grid" style="grid-template-columns:1fr 1fr; align-items:start;" id="ghGrid">
+  <div class="grid ghgrid" id="ghGrid">
     <div class="panel pad" id="ghStats"></div>
     <div class="panel pad" id="ghMaint"></div>
   </div>
@@ -861,14 +902,30 @@ function renderDetail(d){
 // updateWire(data). Signals flow as pulses from the signaled tradeable out to
 // its graph neighbours; the active ticker item lights its path.
 // ===========================================================================
-var WIRE = { nodes:[], edges:[], pos:{}, byId:{}, active:0, t0:0, laid:false, sigKey:"" };
+var WIRE = { nodes:[], edges:[], pos:{}, feed:[], activeKey:"", t0:0, layoutKey:"", dirty:true };
+
+// The stylesheet has always honoured prefers-reduced-motion for the two CSS
+// pulse dots; the animation that actually moves -- travelling pulses, a beating
+// selection ring, a full canvas repaint 60 times a second -- never consulted it.
+// Under the preference the wire now holds still: no auto-advancing ticker (an
+// auto-rotating list is the exact pattern the preference exists to stop),
+// no travelling dots, and a selection ring at a fixed phase. Clicking a feed
+// row still moves the selection, so nothing becomes unreachable.
+var RMQ = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+var REDUCED = !!(RMQ && RMQ.matches);
+if (RMQ && RMQ.addEventListener) RMQ.addEventListener("change", function(e){ REDUCED = e.matches; WIRE.dirty = true; });
 var cv, ctx, dpr=Math.max(1,Math.min(2,window.devicePixelRatio||1)), cw=700, ch=460, scale=1, VW=1000, VH=560;
 
 var TCK = {};
 function tok(name){ return TCK[name] !== undefined ? TCK[name] : getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
-function refreshTokens(){ ["--gc-cust","--gc-supp","--gc-comp","--gc-reg","--gc-eco","--gn-anchor","--pos","--neg","--faint","--gn-stroke","--gn-txt"]
+function refreshTokens(){ ["--gc-cust","--gc-supp","--gc-comp","--gc-reg","--gc-eco","--gn-anchor","--pos","--neg","--faint","--gn-stroke","--gn-txt","--warn","--muted"]
   .forEach(function(k){ TCK[k]=getComputedStyle(document.documentElement).getPropertyValue(k).trim(); }); }
-function gvColorTok(type){ return {customer:"--gc-cust",supplier:"--gc-supp",competitor:"--gc-comp",regulator:"--gc-reg"}[type]||"--gc-eco"; }
+// The four REL_TYPES and their channel colours. Anything else cannot reach the
+// canvas today -- RelationshipGraph drops an unknown rel_type on load -- but it
+// is drawn dashed in the fallback colour below rather than silently borrowing a
+// real channel's, so a new relationship type shows up as obviously unkeyed.
+var GC={customer:"--gc-cust",supplier:"--gc-supp",competitor:"--gc-comp",regulator:"--gc-reg"};
+function gvColorTok(type){ return GC[type]||"--gc-eco"; }
 function gvR(n){ if(n.kind==="anchor") return 13; if(n.score!=null) return 6+n.score*10; return 6; }
 function gvFill(n){ if(n.kind==="anchor") return "--gn-anchor"; if(n.dir==="LONG") return "--pos"; if(n.dir==="SHORT") return "--neg"; return "--faint"; }
 
@@ -889,55 +946,186 @@ function layoutWire(){
   for(var pass=0;pass<9;pass++) for(i=0;i<nodes.length;i++) for(j=i+1;j<nodes.length;j++){ var qa=pos[nodes[i].id],qb=pos[nodes[j].id];
     var ex=qb.x-qa.x,ey=qb.y-qa.y,ed=Math.sqrt(ex*ex+ey*ey)+0.01,need=gvR(nodes[i])+gvR(nodes[j])+13;
     if(ed<need){ var pu=(need-ed)/2,nx=ex/ed,ny=ey/ed; qa.x-=nx*pu;qa.y-=ny*pu;qb.x+=nx*pu;qb.y+=ny*pu; } }
-  WIRE.pos=pos; WIRE.laid=true;
+  WIRE.pos=pos;
 }
 
-function activeSig(){ var s=data.recent_signals||[]; return s.length?s[WIRE.active%s.length]:null; }
+// ---- the feed's derived list ----------------------------------------------
+// ONE ordered, de-duplicated list drives the ticker, the feed highlight and the
+// canvas -- not three separate readings of the raw log window.
+//
+// Two things are wrong with rendering data.recent_signals directly. It arrives
+// OLDEST FIRST: gather_recent_signals returns the tail of an append-only log
+// verbatim, so the panel with the pulsing "live" dot opened on the oldest signal
+// it held, with the newest below the fold of the scroll list (the Recent signals
+// table below reverses for exactly this reason; this panel did not). And signal
+// evaluation is deliberately status-blind (see signals.py's module docstring):
+// one signal EPISODE re-logs a row on every newly accepted piece of corroborating
+// evidence, so the raw window can be the same name five times over and the ticker
+// would dwell on it five times. Rows carry an `episode` key precisely so that can
+// be collapsed -- event_study.collapse_episodes already does it for the analysis.
+function sigKeyOf(s){ return s?(s.symbol+"|"+(s.episode||s.generated_at||"")):""; }
+function feedRows(sigs){
+  var byKey={}, keys=[];
+  (sigs||[]).forEach(function(s){
+    if(!s||!s.symbol) return;
+    var k=sigKeyOf(s);
+    if(!byKey[k]){ byKey[k]=s; keys.push(k); }
+    else if((s.generated_at||"")>=(byKey[k].generated_at||"")) byKey[k]=s;  // the latest re-log wins
+  });
+  return keys.map(function(k){ return byKey[k]; })
+    .sort(function(a,b){ var x=a.generated_at||"", y=b.generated_at||""; return x<y?1:(x>y?-1:0); });
+}
+// Position is not identity. The window slides as new signals fire, so the index
+// that meant INTT on one refresh means ASYS on the next -- the operator's
+// selection silently moved to a different company under them every time the
+// engine logged a signal. Selection is held as symbol+episode and resolved back
+// to a position on each rebuild; -1 means "the selected episode is gone".
+function activeIndex(){
+  for(var i=0;i<WIRE.feed.length;i++) if(sigKeyOf(WIRE.feed[i])===WIRE.activeKey) return i;
+  return -1;
+}
+function activeSig(){ var i=activeIndex(); return i<0?(WIRE.feed[0]||null):WIRE.feed[i]; }
 function sigEdges(sym){ return WIRE.edges.filter(function(e){ return e[0]===sym||e[1]===sym; }); }
+// Whether anything on the canvas is actually in motion this frame. Only the
+// pulses and the selection ring ever move, and both need a selected node with
+// at least one edge to travel along -- so a wire showing an unconnected signal,
+// or no signal at all, has nothing to redraw and is left alone until something
+// marks it dirty. This is the difference between a dashboard left open on a
+// wall repainting 60 times a second forever and repainting when there is news.
+function wireAnimating(){
+  if(REDUCED) return false;
+  var sig=activeSig();
+  return !!(sig && WIRE.pos[sig.symbol] && sigEdges(sig.symbol).length);
+}
 
 function drawWire(now){
   if(!ctx) return;
   ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,cw,ch);
+  // A deployment with no graph yet (a custom SYMBOLS universe whose filings have
+  // not been read, or a first run) has nothing to draw. Two empty rectangles
+  // under a pulsing "live" dot read as a broken page -- every table on this
+  // dashboard carries an empty-state line and this panel carried none.
+  if(!WIRE.nodes.length){
+    var es=Math.max(scale,0.6);
+    ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillStyle=tok("--muted"); ctx.font="600 "+(13*es)+"px -apple-system,sans-serif";
+    ctx.fillText("No relationships extracted yet", cw/2, ch/2-9*es);
+    ctx.fillStyle=tok("--faint"); ctx.font=(11.5*es)+"px -apple-system,sans-serif";
+    ctx.fillText("Edges appear as the engine reads each symbol's latest filings.", cw/2, ch/2+10*es);
+    return;
+  }
   var s=scale, sig=activeSig(), hotSym=sig?sig.symbol:null, hot={};
   if(hotSym) sigEdges(hotSym).forEach(function(e){ hot[e[0]+">"+e[1]]=1; });
   // edges
   WIRE.edges.forEach(function(e){ var pa=WIRE.pos[e[0]],pb=WIRE.pos[e[1]]; if(!pa||!pb) return;
     var isHot=hot[e[0]+">"+e[1]], col=tok(gvColorTok(e[2]));
-    ctx.globalAlpha=isHot?0.95:0.22; ctx.strokeStyle=col; ctx.lineWidth=Math.max(0.6,(0.6+e[3]*2.2))*s*(isHot?1.3:1);
-    if(e[2]==="ecosystem") ctx.setLineDash([3.2*s,4.5*s]); else ctx.setLineDash([]);
+    ctx.globalAlpha=isHot?0.95:0.34; ctx.strokeStyle=col; ctx.lineWidth=Math.max(0.6,(0.6+e[3]*2.2))*s*(isHot?1.3:1);
+    if(!GC[e[2]]) ctx.setLineDash([3.2*s,4.5*s]); else ctx.setLineDash([]);
     ctx.beginPath(); ctx.moveTo(pa.x*s,pa.y*s); ctx.lineTo(pb.x*s,pb.y*s); ctx.stroke();
   });
   ctx.setLineDash([]); ctx.globalAlpha=1;
   // pulses along hot edges
-  if(hotSym){ var pn=WIRE.pos[hotSym]; sigEdges(hotSym).forEach(function(e){ var other=e[0]===hotSym?e[1]:e[0], po=WIRE.pos[other]; if(!pn||!po) return;
+  // Pulses travel INWARD -- from the counterparty to the signalled name. This
+  // band is titled "News -> supply chain" and that is the direction the
+  // mechanism runs: an anchor's news propagates across an edge into a thinly
+  // covered tradeable, accumulates as evidence, and eventually crosses the
+  // conviction bar. Running the dots outward drew the opposite claim -- a
+  // small-cap broadcasting at the giants that actually fed it.
+  if(hotSym && !REDUCED){ var pn=WIRE.pos[hotSym]; sigEdges(hotSym).forEach(function(e){ var other=e[0]===hotSym?e[1]:e[0], po=WIRE.pos[other]; if(!pn||!po) return;
     var col=tok(gvColorTok(e[2]));
-    for(var k=0;k<3;k++){ var t=((now/1200)+k/3)%1, px=(pn.x+(po.x-pn.x)*t)*s, py=(pn.y+(po.y-pn.y)*t)*s, al=Math.sin(t*Math.PI);
+    for(var k=0;k<3;k++){ var t=((now/1200)+k/3)%1, px=(po.x+(pn.x-po.x)*t)*s, py=(po.y+(pn.y-po.y)*t)*s, al=Math.sin(t*Math.PI);
       ctx.globalAlpha=al; ctx.fillStyle=col; ctx.shadowColor=col; ctx.shadowBlur=8*s; ctx.beginPath(); ctx.arc(px,py,3*s,0,7); ctx.fill(); }
   }); ctx.shadowBlur=0; ctx.globalAlpha=1; }
   // nodes
   WIRE.nodes.forEach(function(n){ var p=WIRE.pos[n.id]; if(!p) return; var x=p.x*s,y=p.y*s,r=gvR(n)*s;
     var isHot=(n.id===hotSym);
-    if(isHot){ var beat=0.5+0.5*Math.sin(now/260); ctx.globalAlpha=0.9; ctx.strokeStyle=tok(gvFill(n)); ctx.lineWidth=2;
-      ctx.beginPath(); ctx.arc(x,y,r+(4+beat*5)*s,0,7); ctx.stroke(); ctx.globalAlpha=1; ctx.shadowColor=tok(gvFill(n)); ctx.shadowBlur=(8+beat*10)*s; }
-    ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fillStyle=tok(gvFill(n)); ctx.globalAlpha=n.kind==="anchor"?0.92:1; ctx.fill(); ctx.globalAlpha=1;
-    ctx.shadowBlur=0; ctx.lineWidth=1.5*s; ctx.strokeStyle=tok("--gn-stroke"); ctx.stroke();
+    // The selection ring clears the unlinked marker below rather than beating
+    // through it -- two rings at the same radius read as one smeared ring.
+    if(isHot){ var beat=REDUCED?0.5:(0.5+0.5*Math.sin(now/260)), gap=(n.kind==="unlinked"?9.5:4);
+      ctx.globalAlpha=0.9; ctx.strokeStyle=tok(gvFill(n)); ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(x,y,r+(gap+beat*5)*s,0,7); ctx.stroke(); ctx.globalAlpha=1; ctx.shadowColor=tok(gvFill(n)); ctx.shadowBlur=(8+beat*10)*s; }
+    // An `external` node is a graph endpoint that is not a universe member at
+    // all -- today that is exclusively the regulator pseudo-symbols. Drawn
+    // hollow so it cannot be mistaken for a thesis-less tradeable, which shares
+    // its size and its grey.
+    var isExt=(n.kind==="external");
+    ctx.beginPath(); ctx.arc(x,y,r,0,7);
+    ctx.fillStyle=isExt?tok("--gn-stroke"):tok(gvFill(n)); ctx.globalAlpha=n.kind==="anchor"?0.92:1; ctx.fill(); ctx.globalAlpha=1;
+    ctx.shadowBlur=0; ctx.lineWidth=1.5*s; ctx.strokeStyle=isExt?tok("--faint"):tok("--gn-stroke"); ctx.stroke();
+    // A signal with no disclosed path is MARKED, not merely drawn alone -- an
+    // isolated dot reads as a layout accident, a dashed warning ring reads as the
+    // statement it is: this thesis came from the company's own filings and no
+    // relationship carried it.
+    if(n.kind==="unlinked"){ ctx.save(); ctx.setLineDash([3*s,3*s]); ctx.lineWidth=1.5*s;
+      ctx.strokeStyle=tok("--warn"); ctx.beginPath(); ctx.arc(x,y,r+4.5*s,0,7); ctx.stroke(); ctx.restore(); }
+    // Every label sits ABOVE its node, anchors included. Printing the anchor's
+    // name inside the disc put --gn-txt (a token tuned for the panel ground) on
+    // --gn-anchor grey: 2.6:1 in dark and 3.1:1 in light, against the 4.5:1 that
+    // 11px bold text needs to be legible. Above the disc the same text reads
+    // 15:1 and up, and it no longer paints over the edges passing behind it.
     ctx.fillStyle=tok("--gn-txt"); ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.font="700 "+(11*s)+"px -apple-system,sans-serif";
-    ctx.fillText(n.id, x, n.kind==="anchor"?y:y-r-6*s);
+    ctx.fillText(n.id, x, y-r-6*s);
     if(n.kind!=="anchor"&&n.score!=null&&r>9*s){ ctx.fillStyle=tok("--gn-stroke"); ctx.font="700 "+(8*s)+"px ui-monospace,monospace"; ctx.fillText(n.score.toFixed(2),x,y); }
   });
+  // ...and say it in words when that is the name currently being shown, so a
+  // canvas with nothing moving on it is explained rather than just empty.
+  if(hotSym){
+    var hn=null; WIRE.nodes.forEach(function(n){ if(n.id===hotSym) hn=n; });
+    var hp=WIRE.pos[hotSym];
+    if(hn&&hp&&hn.kind==="unlinked"){
+      ctx.fillStyle=tok("--warn"); ctx.textAlign="center"; ctx.textBaseline="top";
+      ctx.font="600 "+(10*s)+"px -apple-system,sans-serif";
+      ctx.fillText("no disclosed path \\u2014 own filings only", hp.x*s, hp.y*s+(gvR(hn)+9)*s);
+    }
+  }
 }
 
-function resizeWire(){ if(!cv) return; cw=cv.parentNode.clientWidth; ch=Math.round(cw*VH/VW); if(ch>520){ch=520;} scale=cw/VW;
-  cv.width=Math.round(cw*dpr); cv.height=Math.round(ch*dpr); cv.style.height=ch+"px"; }
+// Setting canvas.width/height CLEARS the canvas, so a resize must always be
+// followed by a repaint -- with the idle skip in frame() a still wire would
+// otherwise stay blank until the next signal.
+function resizeWire(){ if(!cv) return;
+  // devicePixelRatio is re-read rather than sampled once at load: a window
+  // dragged to a different-density display keeps its old backing store and
+  // renders soft until something else forces a resize.
+  var d=Math.max(1,Math.min(2,window.devicePixelRatio||1));
+  var w=cv.parentNode.clientWidth, h=Math.round(w*VH/VW); if(h>520){h=520;}
+  // Idempotent, because the observer below can be triggered by this function's
+  // own effect on the panel's height -- and re-assigning canvas.width clears
+  // the bitmap, so a non-guarded version would repaint in a loop.
+  if(w===cw && h===ch && d===dpr) return;
+  dpr=d; cw=w; ch=h; scale=cw/VW;
+  cv.width=Math.round(cw*dpr); cv.height=Math.round(ch*dpr); cv.style.height=ch+"px"; WIRE.dirty=true; }
 
-function renderFeed(){
-  var s=data.recent_signals||[]; el("feedCount").textContent=s.length+" signals";
+function renderFeed(scrollToActive){
+  var s=WIRE.feed; el("feedCount").textContent=s.length+(s.length===1?" signal":" signals");
+  var act=activeIndex(); if(act<0) act=0;
+  // The dot claims the panel is live; with nothing in the window it should not.
+  el("feedDot").className="dotlive"+(s.length?"":" idle");
+  if(!s.length){ el("feed").innerHTML='<div class="ev-empty">No signals yet &mdash; nothing has crossed the conviction bar.</div>'; return; }
   el("feed").innerHTML=s.map(function(x,i){
-    return '<button class="ev'+(i===WIRE.active?" on":"")+'" data-i="'+i+'"><div class="ev-top"><span class="ev-sym mono">'+esc(x.symbol)+
+    return '<button class="ev'+(i===act?" on":"")+'" data-i="'+i+'"><div class="ev-top"><span class="ev-sym mono">'+esc(x.symbol)+
       '</span><span class="dir '+CO[x.direction]+'">'+x.direction+'</span><span class="ev-time">'+esc((x.generated_at||"").slice(5,16).replace("T"," "))+
       '</span></div><div class="ev-body">'+esc(x.thesis_summary)+"</div></button>";
   }).join("");
-  Array.prototype.forEach.call(el("feed").querySelectorAll(".ev"),function(b){ b.addEventListener("click",function(){ WIRE.active=+b.dataset.i; WIRE.t0=performance.now(); renderFeed(); }); });
+  Array.prototype.forEach.call(el("feed").querySelectorAll(".ev"),function(b){ b.addEventListener("click",function(){
+    WIRE.activeKey=sigKeyOf(WIRE.feed[+b.dataset.i]); WIRE.t0=performance.now(); WIRE.dirty=true; renderFeed(true); }); });
+  // The list holds ~4 rows and the ticker walks all 25, so from the fifth item
+  // on the canvas was pulsing a name whose feed row was below the fold. Done on
+  // every selection CHANGE but never on a plain re-render: a refresh landing
+  // while the operator is scrolled back through older signals must not snap the
+  // list out from under them.
+  //
+  // Scrolls the CONTAINER, not scrollIntoView: block:"nearest" walks every
+  // scrollable ancestor, so an operator reading the trade tables further down
+  // the page would be yanked back up here every 4.8 seconds.
+  if(scrollToActive){
+    var on=el("feed").querySelector(".ev.on"), box=el("feed");
+    if(on){
+      var r1=on.getBoundingClientRect(), r0=box.getBoundingClientRect();
+      if(r1.top<r0.top) box.scrollTop+=r1.top-r0.top;
+      else if(r1.bottom>r0.bottom) box.scrollTop+=r1.bottom-r0.bottom;
+    }
+  }
 }
 
 // The full graph is the whole universe (~200 names, hundreds of edges) -- a
@@ -947,7 +1135,7 @@ function renderFeed(){
 function focusGraph(g){
   var nodes=g.nodes||[], edges=g.edges||[], keep={};
   nodes.forEach(function(n){ if(n.kind==="tradeable" && (n.dir || n.score!=null)) keep[n.id]="t"; });
-  (data.recent_signals||[]).forEach(function(s){ keep[s.symbol]="t"; });
+  WIRE.feed.forEach(function(s){ keep[s.symbol]="t"; });
   edges.forEach(function(e){ if(keep[e[0]]==="t" && !keep[e[1]]) keep[e[1]]="a"; if(keep[e[1]]==="t" && !keep[e[0]]) keep[e[0]]="a"; });
   var fnodes=nodes.filter(function(n){ return keep[n.id]; });
   if(fnodes.length<6){
@@ -962,21 +1150,85 @@ function focusGraph(g){
     fnodes=fnodes.slice(0,52);
   }
   var ids={}; fnodes.forEach(function(n){ ids[n.id]=1; });
-  return { nodes:fnodes, edges:edges.filter(function(e){ return ids[e[0]]&&ids[e[1]]; }), total:nodes.length };
+  // A signalled tradeable with NO graph edge has no node in the payload at all:
+  // status.gather_graph_stats builds its node list purely from edge endpoints, so
+  // a name that reaches nothing is simply absent, and filtering `nodes` above can
+  // only ever drop it. Synthesizing it here is not cosmetic. That is exactly the
+  // population gather_graph_health counts as `disconnected_with_thesis` and warns
+  // about two bands down ("their dossier came only from their own filings, so the
+  // cross-company mechanism never fired for them") -- the case an operator most
+  // needs to see, because it is the one where this system's whole premise did not
+  // hold. Without a node the wire went silent precisely when the ticker reached
+  // one: no dot, no pulse, and -- having no hot edges either -- a frozen canvas
+  // with nothing to explain it.
+  //
+  // Appended AFTER the trim above on purpose: a name that actually fired must
+  // never be dropped for being poorly connected, which is the one property that
+  // guarantees it loses a degree-ranked cut. Built from the signal row itself,
+  // which already carries the direction and both factors of the score.
+  var unlinked=0;
+  WIRE.feed.forEach(function(s){
+    if(!s.symbol || ids[s.symbol]) return;
+    ids[s.symbol]=1; unlinked++;
+    fnodes.push({ id:s.symbol, kind:"unlinked", dir:s.direction, name:"", sector:"",
+      score:(s.confidence!=null&&s.magnitude!=null)?Math.round(s.confidence*s.magnitude*1000)/1000:null });
+  });
+  return { nodes:fnodes, edges:edges.filter(function(e){ return ids[e[0]]&&ids[e[1]]; }),
+           total:nodes.length+unlinked, unlinked:unlinked };
 }
 
 function updateWire(d){
+  // Built BEFORE focusGraph: the focus set includes every signalled symbol, so
+  // the ticker, the highlight and the canvas must all read the same list.
+  WIRE.feed=feedRows(d.recent_signals);
+  // Only when the selected episode has fallen out of the window entirely does
+  // the selection move -- and then to the newest, not to whatever now occupies
+  // the old index.
+  if(activeIndex()<0) WIRE.activeKey=sigKeyOf(WIRE.feed[0]);
   var f=focusGraph(d.graph||{});
   var key=JSON.stringify(f.nodes.map(function(n){return n.id;}));
   WIRE.nodes=f.nodes; WIRE.edges=f.edges;
-  if(key!==WIRE.sigKey){ WIRE.sigKey=key; layoutWire(); }
-  el("wireLeg").innerHTML='<span class="gl"><i class="gl-l" style="background:var(--gc-cust)"></i>customer</span>'+
-    '<span class="gl"><i class="gl-l" style="background:var(--gc-comp)"></i>competitor</span>'+
-    '<span class="gl"><i class="gl-l" style="background:var(--gc-eco)"></i>ecosystem</span>'+
-    '<span class="gl"><i class="gl-d" style="background:var(--gn-anchor)"></i>anchor</span>'+
-    '<span class="gl"><i class="gl-d" style="background:var(--pos)"></i>long</span>'+
-    '<span class="gl"><i class="gl-d" style="background:var(--neg)"></i>short</span>'+
-    '<span class="gl" style="margin-left:auto;color:var(--faint)">'+f.nodes.length+' of '+f.total+' names &middot; thesis + the anchors feeding them</span>';
+  if(key!==WIRE.layoutKey){ WIRE.layoutKey=key; layoutWire(); }
+  // The legend keys exactly what is on screen -- nothing more, nothing less.
+  //
+  // It used to be a fixed list that named "ecosystem", which is not a
+  // relationship type at all (it is an evidence class elsewhere in the system,
+  // and RelationshipGraph drops any rel_type outside REL_TYPES on load), while
+  // supplier and regulator edges -- drawn constantly -- had no key. It also gave
+  // one word, "anchor", to three visually distinct node classes. A legend that
+  // describes a channel which cannot occur, and omits two that do, is worse than
+  // no legend: the panel's whole claim is that the mechanism can be read off it.
+  //
+  // Derived rather than hard-coded so it cannot drift again, and so an empty
+  // canvas is not captioned with six keys for things it is not drawing.
+  WIRE.dirty=true;
+  var have={};
+  f.edges.forEach(function(e){ have[GC[e[2]]?e[2]:"other"]=1; });
+  f.nodes.forEach(function(n){
+    if(n.kind==="anchor"){ have.anchor=1; return; }
+    if(n.kind==="external"){ have.external=1; return; }
+    if(n.kind==="unlinked") have.unlinked=1;
+    if(n.dir==="LONG") have.long=1; else if(n.dir==="SHORT") have.short=1; else have.none=1;
+  });
+  var KEYS=[
+    ["customer",  '<i class="gl-l" style="background:var(--gc-cust)"></i>customer'],
+    ["supplier",  '<i class="gl-l" style="background:var(--gc-supp)"></i>supplier'],
+    ["competitor",'<i class="gl-l" style="background:var(--gc-comp)"></i>competitor'],
+    ["regulator", '<i class="gl-l" style="background:var(--gc-reg)"></i>regulator'],
+    ["other",     '<i class="gl-l" style="background:var(--gc-eco)"></i>other'],
+    ["anchor",    '<i class="gl-d" style="background:var(--gn-anchor)"></i>anchor'],
+    ["long",      '<i class="gl-d" style="background:var(--pos)"></i>long'],
+    ["short",     '<i class="gl-d" style="background:var(--neg)"></i>short'],
+    ["none",      '<i class="gl-d small" style="background:var(--faint)"></i>no thesis yet'],
+    ["external",  '<i class="gl-d hollow"></i>off-universe'],
+    ["unlinked",  '<i class="gl-d none"></i>no disclosed path']
+  ];
+  el("wireLeg").innerHTML=KEYS.filter(function(k){ return have[k[0]]; })
+      .map(function(k){ return '<span class="gl">'+k[1]+"</span>"; }).join("")+
+    '<span class="gl" style="margin-left:auto;color:var(--faint)">'+
+      f.nodes.length+' of '+f.total+' names &middot; thesis + the anchors feeding them</span>';
+  // ...and no empty bordered strip under an empty canvas.
+  el("wireLeg").style.display=f.nodes.length?"":"none";
   renderFeed();
 }
 
@@ -988,9 +1240,14 @@ function updateWire(d){
     if(ev.clientX<rect.left||ev.clientX>rect.right||ev.clientY<rect.top||ev.clientY>rect.bottom){ tip.style.opacity="0"; return; }
     var n=nodeAt(ev.clientX-rect.left,ev.clientY-rect.top);
     if(!n){ tip.style.opacity="0"; cv.style.cursor="default"; return; } cv.style.cursor="pointer";
-    var thesis=n.kind==="anchor"?"anchor &middot; news source":(n.score!=null?((n.dir==="LONG"?"long":n.dir==="SHORT"?"short":"no")+" thesis, score "+n.score.toFixed(2)):"no thesis yet");
+    function dirWord(x){ return x.dir==="LONG"?"long":(x.dir==="SHORT"?"short":"no"); }
+    var thesis = n.kind==="anchor" ? "anchor &middot; news source"
+      : n.kind==="external" ? "off-universe &middot; a graph endpoint that is neither a trade target nor an anchor"
+      : n.kind==="unlinked" ? (dirWord(n)+" thesis, score "+(n.score!=null?n.score.toFixed(2):"&ndash;")+
+          " &mdash; signalled with NO disclosed relationship path; this one came from its own filings")
+      : (n.score!=null?(dirWord(n)+" thesis, score "+n.score.toFixed(2)):"no thesis yet");
     var name=n.name||"", info=DESC[n.id]||n.sector||"";
-    tip.innerHTML='<div class="h">'+n.id+(name?' &middot; '+esc(name):"")+"</div>"+(info?'<div class="d">'+esc(info)+"</div>":"")+'<div class="d">'+thesis+"</div>";
+    tip.innerHTML='<div class="h">'+esc(n.id)+(name?' &middot; '+esc(name):"")+"</div>"+(info?'<div class="d">'+esc(info)+"</div>":"")+'<div class="d">'+thesis+"</div>";
     tip.style.opacity="1"; tip.style.left=(ev.clientX+14)+"px"; tip.style.top=(ev.clientY+12)+"px";
   });
 })();
@@ -1006,20 +1263,31 @@ function renderAll(d){
 }
 
 function frame(now){
-  var s=data.recent_signals||[];
-  if(s.length && now-WIRE.t0>4800){ WIRE.active=(WIRE.active+1)%s.length; WIRE.t0=now; renderFeed(); }
-  drawWire(now); requestAnimationFrame(frame);
+  var s=WIRE.feed;
+  if(!REDUCED && s.length && now-WIRE.t0>4800){
+    var i=activeIndex();
+    WIRE.activeKey=sigKeyOf(s[(i<0?0:i+1)%s.length]); WIRE.t0=now; WIRE.dirty=true; renderFeed(true);
+  }
+  // The rAF chain keeps ticking (an empty callback costs nothing, and a loop
+  // that stops has to be restarted correctly from six places -- a missed one
+  // leaves a permanently frozen canvas); it is the REPAINT that is skipped.
+  if(WIRE.dirty || wireAnimating()){ drawWire(now); WIRE.dirty=false; }
+  requestAnimationFrame(frame);
 }
 
 // theme toggle (2-state, seeded from OS)
 (function(){ var root=document.documentElement, btn=el("tgl");
   var dark=!!(window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches);
-  function apply(){ root.setAttribute("data-theme",dark?"dark":"light"); btn.textContent=dark?"☾ Dark":"☀ Light"; refreshTokens(); }
+  function apply(){ root.setAttribute("data-theme",dark?"dark":"light"); btn.textContent=dark?"☾ Dark":"☀ Light"; refreshTokens(); WIRE.dirty=true; }
   btn.addEventListener("click",function(){ dark=!dark; apply(); }); apply();
 })();
 
 cv=el("wireCanvas"); ctx=cv.getContext("2d");
 window.addEventListener("resize",function(){ resizeWire(); });
+// A window resize is not the only thing that changes this panel's width: the
+// legend wrapping to a second line, the grid stacking at a breakpoint, or the
+// "Full detail" section opening all resize it with the window untouched.
+if(window.ResizeObserver){ new ResizeObserver(function(){ resizeWire(); }).observe(cv.parentNode); }
 refreshTokens(); resizeWire(); WIRE.t0=(window.performance&&performance.now)?performance.now():0; requestAnimationFrame(frame);
 refresh(); setInterval(refresh, 10000);
 </script>
@@ -1029,9 +1297,41 @@ refresh(); setInterval(refresh, 10000);
 """
 
 
+class _CachedDossiers:
+    """One disk read per dossier per payload, instead of two or three.
+
+    Four gatherers below want dossiers, and each was calling `store.load()`
+    independently -- gather_dossiers over every symbol, gather_graph_stats over
+    every symbol that appears in the graph, gather_graph_health over the
+    disconnected ones. Each call is a file read plus a JSON parse, and every one
+    of them happens on the ENGINE'S OWN EVENT LOOP (see handle_status), every
+    10 seconds, per open browser tab. Measured on a small install: 38 loads for
+    19 dossiers on disk.
+
+    Deliberately a wrapper rather than a change to DossierStore: the cache must
+    live exactly as long as one payload. The store itself is shared with the
+    engine, which mutates dossiers between awaits -- caching there would hand
+    the polling loop a stale thesis, which is a correctness bug rather than a
+    slow dashboard. Read-only by construction: nothing here writes.
+    """
+
+    def __init__(self, store):
+        self._store = store
+        self._cache: dict = {}
+
+    def all_symbols(self) -> list[str]:
+        return self._store.all_symbols()
+
+    def load(self, symbol: str):
+        if symbol not in self._cache:
+            self._cache[symbol] = self._store.load(symbol)
+        return self._cache[symbol]
+
+
 async def _status_payload(engine) -> dict:
     settings = engine.settings
     log_dir = Path(settings.log_dir)
+    dossiers = _CachedDossiers(engine.dossiers)
     paper_stats, closed_trades = gather_paper_trade_stats(
         log_dir / "paper_trades.jsonl",
         settings.initial_trading_capital, settings.trading_currency,
@@ -1048,6 +1348,16 @@ async def _status_payload(engine) -> dict:
         row["unrealized_currency"] = t.unrealized_currency()
         open_trades.append(row)
 
+    graph = gather_graph_stats(engine.graph, engine.universe, dossiers)
+    # `by_symbol` is the per-filer grouping the ORIGINAL relationship tables
+    # rendered. The redesign replaced those tables with the Live Wire canvas,
+    # which reads only nodes/edges, and nothing on the page has touched the
+    # field since -- but it is the single largest thing in the payload: 24.7 KB
+    # of 66 KB, 37% of every 10-second refresh, serialized for no reader.
+    # gather_graph_stats still returns it (it is part of that function's
+    # contract and its tests); it just is not shipped to the browser.
+    graph.pop("by_symbol", None)
+
     return {
         "version": os.environ.get("SMARTBOI_VERSION", ""),
         "capabilities": {
@@ -1057,11 +1367,11 @@ async def _status_payload(engine) -> dict:
             "ib": engine.price_feed is not None,
         },
         "universe_size": len(engine.symbol_list),
-        "coverage": gather_coverage(engine.universe, engine.graph, engine.dossiers),
-        "dossiers": gather_dossiers(engine.dossiers),
-        "graph": gather_graph_stats(engine.graph, engine.universe, engine.dossiers),
+        "coverage": gather_coverage(engine.universe, engine.graph, dossiers),
+        "dossiers": gather_dossiers(dossiers),
+        "graph": graph,
         "graph_health": gather_graph_health(
-            engine.graph, engine.universe, engine.dossiers,
+            engine.graph, engine.universe, dossiers,
             backfill_state=engine.backfill_state.data,
             last_refresh=engine.periodic_state.get("graph_refresh", "") or "",
             last_research=engine.periodic_state.get("supplier_research", "") or "",
@@ -1097,7 +1407,23 @@ def create_app(engine) -> web.Application:
             log.exception("Dashboard status query failed")
             return web.json_response({"error": str(exc)}, status=500)
         log.debug("Dashboard: /api/status responded in %.2fs", time.monotonic() - start)
-        return web.json_response(data)
+        # The page polls this every 10 seconds forever, and between engine ticks
+        # the answer is usually byte-identical -- the payload carries no clock of
+        # its own, so an unchanged system really does serialize to the same
+        # bytes. An ETag turns those repeats into a 304 with no body: the
+        # browser serves fetch() the cached copy, so the JS needs no change at
+        # all, and a dashboard left open all day stops re-sending an unchanged
+        # graph over the LAN.
+        #
+        # Cache-Control: no-cache is the point -- it means "store it, but always
+        # revalidate", which is exactly this endpoint. Without it the browser
+        # would be free to serve a stale payload from cache without asking.
+        body = json.dumps(data).encode()
+        etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+        headers = {"ETag": etag, "Cache-Control": "no-cache"}
+        if request.headers.get("If-None-Match") == etag:
+            return web.Response(status=304, headers=headers)
+        return web.Response(body=body, content_type="application/json", headers=headers)
 
     async def handle_accept_candidate(request: web.Request) -> web.Response:
         """The dashboard's one-click Accept: adds a discovered universe
