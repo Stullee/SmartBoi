@@ -218,7 +218,8 @@ class RelationshipExtractor:
         if not filing_text.strip():
             return []
         if not self._usage.budget_remaining(CAT_EXTRACTION):
-            log.info("%s: daily LLM call budget reached -- deferring relationship extraction.", filing_symbol)
+            log.info("%s: %s -- deferring relationship extraction.",
+                     filing_symbol, self._usage.deferral_reason(CAT_EXTRACTION))
             return None
         prompt = (
             f"Filing company: {filing_symbol} ({filing_form})\n"
@@ -263,8 +264,11 @@ class RelationshipExtractor:
         if not isinstance(relationships, list):
             log.warning(
                 "%s: relationship extraction returned %s for 'relationships', not a list -- "
-                "discarding this response. The call is paid for either way; the filing is "
-                "retried on the next poll.",
+                "discarding this response. Treated as 'no relationships found', NOT as a "
+                "transient failure: returning None here would mark the filing due again and "
+                "re-pay for a 150k-char extraction on every poll, which is the loop the "
+                "per-element guard downstream was written to escape. This filing yields no "
+                "edges until it is re-extracted by the rolling graph refresh.",
                 filing_symbol, type(relationships).__name__,
             )
             return []

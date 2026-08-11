@@ -883,3 +883,42 @@ def test_the_source_count_gate_is_left_alone():
     recompute_decay(capped, NOW)
 
     assert capped.independent_source_count == 8
+
+
+def test_the_fact_cap_never_hides_a_dossier_from_the_pass_that_capped_it():
+    """The decay pass only synthesises a dossier whose score clears
+    signal_confidence_threshold * synthesis_score_floor_pct. Gating that on
+    the CAPPED score is circular -- a verdict suppresses the re-judgement that
+    would renew it -- and the circle fails open: the verdict goes stale at
+    36h, the cap lapses, and the score springs back to the arithmetic the
+    verdict rejected, above the signal bar, free to fire.
+
+    Reproduced at base 0.60/0.45 over eight channels carrying one distinct
+    fact: 0.622 uncapped, 0.270 capped, against a 0.30 floor and a 0.50 bar.
+    arithmetic_score is what keeps the pass scheduled on the arithmetic."""
+    dossier = Dossier(symbol="BWEN")
+    for n in range(8):
+        merge_evidence(dossier, _evidence(source_name=f"outlet{n}.com", evidence_id=f"e{n}",
+                                          confidence=0.60, magnitude=0.45), now=NOW)
+    dossier.synthesis_at = NOW.isoformat()
+    dossier.distinct_fact_count = 1
+    recompute_decay(dossier, NOW)
+
+    floor, bar = 0.5 * 0.6, 0.5
+    capped = dossier.confidence * dossier.magnitude
+    assert capped < floor, "precondition: the cap must push this under the synthesis floor"
+    # The uncapped arithmetic is recorded, is above the floor, and is what the
+    # pass is scheduled against -- so the verdict keeps being refreshed and
+    # the cap holds continuously instead of lapsing every 36h.
+    assert dossier.arithmetic_score > floor
+    assert dossier.arithmetic_score > bar, "and it would clear the signal bar if it ever lapsed"
+
+
+def test_the_uncapped_arithmetic_is_recorded_even_with_no_verdict():
+    """It is the arithmetic, not a synthesis artefact: a dossier that has
+    never been judged must still carry it, or the floor gate falls back to a
+    capped score on the one pass that would have set the verdict."""
+    dossier = _fanned_out_dossier()
+    recompute_decay(dossier, NOW)
+
+    assert dossier.arithmetic_score == pytest.approx(dossier.confidence * dossier.magnitude)

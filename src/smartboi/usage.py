@@ -73,6 +73,17 @@ CAT_RESEARCH = "research"       # research.SupplierResearcher
 
 CATEGORIES = (CAT_DOSSIER, CAT_SYNTHESIS, CAT_EXTRACTION, CAT_RESEARCH)
 
+# How often the circuit breaker lets a single call through to test whether an
+# account-level problem has been resolved.
+#
+# The failure being prevented is a retry STORM -- 11,893 calls in two hours,
+# three a second -- not a retry. Blocking outright until UTC midnight would
+# trade that storm for the opposite fault: an operator who tops up a balance
+# at 10:00 UTC would get nothing scored for fourteen hours over a problem they
+# had already fixed. Thirty minutes bounds the loop at roughly two calls an
+# hour (a rounding error against a 5000-call day) while recovering on its own.
+BREAKER_PROBE_INTERVAL_SEC = 30 * 60
+
 
 @dataclass(frozen=True)
 class UsageSnapshot:
@@ -214,19 +225,60 @@ class UsageTracker:
         reason = permanent_failure_reason(exc)
         if not reason:
             return False
-        today = today or self._today()
-        self._roll_if_new_day(today)
-        if self._state.get("breaker_reason"):
-            return True  # already open; don't re-log once per suppressed call
-        now = datetime.now(timezone.utc).isoformat()
-        self._state.update({"breaker_reason": reason, "breaker_tripped_at": now})
+        # Never let bookkeeping displace the failure it is recording. This runs
+        # as the first statement of an `except` handler, and JsonState.update
+        # does a real fsync'd write -- an OSError here (a full disk, which is
+        # the characteristic Home-Assistant-on-an-SD-card failure) would
+        # replace the API exception the caller is in the middle of handling
+        # with a disk error, losing the diagnosis entirely.
+        try:
+            today = today or self._today()
+            self._roll_if_new_day(today)
+            already_open = bool(self._state.get("breaker_reason"))
+            now = datetime.now(timezone.utc).isoformat()
+            # Re-stamped on every failure, not only the first: the stamp is
+            # what the probe interval counts from, so a failed probe has to
+            # restart the clock or the breaker would let one call through on
+            # every subsequent check.
+            self._state.update({"breaker_reason": reason, "breaker_tripped_at": now})
+        except OSError:
+            log.exception("Could not persist the LLM circuit breaker state.")
+            return True
+        if already_open:
+            return True  # don't re-log once per suppressed call
         log.error(
-            "LLM circuit breaker OPEN: %s. Halting every Claude call until UTC midnight rather "
-            "than retrying an error that cannot succeed -- ingestion continues, evidence keeps "
-            "accruing, and nothing is scored until this is resolved. Original error: %s",
-            reason, exc,
+            "LLM circuit breaker OPEN: %s. Halting Claude calls rather than retrying an error "
+            "that cannot succeed -- ingestion continues, evidence keeps accruing, and nothing is "
+            "scored until this is resolved. One probe call is allowed every %d minutes so a "
+            "resolved problem recovers on its own. Original error: %s",
+            reason, BREAKER_PROBE_INTERVAL_SEC // 60, exc,
         )
         return True
+
+    def deferral_reason(self, category: str = "", today: str | None = None) -> str:
+        """Why a call in `category` would be refused right now, phrased for a
+        log line, or "" when it would go through.
+
+        Exists because every call site logged "daily LLM call budget reached"
+        for any refusal, so a breaker halt -- a different problem with a
+        different fix -- was reported as an exhausted budget on a day that had
+        spent nothing."""
+        if self.breaker_reason(today):
+            return f"LLM circuit breaker open ({self.breaker_reason(today)})"
+        return "" if self.budget_remaining(category, today) else "daily LLM budget reached"
+
+    def _breaker_probe_due(self) -> bool:
+        """Whether enough time has passed since the last failure to spend one
+        call finding out whether the problem is still there."""
+        stamp = self._state.get("breaker_tripped_at") or ""
+        try:
+            tripped = datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
+            return True  # unreadable stamp: probe rather than block forever
+        if tripped.tzinfo is None:
+            tripped = tripped.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - tripped).total_seconds()
+        return age >= BREAKER_PROBE_INTERVAL_SEC
 
     def breaker_reason(self, today: str | None = None) -> str:
         """Why calls are halted, or "" when they are not. For the dashboard
@@ -261,8 +313,18 @@ class UsageTracker:
         # not category-specific, and a reserved category would otherwise sail
         # past a gate that exists precisely to stop the request it is about
         # to make.
+        #
+        # Not an absolute block, though. Waiting for UTC midnight would mean
+        # an operator who tops up a balance at 10:00 UTC gets nothing scored
+        # for fourteen hours over a problem they already fixed -- and the
+        # thing being prevented is a retry STORM (three per second), not a
+        # retry. So one probe call is let through per interval: the failure
+        # loop is bounded at roughly two calls an hour, and a resolved problem
+        # recovers on its own within the interval. A successful call clears
+        # the breaker outright (see record); a failed probe re-stamps it.
         if self._state.get("breaker_reason"):
-            return False
+            if not self._breaker_probe_due():
+                return False
         # The total call cap, minus whatever other categories have RESERVED and
         # not yet spent -- mirrors the dollar gate below. Without this, a
         # reserved pass (synthesis) had its dollars protected but could still
@@ -303,6 +365,13 @@ class UsageTracker:
         still counts against the totals, it just isn't attributed."""
         today = today or self._today()
         self._roll_if_new_day(today)
+        # A call that actually succeeded is proof the account-level problem is
+        # gone -- somebody topped the balance up, or fixed the key. Clearing
+        # here rather than on a timer is what makes the probe above a recovery
+        # mechanism instead of just a slower failure loop.
+        if self._state.get("breaker_reason"):
+            log.info("LLM circuit breaker CLOSED -- a call succeeded, resuming normal operation.")
+            self._state.update({"breaker_reason": "", "breaker_tripped_at": ""})
         self._state.set("calls", self._state.get("calls", 0) + 1)
         self._state.set("input_tokens", self._state.get("input_tokens", 0) + input_tokens)
         self._state.set("output_tokens", self._state.get("output_tokens", 0) + output_tokens)

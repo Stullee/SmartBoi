@@ -54,6 +54,7 @@ from smartboi.dossier import (
     merge_evidence,
     recompute_decay,
     slot_keys,
+    synthesis_verdict_fresh,
 )
 from smartboi.dod_contracts import DodContractsClient, awards_from_page, business_days_back
 from smartboi.edgar import EdgarClient, FilingEvent, normalize_company_name
@@ -3770,7 +3771,16 @@ class Engine:
         # the one expensive pass in the pipeline at a handful of calls a day
         # rather than one per watchlist entry.
         floor = self.settings.signal_confidence_threshold * self.settings.synthesis_score_floor_pct
-        if dossier.confidence * dossier.magnitude < floor:
+        # Measured against the UNCAPPED arithmetic, not against the score this
+        # pass's own last verdict already lowered. Gating on the capped score
+        # is circular -- a verdict suppresses the re-judgement that would
+        # renew it -- and the circle fails open: the verdict goes stale at 36h,
+        # the cap lapses, and the score springs back to the arithmetic the
+        # verdict rejected, above the signal bar, free to fire. See
+        # Dossier.arithmetic_score. The `or` keeps dossiers persisted before
+        # this field existed on their previous behaviour rather than
+        # synthesising all of them at once on the first pass after upgrade.
+        if (dossier.arithmetic_score or dossier.confidence * dossier.magnitude) < floor:
             return False
         spec = self.spec_by_symbol.get(dossier.symbol)
         verdict = await self.synthesizer.synthesize(
@@ -3804,7 +3814,13 @@ class Engine:
         # written on EVERY path including the veto -- a claim whose premises
         # are not recorded is unfalsifiable by construction, which is exactly
         # what the veto was.
-        dossier.pre_synthesis_score = dossier.confidence * dossier.magnitude
+        # The UNCAPPED arithmetic, for the same reason the gate above uses it.
+        # Once _aggregate applies the previous verdict's fact cap,
+        # confidence * magnitude is no longer "the score before synthesis
+        # touched it" -- it is the score after synthesis touched it LAST time,
+        # so a field whose entire purpose is measuring what the verdict capped
+        # would have been measuring its own predecessor.
+        dossier.pre_synthesis_score = dossier.arithmetic_score or dossier.confidence * dossier.magnitude
         dossier.synthesis_keys = sorted(slot_keys(dossier, now))
         await self._capture_synthesis_price(dossier, now)
         # A fresh verdict re-opens both questions its predecessor closed.
@@ -3854,19 +3870,19 @@ class Engine:
             )
         return True
 
-    def _synthesis_verdict_fresh(self, dossier: Dossier, now: datetime) -> bool:
+    @staticmethod
+    def _synthesis_verdict_fresh(dossier: Dossier, now: datetime) -> bool:
         """Whether a persisted verdict is still inside the window in which it
         is honoured as a cap. Outside it there is nothing to invalidate --
-        the cap has already lapsed on its own."""
-        if not dossier.synthesis_at:
-            return False
-        try:
-            synth_at = datetime.fromisoformat(dossier.synthesis_at)
-        except (TypeError, ValueError):
-            return False
-        if synth_at.tzinfo is None:
-            synth_at = synth_at.replace(tzinfo=timezone.utc)
-        return (now - synth_at).total_seconds() / 3600.0 <= _SYNTHESIS_CAP_MAX_AGE_HOURS
+        the cap has already lapsed on its own.
+
+        Delegates to the dossier module rather than reimplementing the rule.
+        Moving the CONSTANT there while leaving a second copy of the predicate
+        here would have missed the point: the merge-path cap and the
+        corroboration cap are the same judgement about the same field, and any
+        future refinement (clock skew, a verdict with no price baseline) has
+        to reach both or it reaches neither usefully."""
+        return synthesis_verdict_fresh(dossier, now)
 
     async def _veto_refuted_by_price(self, dossier: Dossier) -> bool:
         """Whether the tape has refuted an already-priced-in verdict.
@@ -4548,6 +4564,7 @@ class Engine:
             dossier.synthesis_confidence = 0.0
             dossier.synthesis_magnitude = 0.0
             dossier.already_priced_in = False
+            dossier.redundant_evidence = False
             dossier.synthesis_note = ""
             dossier.synthesis_catalyst = ""
             dossier.distinct_fact_count = 0

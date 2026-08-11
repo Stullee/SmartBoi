@@ -2346,15 +2346,41 @@ async def test_redundant_evidence_trims_rather_than_vetoes(engine):
     assert dossier.magnitude == pytest.approx(0.35)
 
 
-async def test_redundant_evidence_does_not_arm_the_price_falsification(engine):
+def _returns_bar(close: float):
+    """An engine._price_bar stand-in that always prices a symbol at `close`."""
+    from smartboi.prices import PriceBar
+
+    async def _bar(_symbol):
+        return PriceBar(close=close, high=close, low=close)
+    return _bar
+
+
+async def test_redundant_evidence_does_not_arm_the_price_falsification(engine, monkeypatch):
     """_veto_refuted_by_price watches the tape for a move disproving 'the
     market has absorbed this'. A duplication finding makes no such claim, so
-    it must not be put to that test."""
-    engine.synthesizer = FakeSynthesizer(default=synthesis(redundant_evidence=True))
+    it must not be put to that test.
+
+    Every OTHER early return is disarmed first -- a baseline price is set and
+    the tape is moved far enough to refute -- so already_priced_in is the only
+    thing left that can make this False. Without that, the test passed on a
+    missing price baseline and would have kept passing with the flag check
+    deleted."""
+    engine.synthesizer = FakeSynthesizer(
+        default=synthesis(redundant_evidence=True, confidence=0.9, magnitude=0.9))
     dossier = await _build_thesis(engine)
     await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+    dossier.synthesis_price = 10.0
+    monkeypatch.setattr(engine, "_price_bar", _returns_bar(20.0))  # +100%, far past the 8% bar
 
+    assert dossier.redundant_evidence is True
+    assert dossier.already_priced_in is False
     assert await engine._veto_refuted_by_price(dossier) is False
+
+    # Positive control: the same tape DOES refute the claim that actually
+    # asserts something about price, so the assertion above is about the flag
+    # and not about an unreachable code path.
+    dossier.already_priced_in = True
+    assert await engine._veto_refuted_by_price(dossier) is True
 
 
 async def test_both_findings_at_once_still_vetoes(engine):
@@ -3489,3 +3515,33 @@ async def test_the_ib_disabled_warning_still_fires_when_ib_is_off(monkeypatch, c
 
     assert "IB price feed disabled" in caplog.text
     assert "ENABLE_IB_PRICE_FEED=true" in caplog.text
+
+
+async def test_the_daily_snapshot_is_skipped_on_a_weekend(engine, monkeypatch):
+    """A snapshot row is only useful joined to a price mark for the same
+    symbol and DATE, and the mark pass writes nothing on a Saturday. The
+    guard was present on the mark side and missing here, so the fix had been
+    applied to exactly one side of a two-sided join: 44-48 snapshot rows on
+    each of four consecutive weekend days with nothing to join."""
+    monkeypatch.setattr("smartboi.engine.is_trading_day", lambda: False)
+    calls = []
+    monkeypatch.setattr(engine, "_run_daily_snapshot", lambda: calls.append(1) or True)
+
+    await engine._tick()
+
+    assert calls == []
+    # And the pass stays DUE, so Monday still captures rather than the
+    # weekend silently consuming the day's slot.
+    assert engine._daily_pass_due("dossier_snapshot")
+
+
+async def test_the_daily_snapshot_still_runs_on_a_trading_day(engine, monkeypatch):
+    """The guard has to let the ordinary case through, or it would be a
+    capture outage rather than a weekend skip."""
+    monkeypatch.setattr("smartboi.engine.is_trading_day", lambda: True)
+    calls = []
+    monkeypatch.setattr(engine, "_run_daily_snapshot", lambda: calls.append(1) or True)
+
+    await engine._tick()
+
+    assert calls == [1]

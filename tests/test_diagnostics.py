@@ -297,14 +297,30 @@ def test_repeated_failures_are_counted_not_just_tailed(engine, tmp_path):
 
 
 def test_uptime_and_restart_count_are_reported(engine, tmp_path):
-    """A two-hour-old build gets mistaken for a steady state without this."""
+    """A two-hour-old build gets mistaken for a steady state without this.
+
+    Banner timestamps are relative to now, not hardcoded: the count is a
+    24-hour window against the wall clock, so a fixed date would have made
+    this pass today and fail every day after."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+
+    def banner(when):
+        return (f"{when.strftime('%Y-%m-%d %H:%M:%S')} UTC | INFO    | smartboi.main | "
+                "=== SmartBoi version=0.57.0 commit=abc123 ===\n")
+
     _write_log(tmp_path, "smartboi.log",
-               "2026-08-11 12:20:46 UTC | INFO    | smartboi.main | "
-               "=== SmartBoi version=0.57.0 commit=abc123 ===\n")
+               banner(now - timedelta(hours=2))
+               + banner(now - timedelta(hours=10))
+               # Outside the window, and must NOT be counted.
+               + banner(now - timedelta(hours=30)))
     report = run_diagnostics(engine)
 
     assert "started_at" in report
-    assert "restarts/24h" in report
+    # The VALUE, not just the label: asserting the heading is present would
+    # pass with the count hardcoded to zero.
+    assert "restarts/24h : 2" in report
 
 
 def test_the_daily_pass_schedule_is_reported(engine):
@@ -442,3 +458,68 @@ def test_the_message_shape_collapses_one_bug_into_one_row():
         for c in "abcdefg\"\n,"
     }
     assert len(shapes) == 1
+
+
+def _episode_logs(log_dir, rows):
+    import json
+    from pathlib import Path
+
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    signals, decisions = [], []
+    for symbol, day, event in rows:
+        episode = f"{day}T00:00:00+00:00"
+        signals.append({
+            "symbol": symbol, "direction": "LONG", "confidence": 0.8, "magnitude": 0.7,
+            "horizon_days": 20, "independent_source_count": 3, "thesis_summary": "t",
+            "generated_at": episode, "episode": episode,
+        })
+        if event:
+            decisions.append({"event": event, "symbol": symbol, "direction": "LONG",
+                              "episode": episode, "price": 10.0, "reason": "r", "at": episode})
+    (log_dir / "signals.jsonl").write_text("".join(json.dumps(r) + "\n" for r in signals))
+    (log_dir / "decisions.jsonl").write_text("".join(json.dumps(r) + "\n" for r in decisions))
+
+
+def test_the_per_day_table_counts_outcomes_by_key_not_by_label(engine):
+    """attach_outcomes stores the ledger EVENT ("trade_opened"), and
+    OUTCOME_LABELS maps that to the display string ("opened"). Counting
+    against the display strings left both columns permanently zero and fired
+    the "nothing has OPENED" alarm on every bundle carrying any signal at
+    all -- on a deployment with fifteen closed trades."""
+    _episode_logs(engine.settings.log_dir, [
+        ("AAA", "2026-08-06", "trade_opened"),
+        ("BBB", "2026-08-07", "signal_expired"),
+    ])
+
+    report = run_diagnostics(engine)
+
+    assert "2026-08-06     1 /   1 /   0" in report
+    assert "2026-08-07     1 /   0 /   1" in report
+    assert "nothing has OPENED" not in report
+
+
+def test_a_day_with_no_signals_still_gets_a_row(engine):
+    """A day with zero signals is the most important row in this table.
+    Skipping it is how a collapse from 113/day to 0/day renders as an
+    unbroken column of numbers."""
+    _episode_logs(engine.settings.log_dir, [
+        ("AAA", "2026-08-01", "trade_opened"),
+        ("BBB", "2026-08-04", "signal_expired"),
+    ])
+
+    report = run_diagnostics(engine)
+
+    for quiet_day in ("2026-08-02", "2026-08-03"):
+        assert f"    {quiet_day}     0 /   0 /   0" in report
+
+
+def test_the_no_opens_alarm_fires_when_it_is_actually_true(engine):
+    """The alarm has to be able to fire, or fixing the false positive would
+    just have replaced it with a silent one."""
+    _episode_logs(engine.settings.log_dir, [
+        ("AAA", "2026-08-06", "signal_expired"),
+        ("BBB", "2026-08-07", "signal_expired"),
+    ])
+
+    assert "nothing has OPENED" in run_diagnostics(engine)

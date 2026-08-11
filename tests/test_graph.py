@@ -201,3 +201,67 @@ async def test_a_missing_relationships_key_is_an_empty_list_not_a_retry(tmp_path
     extractor = _extractor(tmp_path, {})
 
     assert await extractor.extract("AAA", "8-K", "filing text", ["AAA"]) == []
+
+
+class _FailingMessages:
+    def __init__(self, exc):
+        self._exc = exc
+
+    async def create(self, **_kwargs):
+        raise self._exc
+
+
+async def test_an_account_level_failure_here_trips_the_shared_breaker(tmp_path):
+    """The wiring, not the mechanism. Every call site catches broadly and
+    returns None, which the engine reads as 'transient' -- so the breaker only
+    does anything if each site actually reports its failure. Deleting all five
+    of those one-line wirings left the whole suite green."""
+    from smartboi.usage import CAT_DOSSIER, UsageTracker
+
+    usage = UsageTracker(tmp_path / "usage.json", daily_call_budget=5000)
+    extractor = _extractor(tmp_path, {})
+    extractor._usage = usage
+    extractor._client = SimpleNamespace(
+        messages=_FailingMessages(RuntimeError(
+            "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+            "'message': 'Your credit balance is too low to access the Anthropic API.'}}"))
+    )
+
+    assert await extractor.extract("AAA", "8-K", "filing text", ["AAA"]) is None
+    # Tripped for EVERY category, not just extraction's.
+    assert not usage.budget_remaining(CAT_DOSSIER)
+    assert "credit balance" in usage.breaker_reason()
+
+
+async def test_a_transient_failure_here_leaves_the_breaker_closed(tmp_path):
+    """Over-tripping would halt the day on an error that clears in seconds."""
+    from smartboi.usage import CAT_DOSSIER, UsageTracker
+
+    usage = UsageTracker(tmp_path / "usage.json", daily_call_budget=5000)
+    extractor = _extractor(tmp_path, {})
+    extractor._usage = usage
+    extractor._client = SimpleNamespace(
+        messages=_FailingMessages(RuntimeError("Error code: 429 - rate_limit_error")))
+
+    assert await extractor.extract("AAA", "8-K", "filing text", ["AAA"]) is None
+    assert usage.budget_remaining(CAT_DOSSIER)
+
+
+def test_every_llm_call_site_reports_its_failures_to_the_breaker():
+    """Structural, because the behavioural tests above can only cover the
+    sites someone remembered to cover. Any module that gates on
+    budget_remaining is making Anthropic calls, and must report their failures
+    or the breaker silently stops covering it."""
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "src" / "smartboi"
+    # A module that actually TALKS to Anthropic: it both gates on the budget
+    # and issues a request. engine.py and tools.py read budget_remaining only
+    # to render it, and have no failure of their own to report.
+    callers = [
+        p for p in src.glob("*.py")
+        if "budget_remaining(" in p.read_text() and "messages.create(" in p.read_text()
+    ]
+    assert {p.name for p in callers} == {"dossier.py", "graph.py", "skeptic.py", "research.py"}
+    missing = [p.name for p in callers if "note_failure(" not in p.read_text()]
+    assert not missing, f"LLM call sites that never trip the breaker: {missing}"

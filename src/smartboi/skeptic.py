@@ -172,7 +172,7 @@ class Skeptic:
         to re-infer proportionality purely from the wording of the note
         every time."""
         if not self._usage.budget_remaining(CAT_DOSSIER):
-            log.info("Daily LLM call budget reached -- deferring skeptic review.")
+            log.info("%s -- deferring skeptic review.", self._usage.deferral_reason(CAT_DOSSIER))
             return None
         now = now or datetime.now(timezone.utc)
         confidence_suffix = (

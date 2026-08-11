@@ -207,6 +207,24 @@ class Dossier:
     # rated 0.9-but-priced-in was indistinguishable from one it rated 0.05,
     # permanently and for the most expensive pass in the system.
     pre_synthesis_score: float = 0.0
+    # confidence * magnitude as the arithmetic aggregate computed it with NO
+    # fact cap applied (see effective_corroboration_count). Recorded on every
+    # _aggregate; never used as a score, only to SCHEDULE the whole-body pass
+    # and to record what it capped.
+    #
+    # Without it the scheduling is circular, and the circle fails open. The
+    # decay pass only synthesises a dossier whose score clears
+    # signal_confidence_threshold * synthesis_score_floor_pct, so once the
+    # cap pushed a dossier under that floor the verdict stopped being
+    # refreshed -- and 36h later it went stale, the cap lapsed, and the score
+    # sprang back to the uncapped arithmetic. Reproduced: eight channels
+    # carrying one distinct fact at base 0.60/0.45 sit at 0.622 uncapped and
+    # 0.270 capped, so the dossier alternated between 0.270 and 0.622 forever,
+    # and every time it was at 0.622 it was ABOVE the 0.5 signal bar and could
+    # fire the trade on exactly the arithmetic the whole-body pass had
+    # rejected. Gating on this field instead keeps the verdict refreshed, so
+    # the cap holds continuously.
+    arithmetic_score: float = 0.0
     # --- Per-row attribution flags. Three changes in this scoring version
     # move scores in the same region and the same direction; recorded per
     # dossier so the forward-return series can be bucketed by WHICH
@@ -618,7 +636,7 @@ def evidence_weight(record: EvidenceRecord, now: datetime) -> float:
     return 1.0 - fraction * (1.0 - _DECAY_FLOOR)
 
 
-def _synthesis_verdict_fresh(dossier: Dossier, now: datetime) -> bool:
+def synthesis_verdict_fresh(dossier: Dossier, now: datetime) -> bool:
     """Whether the persisted whole-body verdict is recent enough to be
     honoured. Outside the window there is nothing to honour -- the cap has
     lapsed on its own, and the next daily pass re-judges."""
@@ -663,7 +681,7 @@ def effective_corroboration_count(dossier: Dossier, now: datetime) -> int:
     - A cap, never a lift, matching every other thing synthesis is allowed to
       do to a score."""
     counted = dossier.independent_source_count
-    if not _synthesis_verdict_fresh(dossier, now):
+    if not synthesis_verdict_fresh(dossier, now):
         return counted
     if dossier.distinct_fact_count <= 0:
         return counted
@@ -840,6 +858,11 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     # arithmetic manufacturing a 0.94 out of one restated macro story.
     doublings = min(_corroboration_doublings(effective_corroboration_count(dossier, now)),
                     MAX_CORROBORATION_DOUBLINGS)
+    # The same figure with NO fact cap applied, kept so the pass that produced
+    # the cap can still be scheduled against the arithmetic rather than
+    # against its own last verdict. See dossier.arithmetic_score.
+    uncapped_doublings = min(_corroboration_doublings(dossier.independent_source_count),
+                             MAX_CORROBORATION_DOUBLINGS)
     corroboration_bonus = CONFIDENCE_CORROBORATION_STEP * doublings
     raw_confidence = min(1.0, base_confidence + corroboration_bonus)
 
@@ -874,6 +897,14 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
     base_magnitude = best.magnitude * best_weight
     magnitude_bonus = 1.0 + MAGNITUDE_CORROBORATION_STEP * doublings
     dossier.magnitude = min(1.0, base_magnitude * magnitude_bonus)
+    # What the aggregate would have said with no fact cap. Recorded, never
+    # traded on -- see the field's own comment for the fail-open this exists
+    # to close.
+    dossier.arithmetic_score = (
+        min(1.0, base_confidence + CONFIDENCE_CORROBORATION_STEP * uncapped_doublings)
+        * contest_factor
+        * min(1.0, base_magnitude * (1.0 + MAGNITUDE_CORROBORATION_STEP * uncapped_doublings))
+    )
     dossier.horizon_days = round(sum(e.horizon_days for e in agreeing) / len(agreeing))
     # The last few agreeing items' reasoning, not just the single latest --
     # a one-sentence blurb from only the newest item is a thin "current
@@ -1067,7 +1098,8 @@ class DossierUpdater:
         now: datetime | None = None,
     ) -> dict | None:
         if not self._usage.budget_remaining(CAT_DOSSIER):
-            log.info("%s: daily LLM call budget reached -- deferring dossier update.", dossier.symbol)
+            log.info("%s: %s -- deferring dossier update.",
+                     dossier.symbol, self._usage.deferral_reason(CAT_DOSSIER))
             return None
         now = now or datetime.now(timezone.utc)
         current = (
@@ -1296,7 +1328,8 @@ class DossierSynthesizer:
         keeps the arithmetic aggregate unchanged rather than acting on a
         synthesis it does not have."""
         if not self._usage.budget_remaining(CAT_SYNTHESIS):
-            log.info("%s: daily LLM budget reached -- deferring synthesis.", dossier.symbol)
+            log.info("%s: %s -- deferring synthesis.",
+                     dossier.symbol, self._usage.deferral_reason(CAT_SYNTHESIS))
             return None
         now = now or datetime.now(timezone.utc)
         digest = self._evidence_digest(dossier, now)

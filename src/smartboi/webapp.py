@@ -1675,11 +1675,23 @@ def create_app(engine) -> web.Application:
         back every dossier, the whole graph, the entire trade record and the
         logs, so it gets the same protection as the endpoints that change
         things, not the one the auto-refresh poll gets."""
-        try:
-            payload = await asyncio.to_thread(collect_full_diagnostics, engine)
-        except Exception as exc:  # noqa: BLE001 - a failed download must not kill the dashboard
-            log.exception("Full diagnostics bundle failed.")
-            return web.json_response({"error": redact_token(exc)}, status=500)
+        # Behind the same single-flight lock every other tool endpoint uses,
+        # rather than _run_tool itself (which wraps its result in JSON, and
+        # this one returns bytes). Without it the HEAVIEST tool in the app --
+        # it reads the whole retained log history and every dossier -- was the
+        # only one that could run concurrently with itself, so two impatient
+        # clicks meant two simultaneous 30MB reads on a Raspberry Pi.
+        if tool_lock.locked():
+            return web.json_response(
+                {"error": "Another tool run is already in progress -- wait for it to finish."},
+                status=409,
+            )
+        async with tool_lock:
+            try:
+                payload = await asyncio.to_thread(collect_full_diagnostics, engine)
+            except Exception as exc:  # noqa: BLE001 - a failed download must not kill the dashboard
+                log.exception("Full diagnostics bundle failed.")
+                return web.json_response({"error": redact_token(exc)}, status=500)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         return web.Response(
             body=payload,

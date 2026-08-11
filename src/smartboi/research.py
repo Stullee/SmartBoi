@@ -185,7 +185,8 @@ class SupplierResearcher:
     async def research(self, anchor: str, anchor_name: str, ecosystem: str,
                        min_cap_musd: float, max_cap_musd: float) -> list[ResearchedSupplier]:
         if not self._usage.budget_remaining(CAT_RESEARCH):
-            log.info("%s: daily LLM budget reached -- skipping supplier research.", anchor)
+            log.info("%s: %s -- skipping supplier research.",
+                     anchor, self._usage.deferral_reason(CAT_RESEARCH))
             return []
         messages = [{
             "role": "user",

@@ -154,12 +154,24 @@ def cacheable_system(prompt: str) -> list[dict]:
 # the type alone cannot tell them apart. Anything not listed here stays
 # transient, which is the safe direction -- a missed classification costs
 # retries, an over-eager one silently stops the system for a day.
+# Deliberately narrow. Two entries that look like obvious inclusions are left
+# out, because the breaker halts EVERY category on one failure:
+#
+#   - a bare "billing" substring. It appears in prose ("a billing period"),
+#     in URLs the SDK echoes back, and in messages that are per-request
+#     rather than account-level -- an unanchored match with a blast radius of
+#     the whole day and no coverage the specific phrases below do not give.
+#   - permission_error. This system runs FOUR different models (extraction,
+#     dossier, skeptic, synthesis), and a key that lacks access to one of
+#     them works perfectly for the other three. Halting all four on one
+#     model's permission failure would turn a partial outage into a total
+#     one; that call site correctly retries and fails, which is loud in the
+#     log without stopping anything that still works.
 _PERMANENT_API_FAILURES: tuple[tuple[str, str], ...] = (
     ("credit balance is too low", "the Anthropic credit balance is exhausted"),
-    ("billing", "an Anthropic billing problem"),
+    ("exceeded your organization's", "an Anthropic organization spend limit was reached"),
     ("authentication_error", "the Anthropic API key was rejected"),
     ("invalid x-api-key", "the Anthropic API key is invalid"),
-    ("permission_error", "this Anthropic API key lacks permission for the configured model"),
 )
 
 

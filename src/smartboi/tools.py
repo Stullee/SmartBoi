@@ -713,6 +713,30 @@ def _recent_log_problems(records: list[list[str]], webhook_url: str = "") -> lis
     return [redact_url(webhook_url, ln) for ln in out]
 
 
+def _calendar_days(first: str, last: str) -> list[str]:
+    """Every YYYY-MM-DD from `first` to `last` inclusive.
+
+    Bounded at a year so a single stray timestamp in an old capture file
+    cannot turn a table into tens of thousands of rows."""
+    try:
+        start = datetime.strptime(first, "%Y-%m-%d")
+        end = datetime.strptime(last, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return sorted({first, last})
+    span = min((end - start).days, 365)
+    return [(start + timedelta(days=n)).strftime("%Y-%m-%d") for n in range(max(span, 0) + 1)]
+
+
+def _log_span(records: list[list[str]]) -> str:
+    """"2026-08-09 06:21 .. 2026-08-11 14:26" for a set of log records.
+
+    Read off the first and last record that actually carries a timestamp, so
+    a leading continuation line (a file that starts mid-record) cannot report
+    a blank bound."""
+    stamps = [r[0][:16] for r in records if _LOG_RECORD_START.match(r[0])]
+    return f"{stamps[0]} .. {stamps[-1]}" if stamps else "no timestamped records"
+
+
 def _log_problem_histogram(records: list[list[str]], webhook_url: str = "") -> list[str]:
     """WARNING/ERROR counts by logger and message shape, across the whole
     retained log history.
@@ -900,6 +924,12 @@ def collect_full_diagnostics(engine) -> bytes:
         except Exception as exc:  # noqa: BLE001 - a broken summary must not cost the files
             report = f"run_diagnostics raised: {exc!r}"
             log.exception("Diagnostics summary failed while building the full bundle.")
+        # Scrubbed like every other member rather than trusted. run_diagnostics
+        # scrubs its own log lines, but the FAILURE path above interpolates a
+        # raw exception -- and an httpx error carries the full request URL,
+        # which for Finnhub has the API key in its query string. The one member
+        # written outside store() must not be the one member that leaks.
+        report = _redact_text(report, webhook)
         zf.writestr("diagnostics.txt", report)
         manifest.append(f"  {len(report):>10,}  diagnostics.txt")
 
@@ -921,7 +951,9 @@ def collect_full_diagnostics(engine) -> bytes:
             for path in sorted(dossier_dir.glob("*.json")):
                 store(zf, f"data/dossiers/{path.name}", path)
 
-        zf.writestr("MANIFEST.txt", "\n".join([
+        # Also scrubbed: a SKIPPED line embeds an OSError, whose text is a
+        # path this system did not compose.
+        zf.writestr("MANIFEST.txt", _redact_text("\n".join([
             "SmartBoi full diagnostics bundle",
             f"generated_at : {datetime.now(timezone.utc).isoformat()}",
             f"version      : {os.environ.get('SMARTBOI_VERSION', 'dev')}",
@@ -932,7 +964,7 @@ def collect_full_diagnostics(engine) -> bytes:
             "",
             "Contents (uncompressed bytes):",
             *manifest,
-        ]))
+        ]), webhook))
     return buf.getvalue()
 
 
@@ -1150,21 +1182,31 @@ def run_diagnostics(engine) -> str:
         # number in the bundle looked ordinary, and reading it off required
         # loading signals.jsonl by hand.
         add("\n  Per day (last 14):  fired / opened / expired")
+        # Keyed on the outcome KEYS ("trade_opened"/"signal_expired"), not on
+        # the display strings OUTCOME_LABELS maps them to. Comparing against
+        # the labels made both columns permanently zero and fired the alarm
+        # below on every bundle that had any signal at all -- on a deployment
+        # with fifteen closed trades, which is the precise opposite of what
+        # this table is for.
         by_day: dict[str, list[int]] = {}
         for e in episodes:
             row = by_day.setdefault(e["fired_at"][:10], [0, 0, 0])
             row[0] += 1
-            if e["outcome"] == "opened":
+            if e["outcome"] == "trade_opened":
                 row[1] += 1
-            elif e["outcome"].startswith("expired"):
+            elif e["outcome"] == "signal_expired":
                 row[2] += 1
-        for day in sorted(by_day)[-14:]:
-            fired, opened, expired = by_day[day]
+        # Every CALENDAR day in the window, not only the days that happened to
+        # produce a signal. A day with zero signals is the single most
+        # important row here -- skipping it is how a collapse from 113/day to
+        # 0/day renders as an unbroken column of numbers.
+        for day in _calendar_days(min(by_day), max(by_day))[-14:]:
+            fired, opened, expired = by_day.get(day, (0, 0, 0))
             add(f"    {day}  {fired:>4} / {opened:>3} / {expired:>3}")
-        recent = [by_day[d][1] for d in sorted(by_day)[-5:]]
-        if recent and not any(recent):
-            add("    ^^ nothing has OPENED in the last 5 days with signals. Check the synthesis")
-            add("       verdict table above before touching the signal bar.")
+        recent = [by_day.get(d, (0, 0, 0))[1] for d in _calendar_days(min(by_day), max(by_day))[-5:]]
+        if not any(recent):
+            add("    ^^ nothing has OPENED in the last 5 days. Check the synthesis verdict table")
+            add("       above before touching the signal bar.")
     else:
         add("  none yet")
 
@@ -1381,7 +1423,11 @@ def run_diagnostics(engine) -> str:
     # of the live file entirely) and 243 whole-universe price failures, while
     # the visible 40 lines were hourly Reg SHO and DoD repeats.
     histogram = _log_problem_histogram(log_records, s.alert_webhook_url)
-    add("\n--- Warning/error counts across the whole retained log ---")
+    # The span the counts are over, following the same convention the
+    # forward-validation section uses. A bare "11893" cannot distinguish a
+    # two-hour hard failure loop from six months of slow accrual, and that
+    # distinction is most of why this section exists.
+    add(f"\n--- Warning/error counts across the whole retained log ({_log_span(log_records)}) ---")
     for line in histogram:
         add(line)
     if not histogram:

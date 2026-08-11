@@ -666,6 +666,13 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str, min_sources_required: int 
         "synthesis_magnitude": round(d.synthesis_magnitude, 4),
         "distinct_fact_count": d.distinct_fact_count,
         "already_priced_in": d.already_priced_in,
+        # Recorded separately from already_priced_in because SCORING_VERSION 7
+        # exists to let forward rows be bucketed by WHICH mechanism touched
+        # them, and splitting the veto from the trim is one of its two
+        # changes. Omitting it would repeat exactly the mistake v6 was bumped
+        # to stop: shipping a scoring change whose effect cannot afterwards be
+        # attributed to it.
+        "redundant_evidence": d.redundant_evidence,
         # The arithmetic score BEFORE synthesis capped or vetoed it. Without
         # this a vetoed row records 0.000 for both numbers, so "0.9 confidence
         # but priced in" and "0.05 and priced in" are the same row forever --
