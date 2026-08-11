@@ -324,6 +324,86 @@ async def test_status_reads_each_dossier_from_disk_once(engine):
     assert len(loads) == len(set(loads)), f"a dossier was re-read from disk: {loads}"
 
 
+# --- GET /api/dossier/{symbol} -- what a clicked ladder row opens ---------
+
+
+async def test_dossier_endpoint_returns_the_evidence_behind_a_score(engine):
+    """The status payload carries only evidence_count, so the panel a click
+    opens has to get the items from somewhere."""
+    from smartboi.dossier import Dossier, EvidenceRecord
+
+    engine.dossiers.save(Dossier(
+        symbol="DCO", direction="LONG", confidence=0.8, magnitude=0.7,
+        thesis_summary="Backlog build",
+        evidence=[EvidenceRecord(
+            evidence_id="e1", source_type="8-K", source_name="SEC EDGAR (8-K)",
+            url="https://sec.gov/x", headline="Award announced", published_at="2026-08-01T00:00:00+00:00",
+            origin_symbol="RTX", is_propagated=True, relationship_note="RTX is a customer of DCO",
+            direction="LONG", magnitude=0.6, confidence=0.7, horizon_days=30,
+            reasoning="Sole-source award", skeptic_note="Size undisclosed",
+        )],
+    ))
+
+    async with _client(engine) as client:
+        resp = await client.get("/api/dossier/DCO")
+        assert resp.status == 200
+        body = await resp.json()
+
+    assert body["symbol"] == "DCO" and body["thesis_summary"] == "Backlog build"
+    assert body["evidence_count"] == 1 and body["evidence_shown"] == 1
+    item = body["evidence"][0]
+    assert item["headline"] == "Award announced"
+    # The propagation fields are the whole reason a graph-driven thesis is
+    # explicable at all: without them an item about RTX on DCO's dossier looks
+    # like a bug rather than the mechanism working.
+    assert item["is_propagated"] is True and item["relationship_note"] == "RTX is a customer of DCO"
+
+
+async def test_dossier_endpoint_is_case_insensitive_about_the_symbol(engine):
+    from smartboi.dossier import Dossier
+
+    engine.dossiers.save(Dossier(symbol="DCO", direction="LONG", confidence=0.5, magnitude=0.5))
+    async with _client(engine) as client:
+        assert (await client.get("/api/dossier/dco")).status == 200
+
+
+async def test_dossier_endpoint_404s_for_a_symbol_with_no_dossier(engine):
+    """A real ticker that simply has no file must not read as a server fault
+    -- and must not hand back an empty Dossier() as though it were one."""
+    async with _client(engine) as client:
+        resp = await client.get("/api/dossier/ZZZZ")
+        assert resp.status == 404
+        assert "error" in await resp.json()
+
+
+async def test_dossier_endpoint_refuses_a_path_traversal(engine):
+    """DossierStore turns the symbol straight into `<dir>/<symbol>.json`, so an
+    unvalidated segment here reads arbitrary files off the add-on host. Both
+    the pattern check and the all_symbols membership check exist for this."""
+    from smartboi.dossier import Dossier
+
+    engine.dossiers.save(Dossier(symbol="DCO", direction="LONG", confidence=0.5, magnitude=0.5))
+    secret = engine.dossiers.dir_path.parent / "secret.json"
+    secret.write_text('{"symbol": "SECRET"}')
+
+    async with _client(engine) as client:
+        for attempt in ("../secret", "..%2Fsecret", "%2e%2e%2fsecret", "DCO/../../secret"):
+            resp = await client.get(f"/api/dossier/{attempt}")
+            assert resp.status in (400, 404), f"{attempt} returned {resp.status}"
+            if resp.status == 400:
+                assert (await resp.json())["error"] == "not a ticker"
+
+
+async def test_dossier_endpoint_is_a_read_and_needs_no_csrf_header(engine):
+    """It is a GET like /api/status, and the page's fetch sends no header on
+    reads -- so a guard that demanded one would just break the panel."""
+    from smartboi.dossier import Dossier
+
+    engine.dossiers.save(Dossier(symbol="DCO", direction="LONG", confidence=0.5, magnitude=0.5))
+    async with TestClient(TestServer(create_app(engine))) as client:
+        assert (await client.get("/api/dossier/DCO")).status == 200
+
+
 # --- The full diagnostics download ---------------------------------------
 
 
