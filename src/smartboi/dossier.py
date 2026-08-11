@@ -778,6 +778,13 @@ def _aggregate(dossier: Dossier, now: datetime) -> None:
         dossier.independent_source_count = 0
         dossier.confidence = 0.0
         dossier.magnitude = 0.0
+        # Zeroed with the rest. Leaving the last resolved direction's figure
+        # standing would keep a number the aggregate no longer believes in a
+        # field the synthesis floor gate reads -- currently unreachable, since
+        # _apply_synthesis refuses a NONE direction before it looks, but a
+        # stale score sitting behind one guard is how the next reader gets it
+        # wrong.
+        dossier.arithmetic_score = 0.0
         dossier.mass_agree = 0.0
         dossier.mass_opposing = 0.0
         dossier.has_filing_evidence = False
