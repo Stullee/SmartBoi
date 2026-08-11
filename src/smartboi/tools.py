@@ -246,8 +246,10 @@ async def run_edgar_supplier_search(engine) -> str:
         return ("Every anchor has already been searched. Delete "
                 "data/anchor_edgar_search.json to re-run them, or add more anchors.")
     anchors.sort(key=lambda c: (not is_inert(c.symbol), c.ecosystem, c.symbol))
-    selected = anchors[:MAX_SEARCH_ANCHORS_PER_RUN]
-    skipped = [c.symbol for c in anchors[MAX_SEARCH_ANCHORS_PER_RUN:]]
+    per_run = max(1, int(getattr(engine.settings, "edgar_search_anchors_per_run",
+                                 MAX_SEARCH_ANCHORS_PER_RUN)))
+    selected = anchors[:per_run]
+    skipped = [c.symbol for c in anchors[per_run:]]
 
     lines: list[str] = ["EDGAR full-text supplier search", "=" * 34, ""]
     new = updated = 0
@@ -322,6 +324,134 @@ async def run_edgar_supplier_search(engine) -> str:
         lines.append(f"\n{len(skipped)} anchor(s) not searched this run (capped at "
                      f"{MAX_SEARCH_ANCHORS_PER_RUN}): {', '.join(skipped[:12])}"
                      f"{' ...' if len(skipped) > 12 else ''}. Re-run to continue.")
+    return "\n".join(lines)
+
+
+async def run_graph_maintenance(engine, apply: bool = False) -> str:
+    """The one graph-maintenance pass: AUDIT what is already there, CLEAN what
+    is structurally unfit, then GROW.
+
+    WHY ONE BUTTON. Maintenance had accreted into three daily passes, two
+    operator buttons and a connectivity reconcile with its own dry-run, and
+    between them they only ever asked "is the graph BIG enough". Nothing asked
+    "is what we have CORRECT" -- which is how seven of eleven accepted
+    tradeables came to be bond funds, preferred series and delisted shells,
+    each polled hourly and accruing LLM spend against a thesis that cannot
+    exist. Splitting the work across buttons also made the ORDER an operator
+    problem, and the order matters: growing before cleaning re-admits the
+    symbol you just removed, and cleaning before the ticker recheck acts on
+    stale resolutions.
+
+    So the sequence is fixed, and it is the argument for the button:
+
+      1. AUDIT      read-only; every structural fault, most decisive first.
+      2. CLEAN      quarantine the unfit (only with apply=True). Never
+                    deletes, never touches a symbol with an open paper trade.
+      3. RESOLVE    retry ticker resolution and re-screen candidates, so the
+                    growth step sees current recommendations.
+      4. DISCOVER   EDGAR full-text search: which other filers name our
+                    anchors. Free, and the only pass that is size-selected
+                    toward small counterparties.
+      5. CONNECT    the connectivity reconcile, last, so it can act on
+                    everything the previous steps produced.
+
+    apply=False is a full dry run: the audit and the search still run (they
+    are read-only and candidate-only respectively), and the clean and the
+    reconcile report exactly what they WOULD do without mutating anything.
+
+    Deliberately NOT included: the web-search supplier research. It is the one
+    pass that spends real money per press, it already runs daily on its own
+    cadence, and a maintenance button an operator is meant to press freely
+    must not have a variable bill attached to it."""
+    lines: list[str] = [
+        f"Graph maintenance -- {'APPLY' if apply else 'DRY RUN'}",
+        "=" * 46,
+        "",
+    ]
+
+    # --- 1. AUDIT ---
+    findings = await engine.audit_universe()
+    # Persisted even on a dry run: the audit is read-only, so refreshing the
+    # dashboard's panel from it costs nothing and stops the panel showing
+    # yesterday's count beside a report generated just now.
+    summary = engine.persist_audit(findings)
+    lines.append(f"1. AUDIT: {summary['total']} finding(s), {summary['actionable']} actionable.")
+    if not findings:
+        lines.append("   Nothing structurally wrong with the universe or the graph.")
+    for kind, count in sorted(summary["by_kind"].items(), key=lambda kv: -kv[1]):
+        lines.append(f"   {count:>4}  {kind}")
+    lines.append("")
+    for finding in findings[:MAX_LISTED_ROWS]:
+        flag = "  " if finding.actionable else "!!"
+        lines.append(f"   {flag} [{finding.kind}] {finding.subject}")
+        lines.append(f"        {finding.detail}")
+        if finding.blocked_reason:
+            lines.append(f"        NOT ACTIONED: {finding.blocked_reason}")
+    if len(findings) > MAX_LISTED_ROWS:
+        lines.append(f"   ... and {len(findings) - MAX_LISTED_ROWS} more.")
+    lines.append("")
+
+    # --- 2. CLEAN ---
+    cleaned = engine.quarantine_from_findings(findings, apply=apply)
+    planned = cleaned["would_quarantine"]
+    if not planned:
+        lines.append("2. CLEAN: nothing to quarantine.")
+    elif apply:
+        lines.append(f"2. CLEAN: quarantined {len(cleaned['quarantined'])} symbol(s): "
+                     f"{', '.join(cleaned['quarantined'])}.")
+        lines.append("   Recoverable from data/quarantined_symbols.json -- delete a row to reconsider.")
+    else:
+        lines.append(f"2. CLEAN: would quarantine {len(planned)} symbol(s): "
+                     f"{', '.join(row['symbol'] for row in planned)}.")
+    lines.append("")
+
+    # --- 3. RESOLVE ---
+    try:
+        await engine._run_candidate_ticker_recheck()
+        lines.append("3. RESOLVE: ticker resolution and candidate screening refreshed.")
+    except Exception as exc:  # noqa: BLE001 - one failed step must not lose the rest of the report
+        log.exception("Graph maintenance: ticker recheck failed")
+        lines.append(f"3. RESOLVE: FAILED ({exc}). Later steps still ran.")
+    lines.append("")
+
+    # --- 4. DISCOVER ---
+    try:
+        search_report = await run_edgar_supplier_search(engine)
+        lines.append("4. DISCOVER (EDGAR full-text search)")
+        lines += [f"   {line}" for line in search_report.splitlines() if line.strip()]
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Graph maintenance: EDGAR search failed")
+        lines.append(f"4. DISCOVER: FAILED ({exc}).")
+    lines.append("")
+
+    # --- 5. CONNECT ---
+    try:
+        rec = await engine.reconcile_universe_connectivity(apply=apply)
+        added = rec["added"] if apply else [a["symbol"] for a in rec["would_add"]]
+        pruned = rec["pruned"] if apply else rec["would_prune"]
+        verb = "" if apply else "would "
+        lines.append(f"5. CONNECT: {verb}add {len(added or [])} connected symbol(s), "
+                     f"{verb}prune {len(pruned or [])} inert accepted anchor(s).")
+        if added:
+            lines.append(f"   add:   {', '.join(sorted(added))}")
+        if pruned:
+            lines.append(f"   prune: {', '.join(sorted(pruned))}")
+        if rec["inert_seed_anchors"]:
+            lines.append(f"   {len(rec['inert_seed_anchors'])} curated seed anchor(s) inert -- "
+                         "reported only, remove them from universe.py by hand.")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Graph maintenance: connectivity reconcile failed")
+        lines.append(f"5. CONNECT: FAILED ({exc}).")
+
+    lines.append("")
+    if apply:
+        lines.append("Applied. Nothing was deleted: quarantined symbols keep their row and their "
+                     "reason, and no symbol with an open paper trade was touched.")
+    else:
+        lines.append("Dry run -- nothing was changed. New CANDIDATES may have been recorded by the "
+                     "search step, which is candidate-only by construction and writes no edge.")
+    lines.append("The web-search supplier research is not part of this button (it costs money per "
+                 "run); it keeps its own daily cadence.")
     return "\n".join(lines)
 
 
@@ -455,7 +585,7 @@ _DIAGNOSTIC_SETTINGS = (
     "auto_accept_min_seen_count", "auto_accept_max_per_day",
     "enable_relationship_backfill", "backfill_anchors",
     "enable_graph_refresh", "graph_refresh_symbols_per_day", "enable_auto_supplier_research",
-    "enable_auto_edgar_search",
+    "enable_auto_edgar_search", "edgar_search_anchors_per_run",
     "enable_ib_price_feed", "ib_host", "ib_port",
 )
 MAX_LOG_LINES = 40

@@ -494,6 +494,22 @@ class EdgarClient:
                 return ticker
         return None
 
+    async def live_tickers(self) -> set[str] | None:
+        """Every ticker SEC currently lists a registered filer for, or None if
+        the map could not be loaded.
+
+        None is not an empty set, and the distinction is the whole point: a
+        caller using this to spot delisted symbols would, on an unreachable
+        endpoint, otherwise conclude that EVERY symbol is dead and propose
+        emptying the universe. Reuses the same cached company_tickers.json the
+        CIK lookups already fetch, so this costs no extra request."""
+        try:
+            cik_by_ticker, _ = await self._ticker_map()
+        except Exception as exc:  # noqa: BLE001 - unknown must never read as "all dead"
+            log.warning("Could not load SEC's ticker map for the liveness check: %s", exc)
+            return None
+        return set(cik_by_ticker) or None
+
     async def name_matches_ticker(self, company_name: str, ticker: str) -> bool:
         """Whether `ticker`'s registered SEC filer name is actually the same
         company as the free-text `company_name` a filing named.

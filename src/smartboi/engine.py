@@ -55,7 +55,7 @@ from smartboi.dossier import (
     slot_keys,
 )
 from smartboi.dod_contracts import DodContractsClient, awards_from_page, business_days_back
-from smartboi.edgar import EdgarClient, FilingEvent
+from smartboi.edgar import EdgarClient, FilingEvent, normalize_company_name
 from smartboi.federal_register import (
     CURATED_SEARCHES,
     REGULATOR_SYMBOLS,
@@ -79,7 +79,7 @@ from smartboi.signals import (
 )
 from smartboi.skeptic import Skeptic
 from smartboi.state import JsonState
-from smartboi.status import snapshot_dossier
+from smartboi.status import _STALE_EDGE_DAYS, snapshot_dossier
 from smartboi.universe import SEED_RELATIONSHIPS, CompanySpec, spec_by_symbol
 from smartboi.universe_screen import guess_ecosystem, recommend_candidate_type, screen_universe
 from smartboi.usage import CAT_EXTRACTION, CAT_RESEARCH, CAT_SYNTHESIS, UsageTracker
@@ -386,6 +386,22 @@ class Engine:
         # whichever pass ran first permanently suppress the other.
         self.edgar_search_state = JsonState(DATA_DIR / "anchor_edgar_search.json")
         self.accepted_candidates = JsonState(DATA_DIR / "accepted_candidates.json")
+        # Symbols removed from the live universe by a graph-maintenance clean,
+        # with the finding that removed them and the row they had. Quarantine
+        # rather than delete, for the same reason _block_junk_candidates marks
+        # rather than deletes: a removal is a judgement, and a judgement a
+        # human cannot see or reverse is indistinguishable from data loss.
+        #
+        # It is also load-bearing, not just a receipt. Without it the next
+        # auto-accept or connectivity reconcile would re-add the symbol from
+        # the same candidate row that produced it, and the clean would undo
+        # itself on a schedule.
+        self.quarantine = JsonState(DATA_DIR / "quarantined_symbols.json")
+        # Last audit result, for the dashboard's graph-health panel. Persisted
+        # rather than recomputed on each page load because the audit needs
+        # SEC's ticker map and a name check per accepted symbol -- cheap on a
+        # daily cadence, wasteful on every 30-second dashboard poll.
+        self.audit_state = JsonState(DATA_DIR / "graph_audit.json")
         # Per-accession "relationship extraction already ran" markers for the
         # POLL path. Extraction (a paid ~150k-char call) runs before dossier
         # scoring in _process_filing, and the filing's dedup fingerprint is
@@ -1323,6 +1339,13 @@ class Engine:
         ):
             self._mark_daily_pass_done("edgar_search")
             await self._run_auto_edgar_search()
+        # The audit is READ-ONLY, so unlike the passes above it is safe to run
+        # unattended: it surfaces a bad symbol within a day instead of waiting
+        # for someone to press the maintenance button. The destructive half
+        # (quarantine) stays behind that button deliberately.
+        if self._daily_pass_due("graph_audit"):
+            self._mark_daily_pass_done("graph_audit")
+            await self._run_daily_graph_audit()
         if self._due(self._last_heartbeat, HEARTBEAT_INTERVAL_SEC, now):
             self._last_heartbeat = now
             self._log_heartbeat()
@@ -2132,6 +2155,14 @@ class Engine:
                 return
             ticker = (entry.get("ticker") or "").upper()
             if not ticker or ticker in self.spec_by_symbol or ticker in self.accepted_candidates.data:
+                continue
+            if ticker in self.quarantine.data:
+                # Removed by a graph-maintenance clean as structurally unfit
+                # (delisted, not common equity, misresolved, or a financing
+                # relationship). The candidate row that discovered it is still
+                # on file and still eligible, so without this the very next
+                # auto-accept pass re-adds it and the clean undoes itself.
+                # Delete the row from quarantined_symbols.json to reconsider.
                 continue
             if entry.get("auto_accept_blocked"):
                 # The field was previously only ever WRITTEN -- the
@@ -4155,6 +4186,151 @@ class Engine:
                     len(removed), ", ".join(removed) or "none")
         return {"removed": removed, "universe_size": len(self.universe)}
 
+    async def _run_daily_graph_audit(self) -> None:
+        """Runs the read-only audit daily and persists its summary for the
+        dashboard, so a delisted or misresolved symbol surfaces within a day
+        instead of waiting for someone to press the maintenance button.
+
+        Records nothing destructive and alerts only on ACTIONABLE findings: a
+        stale edge or a dangling endpoint is information, not a fault, and an
+        alert that fires every day for something nobody should act on trains
+        the operator to ignore the channel."""
+        from smartboi.graph_audit import summarize
+
+        try:
+            findings = await self.audit_universe()
+        except Exception:  # noqa: BLE001 - the audit must never kill the tick
+            log.exception("[GRAPH] Daily universe audit failed -- retrying tomorrow.")
+            return
+        summary = self.persist_audit(findings)
+        log.info("[GRAPH] Universe audit: %d finding(s), %d actionable%s.",
+                 summary["total"], summary["actionable"],
+                 f" ({', '.join(summary['symbols_at_fault'])})" if summary["symbols_at_fault"] else "")
+        if summary["actionable"]:
+            await self.alerts.send(
+                "graph_audit",
+                f"{summary['actionable']} universe fault(s) need a decision",
+                "The daily audit found symbols that are structurally unfit to hold: "
+                + ", ".join(summary["symbols_at_fault"])
+                + ". Press 'Graph maintenance' on the dashboard for the detail and to quarantine them "
+                  "(nothing is deleted, and a symbol with an open trade is never touched).",
+                summary,
+            )
+
+    def persist_audit(self, findings: list) -> dict:
+        """Stores the audit's verdict for the dashboard's graph-health panel
+        and returns its summary. Called by BOTH the daily pass and the
+        maintenance button, so pressing the button refreshes the panel rather
+        than leaving it showing yesterday's number next to a fresh report."""
+        from smartboi.graph_audit import summarize
+
+        summary = summarize(findings)
+        self.audit_state.set("last", {
+            "at": datetime.now(timezone.utc).isoformat(),
+            **summary,
+            # Bounded: the panel shows counts and the at-fault symbols, and the
+            # full evidence lives in the maintenance report. An unbounded list
+            # would put every stale edge in the dashboard payload.
+            "findings": [
+                {"kind": f.kind, "subject": f.subject, "detail": f.detail,
+                 "actionable": f.actionable, "blocked_reason": f.blocked_reason}
+                for f in findings[:60]
+            ],
+        })
+        return summary
+
+    async def audit_universe(self) -> list:
+        """Every structural fault in the universe and the graph -- see
+        graph_audit.py for what is checked and why.
+
+        Read-only. Resolves the two things the pure checks cannot (SEC's live
+        ticker map, and a per-symbol name verification) and hands everything
+        else in. Both async results degrade to "not checked" rather than to a
+        failing verdict: an unreachable SEC must never be read as evidence that
+        the whole universe is delisted."""
+        from smartboi.graph_audit import audit
+
+        live_tickers = await self.edgar_client.live_tickers() if self.edgar_client else None
+
+        # Only symbols the audit can actually act on are worth verifying, and
+        # only where a disclosed name exists to verify against.
+        name_verified: dict[str, bool] = {}
+        if self.edgar_client is not None:
+            for symbol in sorted(self.accepted_candidates.data):
+                disclosed = (self.candidates.get(symbol) or {}).get("name") or ""
+                if not disclosed:
+                    continue
+                if live_tickers is not None and symbol not in live_tickers:
+                    continue  # dead already; the name check would only add noise
+                try:
+                    name_verified[symbol] = await self.edgar_client.name_matches_ticker(disclosed, symbol)
+                except Exception:  # noqa: BLE001 - one bad lookup must not stop the audit
+                    log.exception("%s: name verification failed during the audit", symbol)
+
+        return audit(
+            accepted=self.accepted_candidates.data,
+            candidates=self.candidates.data,
+            relationships=self.graph.relationships,
+            universe_symbols=set(self.symbol_list),
+            curated_symbols={c.symbol for c in self.settings.universe},
+            open_positions=set(self.journal.open_trades),
+            live_tickers=live_tickers,
+            name_verified=name_verified,
+            is_common_equity=is_common_equity,
+            lender_phrases=_LENDER_PHRASES,
+            normalize_name=normalize_company_name,
+            stale_edge_days=_STALE_EDGE_DAYS,
+        )
+
+    def quarantine_from_findings(self, findings: list, apply: bool = False) -> dict:
+        """Removes symbols the audit found structurally unfit from the live
+        universe, recording the finding that removed each one.
+
+        Never deletes: the row moves to data/quarantined_symbols.json with its
+        reason and its original accepted entry, so a wrong verdict is visible
+        and reversible by hand. Only ACTIONABLE findings are acted on -- a
+        curated seed symbol and a symbol with an open paper trade are both
+        reported and skipped, the latter because removing it would strand a
+        position that could then never be marked out.
+
+        apply=False computes exactly what it would do and mutates nothing, the
+        same contract reconcile_universe_connectivity offers."""
+        actionable: dict[str, list] = {}
+        for finding in findings:
+            if finding.actionable and finding.is_symbol_fault:
+                actionable.setdefault(finding.subject, []).append(finding)
+
+        planned = [
+            {"symbol": symbol,
+             "reasons": [f"{f.kind}: {f.detail}" for f in found],
+             "as": (self.accepted_candidates.get(symbol) or {}).get("as", "")}
+            for symbol, found in sorted(actionable.items())
+        ]
+        if not apply or not planned:
+            return {"applied": False, "quarantined": [], "would_quarantine": planned}
+
+        now = datetime.now(timezone.utc).isoformat()
+        for row in planned:
+            symbol = row["symbol"]
+            self.quarantine.set(symbol, {
+                "quarantined_at": now,
+                "reasons": row["reasons"],
+                "was": self.accepted_candidates.get(symbol),
+            })
+            self.accepted_candidates.delete(symbol)
+        # Rebuild from the curated base + the surviving accepted set, exactly
+        # as the connectivity reconcile does, so the in-memory universe matches
+        # what the next restart would load rather than drifting until then.
+        self.universe = list(self.settings.universe)
+        self._apply_accepted_candidates()
+        self.spec_by_symbol = spec_by_symbol(self.universe)
+        self._archive_orphaned_dossiers()
+        removed = [row["symbol"] for row in planned]
+        log.warning("[UNIVERSE] Graph maintenance quarantined %d symbol(s): %s. "
+                    "Recoverable from data/quarantined_symbols.json.",
+                    len(removed), ", ".join(removed))
+        return {"applied": True, "quarantined": removed, "would_quarantine": planned}
+
     async def reconcile_universe_connectivity(self, apply: bool = False) -> dict:
         """One connectivity reconcile of the ANCHOR set: GROW with candidates
         that will land connected to a tradeable, PRUNE runtime-accepted anchors
@@ -4197,6 +4373,8 @@ class Engine:
             ticker = (entry.get("ticker") or "").upper()
             if not ticker or ticker in known or ticker in self.accepted_candidates.data:
                 continue
+            if ticker in self.quarantine.data:
+                continue  # quarantined by a clean -- see _auto_accept_candidates
             links = self._tradeable_links(entry)
             if not links:
                 continue  # anchor-only disclosure (or sub-floor): would land inert

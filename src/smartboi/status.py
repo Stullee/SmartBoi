@@ -272,6 +272,7 @@ def gather_graph_health(
     last_research: str = "",
     researched_anchor_count: int = 0,
     refresh_per_day: int = 0,
+    audit: dict | None = None,
 ) -> dict:
     """Health and maintenance state of the relationship graph -- the numbers
     that say whether the mechanism the whole strategy runs on is actually
@@ -375,6 +376,16 @@ def gather_graph_health(
         # How long a full pass over the universe takes at the current rate --
         # the number that says whether "monthly" is really monthly.
         "cycle_days": round(universe_size / refresh_per_day, 1) if refresh_per_day else None,
+        # The correctness half. Everything above measures whether the graph is
+        # BIG enough; this is the daily read-only audit's verdict on whether
+        # what is already there is RIGHT -- delisted symbols, securities that
+        # are not common equity, misresolved names, financing relationships
+        # wearing a supply-chain label. See graph_audit.py. None until the
+        # first daily pass has run.
+        "audit": audit or None,
+        "audit_actionable": (audit or {}).get("actionable", 0),
+        "audit_at": (audit or {}).get("at", ""),
+        "audit_age_days": _days_since((audit or {}).get("at", "")),
     }
 
 

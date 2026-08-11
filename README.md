@@ -271,7 +271,11 @@ surfaces it. No LLM spend; SEC requests only.
 
 Both run on a **daily cadence** (`ENABLE_AUTO_SUPPLIER_RESEARCH`,
 `ENABLE_AUTO_EDGAR_SEARCH`), most-inert anchors first, as well as on their
-dashboard buttons. Scheduling the EDGAR one matters more than it sounds:
+dashboard buttons. `EDGAR_SEARCH_ANCHORS_PER_RUN` (default 25) sets the
+full-text search's throughput: one EFTS query plus at most ten document
+fetches per anchor, at SEC's 0.3s spacing, is ~3 seconds and zero tokens, so
+the old operator-sized cap of 5 was a 64-day rotation over a ~320-anchor list
+for no saving worth having. Scheduling the EDGAR one matters more than it sounds:
 left on a button it simply never ran, and it is the cheapest mechanism here
 that is size-selected in the direction the strategy needs. Reading an
 anchor's own filings finds its big customers; asking who *names* the anchor
@@ -426,6 +430,54 @@ a ranked table (thinnest coverage first) with an ecosystem guess (the
 first already-classified company a candidate was discovered in relation
 to) -- a starting point for review, never applied automatically; picking
 the final list is still your call, same as accepting any other candidate.
+
+### Graph maintenance: one button, one order
+
+Maintenance had accreted into three daily passes, two operator buttons and a
+connectivity reconcile with its own dry run — and between them they only ever
+asked *is the graph big enough*. Nothing asked *is what we already have
+correct*. An audit of the live board answered that: of eleven accepted
+tradeables, only four were sound. `GHY` was a closed-end **bond fund**
+recorded as "PGIM, Inc." off a note purchase agreement (a lender, the exact
+class the extraction filters exist to drop), `TCPA` a junior subordinated note
+due 2085, `SCE-PN` a preferred series, `SPWR` and `RJET` delisted shells. Each
+was polled hourly and accrued LLM spend against a thesis that cannot exist.
+
+**Graph maintenance** runs one fixed sequence, and the order *is* the argument
+for the button — growing before cleaning re-admits the symbol you just
+removed, and cleaning before ticker resolution acts on stale data:
+
+| | | |
+|---|---|---|
+| 1 | **Audit** | Read-only. Every structural fault, most decisive first (`graph_audit.py`). |
+| 2 | **Clean** | Quarantine the unfit — only with `apply`. |
+| 3 | **Resolve** | Retry ticker resolution and re-screen, so growth sees current recommendations. |
+| 4 | **Discover** | EDGAR full-text search — the only pass size-selected toward small counterparties. |
+| 5 | **Connect** | The connectivity reconcile, last, acting on everything above produced. |
+
+The audit checks eight things nothing else looked at: delisted tickers,
+tradeables that are not common equity, names that no longer verify against
+SEC's filer list, financing relationships wearing a supply-chain label,
+self-edges, dangling endpoints, edges no filing has re-confirmed in months,
+and candidate rows that collapse to one company (1,903 rows contain only 1,797
+distinct normalized names — `seen_count` is split across spellings, and
+`seen_count` is what gates tradeable auto-accept).
+
+**Quarantine never deletes.** A removed symbol keeps its row and its reason in
+`data/quarantined_symbols.json` and is restored by hand by deleting the row —
+the same reasoning behind `_block_junk_candidates` marking rather than
+deleting: a removal is a judgement, and a judgement you cannot see or reverse
+is indistinguishable from data loss. It is also load-bearing rather than a
+receipt, because auto-accept and the reconcile both consult it; without it the
+next pass re-adds the symbol from the same candidate row and the clean undoes
+itself on a schedule. **A symbol with an open paper trade is never touched** —
+removing it would strand a position that could then never be marked out — and
+neither is a curated `universe.py` anchor, since a runtime pass cannot durably
+delete a code-seeded symbol.
+
+The audit half is read-only, so it also runs **daily** on its own and surfaces
+in the dashboard's Graph health panel with an alert on anything actionable. The
+destructive half stays behind the button.
 
 ## Entry timing: are we too late?
 

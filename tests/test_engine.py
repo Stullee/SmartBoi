@@ -406,6 +406,119 @@ async def test_reconcile_grows_connected_anchor_and_promotes_its_edge(engine):
                for r in engine.graph.relationships)
 
 
+# --- Graph maintenance: quarantine is removal from the live universe, never
+# deletion, and never of something holding an open position. ---
+
+def _finding(kind, subject, actionable=True, blocked=""):
+    from smartboi.graph_audit import Finding
+
+    return Finding(kind, subject, "because", actionable, blocked)
+
+
+async def test_quarantine_dry_run_reports_without_mutating(engine):
+    from smartboi.graph_audit import KIND_DEAD_LISTING
+
+    engine.accept_candidate("DEADCO", "anchor", source="auto")
+    findings = [_finding(KIND_DEAD_LISTING, "DEADCO")]
+
+    result = engine.quarantine_from_findings(findings, apply=False)
+
+    assert result["applied"] is False
+    assert [r["symbol"] for r in result["would_quarantine"]] == ["DEADCO"]
+    assert "DEADCO" in engine.spec_by_symbol
+    assert not engine.quarantine.data
+
+
+async def test_quarantine_removes_from_the_universe_but_keeps_the_row(engine):
+    from smartboi.graph_audit import KIND_DEAD_LISTING
+
+    engine.accept_candidate("DEADCO", "anchor", source="auto")
+    findings = [_finding(KIND_DEAD_LISTING, "DEADCO")]
+
+    result = engine.quarantine_from_findings(findings, apply=True)
+
+    assert result["quarantined"] == ["DEADCO"]
+    assert "DEADCO" not in engine.spec_by_symbol          # out of the live universe
+    assert "DEADCO" not in engine.accepted_candidates.data
+    row = engine.quarantine.get("DEADCO")                 # but recoverable, with the reason
+    assert row["was"]["as"] == "anchor"
+    assert any(KIND_DEAD_LISTING in r for r in row["reasons"])
+
+
+async def test_quarantine_never_acts_on_a_non_actionable_finding(engine):
+    from smartboi.graph_audit import KIND_DEAD_LISTING
+
+    engine.accept_candidate("DEADCO", "anchor", source="auto")
+    findings = [_finding(KIND_DEAD_LISTING, "DEADCO", actionable=False,
+                         blocked="has an OPEN paper trade")]
+
+    result = engine.quarantine_from_findings(findings, apply=True)
+
+    assert result["would_quarantine"] == []
+    assert "DEADCO" in engine.spec_by_symbol
+
+
+async def test_a_quarantined_symbol_is_not_re_accepted(engine):
+    """Without this the next auto-accept re-adds it from the same candidate row
+    and the clean undoes itself on a schedule."""
+    from smartboi.graph_audit import KIND_DEAD_LISTING
+
+    engine.settings.enable_auto_accept_candidates = True
+    engine.settings.auto_accept_anchors = True
+    engine.candidates.set("ZOMBI", {
+        "name": "Zombi Inc", "ticker": "ZOMBI", "related_to": ["FORM"],
+        "rel_types": ["customer"], "description": "", "sources": [], "seen_count": 3,
+        "recommended_as": "anchor", "recommendation_reason": "big",
+        "pending_edges": [{"from_symbol": "FORM", "rel_type": "customer",
+                           "description": "d", "confidence": 0.9, "source": "u"}],
+    })
+    engine.accept_candidate("ZOMBI", "anchor", source="auto")
+    engine.quarantine_from_findings([_finding(KIND_DEAD_LISTING, "ZOMBI")], apply=True)
+    assert "ZOMBI" not in engine.spec_by_symbol
+
+    await engine._auto_accept_candidates()
+
+    assert "ZOMBI" not in engine.spec_by_symbol
+    result = await engine.reconcile_universe_connectivity(apply=True)
+    assert "ZOMBI" not in (result["added"] or [])
+
+
+async def test_audit_skips_the_liveness_check_when_sec_is_unreachable(engine, monkeypatch):
+    """An unreachable SEC must never read as "the whole universe is delisted"."""
+    from smartboi.graph_audit import KIND_DEAD_LISTING
+
+    async def no_map():
+        return None
+
+    monkeypatch.setattr(engine.edgar_client, "live_tickers", no_map, raising=False)
+    engine.accept_candidate("DEADCO", "anchor", source="auto")
+
+    findings = await engine.audit_universe()
+
+    assert KIND_DEAD_LISTING not in {f.kind for f in findings}
+
+
+async def test_graph_maintenance_dry_run_changes_nothing(engine, monkeypatch):
+    from smartboi.tools import run_graph_maintenance
+
+    async def no_map():
+        return None
+
+    monkeypatch.setattr(engine.edgar_client, "live_tickers", no_map, raising=False)
+    engine.accept_candidate("KEEPME", "anchor", source="auto")
+    before = set(engine.spec_by_symbol)
+
+    report = await run_graph_maintenance(engine, apply=False)
+
+    assert "DRY RUN" in report
+    assert set(engine.spec_by_symbol) == before
+    assert not engine.quarantine.data
+    # The five steps must all be present and in order -- growing before
+    # cleaning would re-admit what was just removed.
+    for step in ("1. AUDIT", "2. CLEAN", "3. RESOLVE", "4. DISCOVER", "5. CONNECT"):
+        assert step in report
+
+
 async def test_reconcile_grows_a_tradeable_candidate_as_tradeable(engine):
     """The GROW arm used to hardcode "anchor", which permanently converted a
     candidate that screens TRADEABLE -- _auto_accept_candidates skips anything
