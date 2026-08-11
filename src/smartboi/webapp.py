@@ -317,6 +317,8 @@ _INDEX_HTML = """<!doctype html>
   .gl-l { width:15px; height:3px; border-radius:2px; }
   .gl-d { width:9px; height:9px; border-radius:50%; }
   .gl-d.none { width:11px; height:11px; background:transparent; border:1.5px dashed var(--warn); }
+  .gl-d.small { width:7px; height:7px; }
+  .gl-d.hollow { background:transparent; border:1.5px solid var(--faint); }
 
   details.more { margin-top:14px; }
   details.more > summary { cursor:pointer; list-style:none; font-size:12px; color:var(--accent);
@@ -869,7 +871,12 @@ var TCK = {};
 function tok(name){ return TCK[name] !== undefined ? TCK[name] : getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 function refreshTokens(){ ["--gc-cust","--gc-supp","--gc-comp","--gc-reg","--gc-eco","--gn-anchor","--pos","--neg","--faint","--gn-stroke","--gn-txt","--warn"]
   .forEach(function(k){ TCK[k]=getComputedStyle(document.documentElement).getPropertyValue(k).trim(); }); }
-function gvColorTok(type){ return {customer:"--gc-cust",supplier:"--gc-supp",competitor:"--gc-comp",regulator:"--gc-reg"}[type]||"--gc-eco"; }
+// The four REL_TYPES and their channel colours. Anything else cannot reach the
+// canvas today -- RelationshipGraph drops an unknown rel_type on load -- but it
+// is drawn dashed in the fallback colour below rather than silently borrowing a
+// real channel's, so a new relationship type shows up as obviously unkeyed.
+var GC={customer:"--gc-cust",supplier:"--gc-supp",competitor:"--gc-comp",regulator:"--gc-reg"};
+function gvColorTok(type){ return GC[type]||"--gc-eco"; }
 function gvR(n){ if(n.kind==="anchor") return 13; if(n.score!=null) return 6+n.score*10; return 6; }
 function gvFill(n){ if(n.kind==="anchor") return "--gn-anchor"; if(n.dir==="LONG") return "--pos"; if(n.dir==="SHORT") return "--neg"; return "--faint"; }
 
@@ -940,14 +947,20 @@ function drawWire(now){
   WIRE.edges.forEach(function(e){ var pa=WIRE.pos[e[0]],pb=WIRE.pos[e[1]]; if(!pa||!pb) return;
     var isHot=hot[e[0]+">"+e[1]], col=tok(gvColorTok(e[2]));
     ctx.globalAlpha=isHot?0.95:0.22; ctx.strokeStyle=col; ctx.lineWidth=Math.max(0.6,(0.6+e[3]*2.2))*s*(isHot?1.3:1);
-    if(e[2]==="ecosystem") ctx.setLineDash([3.2*s,4.5*s]); else ctx.setLineDash([]);
+    if(!GC[e[2]]) ctx.setLineDash([3.2*s,4.5*s]); else ctx.setLineDash([]);
     ctx.beginPath(); ctx.moveTo(pa.x*s,pa.y*s); ctx.lineTo(pb.x*s,pb.y*s); ctx.stroke();
   });
   ctx.setLineDash([]); ctx.globalAlpha=1;
   // pulses along hot edges
+  // Pulses travel INWARD -- from the counterparty to the signalled name. This
+  // band is titled "News -> supply chain" and that is the direction the
+  // mechanism runs: an anchor's news propagates across an edge into a thinly
+  // covered tradeable, accumulates as evidence, and eventually crosses the
+  // conviction bar. Running the dots outward drew the opposite claim -- a
+  // small-cap broadcasting at the giants that actually fed it.
   if(hotSym){ var pn=WIRE.pos[hotSym]; sigEdges(hotSym).forEach(function(e){ var other=e[0]===hotSym?e[1]:e[0], po=WIRE.pos[other]; if(!pn||!po) return;
     var col=tok(gvColorTok(e[2]));
-    for(var k=0;k<3;k++){ var t=((now/1200)+k/3)%1, px=(pn.x+(po.x-pn.x)*t)*s, py=(pn.y+(po.y-pn.y)*t)*s, al=Math.sin(t*Math.PI);
+    for(var k=0;k<3;k++){ var t=((now/1200)+k/3)%1, px=(po.x+(pn.x-po.x)*t)*s, py=(po.y+(pn.y-po.y)*t)*s, al=Math.sin(t*Math.PI);
       ctx.globalAlpha=al; ctx.fillStyle=col; ctx.shadowColor=col; ctx.shadowBlur=8*s; ctx.beginPath(); ctx.arc(px,py,3*s,0,7); ctx.fill(); }
   }); ctx.shadowBlur=0; ctx.globalAlpha=1; }
   // nodes
@@ -958,8 +971,14 @@ function drawWire(now){
     if(isHot){ var beat=0.5+0.5*Math.sin(now/260), gap=(n.kind==="unlinked"?9.5:4);
       ctx.globalAlpha=0.9; ctx.strokeStyle=tok(gvFill(n)); ctx.lineWidth=2;
       ctx.beginPath(); ctx.arc(x,y,r+(gap+beat*5)*s,0,7); ctx.stroke(); ctx.globalAlpha=1; ctx.shadowColor=tok(gvFill(n)); ctx.shadowBlur=(8+beat*10)*s; }
-    ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fillStyle=tok(gvFill(n)); ctx.globalAlpha=n.kind==="anchor"?0.92:1; ctx.fill(); ctx.globalAlpha=1;
-    ctx.shadowBlur=0; ctx.lineWidth=1.5*s; ctx.strokeStyle=tok("--gn-stroke"); ctx.stroke();
+    // An `external` node is a graph endpoint that is not a universe member at
+    // all -- today that is exclusively the regulator pseudo-symbols. Drawn
+    // hollow so it cannot be mistaken for a thesis-less tradeable, which shares
+    // its size and its grey.
+    var isExt=(n.kind==="external");
+    ctx.beginPath(); ctx.arc(x,y,r,0,7);
+    ctx.fillStyle=isExt?tok("--gn-stroke"):tok(gvFill(n)); ctx.globalAlpha=n.kind==="anchor"?0.92:1; ctx.fill(); ctx.globalAlpha=1;
+    ctx.shadowBlur=0; ctx.lineWidth=1.5*s; ctx.strokeStyle=isExt?tok("--faint"):tok("--gn-stroke"); ctx.stroke();
     // A signal with no disclosed path is MARKED, not merely drawn alone -- an
     // isolated dot reads as a layout accident, a dashed warning ring reads as the
     // statement it is: this thesis came from the company's own filings and no
@@ -986,7 +1005,7 @@ function drawWire(now){
 function resizeWire(){ if(!cv) return; cw=cv.parentNode.clientWidth; ch=Math.round(cw*VH/VW); if(ch>520){ch=520;} scale=cw/VW;
   cv.width=Math.round(cw*dpr); cv.height=Math.round(ch*dpr); cv.style.height=ch+"px"; }
 
-function renderFeed(){
+function renderFeed(scrollToActive){
   var s=WIRE.feed; el("feedCount").textContent=s.length+(s.length===1?" signal":" signals");
   var act=activeIndex(); if(act<0) act=0;
   el("feed").innerHTML=s.map(function(x,i){
@@ -995,7 +1014,24 @@ function renderFeed(){
       '</span></div><div class="ev-body">'+esc(x.thesis_summary)+"</div></button>";
   }).join("");
   Array.prototype.forEach.call(el("feed").querySelectorAll(".ev"),function(b){ b.addEventListener("click",function(){
-    WIRE.activeKey=sigKeyOf(WIRE.feed[+b.dataset.i]); WIRE.t0=performance.now(); renderFeed(); }); });
+    WIRE.activeKey=sigKeyOf(WIRE.feed[+b.dataset.i]); WIRE.t0=performance.now(); renderFeed(true); }); });
+  // The list holds ~4 rows and the ticker walks all 25, so from the fifth item
+  // on the canvas was pulsing a name whose feed row was below the fold. Done on
+  // every selection CHANGE but never on a plain re-render: a refresh landing
+  // while the operator is scrolled back through older signals must not snap the
+  // list out from under them.
+  //
+  // Scrolls the CONTAINER, not scrollIntoView: block:"nearest" walks every
+  // scrollable ancestor, so an operator reading the trade tables further down
+  // the page would be yanked back up here every 4.8 seconds.
+  if(scrollToActive){
+    var on=el("feed").querySelector(".ev.on"), box=el("feed");
+    if(on){
+      var r1=on.getBoundingClientRect(), r0=box.getBoundingClientRect();
+      if(r1.top<r0.top) box.scrollTop+=r1.top-r0.top;
+      else if(r1.bottom>r0.bottom) box.scrollTop+=r1.bottom-r0.bottom;
+    }
+  }
 }
 
 // The full graph is the whole universe (~200 names, hundreds of edges) -- a
@@ -1059,12 +1095,26 @@ function updateWire(d){
   var key=JSON.stringify(f.nodes.map(function(n){return n.id;}));
   WIRE.nodes=f.nodes; WIRE.edges=f.edges;
   if(key!==WIRE.layoutKey){ WIRE.layoutKey=key; layoutWire(); }
+  // The legend keys what is ACTUALLY drawn. It used to name "ecosystem", which
+  // is not a relationship type at all (it is an evidence class elsewhere in the
+  // system) and which RelationshipGraph drops on load if it ever appeared --
+  // while supplier and regulator edges, which are drawn constantly, had no key
+  // at all. A legend that describes a channel that cannot occur and omits two
+  // that do is worse than none: the panel's whole claim is that the mechanism
+  // can be read off it.
   el("wireLeg").innerHTML='<span class="gl"><i class="gl-l" style="background:var(--gc-cust)"></i>customer</span>'+
+    '<span class="gl"><i class="gl-l" style="background:var(--gc-supp)"></i>supplier</span>'+
     '<span class="gl"><i class="gl-l" style="background:var(--gc-comp)"></i>competitor</span>'+
-    '<span class="gl"><i class="gl-l" style="background:var(--gc-eco)"></i>ecosystem</span>'+
+    '<span class="gl"><i class="gl-l" style="background:var(--gc-reg)"></i>regulator</span>'+
     '<span class="gl"><i class="gl-d" style="background:var(--gn-anchor)"></i>anchor</span>'+
     '<span class="gl"><i class="gl-d" style="background:var(--pos)"></i>long</span>'+
     '<span class="gl"><i class="gl-d" style="background:var(--neg)"></i>short</span>'+
+    // Three different things used to render as the same grey disc: an anchor, a
+    // tradeable with no thesis yet, and an `external` non-member (the regulator
+    // pseudo-symbols BIS/EPA/ITC/NHTSA, which are graph endpoints but not in the
+    // universe). The legend called all three "anchor".
+    '<span class="gl"><i class="gl-d small" style="background:var(--faint)"></i>no thesis yet</span>'+
+    '<span class="gl"><i class="gl-d hollow"></i>off-universe</span>'+
     // Only keyed when one is actually on screen -- a legend entry for something
     // that is not being drawn is the defect this panel already had once.
     (f.unlinked?'<span class="gl"><i class="gl-d none"></i>no disclosed path</span>':"")+
@@ -1082,6 +1132,7 @@ function updateWire(d){
     if(!n){ tip.style.opacity="0"; cv.style.cursor="default"; return; } cv.style.cursor="pointer";
     function dirWord(x){ return x.dir==="LONG"?"long":(x.dir==="SHORT"?"short":"no"); }
     var thesis = n.kind==="anchor" ? "anchor &middot; news source"
+      : n.kind==="external" ? "off-universe &middot; a graph endpoint that is neither a trade target nor an anchor"
       : n.kind==="unlinked" ? (dirWord(n)+" thesis, score "+(n.score!=null?n.score.toFixed(2):"&ndash;")+
           " &mdash; signalled with NO disclosed relationship path; this one came from its own filings")
       : (n.score!=null?(dirWord(n)+" thesis, score "+n.score.toFixed(2)):"no thesis yet");
@@ -1105,7 +1156,7 @@ function frame(now){
   var s=WIRE.feed;
   if(s.length && now-WIRE.t0>4800){
     var i=activeIndex();
-    WIRE.activeKey=sigKeyOf(s[(i<0?0:i+1)%s.length]); WIRE.t0=now; renderFeed();
+    WIRE.activeKey=sigKeyOf(s[(i<0?0:i+1)%s.length]); WIRE.t0=now; renderFeed(true);
   }
   drawWire(now); requestAnimationFrame(frame);
 }
