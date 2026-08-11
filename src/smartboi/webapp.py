@@ -862,7 +862,7 @@ function renderDetail(d){
 // updateWire(data). Signals flow as pulses from the signaled tradeable out to
 // its graph neighbours; the active ticker item lights its path.
 // ===========================================================================
-var WIRE = { nodes:[], edges:[], pos:{}, byId:{}, active:0, t0:0, laid:false, sigKey:"" };
+var WIRE = { nodes:[], edges:[], pos:{}, byId:{}, feed:[], activeKey:"", t0:0, laid:false, layoutKey:"" };
 var cv, ctx, dpr=Math.max(1,Math.min(2,window.devicePixelRatio||1)), cw=700, ch=460, scale=1, VW=1000, VH=560;
 
 var TCK = {};
@@ -893,7 +893,42 @@ function layoutWire(){
   WIRE.pos=pos; WIRE.laid=true;
 }
 
-function activeSig(){ var s=data.recent_signals||[]; return s.length?s[WIRE.active%s.length]:null; }
+// ---- the feed's derived list ----------------------------------------------
+// ONE ordered, de-duplicated list drives the ticker, the feed highlight and the
+// canvas -- not three separate readings of the raw log window.
+//
+// Two things are wrong with rendering data.recent_signals directly. It arrives
+// OLDEST FIRST: gather_recent_signals returns the tail of an append-only log
+// verbatim, so the panel with the pulsing "live" dot opened on the oldest signal
+// it held, with the newest below the fold of the scroll list (the Recent signals
+// table below reverses for exactly this reason; this panel did not). And signal
+// evaluation is deliberately status-blind (see signals.py's module docstring):
+// one signal EPISODE re-logs a row on every newly accepted piece of corroborating
+// evidence, so the raw window can be the same name five times over and the ticker
+// would dwell on it five times. Rows carry an `episode` key precisely so that can
+// be collapsed -- event_study.collapse_episodes already does it for the analysis.
+function sigKeyOf(s){ return s?(s.symbol+"|"+(s.episode||s.generated_at||"")):""; }
+function feedRows(sigs){
+  var byKey={}, keys=[];
+  (sigs||[]).forEach(function(s){
+    if(!s||!s.symbol) return;
+    var k=sigKeyOf(s);
+    if(!byKey[k]){ byKey[k]=s; keys.push(k); }
+    else if((s.generated_at||"")>=(byKey[k].generated_at||"")) byKey[k]=s;  // the latest re-log wins
+  });
+  return keys.map(function(k){ return byKey[k]; })
+    .sort(function(a,b){ var x=a.generated_at||"", y=b.generated_at||""; return x<y?1:(x>y?-1:0); });
+}
+// Position is not identity. The window slides as new signals fire, so the index
+// that meant INTT on one refresh means ASYS on the next -- the operator's
+// selection silently moved to a different company under them every time the
+// engine logged a signal. Selection is held as symbol+episode and resolved back
+// to a position on each rebuild; -1 means "the selected episode is gone".
+function activeIndex(){
+  for(var i=0;i<WIRE.feed.length;i++) if(sigKeyOf(WIRE.feed[i])===WIRE.activeKey) return i;
+  return -1;
+}
+function activeSig(){ var i=activeIndex(); return i<0?(WIRE.feed[0]||null):WIRE.feed[i]; }
 function sigEdges(sym){ return WIRE.edges.filter(function(e){ return e[0]===sym||e[1]===sym; }); }
 
 function drawWire(now){
@@ -952,13 +987,15 @@ function resizeWire(){ if(!cv) return; cw=cv.parentNode.clientWidth; ch=Math.rou
   cv.width=Math.round(cw*dpr); cv.height=Math.round(ch*dpr); cv.style.height=ch+"px"; }
 
 function renderFeed(){
-  var s=data.recent_signals||[]; el("feedCount").textContent=s.length+" signals";
+  var s=WIRE.feed; el("feedCount").textContent=s.length+(s.length===1?" signal":" signals");
+  var act=activeIndex(); if(act<0) act=0;
   el("feed").innerHTML=s.map(function(x,i){
-    return '<button class="ev'+(i===WIRE.active?" on":"")+'" data-i="'+i+'"><div class="ev-top"><span class="ev-sym mono">'+esc(x.symbol)+
+    return '<button class="ev'+(i===act?" on":"")+'" data-i="'+i+'"><div class="ev-top"><span class="ev-sym mono">'+esc(x.symbol)+
       '</span><span class="dir '+CO[x.direction]+'">'+x.direction+'</span><span class="ev-time">'+esc((x.generated_at||"").slice(5,16).replace("T"," "))+
       '</span></div><div class="ev-body">'+esc(x.thesis_summary)+"</div></button>";
   }).join("");
-  Array.prototype.forEach.call(el("feed").querySelectorAll(".ev"),function(b){ b.addEventListener("click",function(){ WIRE.active=+b.dataset.i; WIRE.t0=performance.now(); renderFeed(); }); });
+  Array.prototype.forEach.call(el("feed").querySelectorAll(".ev"),function(b){ b.addEventListener("click",function(){
+    WIRE.activeKey=sigKeyOf(WIRE.feed[+b.dataset.i]); WIRE.t0=performance.now(); renderFeed(); }); });
 }
 
 // The full graph is the whole universe (~200 names, hundreds of edges) -- a
@@ -968,7 +1005,7 @@ function renderFeed(){
 function focusGraph(g){
   var nodes=g.nodes||[], edges=g.edges||[], keep={};
   nodes.forEach(function(n){ if(n.kind==="tradeable" && (n.dir || n.score!=null)) keep[n.id]="t"; });
-  (data.recent_signals||[]).forEach(function(s){ keep[s.symbol]="t"; });
+  WIRE.feed.forEach(function(s){ keep[s.symbol]="t"; });
   edges.forEach(function(e){ if(keep[e[0]]==="t" && !keep[e[1]]) keep[e[1]]="a"; if(keep[e[1]]==="t" && !keep[e[0]]) keep[e[0]]="a"; });
   var fnodes=nodes.filter(function(n){ return keep[n.id]; });
   if(fnodes.length<6){
@@ -1000,7 +1037,7 @@ function focusGraph(g){
   // guarantees it loses a degree-ranked cut. Built from the signal row itself,
   // which already carries the direction and both factors of the score.
   var unlinked=0;
-  (data.recent_signals||[]).forEach(function(s){
+  WIRE.feed.forEach(function(s){
     if(!s.symbol || ids[s.symbol]) return;
     ids[s.symbol]=1; unlinked++;
     fnodes.push({ id:s.symbol, kind:"unlinked", dir:s.direction, name:"", sector:"",
@@ -1011,10 +1048,17 @@ function focusGraph(g){
 }
 
 function updateWire(d){
+  // Built BEFORE focusGraph: the focus set includes every signalled symbol, so
+  // the ticker, the highlight and the canvas must all read the same list.
+  WIRE.feed=feedRows(d.recent_signals);
+  // Only when the selected episode has fallen out of the window entirely does
+  // the selection move -- and then to the newest, not to whatever now occupies
+  // the old index.
+  if(activeIndex()<0) WIRE.activeKey=sigKeyOf(WIRE.feed[0]);
   var f=focusGraph(d.graph||{});
   var key=JSON.stringify(f.nodes.map(function(n){return n.id;}));
   WIRE.nodes=f.nodes; WIRE.edges=f.edges;
-  if(key!==WIRE.sigKey){ WIRE.sigKey=key; layoutWire(); }
+  if(key!==WIRE.layoutKey){ WIRE.layoutKey=key; layoutWire(); }
   el("wireLeg").innerHTML='<span class="gl"><i class="gl-l" style="background:var(--gc-cust)"></i>customer</span>'+
     '<span class="gl"><i class="gl-l" style="background:var(--gc-comp)"></i>competitor</span>'+
     '<span class="gl"><i class="gl-l" style="background:var(--gc-eco)"></i>ecosystem</span>'+
@@ -1058,8 +1102,11 @@ function renderAll(d){
 }
 
 function frame(now){
-  var s=data.recent_signals||[];
-  if(s.length && now-WIRE.t0>4800){ WIRE.active=(WIRE.active+1)%s.length; WIRE.t0=now; renderFeed(); }
+  var s=WIRE.feed;
+  if(s.length && now-WIRE.t0>4800){
+    var i=activeIndex();
+    WIRE.activeKey=sigKeyOf(s[(i<0?0:i+1)%s.length]); WIRE.t0=now; renderFeed();
+  }
   drawWire(now); requestAnimationFrame(frame);
 }
 
