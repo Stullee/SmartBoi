@@ -90,6 +90,16 @@ LLM call/token usage against the daily budget, and discovered **universe
 candidates** -- companies outside your universe that a filing disclosed a
 relationship to. Auto-refreshes every 10 seconds. Never places orders.
 
+**Dossiers by conviction** ranks the top names by `confidence x magnitude`
+against a vertical rule at the 0.50 signal bar, so which ones actually fire
+is readable at a glance. Click a row -- there or in the all-dossiers table
+-- to open that dossier: the score and its components, mass agreeing vs
+opposing, what the whole-body synthesis pass did to it, and the individual
+evidence items behind it, each with its source, its own
+direction/confidence/magnitude, the skeptic's note, and (for anything that
+arrived through the relationship graph) which company it was actually about
+and via which relationship.
+
 Almost entirely read-only, with one exception: each universe candidate
 that resolved to a real ticker gets a one-click **"+ Tradeable"** / **"+
 Anchor"** button that adds it to the live universe immediately (no

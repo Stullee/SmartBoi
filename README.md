@@ -997,6 +997,19 @@ average R, recent signals, today's LLM call/token usage against the daily
 budget, and discovered universe candidates. Auto-refreshes every 10
 seconds. Never places orders.
 
+"Dossiers by conviction" ranks the top names by `confidence x magnitude`
+against a vertical rule at the 0.50 signal bar, so which ones actually fire
+is readable at a glance rather than inferred. Clicking a row -- there or in
+the all-dossiers table -- opens that dossier: the score and its components,
+mass agreeing vs opposing, what the whole-body synthesis pass did to it,
+and the individual evidence items behind it, each with its source, its own
+direction/confidence/magnitude, the skeptic's note, and (for anything that
+arrived through the graph) which company it was actually about and via
+which relationship. Served by `GET /api/dossier/<symbol>` on click rather
+than on the refresh cycle -- evidence is the largest thing the system
+stores, and it would otherwise be re-sent every 10 seconds for every
+dossier to fill a panel nobody has opened.
+
 Almost entirely read-only, except one endpoint: `POST /api/candidates/accept`
 adds a discovered candidate into the live universe (the dashboard's "+
 Tradeable"/"+ Anchor" buttons) -- bounded to symbols the extraction

@@ -47,6 +47,7 @@ from smartboi.tools import (
 )
 from smartboi.status import (
     gather_coverage,
+    gather_dossier_detail,
     gather_dossiers,
     gather_graph_stats,
     gather_graph_health,
@@ -315,16 +316,87 @@ _INDEX_HTML = """<!doctype html>
   .work { grid-template-columns:1.3fr 1fr; align-items:start; }
   @media (max-width:900px){ .work{ grid-template-columns:1fr; } }
 
-  .ladder { padding:14px 16px 16px; }
-  .lad-scale { position:relative; height:16px; margin:0 0 2px 62px; }
-  .lad-line { position:absolute; top:8px; left:0; right:0; border-top:1px dashed var(--warn); }
-  .lad-lab { position:absolute; top:-3px; font-size:9.5px; color:var(--warn); transform:translateX(-50%); white-space:nowrap; }
-  .lad-row { display:grid; grid-template-columns:56px 1fr; align-items:center; gap:6px; height:23px; }
+  /* Column widths live here as custom properties because the 0.50 rule below
+     is positioned from the same arithmetic -- hard-coding both is how the
+     label and the thing it labels drift apart. */
+  .ladder { padding:14px 16px 16px;
+            --lad-sym:56px; --lad-dir:16px; --lad-gap:6px; --lad-val:42px;
+            --lad-l:calc(var(--lad-sym) + var(--lad-dir) + var(--lad-gap)*2);
+            --lad-r:calc(var(--lad-val) + var(--lad-gap)); }
+  /* The signal bar is a VERTICAL rule through every row at exactly the x the
+     bars are measured against. It used to be a horizontal dashed line ACROSS
+     THE TOP of the panel with the "0.50" caption floating over its midpoint,
+     which read as a heading underline -- and left the one question this panel
+     exists to answer ("which of these fire?") with nothing on any row that
+     could answer it. Nothing marked 0.50; you could not tell a 0.34 from a
+     0.62 by looking. */
+  .lad-plot { position:relative; padding-top:15px; }
+  .lad-bar { position:absolute; top:15px; bottom:2px; z-index:2; pointer-events:none;
+             left:calc(var(--lad-l) + (100% - var(--lad-l) - var(--lad-r))/2);
+             border-left:1px dashed var(--warn); }
+  .lad-bar b { position:absolute; top:-15px; left:0; transform:translateX(-50%); font-weight:500;
+               font-size:9.5px; color:var(--warn); white-space:nowrap; }
+  .lad-row { display:grid; width:100%; height:24px; align-items:center; gap:var(--lad-gap);
+             grid-template-columns:var(--lad-sym) var(--lad-dir) 1fr var(--lad-val);
+             font:inherit; color:var(--ink); background:transparent; border:0; padding:0;
+             border-radius:5px; cursor:pointer; text-align:left; }
+  .lad-row:hover { background:var(--panel-hi); }
+  .lad-row:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
   .lad-sym { font-size:12px; text-align:right; }
+  /* Direction was encoded in the bar colour and nowhere else, which is no
+     encoding at all for the ~8% of men who cannot separate this red from this
+     green -- and the legend's own two dots rendered grey, because bare bullets
+     in a .note inherit .note's colour. */
+  .lad-dir { font-size:9px; font-weight:700; text-align:center; border-radius:3px; line-height:14px; }
+  .lad-dir.L { color:var(--pos); background:var(--pos-soft); }
+  .lad-dir.S { color:var(--neg); background:var(--neg-soft); }
   .lad-track { position:relative; height:15px; }
   .lad-fill { position:absolute; top:3px; left:0; height:9px; border-radius:5px; }
   .lad-dot { position:absolute; top:1px; width:13px; height:13px; border-radius:50%; transform:translateX(-50%); border:2px solid var(--panel); }
-  .lad-con { position:absolute; top:-1px; width:17px; height:17px; border-radius:50%; transform:translateX(-50%); border:1.5px dashed var(--warn); }
+  .lad-con { position:absolute; top:-2px; width:19px; height:19px; border-radius:50%; transform:translateX(-50%); border:1.5px dashed var(--warn); }
+  /* The score in figures. Fourteen bars carried no number anywhere, and the
+     one table that does is folded away behind a <details>. */
+  .lad-val { font-size:11px; text-align:right; color:var(--muted); }
+  .lad-row.fires .lad-val { color:var(--ink); font-weight:600; }
+  .lad-empty { font-size:12px; color:var(--faint); padding:10px 0 2px; }
+  .lad-key { display:flex; flex-wrap:wrap; align-items:center; gap:4px 12px; margin-top:10px; font-size:11px; color:var(--faint); }
+  .lad-key i { display:inline-block; width:9px; height:9px; border-radius:50%; vertical-align:-1px; margin-right:5px; }
+  .lad-key i.con { width:11px; height:11px; background:transparent; border:1.5px dashed var(--warn); }
+
+  /* ===== Dossier sheet =====
+     What a ladder row (or an all-dossiers row) is a summary OF. Fixed and
+     outside every panel on purpose: the page re-renders #ladder from a fresh
+     payload every 10 seconds, and a detail view nested inside it would be
+     wiped mid-read. */
+  .dsh { position:fixed; inset:0; z-index:60; display:flex; align-items:flex-start; justify-content:center; padding:5vh 16px; }
+  .dsh[hidden] { display:none; }
+  .dsh-back { position:absolute; inset:0; background:rgba(4,8,13,0.55); }
+  .dsh-card { position:relative; display:flex; flex-direction:column; width:min(760px,100%); max-height:90vh;
+              background:var(--panel); border:1px solid var(--line); border-radius:14px; box-shadow:var(--shadow); overflow:hidden; }
+  .dsh-head { display:flex; align-items:center; gap:9px; padding:13px 16px; border-bottom:1px solid var(--line-soft); }
+  .dsh-head h3 { margin:0; font-size:15px; font-weight:650; letter-spacing:-0.01em; }
+  .dsh-x { margin-left:auto; width:26px; height:26px; flex:none; font-size:13px; line-height:1; cursor:pointer;
+           background:transparent; border:1px solid var(--line); color:var(--muted); border-radius:7px; }
+  .dsh-x:hover { background:var(--panel-hi); color:var(--ink); }
+  .dsh-body { overflow-y:auto; padding:14px 16px 18px; }
+  .dsh-score { display:flex; align-items:baseline; flex-wrap:wrap; gap:5px 10px; }
+  .dsh-score .n { font-size:30px; font-weight:650; letter-spacing:-0.02em; line-height:1; }
+  .dsh-score .c { font-size:11.5px; color:var(--muted); }
+  .dsh-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(104px,1fr)); gap:8px; margin-top:13px; }
+  .dsh-s { background:var(--sunk); border-radius:8px; padding:7px 9px; }
+  .dsh-s .l { font-size:9.5px; text-transform:uppercase; letter-spacing:0.06em; color:var(--faint); }
+  .dsh-s .v { font-size:14px; font-weight:600; margin-top:1px; }
+  .dsh-h { font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted); margin:17px 0 7px; }
+  .dsh-p { font-size:12.5px; color:var(--ink-2); line-height:1.5; }
+  .dsh-ev { border:1px solid var(--line-soft); border-radius:9px; padding:9px 11px; margin-bottom:7px; }
+  .dsh-ev-h { font-size:12.5px; font-weight:600; line-height:1.35; }
+  .dsh-ev-h a { color:inherit; }
+  .dsh-ev-m { display:flex; flex-wrap:wrap; gap:2px 9px; margin-top:5px; font-size:10.5px; color:var(--faint); }
+  .dsh-ev-n { margin-top:6px; font-size:11.5px; color:var(--muted); line-height:1.4; }
+  .dsh-tags { display:flex; flex-wrap:wrap; align-items:center; gap:5px; margin-bottom:4px; }
+  .dsh-via { font-size:10px; color:var(--accent); background:var(--accent-soft); border-radius:5px; padding:1px 6px; }
+  .dsh-skep { border-left:2px solid var(--warn); padding-left:8px; }
+  #dossTable tbody tr[data-sym] { cursor:pointer; }
 
   table { border-collapse:collapse; width:100%; font-size:12.5px; }
   .scroll { overflow-x:auto; }
@@ -438,7 +510,7 @@ _INDEX_HTML = """<!doctype html>
   <div class="eyebrow">Live now</div>
   <div class="grid work">
     <div class="panel">
-      <div class="phead"><h2>Dossiers by conviction</h2><span class="hint">score = conf &times; mag &middot; bar at 0.50 fires</span></div>
+      <div class="phead"><h2>Dossiers by conviction</h2><span class="hint">score = conf &times; mag &middot; click a row for its dossier</span></div>
       <div class="ladder" id="ladder"></div>
     </div>
     <div class="panel">
@@ -507,6 +579,17 @@ _INDEX_HTML = """<!doctype html>
   </div></div>
 </div>
 <div class="tip" id="tip"></div>
+<div class="dsh" id="dossierSheet" hidden>
+  <div class="dsh-back" id="dossierBack"></div>
+  <div class="dsh-card" role="dialog" aria-modal="true" aria-labelledby="dossierTitle">
+    <div class="dsh-head">
+      <h3 class="mono" id="dossierTitle"></h3>
+      <span class="hint" id="dossierSub"></span>
+      <button class="dsh-x" id="dossierClose" aria-label="Close dossier">&#10005;</button>
+    </div>
+    <div class="dsh-body" id="dossierBody"></div>
+  </div>
+</div>
 
 <script>
 var data = {};
@@ -905,14 +988,161 @@ function renderGraphHealth(d){
 
 function renderLadder(d){
   var ds=(d.dossiers||[]).slice().sort(function(a,b){return (b.confidence*b.magnitude)-(a.confidence*a.magnitude);}).slice(0,14);
-  var rows=ds.map(function(x){ var sc=x.confidence*x.magnitude, pct=Math.min(100,sc*100), isS=x.direction==="SHORT";
-    var col=isS?"var(--neg)":"var(--pos)", soft=isS?"var(--neg-soft)":"var(--pos-soft)";
-    var con=x.mass_opposing>0.3?'<span class="lad-con" style="left:'+pct+'%"></span>':"";
-    return '<div class="lad-row"><div class="lad-sym mono">'+esc(x.symbol)+'</div><div class="lad-track">'+
-      '<div class="lad-fill" style="width:'+pct+"%;background:"+soft+'"></div>'+con+'<div class="lad-dot" style="left:'+pct+"%;background:"+col+'"></div></div></div>';
+  if(!ds.length){ el("ladder").innerHTML='<div class="lad-empty">No dossiers yet &mdash; nothing has accumulated a thesis.</div>'; return; }
+  var rows=ds.map(function(x){
+    var sc=x.confidence*x.magnitude, pct=Math.max(0,Math.min(100,sc*100)).toFixed(1), fires=sc>=0.5;
+    // NONE is a real direction here (a dossier that has accumulated evidence
+    // pointing both ways), and on a young install one can be inside the top
+    // 14 -- so it must not render as a green L.
+    var isS=x.direction==="SHORT", isL=x.direction==="LONG", con=x.mass_opposing>0.3;
+    var dc=isS?"S":(isL?"L":"?");
+    var col=isS?"var(--neg)":(isL?"var(--pos)":"var(--faint)");
+    // Solid fill means it cleared 0.50, tinted means it did not. The rule
+    // alone already answers that, but only if you sight along it; the fill
+    // says the same thing from across the room.
+    var soft=isS?"var(--neg-soft)":(isL?"var(--pos-soft)":"var(--line)");
+    var tip=x.symbol+" "+x.direction+" \\u2014 score "+fx(sc)+" (conf "+fx(x.confidence)+" \\u00d7 mag "+fx(x.magnitude)+"), "+
+      x.independent_source_count+" independent sources"+(con?", contested":"")+
+      (fires?" \\u2014 above the bar" : " \\u2014 below the 0.50 bar")+". Click for the dossier.";
+    return '<button type="button" class="lad-row'+(fires?" fires":"")+'" data-sym="'+escAttr(x.symbol)+'" title="'+escAttr(tip)+'">'+
+      '<span class="lad-sym mono">'+esc(x.symbol)+'</span>'+
+      '<span class="lad-dir '+dc+'">'+dc+"</span>"+
+      '<span class="lad-track"><span class="lad-fill" style="width:'+pct+"%;background:"+(fires?col:soft)+'"></span>'+
+      (con?'<span class="lad-con" style="left:'+pct+'%"></span>':"")+
+      '<span class="lad-dot" style="left:'+pct+"%;background:"+col+'"></span></span>'+
+      '<span class="lad-val mono">'+fx(sc)+"</span></button>";
   }).join("");
-  el("ladder").innerHTML='<div class="lad-scale"><div class="lad-line"></div><div class="lad-lab" style="left:50%">signal bar 0.50</div></div>'+rows+
-    '<div class="note" style="margin-top:8px">● long ● short &middot; <span style="color:var(--warn)">◌</span> contested. Right of 0.50 fires.</div>';
+  el("ladder").innerHTML='<div class="lad-plot"><div class="lad-bar" aria-hidden="true"><b>fires at 0.50</b></div>'+rows+"</div>"+
+    '<div class="lad-key"><span><i style="background:var(--pos)"></i>long</span>'+
+    '<span><i style="background:var(--neg)"></i>short</span>'+
+    '<span><i class="con"></i>contested</span>'+
+    '<span>solid fill = past the bar</span>'+
+    '<span>click a row for its dossier</span></div>';
+}
+
+// ===========================================================================
+// DOSSIER SHEET -- the ladder and the all-dossiers table are both summaries,
+// and until now the evidence under a score was reachable only by reading the
+// JSON on disk. Clicking a row opens the dossier it summarises.
+//
+// Fetched per symbol rather than carried on the 10s status payload: evidence
+// is the largest thing this system stores, and shipping every dossier's items
+// on every refresh to render a panel that is usually shut is exactly the
+// mistake _status_payload already had to undo for the graph's by_symbol map.
+// ===========================================================================
+var SHEET = { seq:0, from:null };
+
+// esc() covers innerHTML; an ATTRIBUTE also has to survive a quote, and both
+// are reachable from model-extracted text (headlines, relationship notes), so
+// neither is theoretical. split/join rather than .replace(/"/g,...) because a
+// regex literal containing a quote character reads as an unterminated string
+// to the guard in test_webapp_html.py -- which is the only thing standing
+// between this file and a syntax error that silently kills the dashboard.
+function escAttr(s){ return esc(s).split('"').join("&quot;").split("'").join("&#39;"); }
+// Evidence URLs come from news feeds and model extraction, i.e. not from us.
+// Anything that is not plainly http(s) does not become an href.
+function safeUrl(u){ u=String(u||""); return /^https?:\\/\\//i.test(u)?u:""; }
+
+function openDossier(sym, origin){
+  if(!sym) return;
+  var seq=++SHEET.seq; SHEET.from=origin||null;
+  el("dossierTitle").textContent=sym;
+  el("dossierSub").textContent="";
+  el("dossierBody").innerHTML='<div class="lad-empty">Loading dossier&hellip;</div>';
+  el("dossierSheet").hidden=false;
+  document.body.style.overflow="hidden";
+  el("dossierClose").focus();
+  fetch(API_BASE+"dossier/"+encodeURIComponent(sym))
+    .then(function(r){ return r.json().then(function(j){ return { ok:r.ok, body:j }; }); })
+    .then(function(res){
+      // A second row clicked while this one was in flight must not have its
+      // panel overwritten when the slower response lands.
+      if(seq!==SHEET.seq) return;
+      if(!res.ok){ el("dossierBody").innerHTML='<div class="lad-empty">'+esc(res.body.error||"Could not load this dossier.")+"</div>"; return; }
+      renderDossierSheet(res.body);
+    })
+    .catch(function(err){ if(seq===SHEET.seq) el("dossierBody").innerHTML='<div class="lad-empty">Failed to load: '+esc(err)+"</div>"; });
+}
+
+function closeDossier(){
+  var sheet=el("dossierSheet"); if(sheet.hidden) return;
+  SHEET.seq++; sheet.hidden=true; document.body.style.overflow="";
+  // Only if it is still on the page -- the row that opened this may have been
+  // replaced by a refresh while the sheet was up.
+  if(SHEET.from && document.contains(SHEET.from)) SHEET.from.focus();
+  SHEET.from=null;
+}
+
+function statTile(label, value, colour){
+  return '<div class="dsh-s"><div class="l">'+label+'</div><div class="v mono"'+(colour?' style="color:'+colour+'"':"")+">"+value+"</div></div>";
+}
+
+function renderDossierSheet(x){
+  var sc=x.confidence*x.magnitude, fires=sc>=0.5, con=x.mass_opposing>0.3;
+  // Same fallback as the ladder: anything that is not LONG or SHORT gets the
+  // neutral colour rather than defaulting to green.
+  var col=x.direction==="SHORT"?"var(--neg)":(x.direction==="LONG"?"var(--pos)":"var(--faint)");
+  el("dossierSub").innerHTML='<span class="dir '+(CO[x.direction]||"")+'">'+esc(x.direction)+"</span>";
+
+  var head='<div class="dsh-score"><span class="n mono" style="color:'+col+'">'+fx(sc)+"</span>"+
+    '<span class="c">'+fx(x.confidence)+" conf &times; "+fx(x.magnitude)+" mag"+"</span>"+
+    // Coloured by DIRECTION rather than with .pill.sig, which is the accent
+    // the SIGNALED pill right next to it already uses -- two accent pills side
+    // by side read as one repeated fact instead of two different ones.
+    '<span class="pill"'+(fires?' style="color:'+col+";border-color:"+col+'"':"")+">"+
+      (fires?"above the 0.50 bar":"below the 0.50 bar")+"</span>"+
+    (x.status==="SIGNALED"?'<span class="pill sig">SIGNALED</span>':'<span class="pill">'+esc(x.status)+"</span>")+
+    (con?'<span class="pill" style="color:var(--warn);border-color:var(--warn)">contested</span>':"")+"</div>";
+
+  var tiles=statTile("Sources",x.independent_source_count)+
+    statTile("Evidence",x.evidence_count)+
+    statTile("Distinct facts",x.distinct_fact_count||x.distinct_fact_keys||0)+
+    statTile("Horizon",(x.horizon_days||0)+"d")+
+    statTile("Mass agree",fx(x.mass_agree),"var(--pos)")+
+    statTile("Mass opposing",fx(x.mass_opposing),con?"var(--warn)":"")+
+    statTile("Updated",timeAgo(x.updated_at).t)+
+    (x.signaled_at?statTile("Signal price",x.signaled_price==null?"&ndash;":fx(x.signaled_price)):"");
+
+  var thesis=x.thesis_summary?'<div class="dsh-h">Thesis</div><div class="dsh-p">'+esc(x.thesis_summary)+"</div>":"";
+
+  // Why the number moved. A 0.000 from the whole-body pass and a 0.000 from
+  // decay are the same digit and completely different situations.
+  var syn="";
+  if(x.synthesis_at){
+    var flags=[];
+    if(x.already_priced_in) flags.push("already priced in");
+    if(x.redundant_evidence) flags.push("redundant evidence");
+    syn='<div class="dsh-h">Whole-body synthesis</div><div class="dsh-p">Scored '+fx(x.pre_synthesis_score)+
+      " before the pass, "+fx(sc)+" after ("+fx(x.synthesis_confidence)+" conf &times; "+fx(x.synthesis_magnitude)+" mag)"+
+      (flags.length?", flagged "+esc(flags.join(" and ")):"")+". Last run "+esc((x.synthesis_at||"").slice(0,16).replace("T"," "))+".</div>";
+  }
+
+  var shown=x.evidence_shown===undefined?(x.evidence||[]).length:x.evidence_shown;
+  var evHead='<div class="dsh-h">Evidence &middot; '+shown+(x.evidence_count>shown?" of "+x.evidence_count+" (newest)":"")+"</div>";
+  el("dossierBody").innerHTML=head+'<div class="dsh-grid">'+tiles+"</div>"+thesis+syn+evHead+dossierEvidence(x);
+}
+
+function dossierEvidence(x){
+  var ev=x.evidence||[];
+  if(!ev.length) return '<div class="lad-empty">No evidence items on this dossier.</div>';
+  return ev.map(function(e){
+    var url=safeUrl(e.url), title=esc(e.headline||"(no headline)");
+    var tags='<span class="dir '+(CO[e.direction]||"")+'">'+esc(e.direction)+"</span>"+
+      (e.is_propagated?'<span class="dsh-via">via '+esc(e.origin_symbol)+"</span>":"");
+    var meta=[esc(e.source_type||"")+(e.source_name?" &middot; "+esc(e.source_name):""),
+              esc((e.published_at||"").slice(0,10)),
+              "conf "+fx(e.confidence)+" &middot; mag "+fx(e.magnitude),
+              e.horizon_days?e.horizon_days+"d horizon":"",
+              e.fact_key?"fact: "+esc(e.fact_key):""]
+      .filter(Boolean).map(function(t){ return "<span>"+t+"</span>"; }).join("");
+    return '<div class="dsh-ev"><div class="dsh-tags">'+tags+"</div>"+
+      '<div class="dsh-ev-h">'+(url?'<a href="'+escAttr(url)+'" target="_blank" rel="noopener noreferrer">'+title+"</a>":title)+"</div>"+
+      '<div class="dsh-ev-m">'+meta+"</div>"+
+      (e.relationship_note?'<div class="dsh-ev-n">'+esc(e.relationship_note)+
+        (e.relationship_confidence==null?"":" (edge "+fx(e.relationship_confidence)+")")+"</div>":"")+
+      (e.reasoning?'<div class="dsh-ev-n">'+esc(e.reasoning)+"</div>":"")+
+      (e.skeptic_note?'<div class="dsh-ev-n dsh-skep">'+esc(e.skeptic_note)+"</div>":"")+"</div>";
+  }).join("");
 }
 
 function renderOpen(d){
@@ -949,7 +1179,8 @@ function renderDetail(d){
   var ds=d.dossiers||[]; el("dossCount").textContent=ds.length+" active";
   el("dossTable").innerHTML='<thead><tr><th>Sym</th><th>Dir</th><th class="num">Score</th><th class="num">Src</th><th>Status</th></tr></thead><tbody>'+
     ds.map(function(x){ var sc=x.confidence*x.magnitude;
-      return '<tr><td class="sym mono">'+esc(x.symbol)+'</td><td><span class="dir '+CO[x.direction]+'">'+x.direction+"</span></td>"+
+      return '<tr data-sym="'+escAttr(x.symbol)+'" title="Click for the dossier"><td class="sym mono">'+esc(x.symbol)+
+        '</td><td><span class="dir '+CO[x.direction]+'">'+x.direction+"</span></td>"+
         '<td class="num mono '+(sc>=0.5?"acc":"")+'">'+fx(sc)+(x.mass_opposing>0.3?' <span style="color:var(--warn)">◌</span>':"")+"</td>"+
         '<td class="num mono">'+x.independent_source_count+"</td>"+
         "<td>"+(x.status==="SIGNALED"?'<span class="pill sig">SIGNALED</span>':'<span class="pill">'+x.status+"</span>")+"</td></tr>";
@@ -1342,6 +1573,22 @@ function frame(now){
   btn.addEventListener("click",function(){ dark=!dark; apply(); }); apply();
 })();
 
+// Delegated, because both containers have their innerHTML replaced wholesale
+// every 10 seconds -- a listener bound to the rows themselves would have to be
+// re-bound on every render, and would be silently lost the first time someone
+// forgot.
+el("ladder").addEventListener("click", function(ev){
+  var row=ev.target&&ev.target.closest?ev.target.closest(".lad-row"):null;
+  if(row) openDossier(row.getAttribute("data-sym"), row);
+});
+el("dossTable").addEventListener("click", function(ev){
+  var tr=ev.target&&ev.target.closest?ev.target.closest("tr[data-sym]"):null;
+  if(tr) openDossier(tr.getAttribute("data-sym"), null);
+});
+el("dossierBack").addEventListener("click", closeDossier);
+el("dossierClose").addEventListener("click", closeDossier);
+document.addEventListener("keydown", function(ev){ if(ev.key==="Escape") closeDossier(); });
+
 cv=el("wireCanvas"); ctx=cv.getContext("2d");
 window.addEventListener("resize",function(){ resizeWire(); });
 // A window resize is not the only thing that changes this panel's width: the
@@ -1485,6 +1732,37 @@ def create_app(engine) -> web.Application:
         if request.headers.get("If-None-Match") == etag:
             return web.Response(status=304, headers=headers)
         return web.Response(body=body, content_type="application/json", headers=headers)
+
+    async def handle_dossier(request: web.Request) -> web.Response:
+        """One dossier with its evidence, fetched when a row is clicked.
+
+        Split out of /api/status rather than folded into it: evidence is by
+        far the largest thing the system stores, and the page re-polls status
+        every 10 seconds. Shipping every dossier's evidence on that cycle to
+        render a panel that is usually closed is how the payload got trimmed
+        in the first place (see _status_payload on `by_symbol`).
+
+        The symbol is pattern-checked here and membership-checked in
+        gather_dossier_detail, because DossierStore turns the string into a
+        filesystem path -- a bare `dir / f"{symbol}.json"` with an unvalidated
+        segment is a traversal, even from a GET that only reads.
+        """
+        symbol = (request.match_info.get("symbol") or "").upper()
+        if not _TICKER_RE.match(symbol):
+            return web.json_response({"error": "not a ticker"}, status=400)
+        try:
+            detail = await asyncio.wait_for(
+                asyncio.to_thread(gather_dossier_detail, engine.dossiers, symbol),
+                timeout=_STATUS_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            return web.json_response({"error": "dossier read timed out"}, status=504)
+        except Exception as exc:  # noqa: BLE001 - a bad dossier must not 500 the page
+            log.exception("Dashboard dossier query failed for %s", symbol)
+            return web.json_response({"error": str(exc)}, status=500)
+        if detail is None:
+            return web.json_response({"error": f"no dossier for {symbol}"}, status=404)
+        return web.json_response(detail, headers={"Cache-Control": "no-cache"})
 
     async def handle_accept_candidate(request: web.Request) -> web.Response:
         """The dashboard's one-click Accept: adds a discovered universe
@@ -1774,6 +2052,7 @@ def create_app(engine) -> web.Application:
     app = web.Application(middlewares=[_require_csrf_header])
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_status)
+    app.router.add_get("/api/dossier/{symbol}", handle_dossier)
     app.router.add_post("/api/candidates/accept", handle_accept_candidate)
     app.router.add_post("/api/tools/screen", handle_tool_screen)
     app.router.add_post("/api/tools/supplier-research", handle_tool_supplier_research)

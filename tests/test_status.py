@@ -5,6 +5,7 @@ from smartboi.dossier import Dossier
 from smartboi.graph import Relationship, RelationshipGraph
 from smartboi.status import (
     _peak_concurrent,
+    gather_dossier_detail,
     gather_graph_stats,
     gather_paper_trade_stats,
     gather_strategy_generations,
@@ -323,6 +324,76 @@ def test_gather_graph_stats_builds_typed_nodes_and_edges(tmp_path):
     assert nodes["AMAT"]["kind"] == "anchor" and nodes["AMAT"]["dir"] is None
     assert nodes["AMAT"]["name"] == "Applied Materials"
     assert stats["edges"] == [["UCTT", "AMAT", "customer", 0.85]]
+
+
+# --- Per-dossier detail: the evidence the refresh payload deliberately does
+# NOT carry, fetched when a ladder row is clicked. ---
+
+
+def _ev(evidence_id, published_at, **kw):
+    from smartboi.dossier import EvidenceRecord
+
+    fields = {
+        "evidence_id": evidence_id, "source_type": "news", "source_name": "Reuters",
+        "url": "https://example.com/" + evidence_id, "headline": "H " + evidence_id,
+        "published_at": published_at, "origin_symbol": "UCTT", "is_propagated": False,
+        "relationship_note": "", "direction": "LONG", "magnitude": 0.5,
+        "confidence": 0.5, "horizon_days": 20, "reasoning": "r", "skeptic_note": "",
+    }
+    fields.update(kw)
+    return EvidenceRecord(**fields)
+
+
+def test_dossier_detail_carries_the_evidence_and_the_summary_fields(tmp_path):
+    from smartboi.dossier import Dossier, DossierStore
+
+    store = DossierStore(tmp_path / "d")
+    store.save(Dossier(
+        symbol="UCTT", direction="LONG", confidence=0.8, magnitude=0.5,
+        thesis_summary="Tool orders recovering",
+        evidence=[_ev("a", "2026-07-01T00:00:00+00:00",
+                      is_propagated=True, origin_symbol="AMAT",
+                      relationship_note="AMAT is a customer of UCTT",
+                      relationship_confidence=0.7)],
+    ))
+
+    detail = gather_dossier_detail(store, "UCTT")
+
+    # Every field the summary row has, so a view can render either payload.
+    assert detail["thesis_summary"] == "Tool orders recovering"
+    assert detail["confidence"] == 0.8 and detail["evidence_count"] == 1
+    assert detail["evidence"][0]["relationship_note"] == "AMAT is a customer of UCTT"
+    assert detail["evidence"][0]["relationship_confidence"] == 0.7
+
+
+def test_dossier_detail_is_none_for_a_symbol_with_no_dossier(tmp_path):
+    """DossierStore.load invents an empty Dossier for an unknown symbol, which
+    would render as a real dossier scoring 0.00 rather than as 'no such
+    thing'. The membership check is also what keeps a crafted symbol from
+    reaching outside the dossier directory."""
+    from smartboi.dossier import DossierStore
+
+    store = DossierStore(tmp_path / "d")
+    assert gather_dossier_detail(store, "NOPE") is None
+
+
+def test_dossier_detail_caps_evidence_newest_first_and_says_so(tmp_path):
+    """A name that has been in the universe a year can carry hundreds of
+    items; the panel must not become a megabyte. What is cut is the oldest,
+    and the header can still say 3 of 5 because both numbers are reported."""
+    from smartboi.dossier import Dossier, DossierStore
+
+    store = DossierStore(tmp_path / "d")
+    store.save(Dossier(
+        symbol="UCTT", direction="LONG", confidence=0.8, magnitude=0.5,
+        evidence=[_ev(chr(ord("a") + i), f"2026-07-0{i + 1}T00:00:00+00:00") for i in range(5)],
+    ))
+
+    detail = gather_dossier_detail(store, "UCTT", evidence_limit=3)
+
+    assert detail["evidence_count"] == 5          # what exists
+    assert detail["evidence_shown"] == 3          # what was sent
+    assert [e["evidence_id"] for e in detail["evidence"]] == ["e", "d", "c"]
 
 
 # --- Coverage: how much of the TRADEABLE universe is actually live. A

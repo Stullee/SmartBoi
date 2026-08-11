@@ -104,54 +104,115 @@ class StrategyGeneration:
     realized_pnl: float
 
 
+def _dossier_row(d: Dossier) -> dict:
+    """The summary fields every dossier readout shares -- the ladder, the
+    all-dossiers table and the per-symbol detail below all start here, so a
+    field added for one is present in the others rather than in whichever
+    view happened to need it first."""
+    return {
+        "symbol": d.symbol,
+        "direction": d.direction,
+        "confidence": round(d.confidence, 3),
+        "magnitude": round(d.magnitude, 3),
+        "horizon_days": d.horizon_days,
+        "independent_source_count": d.independent_source_count,
+        "status": d.status,
+        "thesis_summary": d.thesis_summary,
+        "evidence_count": len(d.evidence),
+        "updated_at": d.updated_at,
+        "signaled_at": d.signaled_at,
+        "signaled_price": d.signaled_price,
+        "mass_agree": round(d.mass_agree, 3),
+        "mass_opposing": round(d.mass_opposing, 3),
+        # How many of this dossier's items carry a fact label, and how
+        # many distinct labels that is. The whole per-fact
+        # independence mechanism rests on the model reusing a label
+        # rather than paraphrasing it, and a model that quietly stops
+        # doing so degrades scoring back to per-channel counting with
+        # no error anywhere -- so it has to be visible.
+        "labelled_evidence_count": sum(1 for e in d.evidence if e.fact_key),
+        "distinct_fact_keys": len({
+            normalized_fact_key(e.fact_key) for e in d.evidence if e.fact_key
+        }),
+        # --- What the whole-body pass did to this row. Carried here
+        # because the dossier table showed a vetoed 0.000 and a
+        # decayed-to-zero 0.000 as the same thing, which made the one
+        # pass capable of stopping every trade in the system
+        # invisible in the only artifact an operator reads. Live, 22
+        # of 45 dossiers sat at exactly 0.000 with no way to tell
+        # from here which pass had put them there.
+        "synthesis_at": d.synthesis_at,
+        "pre_synthesis_score": round(d.pre_synthesis_score, 3),
+        "synthesis_confidence": round(d.synthesis_confidence, 3),
+        "synthesis_magnitude": round(d.synthesis_magnitude, 3),
+        "distinct_fact_count": d.distinct_fact_count,
+        "already_priced_in": d.already_priced_in,
+        "redundant_evidence": d.redundant_evidence,
+    }
+
+
 def gather_dossiers(store: DossierStore) -> list[dict]:
-    rows = []
-    for symbol in store.all_symbols():
-        d = store.load(symbol)
-        rows.append(
-            {
-                "symbol": d.symbol,
-                "direction": d.direction,
-                "confidence": round(d.confidence, 3),
-                "magnitude": round(d.magnitude, 3),
-                "horizon_days": d.horizon_days,
-                "independent_source_count": d.independent_source_count,
-                "status": d.status,
-                "thesis_summary": d.thesis_summary,
-                "evidence_count": len(d.evidence),
-                "updated_at": d.updated_at,
-                "signaled_at": d.signaled_at,
-                "signaled_price": d.signaled_price,
-                "mass_agree": round(d.mass_agree, 3),
-                "mass_opposing": round(d.mass_opposing, 3),
-                # How many of this dossier's items carry a fact label, and how
-                # many distinct labels that is. The whole per-fact
-                # independence mechanism rests on the model reusing a label
-                # rather than paraphrasing it, and a model that quietly stops
-                # doing so degrades scoring back to per-channel counting with
-                # no error anywhere -- so it has to be visible.
-                "labelled_evidence_count": sum(1 for e in d.evidence if e.fact_key),
-                "distinct_fact_keys": len({
-                    normalized_fact_key(e.fact_key) for e in d.evidence if e.fact_key
-                }),
-                # --- What the whole-body pass did to this row. Carried here
-                # because the dossier table showed a vetoed 0.000 and a
-                # decayed-to-zero 0.000 as the same thing, which made the one
-                # pass capable of stopping every trade in the system
-                # invisible in the only artifact an operator reads. Live, 22
-                # of 45 dossiers sat at exactly 0.000 with no way to tell
-                # from here which pass had put them there.
-                "synthesis_at": d.synthesis_at,
-                "pre_synthesis_score": round(d.pre_synthesis_score, 3),
-                "synthesis_confidence": round(d.synthesis_confidence, 3),
-                "synthesis_magnitude": round(d.synthesis_magnitude, 3),
-                "distinct_fact_count": d.distinct_fact_count,
-                "already_priced_in": d.already_priced_in,
-                "redundant_evidence": d.redundant_evidence,
-            }
-        )
+    rows = [_dossier_row(store.load(symbol)) for symbol in store.all_symbols()]
     rows.sort(key=lambda r: (r["confidence"] * r["magnitude"]), reverse=True)
     return rows
+
+
+# The evidence a single dossier can accumulate is unbounded, and this payload
+# is fetched on a click rather than on the 10s refresh -- but a name that has
+# been in the universe for a year should still not ship a megabyte to a phone.
+# Newest first, so what is cut is the tail nobody scrolls to.
+_DETAIL_EVIDENCE_LIMIT = 60
+
+
+def gather_dossier_detail(
+    store: DossierStore, symbol: str, evidence_limit: int = _DETAIL_EVIDENCE_LIMIT
+) -> dict | None:
+    """One dossier, with the evidence rows behind its score.
+
+    The refresh payload deliberately carries only `evidence_count` -- the
+    records themselves are the largest thing in the system and would be
+    re-sent every 10 seconds for every dossier to render a panel nobody has
+    opened. This is the on-demand half: same summary fields, plus the
+    individual items, so "why is this at 0.34" has an answer in the UI
+    instead of only in the JSON on disk.
+
+    Returns None for a symbol with no dossier on disk. Callers are expected
+    to have validated the symbol already -- `all_symbols` membership is
+    checked here too, because DossierStore builds a path from the string.
+    """
+    if symbol not in set(store.all_symbols()):
+        return None
+    d = store.load(symbol)
+    evidence = sorted(
+        d.evidence, key=lambda e: (e.published_at or "", e.evidence_id), reverse=True
+    )
+    row = _dossier_row(d)
+    row["evidence"] = [
+        {
+            "evidence_id": e.evidence_id,
+            "source_type": e.source_type,
+            "source_name": e.source_name,
+            "url": e.url,
+            "headline": e.headline,
+            "published_at": e.published_at,
+            "origin_symbol": e.origin_symbol,
+            "is_propagated": e.is_propagated,
+            "relationship_note": e.relationship_note,
+            "relationship_confidence": e.relationship_confidence,
+            "direction": e.direction,
+            "magnitude": round(e.magnitude, 3),
+            "confidence": round(e.confidence, 3),
+            "horizon_days": e.horizon_days,
+            "reasoning": e.reasoning,
+            "skeptic_note": e.skeptic_note,
+            "fact_key": e.fact_key,
+        }
+        for e in evidence[:evidence_limit]
+    ]
+    # Stated rather than inferred from len(evidence): a panel showing 60 rows
+    # under a header saying 214 is honest; one silently showing 60 is not.
+    row["evidence_shown"] = len(row["evidence"])
+    return row
 
 
 def gather_coverage(universe, graph: RelationshipGraph, store: DossierStore) -> dict:
