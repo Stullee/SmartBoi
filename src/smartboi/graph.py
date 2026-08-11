@@ -218,7 +218,8 @@ class RelationshipExtractor:
         if not filing_text.strip():
             return []
         if not self._usage.budget_remaining(CAT_EXTRACTION):
-            log.info("%s: daily LLM call budget reached -- deferring relationship extraction.", filing_symbol)
+            log.info("%s: %s -- deferring relationship extraction.",
+                     filing_symbol, self._usage.deferral_reason(CAT_EXTRACTION))
             return None
         prompt = (
             f"Filing company: {filing_symbol} ({filing_form})\n"
@@ -241,12 +242,37 @@ class RelationshipExtractor:
                 messages=[{"role": "user", "content": prompt}],
             )
         except Exception as exc:  # noqa: BLE001 - never let a bad API call kill the ingestion loop
+            self._usage.note_failure(exc)
             log.warning("%s: relationship extraction failed: %s", filing_symbol, exc)
             return None
         self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
                            model=self._model, category=CAT_EXTRACTION)
         payload = first_tool_use(response)
-        return [] if payload is None else payload.get("relationships", [])
+        if payload is None:
+            return []
+        relationships = payload.get("relationships", [])
+        # The tool schema says this is an array; the model does not always
+        # agree, and when it hands back a STRING the caller's `for rel in
+        # relationships` walks it one character at a time. Every character is
+        # a non-dict, so every character logs its own "non-object entry"
+        # warning: measured live, 7,618 warnings from three filings, which is
+        # both a log storm and a completely illegible way to say "this call
+        # produced nothing". The caller's per-element guard is still right for
+        # a list holding one bad entry -- this is the container being wrong,
+        # which is a different failure and belongs where the contract is
+        # declared.
+        if not isinstance(relationships, list):
+            log.warning(
+                "%s: relationship extraction returned %s for 'relationships', not a list -- "
+                "discarding this response. Treated as 'no relationships found', NOT as a "
+                "transient failure: returning None here would mark the filing due again and "
+                "re-pay for a 150k-char extraction on every poll, which is the loop the "
+                "per-element guard downstream was written to escape. This filing yields no "
+                "edges until it is re-extracted by the rolling graph refresh.",
+                filing_symbol, type(relationships).__name__,
+            )
+            return []
+        return relationships
 
     async def aclose(self) -> None:
         await self._client.close()

@@ -9,8 +9,28 @@ import pytest
 from smartboi.paper_journal import assumes_borrow
 from smartboi.regsho import RegShoClient
 
-# Real shape: pipe-delimited, header row, trailing record count.
+# The shape ACTUALLY PUBLISHED, copied from a live fetch: no Date column, the
+# symbol first. This fixture is the regression -- the parser read column 1
+# against a `Date|Symbol|...` layout the file does not have, so it pulled the
+# security NAME, which contains spaces, failed the ticker-shape check and
+# returned the empty set for a perfectly good file. Every day, for the life of
+# the integration, silently falling every SHORT back to the market-cap proxy.
+#
+# The old fixture asserted the same wrong layout as the code, which is exactly
+# why 818 passing tests never caught it. It is kept below, as _FILE_WITH_DATE,
+# to pin that column order is now DERIVED rather than assumed.
 _FILE = (
+    "Symbol|Security Name|Market Category|Reg SHO Threshold Flag|Rule 3210|Filler\n"
+    "ABCD|SOME CORP COMMON STOCK|Q|Y|N|\n"
+    "WXYZ|ANOTHER INC|N|Y|N|\n"
+    "BRK.A|CLASS A|N|Y|N|\n"
+    "File Creation Time: 0807202611:30|||||\n"
+)
+
+# A leading Date column. Not currently published, but the point is that the
+# parser locates the symbol by HEADER NAME, so neither layout is privileged
+# and neither can silently return nothing.
+_FILE_WITH_DATE = (
     "Date|Symbol|SecurityName|Market Category|Reg SHO Threshold Flag|Rule 4320\n"
     "20260807|ABCD|Some Corp Common Stock|Q|Y|N\n"
     "20260807|WXYZ|Another Inc|N|Y|N\n"
@@ -48,6 +68,38 @@ async def test_the_header_and_trailer_rows_are_not_mistaken_for_tickers():
 
     assert client.is_threshold("Symbol") is False
     assert not any("|" in s or " " in s for s in client._symbols)
+
+
+@pytest.mark.regsho_network
+@pytest.mark.asyncio
+async def test_the_symbol_column_is_located_by_header_not_by_index():
+    """The live file has no Date column; an older shape had one. Both must
+    parse, because assuming either index is what broke this integration
+    silently for its whole life -- and a fixture agreeing with the code's
+    assumption is what let it pass 818 tests."""
+    client = _client(lambda request: httpx.Response(200, text=_FILE_WITH_DATE))
+
+    assert await client.refresh(today=date(2026, 8, 7)) is True
+    assert client.count == 3
+    assert client.is_threshold("ABCD") is True
+    assert client.is_threshold("BRK.A") is True
+    # The security name must never be mistaken for a ticker, whichever
+    # column it lands in.
+    assert client.is_threshold("Some Corp Common Stock") is False
+    assert client.is_threshold("20260807") is False
+
+
+@pytest.mark.regsho_network
+@pytest.mark.asyncio
+async def test_a_good_file_never_parses_to_an_empty_list():
+    """The precise failure this integration shipped with: HTTP 200, a
+    well-formed file full of threshold securities, and zero symbols parsed.
+    refresh() must report success, not fall through to the 'no list found in
+    6 days' path that hid the real cause behind a lookup-failure message."""
+    client = _client(lambda request: httpx.Response(200, text=_FILE))
+
+    assert await client.refresh(today=date(2026, 8, 7)) is True
+    assert client.count > 0
 
 
 @pytest.mark.regsho_network

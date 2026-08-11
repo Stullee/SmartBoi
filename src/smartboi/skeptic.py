@@ -172,7 +172,7 @@ class Skeptic:
         to re-infer proportionality purely from the wording of the note
         every time."""
         if not self._usage.budget_remaining(CAT_DOSSIER):
-            log.info("Daily LLM call budget reached -- deferring skeptic review.")
+            log.info("%s -- deferring skeptic review.", self._usage.deferral_reason(CAT_DOSSIER))
             return None
         now = now or datetime.now(timezone.utc)
         confidence_suffix = (
@@ -210,6 +210,7 @@ class Skeptic:
                 messages=[{"role": "user", "content": prompt}],
             )
         except Exception as exc:  # noqa: BLE001 - fail safe: nothing merges without a real verdict
+            self._usage.note_failure(exc)
             log.warning("Skeptic review failed (%s) -- will retry this evidence on a later poll.", exc)
             return None
         self._usage.record(response.usage.input_tokens, response.usage.output_tokens,

@@ -47,12 +47,15 @@ nothing else wants it, and is guaranteed whatever the capped categories
 cannot touch."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from smartboi.llm import cost_usd
+from smartboi.llm import cost_usd, permanent_failure_reason
 from smartboi.state import JsonState
+
+log = logging.getLogger(__name__)
 
 
 # The five callers, one per class that holds a UsageTracker. EXTRACTION and
@@ -70,6 +73,17 @@ CAT_RESEARCH = "research"       # research.SupplierResearcher
 
 CATEGORIES = (CAT_DOSSIER, CAT_SYNTHESIS, CAT_EXTRACTION, CAT_RESEARCH)
 
+# How often the circuit breaker lets a single call through to test whether an
+# account-level problem has been resolved.
+#
+# The failure being prevented is a retry STORM -- 11,893 calls in two hours,
+# three a second -- not a retry. Blocking outright until UTC midnight would
+# trade that storm for the opposite fault: an operator who tops up a balance
+# at 10:00 UTC would get nothing scored for fourteen hours over a problem they
+# had already fixed. Thirty minutes bounds the loop at roughly two calls an
+# hour (a rounding error against a 5000-call day) while recovering on its own.
+BREAKER_PROBE_INTERVAL_SEC = 30 * 60
+
 
 @dataclass(frozen=True)
 class UsageSnapshot:
@@ -82,6 +96,10 @@ class UsageSnapshot:
     daily_usd_budget: float = 0.0
     # {category: (usd, calls)} for everything that spent anything today.
     by_category: dict[str, tuple[float, int]] = field(default_factory=dict)
+    # Why LLM calls are halted for the rest of the UTC day, or "" when they
+    # are not. See UsageTracker.note_failure.
+    breaker_reason: str = ""
+    breaker_tripped_at: str = ""
 
 
 class UsageTracker:
@@ -134,6 +152,14 @@ class UsageTracker:
             self._state.set("usd_spent", 0.0)
             self._state.set("usd_by_category", {})
             self._state.set("calls_by_category", {})
+            # The breaker clears with the day, exactly like the budget. An
+            # account-level failure is not self-healing, but neither is it
+            # permanent -- somebody tops the balance up -- and UTC midnight is
+            # already this system's retry-everything boundary. Deferred, never
+            # discarded, the same contract an exhausted budget has.
+            self._state.set("breaker_reason", "")
+            self._state.set("breaker_tripped_at", "")
+            self._state.set("breaker_probe_at", "")
 
     def _reserved_elsewhere(self, category: str) -> float:
         """Dollars reserved by OTHER categories that they have not spent yet.
@@ -178,13 +204,114 @@ class UsageTracker:
         calls = (self._state.get("calls_by_category") or {}).get(category, 0)
         return usd, calls
 
+    def note_failure(self, exc: object, today: str | None = None) -> bool:
+        """Record an API failure; trip the breaker and return True when it is
+        an account-level one that retrying cannot fix.
+
+        Every LLM call site in this codebase catches broadly and returns None,
+        which the engine reads as "transient, retry later". That is right for
+        a rate limit and wrong for an exhausted balance, and the difference
+        showed up as 11,893 identical billing failures in two hours -- roughly
+        three requests a second against an error no retry could clear (see
+        llm.permanent_failure_reason). Nothing bounded it, because every
+        bounding mechanism in this system counts SUCCESSFUL calls: the budget
+        meters spend, and a failed call spends nothing, so a hard failure loop
+        is invisible to the one gate that could have stopped it.
+
+        Tripping is deliberately routed through the SAME gate the budget uses,
+        rather than a new check bolted onto each caller: all five call sites
+        already ask budget_remaining() before every request, so one change
+        covers extraction, dossier, skeptic, synthesis and research at once,
+        and no future call site can forget to consult it."""
+        reason = permanent_failure_reason(exc)
+        if not reason:
+            return False
+        # Never let bookkeeping displace the failure it is recording. This runs
+        # as the first statement of an `except` handler, and JsonState.update
+        # does a real fsync'd write -- an OSError here (a full disk, which is
+        # the characteristic Home-Assistant-on-an-SD-card failure) would
+        # replace the API exception the caller is in the middle of handling
+        # with a disk error, losing the diagnosis entirely.
+        try:
+            today = today or self._today()
+            self._roll_if_new_day(today)
+            already_open = bool(self._state.get("breaker_reason"))
+            now = datetime.now(timezone.utc).isoformat()
+            # Re-stamped on every failure, not only the first: the stamp is
+            # what the probe interval counts from, so a failed probe has to
+            # restart the clock or the breaker would let one call through on
+            # every subsequent check.
+            self._state.update({"breaker_reason": reason, "breaker_tripped_at": now})
+        except OSError:
+            log.exception("Could not persist the LLM circuit breaker state.")
+            return True
+        if already_open:
+            return True  # don't re-log once per suppressed call
+        log.error(
+            "LLM circuit breaker OPEN: %s. Halting Claude calls rather than retrying an error "
+            "that cannot succeed -- ingestion continues, evidence keeps accruing, and nothing is "
+            "scored until this is resolved. One probe call is allowed every %d minutes so a "
+            "resolved problem recovers on its own. Original error: %s",
+            reason, BREAKER_PROBE_INTERVAL_SEC // 60, exc,
+        )
+        return True
+
+    def deferral_reason(self, category: str = "", today: str | None = None) -> str:
+        """Why a call in `category` would be refused right now, phrased for a
+        log line, or "" when it would go through.
+
+        Exists because every call site logged "daily LLM call budget reached"
+        for any refusal, so a breaker halt -- a different problem with a
+        different fix -- was reported as an exhausted budget on a day that had
+        spent nothing."""
+        if self.breaker_reason(today):
+            return f"LLM circuit breaker open ({self.breaker_reason(today)})"
+        return "" if self.budget_remaining(category, today) else "daily LLM budget reached"
+
+    def _breaker_probe_due(self) -> bool:
+        """Whether enough time has passed to spend one call finding out
+        whether the problem is still there.
+
+        Counted from the LATER of the last failure and the last probe. Both
+        matter: without the failure stamp a fresh trip would be probed
+        immediately, and without the probe stamp a probe that met a transient
+        error would never close the window at all."""
+        now = datetime.now(timezone.utc)
+        latest = None
+        for key in ("breaker_tripped_at", "breaker_probe_at"):
+            stamp = self._state.get(key) or ""
+            try:
+                when = datetime.fromisoformat(stamp)
+            except (TypeError, ValueError):
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            latest = when if latest is None else max(latest, when)
+        if latest is None:
+            return True  # no readable stamp: probe rather than block forever
+        return (now - latest).total_seconds() >= BREAKER_PROBE_INTERVAL_SEC
+
+    def breaker_reason(self, today: str | None = None) -> str:
+        """Why calls are halted, or "" when they are not. For the dashboard
+        and the diagnostics bundle -- an operator seeing zero LLM activity
+        needs this stated, not inferred from a spend of $0.
+
+        Takes `today` like every other method here rather than reading the
+        wall clock. As a bare property it rolled the day against the real
+        clock, which made READING a diagnostic mutate state: on the first read
+        after midnight it cleared the breaker and wrote to disk as a side
+        effect of being looked at."""
+        today = today or self._today()
+        self._roll_if_new_day(today)
+        return self._state.get("breaker_reason", "") or ""
+
     def budget_remaining(self, category: str = "", today: str | None = None) -> bool:
         """Whether the day still has room for a call in `category`.
 
-        Three gates, all of which must pass: the total call cap, the total
-        dollar cap, and this category's own share of each. Any one exhausted
-        defers the work until UTC midnight, exactly as the call cap alone
-        used to -- deferred, never discarded (see engine.py).
+        Four gates, all of which must pass: the circuit breaker, the total
+        call cap, the total dollar cap, and this category's own share of each.
+        Any one exhausted defers the work until UTC midnight, exactly as the
+        call cap alone used to -- deferred, never discarded (see engine.py).
 
         An empty category, or one with no configured share, is checked
         against the TOTALS only. That is not a loophole, it is the design:
@@ -193,6 +320,30 @@ class UsageTracker:
         categories cannot."""
         today = today or self._today()
         self._roll_if_new_day(today)
+        # Checked FIRST and for every category: an account-level failure is
+        # not category-specific, and a reserved category would otherwise sail
+        # past a gate that exists precisely to stop the request it is about
+        # to make.
+        #
+        # Not an absolute block, though. Waiting for UTC midnight would mean
+        # an operator who tops up a balance at 10:00 UTC gets nothing scored
+        # for fourteen hours over a problem they already fixed -- and the
+        # thing being prevented is a retry STORM (three per second), not a
+        # retry. So one probe call is let through per interval: the failure
+        # loop is bounded at roughly two calls an hour, and a resolved problem
+        # recovers on its own within the interval. A successful call clears
+        # the breaker outright (see record); a failed probe re-stamps it.
+        if self._state.get("breaker_reason"):
+            if not self._breaker_probe_due():
+                return False
+            # The token is CONSUMED here, not merely tested. Without this the
+            # window opens and never shuts: only a success (record) or another
+            # PERMANENT failure (note_failure re-stamping) closed it, so a run
+            # of transient errors -- a 429, which is exactly what hammering a
+            # struggling account produces -- left every subsequent call
+            # allowed. Measured: 20 of 20 calls passed an open breaker, which
+            # is the storm this whole mechanism exists to bound, restored.
+            self._state.set("breaker_probe_at", datetime.now(timezone.utc).isoformat())
         # The total call cap, minus whatever other categories have RESERVED and
         # not yet spent -- mirrors the dollar gate below. Without this, a
         # reserved pass (synthesis) had its dollars protected but could still
@@ -233,6 +384,13 @@ class UsageTracker:
         still counts against the totals, it just isn't attributed."""
         today = today or self._today()
         self._roll_if_new_day(today)
+        # A call that actually succeeded is proof the account-level problem is
+        # gone -- somebody topped the balance up, or fixed the key. Clearing
+        # here rather than on a timer is what makes the probe above a recovery
+        # mechanism instead of just a slower failure loop.
+        if self._state.get("breaker_reason"):
+            log.info("LLM circuit breaker CLOSED -- a call succeeded, resuming normal operation.")
+            self._state.update({"breaker_reason": "", "breaker_tripped_at": "", "breaker_probe_at": ""})
         self._state.set("calls", self._state.get("calls", 0) + 1)
         self._state.set("input_tokens", self._state.get("input_tokens", 0) + input_tokens)
         self._state.set("output_tokens", self._state.get("output_tokens", 0) + output_tokens)
@@ -266,4 +424,6 @@ class UsageTracker:
                 cat: (round(usd, 4), (self._state.get("calls_by_category") or {}).get(cat, 0))
                 for cat, usd in (self._state.get("usd_by_category") or {}).items()
             },
+            breaker_reason=self._state.get("breaker_reason", "") or "",
+            breaker_tripped_at=self._state.get("breaker_tripped_at", "") or "",
         )

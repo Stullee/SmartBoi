@@ -124,6 +124,20 @@ def gather_dossiers(store: DossierStore) -> list[dict]:
                 "signaled_price": d.signaled_price,
                 "mass_agree": round(d.mass_agree, 3),
                 "mass_opposing": round(d.mass_opposing, 3),
+                # --- What the whole-body pass did to this row. Carried here
+                # because the dossier table showed a vetoed 0.000 and a
+                # decayed-to-zero 0.000 as the same thing, which made the one
+                # pass capable of stopping every trade in the system
+                # invisible in the only artifact an operator reads. Live, 22
+                # of 45 dossiers sat at exactly 0.000 with no way to tell
+                # from here which pass had put them there.
+                "synthesis_at": d.synthesis_at,
+                "pre_synthesis_score": round(d.pre_synthesis_score, 3),
+                "synthesis_confidence": round(d.synthesis_confidence, 3),
+                "synthesis_magnitude": round(d.synthesis_magnitude, 3),
+                "distinct_fact_count": d.distinct_fact_count,
+                "already_priced_in": d.already_priced_in,
+                "redundant_evidence": d.redundant_evidence,
             }
         )
     rows.sort(key=lambda r: (r["confidence"] * r["magnitude"]), reverse=True)
@@ -652,6 +666,13 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str, min_sources_required: int 
         "synthesis_magnitude": round(d.synthesis_magnitude, 4),
         "distinct_fact_count": d.distinct_fact_count,
         "already_priced_in": d.already_priced_in,
+        # Recorded separately from already_priced_in because SCORING_VERSION 7
+        # exists to let forward rows be bucketed by WHICH mechanism touched
+        # them, and splitting the veto from the trim is one of its two
+        # changes. Omitting it would repeat exactly the mistake v6 was bumped
+        # to stop: shipping a scoring change whose effect cannot afterwards be
+        # attributed to it.
+        "redundant_evidence": d.redundant_evidence,
         # The arithmetic score BEFORE synthesis capped or vetoed it. Without
         # this a vetoed row records 0.000 for both numbers, so "0.9 confidence
         # but priced in" and "0.05 and priced in" are the same row forever --

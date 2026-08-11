@@ -16,15 +16,18 @@ the paper journal, and neither can place an order (nothing in this codebase
 can -- see prices.py/paper_journal.py)."""
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
-from datetime import datetime, timezone
+import re
+import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from smartboi.news import redact_token, redact_url
 from smartboi.paper_journal import cost_buckets, trade_economics
-from smartboi.usage import CATEGORIES
+from smartboi.usage import CAT_RESEARCH, CATEGORIES
 from smartboi.status import (
     gather_dossiers,
     gather_graph_health,
@@ -181,11 +184,32 @@ async def run_supplier_research(engine) -> str:
                 engine.settings.universe_min_market_cap_musd,
                 engine.settings.universe_max_market_cap_musd,
             )
+            # None means NO REQUEST WENT OUT -- the budget is gone, the
+            # circuit breaker is open, or the call itself failed. Nothing was
+            # spent and nothing was learned, so the anchor must stay unmarked
+            # and the run must stop: the gate that refused this one refuses
+            # every anchor behind it, and marking them all would retire the
+            # entire list permanently in a single run. Nothing expires
+            # anchor_research.json, so that is not recoverable.
+            if found is None:
+                # Appended to the report's not-researched list rather than
+                # counted separately: an operator reading the report needs the
+                # SYMBOLS that still need doing, and these are in exactly the
+                # same state as the ones the per-run cap deferred.
+                unattempted = [s.symbol for s in selected[len(results):]]
+                skipped.extend(unattempted)
+                log.info("Supplier research stopped after %d anchor(s): %s. %d anchor(s) left "
+                         "unmarked for a later run.",
+                         len(results),
+                         engine.usage.deferral_reason(CAT_RESEARCH) or "the call failed",
+                         len(unattempted))
+                break
             results.append((spec.symbol, found))
             # Marked BEFORE the merge and regardless of what came back: the
             # call is what costs money, so the call is what has to be
             # recorded. Gating this on `found` meant a legitimate empty
-            # result was re-billed on every subsequent run, forever.
+            # result was re-billed on every subsequent run, forever. [] still
+            # means exactly that -- billed, and genuinely empty.
             engine.research_state.set(
                 spec.symbol,
                 {"researched_at": datetime.now(timezone.utc).isoformat(), "found": len(found)},
@@ -590,6 +614,17 @@ _DIAGNOSTIC_SETTINGS = (
 )
 MAX_LOG_LINES = 40
 MAX_LISTED_ROWS = 60
+# Continuation lines kept per multi-line warning. Reg SHO's per-URL report is
+# six; the cap is what stops one pathological traceback from consuming the
+# whole tail.
+MAX_LOG_CONTINUATION_LINES = 12
+# How many rotated files to read behind the live one. RotatingFileHandler is
+# configured with backupCount=5 (logging_setup), so this reaches the whole
+# retained history.
+MAX_LOG_BACKUPS = 5
+# A record starts with "2026-08-11 14:24:02 UTC | LEVEL | logger | ...".
+# Anything else is a continuation of the record above it.
+_LOG_RECORD_START = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC \| ")
 
 
 def _jsonl_span(rows: list[dict], key: str) -> str:
@@ -597,19 +632,97 @@ def _jsonl_span(rows: list[dict], key: str) -> str:
     return f"{len(rows)} row(s), {stamps[0]} .. {stamps[-1]}" if stamps else f"{len(rows)} row(s)"
 
 
-def _recent_log_problems(log_dir: Path, webhook_url: str = "") -> list[str]:
-    """The tail of WARNING/ERROR lines from smartboi.log. Run through
-    redact_token because a logged exception can carry a Finnhub request URL,
-    which has the API key in its query string -- this bundle is meant to be
-    pasted somewhere."""
-    path = Path(log_dir) / "smartboi.log"
-    if not path.exists():
-        return []
+def _ago(stamp: str, now: datetime) -> str:
+    """"3h 12m" for an ISO timestamp, or "?" for anything unparseable. Used
+    wherever a bare timestamp would make the reader do the subtraction."""
+    if not stamp:
+        return "?"
     try:
-        lines = path.read_text(errors="replace").splitlines()
-    except OSError:
-        return []
-    problems = [ln for ln in lines if "| WARNING" in ln or "| ERROR" in ln]
+        then = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return "?"
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    seconds = int((now - then).total_seconds())
+    if seconds < 0:
+        return "0m"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    if days:
+        return f"{days}d {hours}h"
+    return f"{hours}h {rem // 60}m"
+
+
+def _restarts_last_24h(records: list[list[str]], now: datetime) -> int:
+    """Startup banners in the last 24h, counted from the log rather than a
+    process counter -- which could not survive the restarts it is counting.
+
+    String comparison on the timestamp is safe rather than lazy: the format is
+    fixed-width "%Y-%m-%d %H:%M:%S", so lexicographic order IS chronological
+    order."""
+    cutoff = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    return sum(
+        1 for record in records
+        if "=== SmartBoi version=" in record[0] and record[0][:19] >= cutoff
+    )
+
+
+def _log_paths(log_dir: Path) -> list[Path]:
+    """The live log plus its rotations, oldest first.
+
+    Reading only smartboi.log was self-defeating in exactly the case that
+    matters: a burst big enough to matter is a burst big enough to ROTATE, so
+    the bigger the incident the less likely the bundle could see it. Confirmed
+    live -- 11,893 identical "credit balance is too low" failures inside two
+    hours had already rotated out of the live file by the time anyone looked,
+    and the bundle reported nothing unusual."""
+    paths = [Path(log_dir) / f"smartboi.log.{n}" for n in range(MAX_LOG_BACKUPS, 0, -1)]
+    paths.append(Path(log_dir) / "smartboi.log")
+    return [p for p in paths if p.exists()]
+
+
+def _read_log_records(log_dir: Path) -> list[list[str]]:
+    """Every log record across the live file and its rotations, each as its
+    own list of [first line, continuation...].
+
+    Records rather than lines because a line filter silently truncates any
+    message that spans lines, keeping the header and dropping the payload.
+    Reg SHO's failure report is the live example: the fix that made the
+    failure diagnosable logs "...Tried:\\n  <url> -> <outcome>" per URL, and
+    the bundle showed nine copies of a bare "Tried:" with every URL removed --
+    so the diagnostic written to explain the failure was invisible in the
+    artifact that exists to carry it, and the integration was misdiagnosed as
+    dead for weeks when the log said plainly that the parse, not the fetch,
+    was at fault."""
+    records: list[list[str]] = []
+    for path in _log_paths(log_dir):
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if _LOG_RECORD_START.match(line) or not records:
+                records.append([line])
+            else:
+                records[-1].append(line)
+    return records
+
+
+def _recent_log_problems(records: list[list[str]], webhook_url: str = "") -> list[str]:
+    """The tail of WARNING/ERROR records from the log and its rotations,
+    continuation lines included.
+
+    Run through redact_token because a logged exception can carry a Finnhub
+    request URL, which has the API key in its query string -- this bundle is
+    meant to be pasted somewhere."""
+    problems = [rec for rec in records if "| WARNING" in rec[0] or "| ERROR" in rec[0]]
+    out: list[str] = []
+    for record in problems[-MAX_LOG_LINES:]:
+        kept = record[:1 + MAX_LOG_CONTINUATION_LINES]
+        dropped = len(record) - len(kept)
+        out.extend(kept)
+        if dropped > 0:
+            out.append(f"  ... {dropped} more line(s) of this message")
     # Scrubbed a SECOND time here, on top of the scrub at each logging site.
     # Not redundancy for its own sake: this function's output is copied
     # verbatim into a bundle whose own heading promises credentials are
@@ -618,7 +731,289 @@ def _recent_log_problems(log_dir: Path, webhook_url: str = "") -> list[str]:
     # edit away from leaking, in a file nobody thinks of as security-
     # sensitive. The boundary that makes the promise is the right place to
     # enforce it.
-    return [redact_url(webhook_url, ln) for ln in problems[-MAX_LOG_LINES:]]
+    return [redact_url(webhook_url, ln) for ln in out]
+
+
+def _calendar_days(first: str, last: str) -> list[str]:
+    """Every YYYY-MM-DD from `first` to `last` inclusive.
+
+    Bounded at a year so a single stray timestamp in an old capture file
+    cannot turn a table into tens of thousands of rows."""
+    try:
+        start = datetime.strptime(first, "%Y-%m-%d")
+        end = datetime.strptime(last, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return sorted({first, last})
+    span = min((end - start).days, 365)
+    return [(start + timedelta(days=n)).strftime("%Y-%m-%d") for n in range(max(span, 0) + 1)]
+
+
+def _log_span(records: list[list[str]]) -> str:
+    """"2026-08-09 06:21 .. 2026-08-11 14:26" for a set of log records.
+
+    Read off the first and last record that actually carries a timestamp, so
+    a leading continuation line (a file that starts mid-record) cannot report
+    a blank bound."""
+    stamps = [r[0][:16] for r in records if _LOG_RECORD_START.match(r[0])]
+    return f"{stamps[0]} .. {stamps[-1]}" if stamps else "no timestamped records"
+
+
+def _log_problem_histogram(records: list[list[str]], webhook_url: str = "") -> list[str]:
+    """WARNING/ERROR counts by logger and message shape, across the whole
+    retained log history.
+
+    The verbatim tail above answers "what just happened"; it cannot answer
+    "what is happening constantly", and the two failures that mattered most in
+    this system's live history were both invisible to it. A 40-line tail full
+    of hourly Reg SHO and DoD repeats showed no trace of 11,893 billing
+    failures in one morning, or of 243 whole-universe price lookup failures --
+    the first because it had rotated away, both because a tail shows the last
+    N lines and not the big N.
+
+    The shape is the message with its variable head stripped (symbols, ids,
+    numbers), so one repeated failure aggregates into one row with a count."""
+    counts: dict[tuple[str, str], int] = {}
+    for record in records:
+        head = record[0]
+        if "| WARNING" not in head and "| ERROR" not in head:
+            continue
+        parts = head.split(" | ", 3)
+        if len(parts) < 4:
+            continue
+        level, logger, message = parts[1].strip(), parts[2].strip(), parts[3]
+        key = (f"{level} {logger}", _message_shape(message))
+        counts[key] = counts.get(key, 0) + 1
+    rows = sorted(counts.items(), key=lambda kv: -kv[1])[:MAX_LISTED_ROWS]
+    return [
+        redact_url(webhook_url, f"  {count:>6}  {origin:<28} {shape}")
+        for (origin, shape), count in rows
+    ]
+
+
+def _message_shape(message: str) -> str:
+    """A log message reduced to its constant part, so N occurrences of one
+    failure collapse to one counted row.
+
+    Drops a leading "SYMBOL: " subject, then replaces digit runs and SHORT
+    quoted values with placeholders. All three are what vary between
+    repetitions of the same underlying problem; without collapsing them,
+    11,893 identical billing failures counted as 11,893 distinct shapes and
+    the histogram would be no better than the tail.
+
+    Short quoted values specifically, because of a real case this missed on
+    its first outing: a malformed extraction response was being walked one
+    CHARACTER at a time, and the offending character is interpolated as %r.
+    That spread 7,618 occurrences of ONE bug across twenty-odd rows -- ('a'),
+    ('b'), ('c') -- each looking like a minor separate annoyance. Only short
+    runs are collapsed; a long quoted string is usually the message itself
+    rather than a varying value."""
+    # A bracketed tag is peeled off first and put back afterwards: it is
+    # constant across repetitions and says which pass logged the line, so it
+    # belongs in the shape -- but while it is in front, the subject strip
+    # cannot see the symbol behind it. This codebase logs "[PAPER] %s: ..."
+    # and "[UNIVERSE] %s dropped: ..." with the symbol as the only varying
+    # part, and every one of those was getting its own histogram row.
+    tag = ""
+    message = message.strip()
+    tag_match = _LEADING_TAG.match(message)
+    if tag_match:
+        tag, message = tag_match.group(0), message[tag_match.end():]
+    message = tag + _LEADING_SUBJECT.sub("", message)
+    message = _QUOTED_SPAN.sub(_collapse_short_quote, message)
+    return _DIGIT_RUN.sub("#", message)[:MAX_SHAPE_CHARS]
+
+
+def _collapse_short_quote(match: re.Match) -> str:
+    """Replace a short quoted value with a placeholder, keeping long ones.
+
+    Matching EVERY quoted span and deciding per match, rather than matching
+    only short ones directly: a `'[^']{0,12}'` pattern skips a long span's
+    opening quote and then pairs that span's CLOSING quote with the next
+    span's opening one, so `'invalid_request_error', 'message'` came out as
+    `'invalid_request_error'?'message'?` -- the delimiters eaten and the
+    shape harder to read than the raw message. Consuming long spans whole
+    keeps the scanner aligned to real quote pairs."""
+    inner = match.group(0)[1:-1]
+    return "'?'" if len(inner) <= 12 else match.group(0)
+
+
+_LEADING_TAG = re.compile(r"^\[[A-Za-z][A-Za-z0-9_. -]{0,15}\] ")
+_LEADING_SUBJECT = re.compile(r"^\[?[A-Z0-9][A-Z0-9.\-]{0,9}\]?: ")
+_DIGIT_RUN = re.compile(r"\d+")
+_QUOTED_SPAN = re.compile(r"'[^']*'")
+# Long enough to keep the CAUSE of a structured API error, which is at the end
+# of the message and not the start. At 110 the busiest row in a real bundle
+# read "dossier update proposal failed: Error code: # - {...'invalid_request_
+# error'..." and stopped -- 11,893 failures reported without ever saying that
+# the credit balance was exhausted.
+MAX_SHAPE_CHARS = 180
+
+
+# --- The full file bundle -------------------------------------------------
+#
+# Everything run_diagnostics summarises, as the actual files. The text bundle
+# is a summary by construction, and a summary is exactly what a novel problem
+# is invisible in: diagnosing this system's last round of failures needed the
+# raw logs (a storm that had rotated away), signals.jsonl (a collapse in the
+# firing RATE), paper_trades.jsonl (which trades predate position sizing),
+# periodic_pass_state.json (two passes drifting apart) and the dossiers (which
+# verdict zeroed which thesis). Every one of those had to be fetched by hand,
+# over several rounds, from a Home Assistant share.
+
+# Files under log_dir. Logs are scrubbed line by line; the .jsonl captures are
+# scrubbed wholesale (see _redact_text).
+_BUNDLE_LOG_FILES = (
+    "signals.jsonl",
+    "decisions.jsonl",
+    "paper_trades.jsonl",
+    "open_paper_trades.json",
+    "price_marks.jsonl",
+    "dossier_snapshots.jsonl",
+    "skeptic_refutations.jsonl",
+    "universe_screen.jsonl",
+)
+
+# Files under data/. Deliberately an ALLOW-LIST rather than a glob: a glob
+# would sweep up whatever a future version happens to drop in that directory,
+# including the .corrupt-<timestamp> quarantine copies, and this archive
+# leaves the machine.
+_BUNDLE_DATA_FILES = (
+    "graph.json",
+    "graph_audit.json",
+    "accepted_candidates.json",
+    "universe_candidates.json",
+    "quarantined_symbols.json",
+    "dedup_index.json",
+    "periodic_pass_state.json",
+    "llm_usage.json",
+    "model_provenance.json",
+    "universe_screen_state.json",
+    "auto_accept_state.json",
+    "retry_state.json",
+    "resynthesis_state.json",
+    "sixk_state.json",
+    "relationship_backfill.json",
+    "edgar_cik_cache.json",
+    "extracted_filings.json",
+    "anchor_research.json",
+    "anchor_edgar_search.json",
+)
+
+# Uncompressed ceiling for the whole archive. Text zips at roughly 10:1, so
+# this is a few MB on the wire; the cap exists so a runaway log cannot turn a
+# diagnostic click into an out-of-memory.
+MAX_BUNDLE_BYTES = 120 * 1024 * 1024
+
+
+def _redact_text(text: str, webhook_url: str) -> str:
+    """The same scrub the text bundle's log lines get, applied to a whole
+    file. This archive carries the same promise run_diagnostics makes and
+    reaches the same places, so it gets the same treatment at the same
+    boundary -- see _recent_log_problems for why the boundary is the right
+    place rather than each logging site."""
+    return redact_url(webhook_url, redact_token(text))
+
+
+def collect_full_diagnostics(engine) -> bytes:
+    """Every runtime file needed to diagnose this deployment from somewhere
+    else, as one redacted zip.
+
+    What is NOT in here is as deliberate as what is: no .env, no
+    /data/options.json, no add-on configuration. Those hold the Anthropic and
+    Finnhub keys and the webhook URL, and nothing in this archive is worth
+    them. The two file lists above are allow-lists for the same reason."""
+    s = engine.settings
+    log_dir = Path(s.log_dir)
+    # Taken from the live store rather than importing engine.DATA_DIR:
+    # engine imports this module lazily, inside functions, precisely to keep
+    # the dependency one-way, and a module-level import back would undo that.
+    data_dir = engine.dossiers.dir_path.parent
+    webhook = s.alert_webhook_url
+    buf = io.BytesIO()
+    manifest: list[str] = []
+    budget = MAX_BUNDLE_BYTES
+
+    def store(zf: zipfile.ZipFile, arcname: str, path: Path) -> None:
+        nonlocal budget
+        # Size checked from the DIRECTORY ENTRY, before the file is opened.
+        # Checking after read_text() meant the cap was consulted once three
+        # full copies of the file were already resident (raw, redacted, and
+        # the encoded measurement), so a runaway log would have caused
+        # precisely the out-of-memory the cap is here to prevent, and only
+        # then been declined. st_size is bytes and the budget is bytes, so
+        # this over-counts only for multi-byte characters -- in the
+        # conservative direction.
+        try:
+            on_disk = path.stat().st_size
+        except OSError as exc:
+            manifest.append(f"  SKIPPED  {arcname}  ({exc})")
+            return
+        if on_disk > budget:
+            manifest.append(
+                f"  SKIPPED  {arcname}  ({on_disk:,} bytes would exceed the "
+                f"{MAX_BUNDLE_BYTES // 1024 // 1024}MB bundle cap)")
+            return
+        try:
+            raw = path.read_text(errors="replace")
+        except OSError as exc:
+            manifest.append(f"  SKIPPED  {arcname}  ({exc})")
+            return
+        text = _redact_text(raw, webhook)
+        size = len(text.encode("utf-8", "replace"))
+        budget -= size
+        zf.writestr(arcname, text)
+        manifest.append(f"  {size:>10,}  {arcname}")
+
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        # The text bundle first: it is the index to everything else, and a
+        # reader should not have to reconstruct it from the raw files.
+        try:
+            report = run_diagnostics(engine)
+        except Exception as exc:  # noqa: BLE001 - a broken summary must not cost the files
+            report = f"run_diagnostics raised: {exc!r}"
+            log.exception("Diagnostics summary failed while building the full bundle.")
+        # Scrubbed like every other member rather than trusted. run_diagnostics
+        # scrubs its own log lines, but the FAILURE path above interpolates a
+        # raw exception -- and an httpx error carries the full request URL,
+        # which for Finnhub has the API key in its query string. The one member
+        # written outside store() must not be the one member that leaks.
+        report = _redact_text(report, webhook)
+        zf.writestr("diagnostics.txt", report)
+        manifest.append(f"  {len(report):>10,}  diagnostics.txt")
+
+        for path in reversed(_log_paths(log_dir)):  # newest first
+            store(zf, f"logs/{path.name}", path)
+        for name in _BUNDLE_LOG_FILES:
+            path = log_dir / name
+            if path.exists():
+                store(zf, f"logs/{name}", path)
+        for name in _BUNDLE_DATA_FILES:
+            path = data_dir / name
+            if path.exists():
+                store(zf, f"data/{name}", path)
+        # The dossiers carry the synthesis verdicts and the full evidence
+        # bodies -- the difference between "this thesis scored 0.000" and
+        # "this thesis was vetoed, on these grounds, against this evidence".
+        dossier_dir = data_dir / "dossiers"
+        if dossier_dir.is_dir():
+            for path in sorted(dossier_dir.glob("*.json")):
+                store(zf, f"data/dossiers/{path.name}", path)
+
+        # Also scrubbed: a SKIPPED line embeds an OSError, whose text is a
+        # path this system did not compose.
+        zf.writestr("MANIFEST.txt", _redact_text("\n".join([
+            "SmartBoi full diagnostics bundle",
+            f"generated_at : {datetime.now(timezone.utc).isoformat()}",
+            f"version      : {os.environ.get('SMARTBOI_VERSION', 'dev')}",
+            f"commit       : {os.environ.get('SMARTBOI_COMMIT', 'unknown')}",
+            "",
+            "Credentials and personal data are scrubbed from every file, and no",
+            "configuration file (.env, /data/options.json) is included at all.",
+            "",
+            "Contents (uncompressed bytes):",
+            *manifest,
+        ]), webhook))
+    return buf.getvalue()
 
 
 def run_diagnostics(engine) -> str:
@@ -637,10 +1032,24 @@ def run_diagnostics(engine) -> str:
     out: list[str] = []
     add = out.append
 
+    now = datetime.now(timezone.utc)
     add("=== SmartBoi diagnostics ===")
-    add(f"generated_at : {datetime.now(timezone.utc).isoformat()}")
+    add(f"generated_at : {now.isoformat()}")
     add(f"version      : {os.environ.get('SMARTBOI_VERSION', 'dev')}")
     add(f"commit       : {os.environ.get('SMARTBOI_COMMIT', 'unknown')}")
+    # Uptime reframes every other number below, and reading a bundle without
+    # it is how a two-hour-old process gets mistaken for a steady state. The
+    # restart count comes from the log rather than a counter, so it survives
+    # the restarts it is counting.
+    add(f"started_at   : {engine.started_at} ({_ago(engine.started_at, now)} ago)")
+    # Read ONCE and shared by the three consumers below (restart count, the
+    # tail, the histogram). The retained history is up to six 5MB files, so
+    # re-reading and re-splitting it per section was triple the work and
+    # triple the peak memory for identical output.
+    log_records = _read_log_records(Path(s.log_dir))
+    restarts = _restarts_last_24h(log_records, now)
+    add(f"restarts/24h : {restarts}"
+        + ("  <-- restarting repeatedly; treat the state below as unsettled" if restarts > 8 else ""))
 
     add("\n--- Integrations ---")
     for label, on in (
@@ -651,6 +1060,19 @@ def run_diagnostics(engine) -> str:
         ("Webhook alerts", engine.alerts.enabled),
     ):
         add(f"  {label:26} {'ENABLED' if on else 'disabled'}")
+    # ENABLED is a config echo, not health. Reg SHO read ENABLED for the whole
+    # life of the integration while holding zero symbols "as of never",
+    # because a parser bug returned the empty set from a perfectly good file
+    # -- a state this block would have shown on day one and the flag never
+    # could. Everything else that is enabled-but-failing shows up in the
+    # warning histogram below rather than needing per-integration bookkeeping.
+    if engine.regsho is not None:
+        as_of = engine.regsho.as_of or "never"
+        add(f"  {'Reg SHO threshold list':26} {engine.regsho.count} symbol(s), as of {as_of}")
+        if not engine.regsho.count:
+            add("    ^^ EMPTY: every SHORT is falling back to the market-cap borrow proxy.")
+            add("       Check the per-URL report in the warnings below -- an HTTP 200 that parses")
+            add("       to zero symbols is a FORMAT problem, not a fetch problem.")
 
     tradeable = [c for c in engine.universe if not c.signal_source_only]
     anchors = [c for c in engine.universe if c.signal_source_only]
@@ -683,6 +1105,53 @@ def run_diagnostics(engine) -> str:
     else:
         add("  none yet")
 
+    # The pass that can stop every trade in the system, and which had no
+    # section here at all. A veto writes confidence AND magnitude to exactly
+    # 0.0, so a vetoed dossier and one whose evidence decayed away are the
+    # same row in the table above -- and when 22 of 45 sat at 0.000 with no
+    # position opened for four days, nothing in this bundle said which pass
+    # had done it, or that a pass had done it at all.
+    #
+    # ARITH is the arithmetic score the aggregate proposed, RATED is what the
+    # whole-body pass judged the same evidence worth, APPLIED is what
+    # survived. A large and persistent ARITH/RATED gap is the finding: it
+    # means the aggregate is counting one story many times, which is what
+    # effective_corroboration_count now bounds.
+    judged = [d for d in dossiers if d.get("synthesis_at")]
+    add(f"\n--- Synthesis verdicts ({len(judged)} of {len(dossiers)} dossier(s) judged) ---")
+    if judged:
+        vetoed = [d for d in judged if d["already_priced_in"]]
+        redundant = [d for d in judged if d["redundant_evidence"] and not d["already_priced_in"]]
+        add(f"  vetoed (already priced in) : {len(vetoed)}")
+        add(f"  trimmed (redundant evidence): {len(redundant)}")
+        add(f"  passed through              : {len(judged) - len(vetoed) - len(redundant)}")
+        add(f"  {'SYM':7}{'ARITH':>7}{'RATED':>7}{'APPLIED':>9}{'FACTS':>7}{'SRC':>5}  {'VERDICT':11} JUDGED")
+        for d in judged[:MAX_LISTED_ROWS]:
+            rated = d["synthesis_confidence"] * d["synthesis_magnitude"]
+            verdict = ("priced-in" if d["already_priced_in"]
+                       else "redundant" if d["redundant_evidence"] else "-")
+            add(f"  {d['symbol']:7}{d['pre_synthesis_score']:7.3f}{rated:7.3f}"
+                f"{d['confidence'] * d['magnitude']:9.3f}{d['distinct_fact_count']:7}"
+                f"{d['independent_source_count']:5}  {verdict:11} {_ago(d['synthesis_at'], now)} ago")
+        gaps = [d["pre_synthesis_score"] / (d["synthesis_confidence"] * d["synthesis_magnitude"])
+                for d in judged
+                if d["synthesis_confidence"] * d["synthesis_magnitude"] > 0
+                and d["pre_synthesis_score"] > 0]
+        if gaps:
+            gaps.sort()
+            add(f"  median ARITH/RATED gap: {gaps[len(gaps) // 2]:.1f}x")
+            if gaps[len(gaps) // 2] >= 3.0:
+                add("  ^^ the arithmetic is running well hot against the only pass that reads the")
+                add("     evidence as a body. That is an aggregate problem, not a synthesis one --")
+                add("     check FACTS against SRC above: a large gap between them is one story")
+                add("     counted many times (see dossier.effective_corroboration_count).")
+        if len(judged) and len(vetoed) == len(judged):
+            add("  ^^ EVERY judged dossier was vetoed. No thesis can reach a trade while this holds.")
+    else:
+        add("  none yet -- a dossier is only judged once it reaches "
+            f"{s.signal_confidence_threshold * s.synthesis_score_floor_pct:.3f} "
+            "(signal_confidence_threshold * synthesis_score_floor_pct)")
+
     # The single most diagnostic table here: independent_source_count counts
     # DISTINCT source names, so if this collapses to one or two entries then
     # corroboration is structurally impossible no matter how much news lands.
@@ -703,6 +1172,12 @@ def run_diagnostics(engine) -> str:
     budget = f"/${u.daily_usd_budget:.2f}" if u.daily_usd_budget else " (no cap)"
     add(f"  {u.date}: {u.calls}/{u.daily_call_budget} calls, {u.input_tokens:,} in / {u.output_tokens:,} out tokens")
     add(f"  {' ' * len(u.date)}  ${u.usd_spent:.2f}{budget} estimated spend")
+    # Stated, never inferred. A halted system and an idle one both read as a
+    # low spend, and the difference is the whole diagnosis.
+    if u.breaker_reason:
+        add(f"  !! LLM CIRCUIT BREAKER OPEN since {u.breaker_tripped_at}: {u.breaker_reason}.")
+        add("     Every Claude call is refused until UTC midnight. Ingestion continues and")
+        add("     evidence keeps accruing, but nothing is being scored. See usage.note_failure.")
     # Per category, because the total alone hid the failure that mattered:
     # the budget was being consumed before the US market opened, by the one
     # pass whose output is not time-sensitive, leaving nothing for the pass
@@ -749,6 +1224,37 @@ def run_diagnostics(engine) -> str:
             add("     decisions.jsonl existed, or they are still SIGNALED awaiting an entry decision")
             add("     (cross-check STATUS in the dossier table above; an episode whose dossier is")
             add("     back to ACTIVE with no ledger row was expired by a pre-ledger build).")
+        # The rate, not just the roster. A list of episodes cannot show a
+        # collapse, and the collapse is the thing worth seeing: live, this
+        # went 113 -> 41 -> 30 -> 1 -> 0 over five days while every other
+        # number in the bundle looked ordinary, and reading it off required
+        # loading signals.jsonl by hand.
+        add("\n  Per day (last 14):  fired / opened / expired")
+        # Keyed on the outcome KEYS ("trade_opened"/"signal_expired"), not on
+        # the display strings OUTCOME_LABELS maps them to. Comparing against
+        # the labels made both columns permanently zero and fired the alarm
+        # below on every bundle that had any signal at all -- on a deployment
+        # with fifteen closed trades, which is the precise opposite of what
+        # this table is for.
+        by_day: dict[str, list[int]] = {}
+        for e in episodes:
+            row = by_day.setdefault(e["fired_at"][:10], [0, 0, 0])
+            row[0] += 1
+            if e["outcome"] == "trade_opened":
+                row[1] += 1
+            elif e["outcome"] == "signal_expired":
+                row[2] += 1
+        # Every CALENDAR day in the window, not only the days that happened to
+        # produce a signal. A day with zero signals is the single most
+        # important row here -- skipping it is how a collapse from 113/day to
+        # 0/day renders as an unbroken column of numbers.
+        for day in _calendar_days(min(by_day), max(by_day))[-14:]:
+            fired, opened, expired = by_day.get(day, (0, 0, 0))
+            add(f"    {day}  {fired:>4} / {opened:>3} / {expired:>3}")
+        recent = [by_day.get(d, (0, 0, 0))[1] for d in _calendar_days(min(by_day), max(by_day))[-5:]]
+        if not any(recent):
+            add("    ^^ nothing has OPENED in the last 5 days. Check the synthesis verdict table")
+            add("       above before touching the signal bar.")
     else:
         add("  none yet")
 
@@ -814,6 +1320,18 @@ def run_diagnostics(engine) -> str:
         f"realized {stats.realized_pnl:+.2f} -> equity {stats.equity:.2f} "
         f"(open unreal. {open_unreal:+.2f}); "
         f"{s.max_concurrent_positions} slots @ {stats.currency} {s.initial_trading_capital / max(1, s.max_concurrent_positions):.0f} each")
+    # Position sizing (PaperTrade.position_value) arrived after most of this
+    # record was written, and currency_pnl is None for every trade opened
+    # before it -- so "realized +0.00 -> equity 5000.00" reads as break-even
+    # on a record that is actually well underwater in R. Say which trades the
+    # money column can even describe, rather than letting a reader infer that
+    # a flat equity means a flat result.
+    closed_rows = [r for r in read_jsonl(log_dir / "paper_trades.jsonl") if r.get("closed_at")]
+    priced = sum(1 for r in closed_rows if r.get("currency_pnl") is not None)
+    if priced < stats.closed:
+        add(f"  ^^ {stats.closed - priced} of {stats.closed} closed trade(s) predate position "
+            "sizing and carry no currency result, so the equity above is NOT the record.")
+        add("     Read avg R below; the money column becomes meaningful as new trades close.")
     add(f"  open: {len(engine.journal.open_trades)} ({', '.join(engine.journal.open_trades) or '-'})")
     # The win rate carries its 95% Wilson interval: at a dozen-odd closed
     # trades the point estimate alone reads as fact when it is noise, and the
@@ -919,11 +1437,48 @@ def run_diagnostics(engine) -> str:
     add(f"  price_marks.jsonl       : {_jsonl_span(read_jsonl(log_dir / 'price_marks.jsonl'), 'marked_at')}")
     add(f"  decisions.jsonl         : {_jsonl_span(read_jsonl(log_dir / 'decisions.jsonl'), 'at')}")
 
-    problems = _recent_log_problems(log_dir, s.alert_webhook_url)
-    add(f"\n--- Recent warnings/errors (last {MAX_LOG_LINES}) ---")
+    # WHEN each daily pass last ran, not just what it produced. Each is gated
+    # on "24h since its own last run", so the passes drift independently and
+    # the two halves of the forward-return join drift apart from each other:
+    # live, the snapshot was landing at 16:00 UTC (midday ET, mid-session)
+    # while the marks landed at 04:11 UTC (prior close) -- twelve hours apart,
+    # visible nowhere except by reading periodic_pass_state.json by hand.
+    add("\n--- Daily pass schedule ---")
+    pass_state = engine.periodic_state.data
+    if pass_state:
+        for name in sorted(pass_state):
+            stamp = str(pass_state.get(name) or "")
+            add(f"  {name:20} last {stamp[:19] or 'never':19} ({_ago(stamp, now)} ago)")
+        stamps = [str(v)[11:16] for v in pass_state.values() if isinstance(v, str) and len(str(v)) > 16]
+        if len(set(stamps)) > 1:
+            add("  ^^ these drift apart independently (each is gated on 24h since ITS last run).")
+            add("     dossier_snapshot and price_marks are the two halves of one join -- a wide")
+            add("     gap between them means scores and prices are captured at different")
+            add("     points of the session.")
+    else:
+        add("  no pass has run yet")
+
+    problems = _recent_log_problems(log_records, s.alert_webhook_url)
+    add(f"\n--- Recent warnings/errors (last {MAX_LOG_LINES} messages) ---")
     for line in problems:
         add(f"  {line}")
     if not problems:
+        add("  none")
+
+    # The tail answers "what just happened"; it cannot answer "what is
+    # happening constantly", and both failures that mattered most here were
+    # invisible to it -- 11,893 billing failures in one morning (rotated out
+    # of the live file entirely) and 243 whole-universe price failures, while
+    # the visible 40 lines were hourly Reg SHO and DoD repeats.
+    histogram = _log_problem_histogram(log_records, s.alert_webhook_url)
+    # The span the counts are over, following the same convention the
+    # forward-validation section uses. A bare "11893" cannot distinguish a
+    # two-hour hard failure loop from six months of slow accrual, and that
+    # distinction is most of why this section exists.
+    add(f"\n--- Warning/error counts across the whole retained log ({_log_span(log_records)}) ---")
+    for line in histogram:
+        add(line)
+    if not histogram:
         add("  none")
 
     add("\n--- Key settings (credentials and personal data omitted) ---")

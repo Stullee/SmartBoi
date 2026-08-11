@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from smartboi.graph import Relationship, RelationshipGraph
 
 
@@ -131,3 +133,135 @@ def test_a_corrupt_graph_file_is_quarantined_not_silently_wiped(tmp_path):
     # A subsequent add writes a clean file rather than clobbering the original.
     graph.add(_rel())
     assert len(RelationshipGraph(path).relationships) == 1
+
+
+# --- Extraction response shape -------------------------------------------
+
+
+class _ToolUseBlock:
+    type = "tool_use"
+
+    def __init__(self, payload):
+        self.input = payload
+
+
+class _Response:
+    def __init__(self, payload):
+        self.content = [_ToolUseBlock(payload)]
+        self.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
+
+
+class _Messages:
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def create(self, **_kwargs):
+        return _Response(self._payload)
+
+
+def _extractor(tmp_path, payload):
+    from smartboi.graph import RelationshipExtractor
+    from smartboi.usage import UsageTracker
+
+    extractor = RelationshipExtractor(
+        api_key="k", model="claude-haiku-4-5",
+        usage=UsageTracker(tmp_path / "usage.json", daily_call_budget=10),
+    )
+    extractor._client = SimpleNamespace(messages=_Messages(payload))
+    return extractor
+
+
+async def test_a_string_payload_is_discarded_once_not_walked_per_character(tmp_path, caplog):
+    """The tool schema says 'relationships' is an array. When the model hands
+    back a STRING instead, the caller's per-element loop walks it one
+    CHARACTER at a time and every character logs its own 'non-object entry'
+    warning -- 7,618 of them from three filings, live, which is both a log
+    storm and a completely illegible way to say the call produced nothing.
+    One bad element in a good list is a different failure; this is the
+    container being wrong, and it belongs where the contract is declared."""
+    extractor = _extractor(tmp_path, {"relationships": "customer|AAA|BBB"})
+
+    with caplog.at_level("WARNING"):
+        out = await extractor.extract("AAA", "8-K", "filing text", ["AAA", "BBB"])
+
+    assert out == []
+    assert len([r for r in caplog.records if "not a list" in r.getMessage()]) == 1
+
+
+async def test_a_well_formed_list_is_returned_untouched(tmp_path):
+    rels = [{"to_symbol": "BBB", "rel_type": "customer", "confidence": 0.9}]
+    extractor = _extractor(tmp_path, {"relationships": rels})
+
+    assert await extractor.extract("AAA", "8-K", "filing text", ["AAA", "BBB"]) == rels
+
+
+async def test_a_missing_relationships_key_is_an_empty_list_not_a_retry(tmp_path):
+    """[] means 'genuinely nothing found' and must not be confused with None,
+    which the engine treats as 'retry this filing later'."""
+    extractor = _extractor(tmp_path, {})
+
+    assert await extractor.extract("AAA", "8-K", "filing text", ["AAA"]) == []
+
+
+class _FailingMessages:
+    def __init__(self, exc):
+        self._exc = exc
+
+    async def create(self, **_kwargs):
+        raise self._exc
+
+
+async def test_an_account_level_failure_here_trips_the_shared_breaker(tmp_path):
+    """The wiring, not the mechanism. Every call site catches broadly and
+    returns None, which the engine reads as 'transient' -- so the breaker only
+    does anything if each site actually reports its failure. Deleting all five
+    of those one-line wirings left the whole suite green."""
+    from smartboi.usage import CAT_DOSSIER, UsageTracker
+
+    usage = UsageTracker(tmp_path / "usage.json", daily_call_budget=5000)
+    extractor = _extractor(tmp_path, {})
+    extractor._usage = usage
+    extractor._client = SimpleNamespace(
+        messages=_FailingMessages(RuntimeError(
+            "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+            "'message': 'Your credit balance is too low to access the Anthropic API.'}}"))
+    )
+
+    assert await extractor.extract("AAA", "8-K", "filing text", ["AAA"]) is None
+    # Tripped for EVERY category, not just extraction's.
+    assert not usage.budget_remaining(CAT_DOSSIER)
+    assert "credit balance" in usage.breaker_reason()
+
+
+async def test_a_transient_failure_here_leaves_the_breaker_closed(tmp_path):
+    """Over-tripping would halt the day on an error that clears in seconds."""
+    from smartboi.usage import CAT_DOSSIER, UsageTracker
+
+    usage = UsageTracker(tmp_path / "usage.json", daily_call_budget=5000)
+    extractor = _extractor(tmp_path, {})
+    extractor._usage = usage
+    extractor._client = SimpleNamespace(
+        messages=_FailingMessages(RuntimeError("Error code: 429 - rate_limit_error")))
+
+    assert await extractor.extract("AAA", "8-K", "filing text", ["AAA"]) is None
+    assert usage.budget_remaining(CAT_DOSSIER)
+
+
+def test_every_llm_call_site_reports_its_failures_to_the_breaker():
+    """Structural, because the behavioural tests above can only cover the
+    sites someone remembered to cover. Any module that gates on
+    budget_remaining is making Anthropic calls, and must report their failures
+    or the breaker silently stops covering it."""
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "src" / "smartboi"
+    # A module that actually TALKS to Anthropic: it both gates on the budget
+    # and issues a request. engine.py and tools.py read budget_remaining only
+    # to render it, and have no failure of their own to report.
+    callers = [
+        p for p in src.glob("*.py")
+        if "budget_remaining(" in p.read_text() and "messages.create(" in p.read_text()
+    ]
+    assert {p.name for p in callers} == {"dossier.py", "graph.py", "skeptic.py", "research.py"}
+    missing = [p.name for p in callers if "note_failure(" not in p.read_text()]
+    assert not missing, f"LLM call sites that never trip the breaker: {missing}"

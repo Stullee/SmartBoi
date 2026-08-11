@@ -2327,6 +2327,75 @@ async def test_already_priced_in_is_a_veto(engine):
     assert dossier.already_priced_in is True
 
 
+async def test_redundant_evidence_trims_rather_than_vetoes(engine):
+    """Overlap is a claim about the EVIDENCE, not the price. Live, the model
+    answered the overlap question with the price flag on all 77 vetoes in
+    three days -- zeroing theses whose actual finding was 'one fact repeated
+    across seven counterparties', and arming a price-based falsification test
+    against a claim it had never made."""
+    engine.synthesizer = FakeSynthesizer(
+        default=synthesis(confidence=0.5, magnitude=0.35, redundant_evidence=True))
+    dossier = await _build_thesis(engine)
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert dossier.redundant_evidence is True
+    assert dossier.already_priced_in is False   # NOT the price claim
+    # Trimmed to what synthesis rated it, not zeroed.
+    assert dossier.confidence == pytest.approx(0.5)
+    assert dossier.magnitude == pytest.approx(0.35)
+
+
+def _returns_bar(close: float):
+    """An engine._price_bar stand-in that always prices a symbol at `close`."""
+    from smartboi.prices import PriceBar
+
+    async def _bar(_symbol):
+        return PriceBar(close=close, high=close, low=close)
+    return _bar
+
+
+async def test_redundant_evidence_does_not_arm_the_price_falsification(engine, monkeypatch):
+    """_veto_refuted_by_price watches the tape for a move disproving 'the
+    market has absorbed this'. A duplication finding makes no such claim, so
+    it must not be put to that test.
+
+    Every OTHER early return is disarmed first -- a baseline price is set and
+    the tape is moved far enough to refute -- so already_priced_in is the only
+    thing left that can make this False. Without that, the test passed on a
+    missing price baseline and would have kept passing with the flag check
+    deleted."""
+    engine.synthesizer = FakeSynthesizer(
+        default=synthesis(redundant_evidence=True, confidence=0.9, magnitude=0.9))
+    dossier = await _build_thesis(engine)
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+    dossier.synthesis_price = 10.0
+    monkeypatch.setattr(engine, "_price_bar", _returns_bar(20.0))  # +100%, far past the 8% bar
+
+    assert dossier.redundant_evidence is True
+    assert dossier.already_priced_in is False
+    assert await engine._veto_refuted_by_price(dossier) is False
+
+    # Positive control: the same tape DOES refute the claim that actually
+    # asserts something about price, so the assertion above is about the flag
+    # and not about an unreachable code path.
+    dossier.already_priced_in = True
+    assert await engine._veto_refuted_by_price(dossier) is True
+
+
+async def test_both_findings_at_once_still_vetoes(engine):
+    """Splitting the fields must not weaken the veto: evidence that is BOTH
+    redundant and already absorbed is still a thesis with nothing to trade."""
+    engine.synthesizer = FakeSynthesizer(
+        default=synthesis(already_priced_in=True, redundant_evidence=True))
+    dossier = await _build_thesis(engine)
+
+    await engine._apply_synthesis(dossier, datetime.now(timezone.utc))
+
+    assert dossier.confidence == 0.0
+    assert dossier.magnitude == 0.0
+
+
 async def test_a_direction_disagreement_is_a_veto(engine):
     engine.synthesizer = FakeSynthesizer(default=synthesis(direction="SHORT"))
     dossier = await _build_thesis(engine)  # arithmetic says LONG
@@ -3397,3 +3466,151 @@ async def test_two_proceedings_by_one_agency_are_two_sources(tmp_path, monkeypat
     assert len(records) == 2, "both proceedings must reach the company"
     keys = {independence_key(r) for r in records}
     assert len(keys) == 2, "and count as two independent sources, not one agency"
+
+
+
+# --- Startup warnings must be true ---------------------------------------
+
+
+class _FakePriceFeed:
+    """Stands in for ReadOnlyPriceFeed so start() makes no IB connection."""
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    async def ensure_connected(self):
+        return True
+
+
+async def test_the_ib_disabled_warning_does_not_fire_when_ib_is_enabled(monkeypatch, caplog, tmp_path):
+    """_has_price_source() is true for IB *or* Finnhub, so a bare `else` on it
+    fired on every startup with IB enabled and connected -- printing 'IB price
+    feed disabled ... until ENABLE_IB_PRICE_FEED=true' on a deployment where
+    it was already true, 15 startups out of 15, one line after CONNECTED. A
+    warning that prescribes a setting already in force sends whoever reads it
+    to check the one thing that was never wrong."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("smartboi.engine.ReadOnlyPriceFeed", _FakePriceFeed)
+    engine = Engine(Settings(_env_file=None, enable_dashboard=False,
+                             enable_universe_autoscreen=False,
+                             enable_ib_price_feed=True, finnhub_api_key="k"))
+
+    with caplog.at_level("WARNING"):
+        await engine.start()
+
+    assert "IB price feed disabled" not in caplog.text
+
+
+async def test_the_ib_disabled_warning_still_fires_when_ib_is_off(monkeypatch, caplog, tmp_path):
+    """Still worth saying when it is TRUE: a Finnhub-only deployment is a real
+    and supported configuration, and this is how an operator knows entries are
+    priced off quotes rather than IB."""
+    monkeypatch.chdir(tmp_path)
+    engine = Engine(Settings(_env_file=None, enable_dashboard=False,
+                             enable_universe_autoscreen=False,
+                             enable_ib_price_feed=False, finnhub_api_key="k"))
+
+    with caplog.at_level("WARNING"):
+        await engine.start()
+
+    assert "IB price feed disabled" in caplog.text
+    assert "ENABLE_IB_PRICE_FEED=true" in caplog.text
+
+
+async def test_the_daily_snapshot_is_skipped_on_a_weekend(engine, monkeypatch):
+    """A snapshot row is only useful joined to a price mark for the same
+    symbol and DATE, and the mark pass writes nothing on a Saturday. The
+    guard was present on the mark side and missing here, so the fix had been
+    applied to exactly one side of a two-sided join: 44-48 snapshot rows on
+    each of four consecutive weekend days with nothing to join."""
+    monkeypatch.setattr("smartboi.engine.is_trading_day", lambda: False)
+    calls = []
+    monkeypatch.setattr(engine, "_run_daily_snapshot", lambda: calls.append(1) or True)
+
+    await engine._tick()
+
+    assert calls == []
+    # And the pass stays DUE, so Monday still captures rather than the
+    # weekend silently consuming the day's slot.
+    assert engine._daily_pass_due("dossier_snapshot")
+
+
+async def test_the_daily_snapshot_still_runs_on_a_trading_day(engine, monkeypatch):
+    """The guard has to let the ordinary case through, or it would be a
+    capture outage rather than a weekend skip."""
+    monkeypatch.setattr("smartboi.engine.is_trading_day", lambda: True)
+    calls = []
+    monkeypatch.setattr(engine, "_run_daily_snapshot", lambda: calls.append(1) or True)
+
+    await engine._tick()
+
+    assert calls == [1]
+
+
+async def test_a_free_refusal_does_not_spend_the_resynthesis_slot(engine):
+    """_apply_synthesis declines for free at three points before it reaches
+    the API -- no synthesizer, a non-directional dossier, and the floor gate.
+    The slot used to be spent before that call, so a dossier sitting below
+    the floor with permanently-changed premises burned the whole day's
+    off-schedule allowance without a single Opus call. The cap bounds SPEND,
+    so an attempt that costs nothing must not count against it."""
+    engine.synthesizer = None  # the cheapest of the three free refusals
+    dossier = await _build_thesis(engine)
+    dossier.already_priced_in = True
+    dossier.synthesis_at = datetime.now(timezone.utc).isoformat()
+    dossier.synthesis_price = 10.0
+    engine._price_bar = _returns_bar(20.0)  # refutes the veto, so premises HAVE changed
+
+    before = int(engine.resynthesis_state.get("count", 0) or 0)
+    await engine._maybe_resynthesize(dossier, datetime.now(timezone.utc))
+
+    assert int(engine.resynthesis_state.get("count", 0) or 0) == before
+
+
+async def test_a_real_re_judgement_does_spend_the_slot(engine):
+    """The cap has to still bind, or removing the false spend would just have
+    removed the bound."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(confidence=0.9, magnitude=0.9))
+    dossier = await _build_thesis(engine)
+    dossier.already_priced_in = True
+    dossier.synthesis_at = datetime.now(timezone.utc).isoformat()
+    dossier.synthesis_price = 10.0
+    engine._price_bar = _returns_bar(20.0)
+
+    before = int(engine.resynthesis_state.get("count", 0) or 0)
+    await engine._maybe_resynthesize(dossier, datetime.now(timezone.utc))
+
+    assert int(engine.resynthesis_state.get("count", 0) or 0) == before + 1
+
+
+async def test_the_synthesis_floor_gate_reads_the_uncapped_arithmetic(engine):
+    """The central fix of the corroboration-cap change, and it survived full
+    reversion with a green suite until this existed.
+
+    A dossier whose CAPPED score sits below the synthesis floor but whose
+    arithmetic is above it must still be judged. Gating on the capped score
+    is circular -- the verdict suppresses the re-judgement that would renew
+    it -- and the circle fails open: the verdict goes stale at 36h, the cap
+    lapses, and the score springs back above the signal bar."""
+    from smartboi.dossier import Dossier, merge_evidence, recompute_decay
+
+    now = datetime.now(timezone.utc)
+    dossier = Dossier(symbol="BWEN")
+    for n in range(8):
+        merge_evidence(dossier, EvidenceRecord(
+            f"e{n}", "news", f"outlet{n}.com", "u", "h", now.isoformat(), "BWEN", False, "",
+            "LONG", 0.45, 0.60, 20, "reason", "skeptic",
+        ), now=now)
+    dossier.synthesis_at = now.isoformat()
+    dossier.distinct_fact_count = 1
+    recompute_decay(dossier, now)
+
+    floor = (engine.settings.signal_confidence_threshold
+             * engine.settings.synthesis_score_floor_pct)
+    assert dossier.confidence * dossier.magnitude < floor, "precondition: capped, under the floor"
+    assert dossier.arithmetic_score > floor, "precondition: the arithmetic is above it"
+
+    engine.synthesizer = FakeSynthesizer(default=synthesis())
+    await engine._apply_synthesis(dossier, now)
+
+    assert engine.synthesizer.calls, "the pass that set the cap must still be reachable under it"

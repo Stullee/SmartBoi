@@ -183,10 +183,23 @@ class SupplierResearcher:
         self._usage = usage
 
     async def research(self, anchor: str, anchor_name: str, ecosystem: str,
-                       min_cap_musd: float, max_cap_musd: float) -> list[ResearchedSupplier]:
+                       min_cap_musd: float, max_cap_musd: float) -> list[ResearchedSupplier] | None:
+        """Suppliers found for `anchor`, [] when the call ran and found none,
+        or None when NO REQUEST WENT OUT.
+
+        The three-way return exists because the caller records an anchor as
+        researched and never revisits it (see tools.run_supplier_research and
+        researched_anchors), so "" and "nothing found" must not look alike.
+        They did: a suppressed call returned [] and the anchor was marked
+        permanently researched having cost nothing and learned nothing. That
+        was survivable while the only suppressor was an exhausted daily
+        budget; routing the circuit breaker through the same gate made one
+        open breaker able to burn the entire anchor list in a single run,
+        irreversibly, because nothing ever expires anchor_research.json."""
         if not self._usage.budget_remaining(CAT_RESEARCH):
-            log.info("%s: daily LLM budget reached -- skipping supplier research.", anchor)
-            return []
+            log.info("%s: %s -- skipping supplier research.",
+                     anchor, self._usage.deferral_reason(CAT_RESEARCH))
+            return None
         messages = [{
             "role": "user",
             "content": (
@@ -214,8 +227,12 @@ class SupplierResearcher:
                     messages=messages,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad anchor must not stop the run
+                self._usage.note_failure(exc)
                 log.warning("%s: supplier research call failed: %s", anchor, exc)
-                return []
+                # None, not []: a timeout or a dropped connection is not a
+                # finding, and marking the anchor researched on the strength
+                # of one would retire it permanently having learned nothing.
+                return None
             self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
                                model=self._model, category=CAT_RESEARCH)
             payload = _report_payload(response)

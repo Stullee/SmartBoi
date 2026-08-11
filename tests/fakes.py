@@ -151,13 +151,14 @@ class FakeSynthesizer(_ScriptedCallable):
 
 
 def synthesis(direction="LONG", confidence=0.9, magnitude=0.9, distinct_fact_count=5,
-              already_priced_in=False, strongest_catalyst="a contract award",
-              thesis="the evidence coheres"):
+              already_priced_in=False, redundant_evidence=False,
+              strongest_catalyst="a contract award", thesis="the evidence coheres"):
     """A well-formed DossierSynthesizer.synthesize() response."""
     return {
         "direction": direction, "confidence": confidence, "magnitude": magnitude,
         "distinct_fact_count": distinct_fact_count, "horizon_days": 20,
         "already_priced_in": already_priced_in,
+        "redundant_evidence": redundant_evidence,
         "strongest_catalyst": strongest_catalyst, "thesis": thesis,
     }
 

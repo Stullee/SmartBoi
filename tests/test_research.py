@@ -4,6 +4,7 @@ A web-sourced relationship is not a disclosure, and an edge at or above
 DISCLOSED_LINK_CONFIDENCE satisfies the corroboration bar that fires trades
 -- so letting research mint one would let a blog post, a stale article or a
 hallucination clear a bar a 10-K disclosure was supposed to."""
+from types import SimpleNamespace
 from smartboi.research import (
     ResearchedSupplier,
     _to_suppliers,
@@ -98,3 +99,49 @@ def test_model_output_is_sanitised():
     assert out[0].ticker == "ZZZZ"
     assert out[0].confidence == 1.0    # clamped, not trusted
     assert out[1].confidence == 0.0    # unparseable -> zero, not crash
+
+
+# --- A suppressed call is not a finding ----------------------------------
+
+
+class _NeverCalled:
+    async def create(self, **_kwargs):
+        raise AssertionError("no request should go out when the budget gate refuses")
+
+
+async def test_a_suppressed_call_returns_none_not_an_empty_list(tmp_path):
+    """The caller records an anchor as researched and never revisits it, so
+    "no request went out" and "the call ran and found nothing" must not look
+    alike. They did -- and routing the circuit breaker through the same gate
+    made one open breaker able to retire the entire anchor list in a single
+    run, irreversibly, since nothing expires anchor_research.json."""
+    from smartboi.research import SupplierResearcher
+    from smartboi.usage import CAT_RESEARCH, UsageTracker
+
+    usage = UsageTracker(tmp_path / "u.json", daily_call_budget=10,
+                         category_shares={CAT_RESEARCH: 0.0})  # switched off
+    researcher = SupplierResearcher(api_key="k", model="claude-haiku-4-5", usage=usage)
+    researcher._client = SimpleNamespace(messages=_NeverCalled())
+
+    assert await researcher.research("RTX", "RTX Corp", "defense", 75.0, 3000.0) is None
+
+
+async def test_an_open_breaker_leaves_every_anchor_unmarked(tmp_path, monkeypatch):
+    """The whole point: the run stops and the anchors stay eligible, rather
+    than being marked researched having cost nothing and learned nothing."""
+    import smartboi.tools as tools_module
+    from smartboi.config import Settings
+    from smartboi.engine import Engine
+
+    monkeypatch.chdir(tmp_path)
+    engine = Engine(Settings(_env_file=None, enable_dashboard=False,
+                             enable_universe_autoscreen=False, anthropic_api_key="k"))
+    engine.usage.note_failure(Exception("your credit balance is too low"))
+
+    async def _suppressed(*_a, **_k):
+        return None
+    monkeypatch.setattr(tools_module.SupplierResearcher, "research", _suppressed)
+
+    await tools_module.run_supplier_research(engine)
+
+    assert engine.research_state.data == {}, "a suppressed run must mark nothing"
