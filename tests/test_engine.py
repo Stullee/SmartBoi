@@ -3581,3 +3581,36 @@ async def test_a_real_re_judgement_does_spend_the_slot(engine):
     await engine._maybe_resynthesize(dossier, datetime.now(timezone.utc))
 
     assert int(engine.resynthesis_state.get("count", 0) or 0) == before + 1
+
+
+async def test_the_synthesis_floor_gate_reads_the_uncapped_arithmetic(engine):
+    """The central fix of the corroboration-cap change, and it survived full
+    reversion with a green suite until this existed.
+
+    A dossier whose CAPPED score sits below the synthesis floor but whose
+    arithmetic is above it must still be judged. Gating on the capped score
+    is circular -- the verdict suppresses the re-judgement that would renew
+    it -- and the circle fails open: the verdict goes stale at 36h, the cap
+    lapses, and the score springs back above the signal bar."""
+    from smartboi.dossier import Dossier, merge_evidence, recompute_decay
+
+    now = datetime.now(timezone.utc)
+    dossier = Dossier(symbol="BWEN")
+    for n in range(8):
+        merge_evidence(dossier, EvidenceRecord(
+            f"e{n}", "news", f"outlet{n}.com", "u", "h", now.isoformat(), "BWEN", False, "",
+            "LONG", 0.45, 0.60, 20, "reason", "skeptic",
+        ), now=now)
+    dossier.synthesis_at = now.isoformat()
+    dossier.distinct_fact_count = 1
+    recompute_decay(dossier, now)
+
+    floor = (engine.settings.signal_confidence_threshold
+             * engine.settings.synthesis_score_floor_pct)
+    assert dossier.confidence * dossier.magnitude < floor, "precondition: capped, under the floor"
+    assert dossier.arithmetic_score > floor, "precondition: the arithmetic is above it"
+
+    engine.synthesizer = FakeSynthesizer(default=synthesis())
+    await engine._apply_synthesis(dossier, now)
+
+    assert engine.synthesizer.calls, "the pass that set the cap must still be reachable under it"

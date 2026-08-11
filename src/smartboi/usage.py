@@ -159,6 +159,7 @@ class UsageTracker:
             # discarded, the same contract an exhausted budget has.
             self._state.set("breaker_reason", "")
             self._state.set("breaker_tripped_at", "")
+            self._state.set("breaker_probe_at", "")
 
     def _reserved_elsewhere(self, category: str) -> float:
         """Dollars reserved by OTHER categories that they have not spent yet.
@@ -268,17 +269,27 @@ class UsageTracker:
         return "" if self.budget_remaining(category, today) else "daily LLM budget reached"
 
     def _breaker_probe_due(self) -> bool:
-        """Whether enough time has passed since the last failure to spend one
-        call finding out whether the problem is still there."""
-        stamp = self._state.get("breaker_tripped_at") or ""
-        try:
-            tripped = datetime.fromisoformat(stamp)
-        except (TypeError, ValueError):
-            return True  # unreadable stamp: probe rather than block forever
-        if tripped.tzinfo is None:
-            tripped = tripped.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - tripped).total_seconds()
-        return age >= BREAKER_PROBE_INTERVAL_SEC
+        """Whether enough time has passed to spend one call finding out
+        whether the problem is still there.
+
+        Counted from the LATER of the last failure and the last probe. Both
+        matter: without the failure stamp a fresh trip would be probed
+        immediately, and without the probe stamp a probe that met a transient
+        error would never close the window at all."""
+        now = datetime.now(timezone.utc)
+        latest = None
+        for key in ("breaker_tripped_at", "breaker_probe_at"):
+            stamp = self._state.get(key) or ""
+            try:
+                when = datetime.fromisoformat(stamp)
+            except (TypeError, ValueError):
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            latest = when if latest is None else max(latest, when)
+        if latest is None:
+            return True  # no readable stamp: probe rather than block forever
+        return (now - latest).total_seconds() >= BREAKER_PROBE_INTERVAL_SEC
 
     def breaker_reason(self, today: str | None = None) -> str:
         """Why calls are halted, or "" when they are not. For the dashboard
@@ -325,6 +336,14 @@ class UsageTracker:
         if self._state.get("breaker_reason"):
             if not self._breaker_probe_due():
                 return False
+            # The token is CONSUMED here, not merely tested. Without this the
+            # window opens and never shuts: only a success (record) or another
+            # PERMANENT failure (note_failure re-stamping) closed it, so a run
+            # of transient errors -- a 429, which is exactly what hammering a
+            # struggling account produces -- left every subsequent call
+            # allowed. Measured: 20 of 20 calls passed an open breaker, which
+            # is the storm this whole mechanism exists to bound, restored.
+            self._state.set("breaker_probe_at", datetime.now(timezone.utc).isoformat())
         # The total call cap, minus whatever other categories have RESERVED and
         # not yet spent -- mirrors the dollar gate below. Without this, a
         # reserved pass (synthesis) had its dollars protected but could still
@@ -371,7 +390,7 @@ class UsageTracker:
         # mechanism instead of just a slower failure loop.
         if self._state.get("breaker_reason"):
             log.info("LLM circuit breaker CLOSED -- a call succeeded, resuming normal operation.")
-            self._state.update({"breaker_reason": "", "breaker_tripped_at": ""})
+            self._state.update({"breaker_reason": "", "breaker_tripped_at": "", "breaker_probe_at": ""})
         self._state.set("calls", self._state.get("calls", 0) + 1)
         self._state.set("input_tokens", self._state.get("input_tokens", 0) + input_tokens)
         self._state.set("output_tokens", self._state.get("output_tokens", 0) + output_tokens)

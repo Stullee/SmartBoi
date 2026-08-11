@@ -412,3 +412,54 @@ def test_the_breaker_logs_once_not_once_per_suppressed_call(tmp_path, caplog):
         for _ in range(50):
             u.note_failure(exc, today="2026-08-09")
     assert sum("circuit breaker OPEN" in r.message for r in caplog.records) == 1
+
+
+def _backdate_breaker(tracker, minutes):
+    """Age the breaker's stamps so the probe window has opened."""
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    tracker._state.update({"breaker_tripped_at": old, "breaker_probe_at": old})
+
+
+def test_the_probe_lets_exactly_one_call_through_per_interval(tmp_path):
+    """The token has to be CONSUMED, not merely tested. Testing it only meant
+    the window opened and never shut: nothing but a success or another
+    PERMANENT failure closed it, so a run of transient errors -- a 429, which
+    is exactly what hammering a struggling account produces -- left every
+    subsequent call allowed. Measured before the fix: 20 of 20 calls passed
+    an open breaker, the storm this mechanism exists to bound, restored."""
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=5000)
+    u.note_failure(_BillingError("your credit balance is too low"))
+    _backdate_breaker(u, minutes=31)
+
+    allowed = 0
+    for _ in range(20):
+        if u.budget_remaining(CAT_DOSSIER):
+            allowed += 1
+            # A TRANSIENT failure: it must not re-stamp, so only the consumed
+            # probe token can close the window.
+            u.note_failure(_BillingError("Error code: 429 - rate_limit_error"))
+
+    assert allowed == 1
+
+
+def test_a_fresh_trip_allows_no_probe_at_all(tmp_path):
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=5000)
+    u.note_failure(_BillingError("your credit balance is too low"))
+
+    assert not any(u.budget_remaining(CAT_DOSSIER) for _ in range(20))
+
+
+def test_a_successful_probe_closes_the_breaker(tmp_path):
+    """The probe is a recovery mechanism, not just a slower failure loop: a
+    call that succeeds proves the account works, so the breaker clears
+    outright rather than waiting for UTC midnight."""
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=5000)
+    u.note_failure(_BillingError("your credit balance is too low"))
+    _backdate_breaker(u, minutes=31)
+
+    assert u.budget_remaining(CAT_DOSSIER)      # the probe
+    u.record(100, 50, model="claude-haiku-4-5", category=CAT_DOSSIER)  # it succeeded
+
+    assert u.breaker_reason() == ""
+    assert all(u.budget_remaining(CAT_DOSSIER) for _ in range(5))
