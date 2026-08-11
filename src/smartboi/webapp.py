@@ -189,6 +189,13 @@ _INDEX_HTML = """<!doctype html>
   .eyebrow::after { content:""; flex:1; height:1px; background:var(--line-soft); }
 
   .grid { display:grid; gap:14px; }
+  /* A grid item defaults to min-width:auto, i.e. it refuses to shrink below
+     its own min-content -- which is what pushed the whole PAGE into a
+     horizontal scroll on a phone even though every grid here collapses to
+     one column. The panels that hold wide content already wrap it in
+     .scroll, so they can shrink safely. */
+  .grid > * { min-width:0; }
+  .phead { flex-wrap:wrap; gap:4px 10px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); }
   .pad { padding:15px 17px; }
 
@@ -251,6 +258,11 @@ _INDEX_HTML = """<!doctype html>
   /* live wire */
   .wire { grid-template-columns:1fr 320px; align-items:stretch; }
   @media (max-width:860px){ .wire{ grid-template-columns:1fr; } }
+  /* Below this the canvas is ~348x195: 4.5px nodes and 3.8px labels, under a
+     legend that renders at full CSS size -- the caption is legible and the
+     thing it captions is not. The feed carries the panel instead; it holds
+     the same signals, in the same order, with the thesis text readable. */
+  @media (max-width:620px){ .wire .stagewrap{ display:none; } }
   .stagewrap { position:relative; overflow:hidden; }
   canvas#wireCanvas { display:block; width:100%; height:460px; }
   .tip { position:fixed; pointer-events:none; background:var(--ink); color:var(--ground); font-size:0.74rem;
@@ -263,7 +275,14 @@ _INDEX_HTML = """<!doctype html>
   .feed-h .t { font-size:12px; font-weight:600; }
   .feed-h .dotlive { width:7px; height:7px; border-radius:50%; background:var(--pos); animation:pulse 2s infinite; }
   .feed-h .c { margin-left:auto; font-size:10.5px; color:var(--faint); }
-  .feed-list { overflow-y:auto; padding:6px; max-height:404px; }
+  /* flex-basis:0 so this contributes NOTHING to the panel's natural height --
+     the canvas panel alone sets the row height and the list then fills whatever
+     the stretch gives it. A fixed 404px left ~74px of dead space under the last
+     row; sizing to content instead just moved that space to the other panel.
+     Once the grid has stacked there is no canvas to match, so it sizes to its
+     content, capped against the viewport. */
+  .feed-list { overflow-y:auto; padding:6px; flex:1 1 0; min-height:0; }
+  @media (max-width:860px){ .feed-list{ flex:0 1 auto; max-height:70vh; } }
   .ev { display:block; width:100%; text-align:left; font:inherit; cursor:pointer; border:1px solid transparent;
         background:transparent; color:var(--ink); border-radius:9px; padding:9px 10px; }
   .ev:hover { background:var(--panel-hi); }
@@ -279,6 +298,13 @@ _INDEX_HTML = """<!doctype html>
   .phead h2 { font-size:13px; margin:0; font-weight:600; letter-spacing:-0.005em; }
   .phead .hint { font-size:11px; color:var(--muted); }
 
+  /* These two were inline styles, which no media query can override -- so the
+     page scrolled sideways at phone width (body 572px against a 390px
+     viewport) because a two-column grid could not shrink below the funnel's
+     min-content. */
+  .act { grid-template-columns:1.4fr 1fr; align-items:start; }
+  .ghgrid { grid-template-columns:1fr 1fr; align-items:start; }
+  @media (max-width:900px){ .act, .ghgrid { grid-template-columns:1fr; } }
   .work { grid-template-columns:1.3fr 1fr; align-items:start; }
   @media (max-width:900px){ .work{ grid-template-columns:1fr; } }
 
@@ -377,7 +403,7 @@ _INDEX_HTML = """<!doctype html>
   <div class="grid"><div class="panel pad" id="genrec"></div></div>
 
   <div class="eyebrow">Universe activation &amp; budget</div>
-  <div class="grid" style="grid-template-columns:1.4fr 1fr; align-items:start;" id="act">
+  <div class="grid act" id="act">
     <div class="panel pad"><div class="funnel" id="funnel"></div></div>
     <div class="panel pad" id="budget"></div>
   </div>
@@ -392,7 +418,7 @@ _INDEX_HTML = """<!doctype html>
   </div>
 
   <div class="eyebrow">Graph health &amp; maintenance</div>
-  <div class="grid" style="grid-template-columns:1fr 1fr; align-items:start;" id="ghGrid">
+  <div class="grid ghgrid" id="ghGrid">
     <div class="panel pad" id="ghStats"></div>
     <div class="panel pad" id="ghMaint"></div>
   </div>
