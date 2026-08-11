@@ -268,6 +268,8 @@ _INDEX_HTML = """<!doctype html>
         background:transparent; color:var(--ink); border-radius:9px; padding:9px 10px; }
   .ev:hover { background:var(--panel-hi); }
   .ev.on { background:var(--panel-hi); border-color:var(--line); }
+  .ev-empty { padding:16px 12px; font-size:12px; color:var(--faint); }
+  .feed-h .dotlive.idle { background:var(--faint); animation:none; }
   .ev-top { display:flex; align-items:center; gap:7px; margin-bottom:3px; }
   .ev-sym { font-size:12px; font-weight:700; }
   .ev-time { font-size:10px; color:var(--faint); margin-left:auto; }
@@ -384,7 +386,7 @@ _INDEX_HTML = """<!doctype html>
   <div class="grid wire">
     <div class="panel stagewrap"><canvas id="wireCanvas"></canvas><div class="gviz-leg" id="wireLeg"></div></div>
     <div class="panel feed">
-      <div class="feed-h"><span class="dotlive"></span><span class="t">Live wire</span><span class="c" id="feedCount"></span></div>
+      <div class="feed-h"><span class="dotlive" id="feedDot"></span><span class="t">Live wire</span><span class="c" id="feedCount"></span></div>
       <div class="feed-list" id="feed"></div>
     </div>
   </div>
@@ -880,7 +882,7 @@ var cv, ctx, dpr=Math.max(1,Math.min(2,window.devicePixelRatio||1)), cw=700, ch=
 
 var TCK = {};
 function tok(name){ return TCK[name] !== undefined ? TCK[name] : getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
-function refreshTokens(){ ["--gc-cust","--gc-supp","--gc-comp","--gc-reg","--gc-eco","--gn-anchor","--pos","--neg","--faint","--gn-stroke","--gn-txt","--warn"]
+function refreshTokens(){ ["--gc-cust","--gc-supp","--gc-comp","--gc-reg","--gc-eco","--gn-anchor","--pos","--neg","--faint","--gn-stroke","--gn-txt","--warn","--muted"]
   .forEach(function(k){ TCK[k]=getComputedStyle(document.documentElement).getPropertyValue(k).trim(); }); }
 // The four REL_TYPES and their channel colours. Anything else cannot reach the
 // canvas today -- RelationshipGraph drops an unknown rel_type on load -- but it
@@ -963,6 +965,19 @@ function wireAnimating(){
 function drawWire(now){
   if(!ctx) return;
   ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,cw,ch);
+  // A deployment with no graph yet (a custom SYMBOLS universe whose filings have
+  // not been read, or a first run) has nothing to draw. Two empty rectangles
+  // under a pulsing "live" dot read as a broken page -- every table on this
+  // dashboard carries an empty-state line and this panel carried none.
+  if(!WIRE.nodes.length){
+    var es=Math.max(scale,0.6);
+    ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillStyle=tok("--muted"); ctx.font="600 "+(13*es)+"px -apple-system,sans-serif";
+    ctx.fillText("No relationships extracted yet", cw/2, ch/2-9*es);
+    ctx.fillStyle=tok("--faint"); ctx.font=(11.5*es)+"px -apple-system,sans-serif";
+    ctx.fillText("Edges appear as the engine reads each symbol's latest filings.", cw/2, ch/2+10*es);
+    return;
+  }
   var s=scale, sig=activeSig(), hotSym=sig?sig.symbol:null, hot={};
   if(hotSym) sigEdges(hotSym).forEach(function(e){ hot[e[0]+">"+e[1]]=1; });
   // edges
@@ -1038,6 +1053,9 @@ function resizeWire(){ if(!cv) return; cw=cv.parentNode.clientWidth; ch=Math.rou
 function renderFeed(scrollToActive){
   var s=WIRE.feed; el("feedCount").textContent=s.length+(s.length===1?" signal":" signals");
   var act=activeIndex(); if(act<0) act=0;
+  // The dot claims the panel is live; with nothing in the window it should not.
+  el("feedDot").className="dotlive"+(s.length?"":" idle");
+  if(!s.length){ el("feed").innerHTML='<div class="ev-empty">No signals yet &mdash; nothing has crossed the conviction bar.</div>'; return; }
   el("feed").innerHTML=s.map(function(x,i){
     return '<button class="ev'+(i===act?" on":"")+'" data-i="'+i+'"><div class="ev-top"><span class="ev-sym mono">'+esc(x.symbol)+
       '</span><span class="dir '+CO[x.direction]+'">'+x.direction+'</span><span class="ev-time">'+esc((x.generated_at||"").slice(5,16).replace("T"," "))+
@@ -1125,31 +1143,46 @@ function updateWire(d){
   var key=JSON.stringify(f.nodes.map(function(n){return n.id;}));
   WIRE.nodes=f.nodes; WIRE.edges=f.edges;
   if(key!==WIRE.layoutKey){ WIRE.layoutKey=key; layoutWire(); }
-  // The legend keys what is ACTUALLY drawn. It used to name "ecosystem", which
-  // is not a relationship type at all (it is an evidence class elsewhere in the
-  // system) and which RelationshipGraph drops on load if it ever appeared --
-  // while supplier and regulator edges, which are drawn constantly, had no key
-  // at all. A legend that describes a channel that cannot occur and omits two
-  // that do is worse than none: the panel's whole claim is that the mechanism
-  // can be read off it.
+  // The legend keys exactly what is on screen -- nothing more, nothing less.
+  //
+  // It used to be a fixed list that named "ecosystem", which is not a
+  // relationship type at all (it is an evidence class elsewhere in the system,
+  // and RelationshipGraph drops any rel_type outside REL_TYPES on load), while
+  // supplier and regulator edges -- drawn constantly -- had no key. It also gave
+  // one word, "anchor", to three visually distinct node classes. A legend that
+  // describes a channel which cannot occur, and omits two that do, is worse than
+  // no legend: the panel's whole claim is that the mechanism can be read off it.
+  //
+  // Derived rather than hard-coded so it cannot drift again, and so an empty
+  // canvas is not captioned with six keys for things it is not drawing.
   WIRE.dirty=true;
-  el("wireLeg").innerHTML='<span class="gl"><i class="gl-l" style="background:var(--gc-cust)"></i>customer</span>'+
-    '<span class="gl"><i class="gl-l" style="background:var(--gc-supp)"></i>supplier</span>'+
-    '<span class="gl"><i class="gl-l" style="background:var(--gc-comp)"></i>competitor</span>'+
-    '<span class="gl"><i class="gl-l" style="background:var(--gc-reg)"></i>regulator</span>'+
-    '<span class="gl"><i class="gl-d" style="background:var(--gn-anchor)"></i>anchor</span>'+
-    '<span class="gl"><i class="gl-d" style="background:var(--pos)"></i>long</span>'+
-    '<span class="gl"><i class="gl-d" style="background:var(--neg)"></i>short</span>'+
-    // Three different things used to render as the same grey disc: an anchor, a
-    // tradeable with no thesis yet, and an `external` non-member (the regulator
-    // pseudo-symbols BIS/EPA/ITC/NHTSA, which are graph endpoints but not in the
-    // universe). The legend called all three "anchor".
-    '<span class="gl"><i class="gl-d small" style="background:var(--faint)"></i>no thesis yet</span>'+
-    '<span class="gl"><i class="gl-d hollow"></i>off-universe</span>'+
-    // Only keyed when one is actually on screen -- a legend entry for something
-    // that is not being drawn is the defect this panel already had once.
-    (f.unlinked?'<span class="gl"><i class="gl-d none"></i>no disclosed path</span>':"")+
-    '<span class="gl" style="margin-left:auto;color:var(--faint)">'+f.nodes.length+' of '+f.total+' names &middot; thesis + the anchors feeding them</span>';
+  var have={};
+  f.edges.forEach(function(e){ have[GC[e[2]]?e[2]:"other"]=1; });
+  f.nodes.forEach(function(n){
+    if(n.kind==="anchor"){ have.anchor=1; return; }
+    if(n.kind==="external"){ have.external=1; return; }
+    if(n.kind==="unlinked") have.unlinked=1;
+    if(n.dir==="LONG") have.long=1; else if(n.dir==="SHORT") have.short=1; else have.none=1;
+  });
+  var KEYS=[
+    ["customer",  '<i class="gl-l" style="background:var(--gc-cust)"></i>customer'],
+    ["supplier",  '<i class="gl-l" style="background:var(--gc-supp)"></i>supplier'],
+    ["competitor",'<i class="gl-l" style="background:var(--gc-comp)"></i>competitor'],
+    ["regulator", '<i class="gl-l" style="background:var(--gc-reg)"></i>regulator'],
+    ["other",     '<i class="gl-l" style="background:var(--gc-eco)"></i>other'],
+    ["anchor",    '<i class="gl-d" style="background:var(--gn-anchor)"></i>anchor'],
+    ["long",      '<i class="gl-d" style="background:var(--pos)"></i>long'],
+    ["short",     '<i class="gl-d" style="background:var(--neg)"></i>short'],
+    ["none",      '<i class="gl-d small" style="background:var(--faint)"></i>no thesis yet'],
+    ["external",  '<i class="gl-d hollow"></i>off-universe'],
+    ["unlinked",  '<i class="gl-d none"></i>no disclosed path']
+  ];
+  el("wireLeg").innerHTML=KEYS.filter(function(k){ return have[k[0]]; })
+      .map(function(k){ return '<span class="gl">'+k[1]+"</span>"; }).join("")+
+    '<span class="gl" style="margin-left:auto;color:var(--faint)">'+
+      f.nodes.length+' of '+f.total+' names &middot; thesis + the anchors feeding them</span>';
+  // ...and no empty bordered strip under an empty canvas.
+  el("wireLeg").style.display=f.nodes.length?"":"none";
   renderFeed();
 }
 
