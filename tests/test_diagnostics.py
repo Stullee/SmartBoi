@@ -383,6 +383,23 @@ def test_the_full_bundle_carries_the_files_a_summary_cannot(engine, tmp_path):
     assert "data/periodic_pass_state.json" in names
 
 
+def test_the_full_bundle_carries_the_llm_trace(engine, tmp_path):
+    """The prompts are the half of the record the summary cannot reconstruct:
+    it reports what every pass DECIDED, and the trace is the only thing that
+    says what each was shown to decide it. A bundle without it can still not
+    answer the question that produced this file (see the fact_key outage)."""
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs" / "llm_trace.jsonl").write_text(
+        '{"category":"synthesis","symbol":"AOSL","prompt":"PRICE (daily closes...)",'
+        '"response":{"already_priced_in":false}}\n')
+
+    names = _bundle(engine).namelist()
+
+    assert "logs/llm_trace.jsonl" in names
+    body = _bundle(engine).read("logs/llm_trace.jsonl").decode()
+    assert "PRICE (daily closes" in body, "the prompt must survive into the zip"
+
+
 def test_the_full_bundle_never_carries_a_credential(engine, tmp_path):
     """It reaches the same places the pasteable bundle does and makes the
     same promise, so it gets the same scrub -- at the same boundary."""
