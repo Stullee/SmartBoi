@@ -1238,6 +1238,17 @@ var RMQ = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce
 var REDUCED = !!(RMQ && RMQ.matches);
 if (RMQ && RMQ.addEventListener) RMQ.addEventListener("change", function(e){ REDUCED = e.matches; WIRE.dirty = true; });
 var cv, ctx, dpr=Math.max(1,Math.min(2,window.devicePixelRatio||1)), cw=700, ch=460, scale=1, VW=1000, VH=560;
+// The virtual height actually ON SCREEN, which is not always VH.
+//
+// resizeWire sizes the canvas to the panel's width at the VW:VH aspect but
+// caps it at 520px tall, while scale stays cw/VW -- so past a panel width of
+// ~929px the cap engages and VH*scale exceeds the canvas. Everything laid out
+// below ch/scale was then drawn past the bottom edge: 7% of the virtual canvas
+// invisible at 1000px wide, 23% at 1200, 34% at 1400, with the labels straddling
+// the boundary sliced in half. The layout has to be told how much of its own
+// canvas is being shown rather than assuming all of it, so this is what
+// layoutWire places, centres and clamps against.
+var VHv=VH;
 
 var TCK = {};
 function tok(name){ return TCK[name] !== undefined ? TCK[name] : getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
@@ -1268,7 +1279,7 @@ function gvFill(n){ if(n.kind==="anchor") return "--gn-anchor"; if(n.dir==="LONG
 function layoutWire(){
   var nodes=WIRE.nodes, edges=WIRE.edges, i,j, seed=1234567;
   function rnd(){ seed=(seed*1664525+1013904223)%4294967296; return seed/4294967296; }
-  var pos={}; nodes.forEach(function(n,k){ var a=k*2*Math.PI/nodes.length; pos[n.id]={x:VW/2+(170+rnd()*50)*Math.cos(a),y:VH/2+(140+rnd()*50)*Math.sin(a),vx:0,vy:0}; });
+  var pos={}; nodes.forEach(function(n,k){ var a=k*2*Math.PI/nodes.length; pos[n.id]={x:VW/2+(170+rnd()*50)*Math.cos(a),y:VHv/2+(140+rnd()*50)*Math.sin(a),vx:0,vy:0}; });
   for(var it=0;it<250;it++){
     for(i=0;i<nodes.length;i++) for(j=i+1;j<nodes.length;j++){ var pa=pos[nodes[i].id],pb=pos[nodes[j].id];
       var dx=pa.x-pb.x,dy=pa.y-pb.y,d2=dx*dx+dy*dy+0.01,d=Math.sqrt(d2),rep=5200/d2,ux=dx/d,uy=dy/d;
@@ -1276,8 +1287,8 @@ function layoutWire(){
     edges.forEach(function(e){ var pa=pos[e[0]],pb=pos[e[1]]; if(!pa||!pb) return;
       var dx=pb.x-pa.x,dy=pb.y-pa.y,d=Math.sqrt(dx*dx+dy*dy)+0.01,f=(d-92)*0.02*(0.5+e[3]),ux=dx/d,uy=dy/d;
       pa.vx+=ux*f;pa.vy+=uy*f;pb.vx-=ux*f;pb.vy-=uy*f; });
-    nodes.forEach(function(n){ var p=pos[n.id]; p.vx+=(VW/2-p.x)*0.006;p.vy+=(VH/2-p.y)*0.006;p.vx*=0.85;p.vy*=0.85;p.x+=p.vx;p.y+=p.vy;
-      p.x=Math.max(38,Math.min(VW-38,p.x));p.y=Math.max(32,Math.min(VH-32,p.y)); });
+    nodes.forEach(function(n){ var p=pos[n.id]; p.vx+=(VW/2-p.x)*0.006;p.vy+=(VHv/2-p.y)*0.006;p.vx*=0.85;p.vy*=0.85;p.x+=p.vx;p.y+=p.vy;
+      p.x=Math.max(38,Math.min(VW-38,p.x));p.y=Math.max(32,Math.min(VHv-32,p.y)); });
   }
   // Final de-overlap, on each node's INK BOX rather than its disc, re-clamped
   // on every pass.
@@ -1311,7 +1322,7 @@ function layoutWire(){
     // Clamped to the INK box, so a label never runs off an edge either.
     nodes.forEach(function(n){ var p=pos[n.id];
       p.x=Math.max(gvHW(n)+2,Math.min(VW-gvHW(n)-2,p.x));
-      p.y=Math.max(gvTop(n)+2,Math.min(VH-gvBot(n)-2,p.y)); });
+      p.y=Math.max(gvTop(n)+2,Math.min(VHv-gvBot(n)-2,p.y)); });
   }
   WIRE.pos=pos;
 }
@@ -1461,6 +1472,16 @@ function resizeWire(){ if(!cv) return;
   // the bitmap, so a non-guarded version would repaint in a loop.
   if(w===cw && h===ch && d===dpr) return;
   dpr=d; cw=w; ch=h; scale=cw/VW;
+  // How much of the virtual canvas this size actually shows. Equal to VH
+  // whenever the 520 cap above is not engaged; below it once the panel is
+  // wide enough for the cap to bite, which is where the bottom of the layout
+  // used to be drawn past the edge. Re-laying out when it moves materially is
+  // what stops nodes from being placed into the invisible strip -- guarded by
+  // a rounded comparison so an ordinary drag-resize does not re-run the sim
+  // on every pixel.
+  var vh=Math.min(VH, ch/scale);
+  if(Math.round(vh/8)!==Math.round(VHv/8)){ VHv=vh; WIRE.layoutKey=""; }
+  else VHv=vh;
   cv.width=Math.round(cw*dpr); cv.height=Math.round(ch*dpr); cv.style.height=ch+"px"; WIRE.dirty=true; }
 
 function renderFeed(scrollToActive){

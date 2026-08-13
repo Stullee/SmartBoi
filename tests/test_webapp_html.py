@@ -159,7 +159,10 @@ def test_wire_layout_keeps_labels_apart_and_on_the_canvas():
     if node is None:
         pytest.skip("node not available to run the wire layout")
 
-    harness = "var WIRE, VW=1000, VH=560;\n" + _layout_source() + """
+    # VHv is the VISIBLE virtual height, which resizeWire sets from the real
+    # canvas; at the design aspect it equals VH, which is what the layout is
+    # asserted against here.
+    harness = "var WIRE, VW=1000, VH=560, VHv=560;\n" + _layout_source() + """
     // Deterministic stand-in for a live focus subgraph. Two properties matter
     // and a uniform graph has neither: symbol lengths span the real range
     // (3-6 chars, so labels are 2-4x wider than their discs), and the edges
