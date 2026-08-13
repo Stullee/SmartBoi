@@ -1250,6 +1250,19 @@ function refreshTokens(){ ["--gc-cust","--gc-supp","--gc-comp","--gc-reg","--gc-
 var GC={customer:"--gc-cust",supplier:"--gc-supp",competitor:"--gc-comp",regulator:"--gc-reg"};
 function gvColorTok(type){ return GC[type]||"--gc-eco"; }
 function gvR(n){ if(n.kind==="anchor") return 13; if(n.score!=null) return 6+n.score*10; return 6; }
+// The half-extents of everything a node PAINTS, which for almost every name is
+// the label rather than the disc: a disc is 12-32px across and "SCE-PN" sets
+// 40px wide next to it. Separation and edge-clamping both have to work on this
+// box, not on gvR, or labels collide and run off the canvas while the discs
+// they belong to sit comfortably clear of each other.
+//
+// 11px bold sans averages ~6.6px per character; halved, plus a small margin.
+// The label is drawn at y-r-6 with textBaseline "middle", so the ink reaches
+// about r+12 above the centre and only r below it -- deliberately asymmetric,
+// because treating it as symmetric wastes half the vertical budget.
+function gvHW(n){ return Math.max(gvR(n), n.id.length*3.3+4); }
+function gvTop(n){ return gvR(n)+13; }
+function gvBot(n){ return gvR(n); }
 function gvFill(n){ if(n.kind==="anchor") return "--gn-anchor"; if(n.dir==="LONG") return "--pos"; if(n.dir==="SHORT") return "--neg"; return "--faint"; }
 
 function layoutWire(){
@@ -1266,9 +1279,40 @@ function layoutWire(){
     nodes.forEach(function(n){ var p=pos[n.id]; p.vx+=(VW/2-p.x)*0.006;p.vy+=(VH/2-p.y)*0.006;p.vx*=0.85;p.vy*=0.85;p.x+=p.vx;p.y+=p.vy;
       p.x=Math.max(38,Math.min(VW-38,p.x));p.y=Math.max(32,Math.min(VH-32,p.y)); });
   }
-  for(var pass=0;pass<9;pass++) for(i=0;i<nodes.length;i++) for(j=i+1;j<nodes.length;j++){ var qa=pos[nodes[i].id],qb=pos[nodes[j].id];
-    var ex=qb.x-qa.x,ey=qb.y-qa.y,ed=Math.sqrt(ex*ex+ey*ey)+0.01,need=gvR(nodes[i])+gvR(nodes[j])+13;
-    if(ed<need){ var pu=(need-ed)/2,nx=ex/ed,ny=ey/ed; qa.x-=nx*pu;qa.y-=ny*pu;qb.x+=nx*pu;qb.y+=ny*pu; } }
+  // Final de-overlap, on each node's INK BOX rather than its disc, re-clamped
+  // on every pass.
+  //
+  // Two faults lived in the version this replaces, and they compounded. It
+  // demanded only gvR(a)+gvR(b)+13 between CENTRES -- ample for two 12px discs
+  // and nowhere near enough for the labels above them, so "TCPA" and "SCRNY"
+  // printed straight through each other while their discs were 13px clear.
+  // And it ran AFTER the simulation loop's clamp without ever re-clamping, so
+  // its own pushes could walk a node off the canvas: MVST came to rest at
+  // y=19, where a label drawn at y-r-6 is cut off by the top edge, and names
+  // shoved past the right edge piled into an unreadable stack.
+  //
+  // Axis-aligned, because the ink is a box and circular separation over-pushes
+  // on the axis that was already clear. Resolving along whichever axis
+  // overlaps LEAST moves each node the shortest distance that actually
+  // separates the pair, which keeps the force-directed shape intact.
+  for(var pass=0;pass<12;pass++){
+    for(i=0;i<nodes.length;i++) for(j=i+1;j<nodes.length;j++){
+      var na=nodes[i],nb=nodes[j],qa=pos[na.id],qb=pos[nb.id];
+      var ex=qb.x-qa.x,ey=qb.y-qa.y;
+      var needX=gvHW(na)+gvHW(nb)+6;
+      // Asymmetric: whichever node is lower needs its LABEL clear of the
+      // other's disc, not its disc clear of the other's disc.
+      var needY=(ey>=0?gvBot(na)+gvTop(nb):gvBot(nb)+gvTop(na))+3;
+      var ovX=needX-Math.abs(ex),ovY=needY-Math.abs(ey);
+      if(ovX<=0||ovY<=0) continue;
+      if(ovX<ovY){ var px=(ex>=0?1:-1)*ovX/2; qa.x-=px;qb.x+=px; }
+      else       { var py=(ey>=0?1:-1)*ovY/2; qa.y-=py;qb.y+=py; }
+    }
+    // Clamped to the INK box, so a label never runs off an edge either.
+    nodes.forEach(function(n){ var p=pos[n.id];
+      p.x=Math.max(gvHW(n)+2,Math.min(VW-gvHW(n)-2,p.x));
+      p.y=Math.max(gvTop(n)+2,Math.min(VH-gvBot(n)-2,p.y)); });
+  }
   WIRE.pos=pos;
 }
 
