@@ -1131,7 +1131,20 @@ def run_diagnostics(engine) -> str:
     add(f"  carrying a label    : {labelled}" + (f"  ({labelled / items * 100:.0f}%)" if items else ""))
     add(f"  distinct facts      : {facts}"
         + (f"  -- {labelled / facts:.1f} item(s) per fact" if facts else ""))
-    if items and labelled / items < 0.5:
+    if items and not labelled:
+        # Distinguished from the partial case below because the two have
+        # nothing in common. A partial rollout is expected and self-healing;
+        # ZERO labels across a board that has merged evidence under v8 is a
+        # broken pipeline, and reporting it as "under half ... a mix of both"
+        # described it as the former for as long as it held -- which read as
+        # a migration in progress rather than a mechanism that had never
+        # once fired.
+        add("  ^^ NOT ONE item carries a label, so per-fact independence is inert: every")
+        add("     dossier is scoring under the OLD per-channel rules. If any evidence here")
+        add("     was merged after SCORING_VERSION 8 went live this is a PIPELINE FAULT, not")
+        add("     a migration -- check that the update-proposal validator carries fact_key")
+        add("     through (engine._validated_proposal) before trusting any source count.")
+    elif items and labelled / items < 0.5:
         add("  ^^ under half the evidence carries a label. Items merged before SCORING_VERSION 8")
         add("     score under the OLD per-channel rules, so the board is currently a mix of both.")
     elif facts and labelled / facts < 1.2:

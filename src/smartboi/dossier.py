@@ -630,10 +630,39 @@ COMPETITOR_SATISFIES_DISCLOSED_LINK = False
 #     delisting forms, so filing evidence now reaches foreign private issuers
 #     that could previously never produce a single filing item.
 #
+# 9: what 8 SAID it did, actually happening. The fact key never survived the
+# engine's proposal validator -- engine._validated_proposal is a whitelist and
+# did not name the field -- so every item merged under 8 carried fact_key="",
+# independence_key never got past its first branch, and 8 scored per CHANNEL
+# exactly as 7 did. The entry below is an accurate description of a mechanism
+# that did not run.
+#
+# Rows must split here for the same reason 8 claimed to: the unit the score is
+# built on moves. They could not split AT 8, because nothing changed there.
+#
+# What the board looked like at the boundary: 0 of 970 evidence items carried
+# a label, including all 77 merged after 8 went live -- a mechanism inert on
+# 100% of evidence while raising no error anywhere. Against the whole-body
+# pass's own fact count, the 29 synthesised dossiers counted 216 independent
+# sources for 110 distinct facts: median 1.8x over, worst 4.0x (NCSM 12
+# sources / 3 facts, VVX and KLXE 15 / 4, DCO 18 / 7). Of those 29, 23 see
+# their source count fall under per-fact keying, 5 hold and 1 rises -- the key
+# splits distinct events from one publisher as readily as it collapses one
+# event across several counterparties -- and none drops below
+# min_independent_sources, so the correction silences nothing outright.
+#
+# FORWARD-ONLY, which is the caveat this boundary carries and 8's does not:
+# existing evidence keeps fact_key="" and nothing backfills it, so 9 marks
+# where the mechanism became live, not where every row became labelled. Early
+# 9 rows still rest mostly on unlabelled evidence and converge as it decays
+# out. The labelling coverage in diagnostics is what says how far along a
+# given row is; read it before comparing a 9 row against a later one.
+#
 # 8: independence is counted per FACT, not per channel
 # (EvidenceRecord.fact_key, assigned by the per-item updater and used by
 # independence_key). This moves the unit the whole score is built on, so rows
-# must split here.
+# must split here. NOTE: see 9 -- the field was dropped before it ever reached
+# an EvidenceRecord, so no row ever written under 8 actually did this.
 #
 # The two keys it replaces were each right about one case and wrong about the
 # other. Keying on the publisher collapsed DCO's seventeen items across RTX,
@@ -671,7 +700,7 @@ COMPETITOR_SATISFIES_DISCLOSED_LINK = False
 # same evidence. Routing those to the trim alone would have changed nothing --
 # none of the 23 clears the bar on its trimmed score either -- which is what
 # says the gap, not the routing, was the defect.
-SCORING_VERSION = 8
+SCORING_VERSION = 9
 
 # How long a persisted synthesis verdict is honoured -- as a cap on the merge
 # path (engine._cap_with_synthesis) and as the corroboration ceiling in

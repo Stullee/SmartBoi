@@ -220,13 +220,20 @@ class FakePriceFeed:
 
 
 def proposal(is_new_information=True, direction="LONG", magnitude=0.6, confidence=0.7,
-             horizon_days=20, reasoning="because reasons"):
-    """A well-formed DossierUpdater.propose_update() response."""
-    return {
+             horizon_days=20, reasoning="because reasons", fact_key=None):
+    """A well-formed DossierUpdater.propose_update() response.
+
+    `fact_key` defaults to ABSENT rather than empty so the default response
+    keeps modelling a model that omits the optional label -- the case that
+    must still merge. Pass a string to exercise the labelled path."""
+    body = {
         "is_new_information": is_new_information, "direction": direction,
         "magnitude": magnitude, "confidence": confidence,
         "horizon_days": horizon_days, "reasoning": reasoning,
     }
+    if fact_key is not None:
+        body["fact_key"] = fact_key
+    return body
 
 
 def verdict(refuted=False, reasoning="looks solid", adjusted_confidence=0.7, adjusted_magnitude=0.6):
