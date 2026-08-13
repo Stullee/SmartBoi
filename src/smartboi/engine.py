@@ -67,6 +67,7 @@ from smartboi.federal_register import (
     REGULATOR_SYMBOLS,
     FederalRegisterClient,
 )
+from smartboi.llm import LLMTrace
 from smartboi.graph import REL_TYPES, RelationshipExtractor, RelationshipGraph, Relationship
 from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal, cost_bps_per_side_for_cap
@@ -88,7 +89,7 @@ from smartboi.state import JsonState
 from smartboi.status import _STALE_EDGE_DAYS, snapshot_dossier
 from smartboi.universe import SEED_RELATIONSHIPS, CompanySpec, spec_by_symbol
 from smartboi.universe_screen import guess_ecosystem, recommend_candidate_type, screen_universe
-from smartboi.usage import CAT_EXTRACTION, CAT_RESEARCH, CAT_SYNTHESIS, UsageTracker
+from smartboi.usage import CAT_DOSSIER, CAT_EXTRACTION, CAT_RESEARCH, CAT_SYNTHESIS, UsageTracker
 from smartboi.webapp import run_dashboard
 
 log = logging.getLogger(__name__)
@@ -1008,9 +1009,20 @@ class Engine:
             )
 
         if self.settings.anthropic_api_key:
+            # One tracer shared by every pass, so sampling counts are global
+            # per category rather than per client (the updater and the skeptic
+            # both bill to `dossier` and would otherwise each sample 1-in-N of
+            # their own calls, doubling the intended volume).
+            self.llm_trace = LLMTrace(
+                Path(self.settings.log_dir) / "llm_trace.jsonl",
+                enabled=self.settings.enable_llm_trace,
+                sample={CAT_DOSSIER: self.settings.llm_trace_sample_dossier,
+                        CAT_SYNTHESIS: 1, CAT_EXTRACTION: self.settings.llm_trace_sample_dossier},
+                max_bytes=int(self.settings.llm_trace_max_mb * 1_000_000),
+            )
             self.extractor = RelationshipExtractor(self.settings.anthropic_api_key, self.settings.extraction_model, self.usage)
-            self.updater = DossierUpdater(self.settings.anthropic_api_key, self.settings.dossier_model, self.usage)
-            self.skeptic = Skeptic(self.settings.anthropic_api_key, self.settings.skeptic_model, self.usage)
+            self.updater = DossierUpdater(self.settings.anthropic_api_key, self.settings.dossier_model, self.usage, self.llm_trace)
+            self.skeptic = Skeptic(self.settings.anthropic_api_key, self.settings.skeptic_model, self.usage, self.llm_trace)
             # Its OWN model, and the only expensive one in the pipeline.
             # Synthesis is the hardest judgement here (is this N facts or
             # one fact N times?) and the only pass that can make it, and
@@ -1018,7 +1030,8 @@ class Engine:
             # dozen-odd calls carry the reasoning budget for the whole
             # system. See config.py's model-tiering note.
             self.synthesizer = DossierSynthesizer(
-                self.settings.anthropic_api_key, self.settings.synthesis_model, self.usage
+                self.settings.anthropic_api_key, self.settings.synthesis_model, self.usage,
+                self.llm_trace,
             )
             log.info(
                 "Dossier engine (Claude): ENABLED (daily LLM call budget: %d, see MAX_DAILY_LLM_CALLS)",

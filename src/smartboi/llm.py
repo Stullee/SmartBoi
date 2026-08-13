@@ -33,6 +33,13 @@ shape (no effort, no thinking, no temperature), which is valid on every
 model in the table."""
 from __future__ import annotations
 
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
 # Model families, matched as a PREFIX of the configured model id so both the
 # alias ("claude-haiku-4-5") and the dated snapshot
 # ("claude-haiku-4-5-20251001") resolve to the same capabilities.
@@ -197,3 +204,83 @@ def first_tool_use(response) -> dict | None:
         if block.type == "tool_use":
             return block.input
     return None
+
+
+# --- Tracing what each pass was actually SHOWN ----------------------------
+
+# One backup generation, so the trace is bounded at 2x this on disk. The
+# newest file is the one that matters -- this exists to answer "what did the
+# model see on the call that produced THAT verdict", and that question is
+# always about the recent past.
+class LLMTrace:
+    """Append-only record of the prompt and the tool call it produced.
+
+    The system already records what every pass DECIDED -- direction,
+    magnitude, the skeptic's note, the synthesis verdict and its flags -- and
+    none of what it was SHOWN. That asymmetry is expensive in exactly the
+    situation the record exists for. When `fact_key` came back empty on 970
+    consecutive items, the stored output could say only that the field was
+    blank; it could not distinguish a model that never emitted it from a
+    pipeline that dropped it, and the wrong one was assumed first. A single
+    traced call would have settled it.
+
+    Sampled per category, because the shapes differ by two orders of
+    magnitude: the per-item updater and skeptic run ~700 times a day, the
+    whole-body synthesis ~30. Synthesis is worth tracing in full -- it is the
+    pass that can veto a thesis to zero, and the one whose prompt changes
+    most -- while the per-item passes only need enough coverage to answer
+    "is the field arriving at all".
+
+    Never raises. A diagnostic that can break ingestion is not a diagnostic;
+    every failure here is swallowed and logged once."""
+
+    def __init__(self, path: Path, enabled: bool = True,
+                 sample: dict[str, int] | None = None,
+                 max_bytes: int = 20_000_000) -> None:
+        self.path = Path(path)
+        self.enabled = enabled
+        self.sample = sample or {}
+        self.max_bytes = max_bytes
+        self._counts: dict[str, int] = {}
+        self._warned = False
+
+    def _due(self, category: str) -> bool:
+        n = max(1, int(self.sample.get(category, 1)))
+        seen = self._counts.get(category, 0) + 1
+        self._counts[category] = seen
+        return seen % n == 0
+
+    def record(self, category: str, model: str, symbol: str, prompt: str,
+               response: object, input_tokens: int = 0, output_tokens: int = 0,
+               system: str = "") -> None:
+        if not self.enabled or not self._due(category):
+            return
+        try:
+            # Rotate BEFORE writing, so the cap bounds the file rather than
+            # being noticed one row after it is exceeded.
+            if self.path.exists() and self.path.stat().st_size >= self.max_bytes:
+                backup = self.path.with_suffix(self.path.suffix + ".1")
+                backup.unlink(missing_ok=True)
+                self.path.rename(backup)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a") as f:
+                f.write(json.dumps({
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "category": category,
+                    "model": model,
+                    "symbol": symbol,
+                    # The system prompt is a constant per pass and would
+                    # dominate the file; its length is enough to notice a
+                    # change, and the text lives in source.
+                    "system_chars": len(system),
+                    "prompt": prompt,
+                    # None is the interesting case, not a gap: it means the
+                    # call returned no tool use at all.
+                    "response": response,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                }, default=str) + "\n")
+        except Exception:  # noqa: BLE001 - tracing must never break ingestion
+            if not self._warned:
+                self._warned = True
+                log.exception("LLM trace write failed -- continuing untraced.")

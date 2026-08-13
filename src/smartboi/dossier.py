@@ -16,7 +16,7 @@ from pathlib import Path
 
 from anthropic import AsyncAnthropic
 
-from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
+from smartboi.llm import LLMTrace, cacheable_system, first_tool_use, request_kwargs
 from smartboi.state import atomic_write_json, quarantine_corrupt_file
 from smartboi.usage import CAT_DOSSIER, CAT_SYNTHESIS, UsageTracker
 
@@ -1234,10 +1234,12 @@ _SYSTEM_PROMPT = (
 
 
 class DossierUpdater:
-    def __init__(self, api_key: str, model: str, usage: UsageTracker):
+    def __init__(self, api_key: str, model: str, usage: UsageTracker,
+                 trace: LLMTrace | None = None):
         self._client = AsyncAnthropic(api_key=api_key)
         self._model = model
         self._usage = usage
+        self._trace = trace
 
     async def propose_update(
         self, dossier: Dossier, evidence_text: str, origin_symbol: str, relationship_note: str,
@@ -1320,7 +1322,12 @@ class DossierUpdater:
             return None
         self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
                            model=self._model, category=CAT_DOSSIER)
-        return first_tool_use(response)
+        proposed = first_tool_use(response)
+        if self._trace is not None:
+            self._trace.record(CAT_DOSSIER, self._model, dossier.symbol, prompt, proposed,
+                               response.usage.input_tokens, response.usage.output_tokens,
+                               system=_SYSTEM_PROMPT)
+        return proposed
 
     async def aclose(self) -> None:
         await self._client.close()
@@ -1460,10 +1467,12 @@ class DossierSynthesizer:
     trade on its own -- that keeps one model call from becoming a single
     point of failure for committing capital."""
 
-    def __init__(self, api_key: str, model: str, usage: UsageTracker):
+    def __init__(self, api_key: str, model: str, usage: UsageTracker,
+                 trace: LLMTrace | None = None):
         self._client = AsyncAnthropic(api_key=api_key)
         self._model = model
         self._usage = usage
+        self._trace = trace
 
     @staticmethod
     def _evidence_digest(dossier: Dossier, now: datetime, limit: int = 40) -> str:
@@ -1531,7 +1540,12 @@ class DossierSynthesizer:
             return None
         self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
                            model=self._model, category=CAT_SYNTHESIS)
-        return first_tool_use(response)
+        verdict = first_tool_use(response)
+        if self._trace is not None:
+            self._trace.record(CAT_SYNTHESIS, self._model, dossier.symbol, prompt, verdict,
+                               response.usage.input_tokens, response.usage.output_tokens,
+                               system=_SYNTHESIS_SYSTEM_PROMPT)
+        return verdict
 
     async def aclose(self) -> None:
         await self._client.close()

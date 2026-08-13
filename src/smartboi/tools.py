@@ -593,6 +593,7 @@ _DIAGNOSTIC_SETTINGS = (
     "propagated_evidence_cooldown_hours",
     "enable_ecosystem_propagation", "max_ecosystem_evidence_per_link",
     "extraction_model", "dossier_model", "skeptic_model", "synthesis_model",
+    "enable_llm_trace", "llm_trace_sample_dossier", "llm_trace_max_mb",
     "synthesis_score_floor_pct",
     "edgar_poll_interval_sec", "news_poll_interval_sec", "price_poll_interval_sec",
     "signal_entry_poll_interval_sec",
@@ -871,6 +872,11 @@ _BUNDLE_LOG_FILES = (
     "dossier_snapshots.jsonl",
     "skeptic_refutations.jsonl",
     "universe_screen.jsonl",
+    # What each pass was SHOWN, alongside what it decided. The bulkiest
+    # thing here by a wide margin (prompts carry the whole evidence
+    # digest), which is why it is sampled at the source rather than
+    # trimmed here -- and why the rotated .1 generation is left out.
+    "llm_trace.jsonl",
 )
 
 # Files under data/. Deliberately an ALLOW-LIST rather than a glob: a glob
