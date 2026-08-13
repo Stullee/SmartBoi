@@ -52,6 +52,7 @@ from smartboi.dossier import (
     DossierSynthesizer,
     DossierUpdater,
     EvidenceRecord,
+    evidence_is_stale,
     has_evidence,
     merge_evidence,
     recompute_decay,
@@ -60,6 +61,7 @@ from smartboi.dossier import (
 )
 from smartboi.dod_contracts import DodContractsClient, awards_from_page, business_days_back
 from smartboi.edgar import EdgarClient, FilingEvent, normalize_company_name
+from smartboi.forward_returns import price_context, price_marks_by_symbol
 from smartboi.federal_register import (
     CURATED_SEARCHES,
     REGULATOR_SYMBOLS,
@@ -98,6 +100,12 @@ DATA_DIR = Path("data")
 # the Gateway restarting daily, or simply not being up yet, shouldn't cost
 # most of a day of price marks.
 IB_RETRY_GAP_SEC = 900
+
+# How long the price-mark series backing the synthesis prompt is reused.
+# The file is appended to once a day, so minutes cannot serve a stale series;
+# this only exists so the daily decay pass does not re-read a 300KB log once
+# per dossier (see _price_context_for).
+PRICE_MARKS_CACHE_TTL_SEC = 900.0
 # How long to wait before retrying a failed Reg SHO refresh. The threshold
 # list publishes once per settlement day, so a failure means the file is not
 # there yet (or the host is unreachable) -- neither of which resolves in
@@ -616,6 +624,9 @@ class Engine:
         # stays DUE (the day must not be lost) but retries on a backoff, not
         # every 30-second tick.
         self._price_marks_retry_after: float = 0.0
+        # Price series for the synthesis prompt (_price_context_for).
+        self._price_marks_cache: dict[str, dict[str, float]] | None = None
+        self._price_marks_cached_at: float = 0.0
         self._dashboard_task: asyncio.Task | None = None
         self._closing = False
 
@@ -3866,6 +3877,53 @@ class Engine:
                      dossier.confidence * dossier.magnitude, dossier.independent_source_count)
             await self._fire_signal(dossier, signal)
 
+    def _price_context_for(self, dossier: Dossier, now: datetime) -> str:
+        """The tape around this dossier's earliest LIVE evidence, for the
+        synthesis prompt. Empty when nothing useful can be built, which
+        leaves the pass judging exactly as it did before.
+
+        Read from logs/price_marks.jsonl rather than the price feed: the
+        question needs a SERIES bracketing the news, the daily marks already
+        are one, and a feed call per dossier inside the daily pass would add
+        a few dozen round trips to a pass that currently makes none.
+
+        Cached behind a short TTL. _run_daily_decay_pass walks every dossier
+        in turn, and re-reading a 300KB log per symbol would be the most
+        expensive thing in a pass whose point is the LLM call. The file is
+        appended to once a day, so a cache measured in minutes cannot serve
+        a meaningfully stale series."""
+        marks_by_symbol = self._price_marks_cache
+        if (marks_by_symbol is None
+                or time.monotonic() - self._price_marks_cached_at > PRICE_MARKS_CACHE_TTL_SEC):
+            path = Path(self.settings.log_dir) / "price_marks.jsonl"
+            rows = []
+            try:
+                if path.exists():
+                    for line in path.read_text().splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rows.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+            except OSError:
+                log.exception("could not read price marks for the synthesis prompt.")
+            marks_by_symbol = price_marks_by_symbol(rows)
+            self._price_marks_cache = marks_by_symbol
+            self._price_marks_cached_at = time.monotonic()
+        marks = marks_by_symbol.get(dossier.symbol) or {}
+        if not marks:
+            return ""
+        # Anchored to the earliest evidence the digest will actually show, so
+        # the window and the item list describe the same thesis.
+        live = [e for e in dossier.evidence if not evidence_is_stale(e, now)]
+        dates = [(e.published_at or e.merged_at or "")[:10] for e in live]
+        dates = [d for d in dates if d]
+        if not dates:
+            return ""
+        return price_context(marks, min(dates))
+
     async def _apply_synthesis(self, dossier: Dossier, now: datetime) -> bool:
         """Runs the whole-evidence-body pass and folds its verdict into the
         dossier as a CAP on the arithmetic aggregate.
@@ -3912,6 +3970,7 @@ class Engine:
         spec = self.spec_by_symbol.get(dossier.symbol)
         verdict = await self.synthesizer.synthesize(
             dossier, ecosystem=spec.ecosystem if spec is not None else "", now=now,
+            price_context=self._price_context_for(dossier, now),
         )
         if verdict is None:
             return False

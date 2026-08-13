@@ -1360,12 +1360,18 @@ _SYNTHESIS_TOOL = {
             "already_priced_in": {
                 "type": "boolean",
                 "description": (
-                    "True ONLY if the market has plainly already absorbed this -- the evidence is "
-                    "old, the story was widely covered when it broke, or it merely confirms what "
-                    "was already known. The whole strategy is trading the lag BEFORE the market "
-                    "connects the dots, so a thesis the market has already connected is not one. "
-                    "This is a claim about the PRICE, and it is checked against the tape later: "
-                    "do not set it merely because the evidence is thin or repetitive -- that is "
+                    "True ONLY if the market has plainly already absorbed this. The whole "
+                    "strategy is trading the lag BEFORE the market connects the dots, so a "
+                    "thesis it has already connected is not one.\n\n"
+                    "This is a claim about the PRICE, so READ THE PRICE BLOCK and answer from "
+                    "it. The move is the evidence: a stock that jumped the session its catalyst "
+                    "landed and has held the gain has absorbed it; one that has not moved since "
+                    "has not, no matter how old or how widely covered the story is. Age and "
+                    "coverage are the WRONG proxy here -- a heavily covered story about an "
+                    "anchor is exactly the setup where the thinly-covered supplier has not "
+                    "moved yet, and that setup is the entire point of this system. Where the "
+                    "block is absent, say so in the note and judge conservatively.\n\n"
+                    "Do not set it merely because the evidence is thin or repetitive -- that is "
                     "redundant_evidence, a different finding with a different consequence."
                 ),
             },
@@ -1482,7 +1488,8 @@ class DossierSynthesizer:
         return "\n".join(lines)
 
     async def synthesize(self, dossier: Dossier, ecosystem: str = "",
-                         now: datetime | None = None) -> dict | None:
+                         now: datetime | None = None,
+                         price_context: str = "") -> dict | None:
         """None on a transient failure or an exhausted budget -- the caller
         keeps the arithmetic aggregate unchanged rather than acting on a
         synthesis it does not have."""
@@ -1502,8 +1509,12 @@ class DossierSynthesizer:
             + f"\nArithmetic aggregate of the items below (for reference, not a constraint): "
             f"direction={dossier.direction} confidence={dossier.confidence:.2f} "
             f"magnitude={dossier.magnitude:.2f} over {dossier.independent_source_count} "
-            f"counted sources.\n\n"
-            f"ACCUMULATED EVIDENCE ({len(dossier.evidence)} items, non-stale shown):\n{digest}"
+            f"counted sources.\n"
+            # The tape, bracketing the earliest evidence. Empty when no marks
+            # exist for this symbol, in which case already_priced_in falls back
+            # to being judged from the evidence alone, as it always was.
+            + price_context
+            + f"\nACCUMULATED EVIDENCE ({len(dossier.evidence)} items, non-stale shown):\n{digest}"
         )
         try:
             response = await self._client.messages.create(
