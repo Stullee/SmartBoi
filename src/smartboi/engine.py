@@ -2947,7 +2947,18 @@ class Engine:
         keep the item at full decay weight for YEARS -- staleness scales off
         horizon_days (see dossier._stale_cutoff_days) -- quietly defeating the
         decay guarantee. Nothing is predictive past the strategy's own max
-        hold, so that is the natural ceiling."""
+        hold, so that is the natural ceiling.
+
+        This is a WHITELIST: the returned dict is the only thing the caller
+        ever sees, so a field the model returns and this function does not
+        name is discarded silently. `fact_key` was added to the update tool's
+        schema (SCORING_VERSION 8) and read at the EvidenceRecord, but never
+        listed here -- so every item merged under v8 carried fact_key="" and
+        the per-fact independence mechanism was inert on 100% of evidence
+        while reporting no error anywhere. Independence fell back to the
+        publisher/origin-symbol key the fact key exists to replace, which is
+        the multi-anchor over-count (see dossier.independence_key). Anything
+        added to _UPDATE_TOOL from here on has to be named here too."""
         try:
             direction = proposed["direction"]
             if direction not in DIRECTIONS:
@@ -2958,6 +2969,11 @@ class Engine:
                 "magnitude": min(1.0, max(0.0, float(proposed["magnitude"]))),
                 "confidence": min(1.0, max(0.0, float(proposed["confidence"]))),
                 "horizon_days": min(max_horizon_days, max(1, int(proposed["horizon_days"]))),
+                # Coerced, not required: an item with no usable label still
+                # merges and scores under the pre-fact-key rules (see
+                # dossier.independence_key), which is strictly better than
+                # dropping the evidence over a missing label.
+                "fact_key": str(proposed.get("fact_key") or "")[:MAX_FACT_KEY_CHARS],
                 "reasoning": str(proposed.get("reasoning") or ""),
             }
         except (KeyError, TypeError, ValueError) as exc:
@@ -3062,12 +3078,12 @@ class Engine:
             magnitude=self._adjusted(verdict, "adjusted_magnitude", proposed["magnitude"]),
             confidence=self._adjusted(verdict, "adjusted_confidence", proposed["confidence"]),
             horizon_days=proposed["horizon_days"],
-            # Coerced defensively like every other read of raw tool output
-            # here: Anthropic tool use does not hard-enforce the schema, and
-            # a non-string here would poison the independence key rather than
-            # merely be missing. Absent or unusable falls back to the
-            # pre-fact-key behaviour (see independence_key).
-            fact_key=str(proposed.get("fact_key") or "")[:MAX_FACT_KEY_CHARS],
+            # Already coerced and length-capped by _validated_proposal.
+            # Still read with .get(): a proposal cached in retry_state.json
+            # by a build from before that function carried the field will not
+            # have it, and such an item should merge under the pre-fact-key
+            # rules (see independence_key) rather than crash the poll cycle.
+            fact_key=proposed.get("fact_key", ""),
             reasoning=proposed["reasoning"],
             skeptic_note=str(verdict.get("reasoning") or ""),
             # The pre-skeptic numbers are kept so the skeptic pass's actual

@@ -1352,6 +1352,54 @@ async def test_malformed_proposal_is_dropped_not_crashing(engine):
     assert engine.dossiers.load("FORM").evidence == []
 
 
+# --- Regression: the fact key the model returns must survive the whole way
+# to the merged EvidenceRecord. dossier.py's per-fact independence was tested
+# on records built directly, and _UPDATE_TOOL declared the field, but nothing
+# covered the path BETWEEN them -- and _validated_proposal, a whitelist, was
+# quietly dropping it. Live effect: 0 of 970 evidence items carried a label,
+# so independence silently counted per publisher/origin symbol (the exact
+# over-count fact keys replace) with no error raised anywhere. ---
+
+async def _merge_one(engine, prop):
+    engine.updater = FakeUpdater(default=prop)
+    engine.skeptic = FakeSkeptic(default=verdict(refuted=False))
+    await engine._update_dossier(
+        "FORM", "evidence text", "FORM", "", None, "news", "reuters.com",
+        "https://x/1", "h1", "2026-07-23",
+    )
+    return engine.dossiers.load("FORM").evidence
+
+
+async def test_fact_key_from_the_proposal_reaches_the_merged_evidence(engine):
+    merged = await _merge_one(engine, proposal(fact_key="ai datacenter capex q2 2026"))
+    assert len(merged) == 1
+    assert merged[0].fact_key == "ai datacenter capex q2 2026"
+
+
+async def test_missing_fact_key_still_merges_under_pre_fact_key_rules(engine):
+    """A model that omits the label must not cost the evidence: it merges
+    with an empty key and scores the old way (see dossier.independence_key)."""
+    merged = await _merge_one(engine, proposal())  # no fact_key at all
+    assert len(merged) == 1
+    assert merged[0].fact_key == ""
+
+
+async def test_overlong_fact_key_is_truncated_not_rejected(engine):
+    from smartboi.dossier import MAX_FACT_KEY_CHARS
+
+    merged = await _merge_one(engine, proposal(fact_key="x" * (MAX_FACT_KEY_CHARS + 40)))
+    assert len(merged) == 1
+    assert merged[0].fact_key == "x" * MAX_FACT_KEY_CHARS
+
+
+async def test_non_string_fact_key_is_coerced_not_crashing(engine):
+    """A non-string here would poison the independence key rather than
+    merely be missing -- coerce, don't propagate."""
+    merged = await _merge_one(engine, proposal(fact_key=12345))
+    assert len(merged) == 1
+    assert isinstance(merged[0].fact_key, str)
+
+
 # --- Regression: daily price marks must not depend on IB -- Finnhub quotes
 # fill in, anchors are marked too (benchmark breadth), and a day with no
 # reachable source is left DUE (retried), never marked done and lost. ---
