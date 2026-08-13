@@ -1279,16 +1279,66 @@ function gvFill(n){ if(n.kind==="anchor") return "--gn-anchor"; if(n.dir==="LONG
 function layoutWire(){
   var nodes=WIRE.nodes, edges=WIRE.edges, i,j, seed=1234567;
   function rnd(){ seed=(seed*1664525+1013904223)%4294967296; return seed/4294967296; }
-  var pos={}; nodes.forEach(function(n,k){ var a=k*2*Math.PI/nodes.length; pos[n.id]={x:VW/2+(170+rnd()*50)*Math.cos(a),y:VHv/2+(140+rnd()*50)*Math.sin(a),vx:0,vy:0}; });
-  for(var it=0;it<250;it++){
-    for(i=0;i<nodes.length;i++) for(j=i+1;j<nodes.length;j++){ var pa=pos[nodes[i].id],pb=pos[nodes[j].id];
-      var dx=pa.x-pb.x,dy=pa.y-pb.y,d2=dx*dx+dy*dy+0.01,d=Math.sqrt(d2),rep=5200/d2,ux=dx/d,uy=dy/d;
-      pa.vx+=ux*rep;pa.vy+=uy*rep;pb.vx-=ux*rep;pb.vy-=uy*rep; }
-    edges.forEach(function(e){ var pa=pos[e[0]],pb=pos[e[1]]; if(!pa||!pb) return;
-      var dx=pb.x-pa.x,dy=pb.y-pa.y,d=Math.sqrt(dx*dx+dy*dy)+0.01,f=(d-92)*0.02*(0.5+e[3]),ux=dx/d,uy=dy/d;
-      pa.vx+=ux*f;pa.vy+=uy*f;pb.vx-=ux*f;pb.vy-=uy*f; });
-    nodes.forEach(function(n){ var p=pos[n.id]; p.vx+=(VW/2-p.x)*0.006;p.vy+=(VHv/2-p.y)*0.006;p.vx*=0.85;p.vy*=0.85;p.x+=p.vx;p.y+=p.vy;
-      p.x=Math.max(38,Math.min(VW-38,p.x));p.y=Math.max(32,Math.min(VHv-32,p.y)); });
+  var pos={};
+  // Half this panel's names have no edge at all -- they carry a thesis from
+  // their own filings and the graph never reached them (the population
+  // gather_graph_health calls disconnected_with_thesis). A force simulation
+  // has nothing to say about such a node: it is repelled by everything and
+  // attracted by nothing, so it travels outward until the boundary stops it.
+  // That is why they arrived in columns welded to the margins with the middle
+  // left empty -- 15 of 52 pinned against the clamp on the live board -- and
+  // why no repulsion-to-centering ratio fixes it. Turning repulsion down
+  // clumps them; turning centering up leaves a blob ringed by dead space.
+  // Neither is a layout, because no force in the model WANTS them anywhere.
+  //
+  // So they are placed rather than simulated: an even lattice in a band at
+  // the foot of the canvas, strongest score first. The simulation then runs
+  // on the connected names alone, in the room above, where every force in it
+  // means something. It also stops being a lie by omission -- "this name
+  // reached the board without the graph" is the single most important thing
+  // about those rows, and scattering them among the linked ones hid it.
+  var deg={}; nodes.forEach(function(n){ deg[n.id]=0; });
+  edges.forEach(function(e){ if(deg[e[0]]!=null) deg[e[0]]++; if(deg[e[1]]!=null) deg[e[1]]++; });
+  var linked=nodes.filter(function(n){ return deg[n.id]>0; });
+  var loose=nodes.filter(function(n){ return !deg[n.id]; });
+
+  var bandTop=VHv;
+  if(loose.length){
+    var cellW=Math.max.apply(null,loose.map(gvHW))*2+26;
+    var cols=Math.max(1,Math.min(loose.length,Math.floor(VW/cellW)));
+    var rows=Math.ceil(loose.length/cols);
+    var rowH=Math.max.apply(null,loose.map(function(n){ return gvTop(n)+gvBot(n); }))+22;
+    // Never take more than half the canvas: with everything unlinked the
+    // lattice IS the picture, but the linked graph must stay the bigger half
+    // whenever there is one.
+    bandTop=linked.length?Math.max(VHv*0.5,VHv-rows*rowH-6):18;
+    loose.slice().sort(function(a,b){ return (b.score||0)-(a.score||0); })
+      .forEach(function(n,k){
+        var r=Math.floor(k/cols), c=k%cols, inRow=Math.min(cols,loose.length-r*cols);
+        pos[n.id]={x:VW*(c+1)/(inRow+1), y:bandTop+rowH*(r+0.62), vx:0, vy:0};
+      });
+  }
+  WIRE.bandTop=(loose.length&&linked.length)?bandTop:null;
+
+  var H=Math.max(140,bandTop-10);
+  if(linked.length){
+    // Seeded on a jittered grid rather than a ring: a ring starts every node
+    // ON the boundary, which is the one place none of them should end up.
+    var gc=Math.max(1,Math.ceil(Math.sqrt(linked.length*VW/H)));
+    linked.forEach(function(n,k){ var cx=k%gc, cy=Math.floor(k/gc);
+      pos[n.id]={x:VW*(cx+0.5+rnd()*0.5-0.25)/gc,
+                 y:H*(cy+0.5+rnd()*0.5-0.25)/Math.ceil(linked.length/gc), vx:0, vy:0}; });
+    for(var it=0;it<250;it++){
+      for(i=0;i<linked.length;i++) for(j=i+1;j<linked.length;j++){ var pa=pos[linked[i].id],pb=pos[linked[j].id];
+        var dx=pa.x-pb.x,dy=pa.y-pb.y,d2=dx*dx+dy*dy+0.01,d=Math.sqrt(d2),rep=5200/d2,ux=dx/d,uy=dy/d;
+        pa.vx+=ux*rep;pa.vy+=uy*rep;pb.vx-=ux*rep;pb.vy-=uy*rep; }
+      edges.forEach(function(e){ var pa=pos[e[0]],pb=pos[e[1]]; if(!pa||!pb) return;
+        var dx=pb.x-pa.x,dy=pb.y-pa.y,d=Math.sqrt(dx*dx+dy*dy)+0.01,f=(d-92)*0.02*(0.5+e[3]),ux=dx/d,uy=dy/d;
+        pa.vx+=ux*f;pa.vy+=uy*f;pb.vx-=ux*f;pb.vy-=uy*f; });
+      linked.forEach(function(n){ var p=pos[n.id]; p.vx+=(VW/2-p.x)*0.006;p.vy+=(H/2-p.y)*0.006;p.vx*=0.85;p.vy*=0.85;p.x+=p.vx;p.y+=p.vy;
+        p.x=Math.max(gvHW(n)+2,Math.min(VW-gvHW(n)-2,p.x));
+        p.y=Math.max(gvTop(n)+2,Math.min(H-gvBot(n)-2,p.y)); });
+    }
   }
   // Final de-overlap, on each node's INK BOX rather than its disc, re-clamped
   // on every pass.
@@ -1394,6 +1444,16 @@ function drawWire(now){
   }
   var s=scale, sig=activeSig(), hotSym=sig?sig.symbol:null, hot={};
   if(hotSym) sigEdges(hotSym).forEach(function(e){ hot[e[0]+">"+e[1]]=1; });
+  // The rule under the graph, above the lattice of names the graph never
+  // reached. Without it the lattice reads as more scatter; with it the split
+  // states the finding -- these carry a thesis their own filings produced and
+  // no relationship carried.
+  if(WIRE.bandTop!=null){ var by=(WIRE.bandTop-9)*s;
+    ctx.save(); ctx.setLineDash([4*s,5*s]); ctx.strokeStyle=tok("--line-soft"); ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(10*s,by); ctx.lineTo(cw-10*s,by); ctx.stroke(); ctx.restore();
+    ctx.fillStyle=tok("--faint"); ctx.textAlign="right"; ctx.textBaseline="bottom";
+    ctx.font=(9.5*s)+"px -apple-system,sans-serif";
+    ctx.fillText("no disclosed link \\u2014 thesis from their own filings", cw-12*s, by-3*s); }
   // edges
   WIRE.edges.forEach(function(e){ var pa=WIRE.pos[e[0]],pb=WIRE.pos[e[1]]; if(!pa||!pb) return;
     var isHot=hot[e[0]+">"+e[1]], col=tok(gvColorTok(e[2]));
