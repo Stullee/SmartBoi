@@ -316,23 +316,31 @@ _INDEX_HTML = """<!doctype html>
   .work { grid-template-columns:1.3fr 1fr; align-items:start; }
   @media (max-width:900px){ .work{ grid-template-columns:1fr; } }
 
-  /* Column widths live here as custom properties because the 0.50 rule below
+  /* Column widths live here as custom properties because the rule below
      is positioned from the same arithmetic -- hard-coding both is how the
-     label and the thing it labels drift apart. */
+     label and the thing it labels drift apart.
+
+     --lad-bar is the threshold as a FRACTION, set inline on .lad-plot from
+     current_strategy.signal_confidence_threshold. The 0.5 here is only a
+     fallback for a payload that predates it: the rule used to be positioned
+     at the literal midpoint of the track (".../2"), which was right only
+     while the threshold happened to be 0.50 and drew a confident line in
+     the wrong place the moment it was configured to anything else. */
   .ladder { padding:14px 16px 16px;
             --lad-sym:56px; --lad-dir:16px; --lad-gap:6px; --lad-val:42px;
+            --lad-bar:0.5;
             --lad-l:calc(var(--lad-sym) + var(--lad-dir) + var(--lad-gap)*2);
             --lad-r:calc(var(--lad-val) + var(--lad-gap)); }
   /* The signal bar is a VERTICAL rule through every row at exactly the x the
      bars are measured against. It used to be a horizontal dashed line ACROSS
-     THE TOP of the panel with the "0.50" caption floating over its midpoint,
-     which read as a heading underline -- and left the one question this panel
-     exists to answer ("which of these fire?") with nothing on any row that
-     could answer it. Nothing marked 0.50; you could not tell a 0.34 from a
-     0.62 by looking. */
+     THE TOP of the panel with the threshold caption floating over its
+     midpoint, which read as a heading underline -- and left the one question
+     this panel exists to answer ("which of these fire?") with nothing on any
+     row that could answer it. Nothing marked the bar; you could not tell a
+     0.34 from a 0.62 by looking. */
   .lad-plot { position:relative; padding-top:15px; }
   .lad-bar { position:absolute; top:15px; bottom:2px; z-index:2; pointer-events:none;
-             left:calc(var(--lad-l) + (100% - var(--lad-l) - var(--lad-r))/2);
+             left:calc(var(--lad-l) + (100% - var(--lad-l) - var(--lad-r)) * var(--lad-bar));
              border-left:1px dashed var(--warn); }
   .lad-bar b { position:absolute; top:-15px; left:0; transform:translateX(-50%); font-weight:500;
                font-size:9.5px; color:var(--warn); white-space:nowrap; }
@@ -986,24 +994,48 @@ function renderGraphHealth(d){
     '<div class="note" style="margin-top:9px">The graph only grows two ways: filings (annual/quarterly) and web research. The rolling pass re-reads the least-recently-extracted names <b>against the current universe</b> &mdash; extraction only writes an edge when the counterparty is already a member, so re-reading is what fills holes left when the universe was smaller.</div>'+aud;
 }
 
+// The live signal bar, from current_strategy.signal_confidence_threshold.
+// settings.strategy_signature already ships it -- signal_confidence_threshold
+// is one of the trade-governing _STRATEGY_PARAM_KEYS -- so the payload carried
+// it all along and nothing on the page ever read it.
+//
+// Module-level because four separate sites answer "does this fire?": the
+// ladder's rule, the ladder's rows, the dossier sheet and the dossiers table.
+// Only the first two are reached from a render holding the payload, and each
+// site hard-coded the default threshold independently. That was right only
+// while the option sat at that default and silently wrong afterwards -- at
+// 0.25 the panel drew the rule at the halfway point of the track, tinted the
+// fill of every name that was actually firing, and captioned them as being
+// under a threshold they had cleared. Set once per payload, in renderAll,
+// ahead of everything that reads it.
+//
+// NOTE: this is the SCORE gate only. signals.evaluate also requires
+// independent_source_count >= required_sources(), so a name past this rule is
+// eligible to fire rather than certain to -- same as before this change.
+var BAR = 0.5;
+function setBar(d){
+  var v = d && d.current_strategy && d.current_strategy.signal_confidence_threshold;
+  BAR = (typeof v === "number" && v > 0 && v <= 1) ? v : 0.5;
+}
+
 function renderLadder(d){
   var ds=(d.dossiers||[]).slice().sort(function(a,b){return (b.confidence*b.magnitude)-(a.confidence*a.magnitude);}).slice(0,14);
   if(!ds.length){ el("ladder").innerHTML='<div class="lad-empty">No dossiers yet &mdash; nothing has accumulated a thesis.</div>'; return; }
   var rows=ds.map(function(x){
-    var sc=x.confidence*x.magnitude, pct=Math.max(0,Math.min(100,sc*100)).toFixed(1), fires=sc>=0.5;
+    var sc=x.confidence*x.magnitude, pct=Math.max(0,Math.min(100,sc*100)).toFixed(1), fires=sc>=BAR;
     // NONE is a real direction here (a dossier that has accumulated evidence
     // pointing both ways), and on a young install one can be inside the top
     // 14 -- so it must not render as a green L.
     var isS=x.direction==="SHORT", isL=x.direction==="LONG", con=x.mass_opposing>0.3;
     var dc=isS?"S":(isL?"L":"?");
     var col=isS?"var(--neg)":(isL?"var(--pos)":"var(--faint)");
-    // Solid fill means it cleared 0.50, tinted means it did not. The rule
+    // Solid fill means it cleared the bar, tinted means it did not. The rule
     // alone already answers that, but only if you sight along it; the fill
     // says the same thing from across the room.
     var soft=isS?"var(--neg-soft)":(isL?"var(--pos-soft)":"var(--line)");
     var tip=x.symbol+" "+x.direction+" \\u2014 score "+fx(sc)+" (conf "+fx(x.confidence)+" \\u00d7 mag "+fx(x.magnitude)+"), "+
       x.independent_source_count+" independent sources"+(con?", contested":"")+
-      (fires?" \\u2014 above the bar" : " \\u2014 below the 0.50 bar")+". Click for the dossier.";
+      (fires?" \\u2014 above the bar" : " \\u2014 below the "+fx(BAR)+" bar")+". Click for the dossier.";
     return '<button type="button" class="lad-row'+(fires?" fires":"")+'" data-sym="'+escAttr(x.symbol)+'" title="'+escAttr(tip)+'">'+
       '<span class="lad-sym mono">'+esc(x.symbol)+'</span>'+
       '<span class="lad-dir '+dc+'">'+dc+"</span>"+
@@ -1012,7 +1044,7 @@ function renderLadder(d){
       '<span class="lad-dot" style="left:'+pct+"%;background:"+col+'"></span></span>'+
       '<span class="lad-val mono">'+fx(sc)+"</span></button>";
   }).join("");
-  el("ladder").innerHTML='<div class="lad-plot"><div class="lad-bar" aria-hidden="true"><b>fires at 0.50</b></div>'+rows+"</div>"+
+  el("ladder").innerHTML='<div class="lad-plot" style="--lad-bar:'+BAR+'"><div class="lad-bar" aria-hidden="true"><b>fires at '+fx(BAR)+'</b></div>'+rows+"</div>"+
     '<div class="lad-key"><span><i style="background:var(--pos)"></i>long</span>'+
     '<span><i style="background:var(--neg)"></i>short</span>'+
     '<span><i class="con"></i>contested</span>'+
@@ -1078,7 +1110,7 @@ function statTile(label, value, colour){
 }
 
 function renderDossierSheet(x){
-  var sc=x.confidence*x.magnitude, fires=sc>=0.5, con=x.mass_opposing>0.3;
+  var sc=x.confidence*x.magnitude, fires=sc>=BAR, con=x.mass_opposing>0.3;
   // Same fallback as the ladder: anything that is not LONG or SHORT gets the
   // neutral colour rather than defaulting to green.
   var col=x.direction==="SHORT"?"var(--neg)":(x.direction==="LONG"?"var(--pos)":"var(--faint)");
@@ -1090,7 +1122,7 @@ function renderDossierSheet(x){
     // the SIGNALED pill right next to it already uses -- two accent pills side
     // by side read as one repeated fact instead of two different ones.
     '<span class="pill"'+(fires?' style="color:'+col+";border-color:"+col+'"':"")+">"+
-      (fires?"above the 0.50 bar":"below the 0.50 bar")+"</span>"+
+      (fires?"above the "+fx(BAR)+" bar":"below the "+fx(BAR)+" bar")+"</span>"+
     (x.status==="SIGNALED"?'<span class="pill sig">SIGNALED</span>':'<span class="pill">'+esc(x.status)+"</span>")+
     (con?'<span class="pill" style="color:var(--warn);border-color:var(--warn)">contested</span>':"")+"</div>";
 
@@ -1181,7 +1213,7 @@ function renderDetail(d){
     ds.map(function(x){ var sc=x.confidence*x.magnitude;
       return '<tr data-sym="'+escAttr(x.symbol)+'" title="Click for the dossier"><td class="sym mono">'+esc(x.symbol)+
         '</td><td><span class="dir '+CO[x.direction]+'">'+x.direction+"</span></td>"+
-        '<td class="num mono '+(sc>=0.5?"acc":"")+'">'+fx(sc)+(x.mass_opposing>0.3?' <span style="color:var(--warn)">◌</span>':"")+"</td>"+
+        '<td class="num mono '+(sc>=BAR?"acc":"")+'">'+fx(sc)+(x.mass_opposing>0.3?' <span style="color:var(--warn)">◌</span>':"")+"</td>"+
         '<td class="num mono">'+x.independent_source_count+"</td>"+
         "<td>"+(x.status==="SIGNALED"?'<span class="pill sig">SIGNALED</span>':'<span class="pill">'+x.status+"</span>")+"</td></tr>";
     }).join("")+"</tbody>";
@@ -1547,6 +1579,9 @@ function updateWire(d){
 // render everything + animation loop
 // ===========================================================================
 function renderAll(d){
+  // Before anything that asks "does this fire?" -- the ladder, the dossiers
+  // table and (via BAR) any dossier sheet opened afterwards all read it.
+  setBar(d);
   renderCaps(d); renderPnl(d); renderWinRate(d); renderExposure(d); renderExpectancy(d);
   renderGenrec(d); renderFunnel(d); renderBudget(d); renderGraphHealth(d); renderLadder(d);
   renderOpen(d); renderSignals(d); renderDetail(d);

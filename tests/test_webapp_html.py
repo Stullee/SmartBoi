@@ -118,3 +118,29 @@ def test_every_button_the_script_binds_actually_exists_in_the_html():
     body = _script_body()
     for element_id in re.findall(r'getElementById\("([^"]+)"\)', body):
         assert f'id="{element_id}"' in _INDEX_HTML, f'script binds #{element_id}, which the HTML never defines'
+
+
+def test_the_signal_bar_is_read_from_config_not_hard_coded():
+    """Four sites answer "does this fire?" -- the conviction rule, the ladder
+    rows, the dossier sheet and the dossiers table -- and each one hard-coded
+    0.5. That is invisible while signal_confidence_threshold sits at its
+    default and actively misleading the moment it does not: at 0.25 the panel
+    drew its rule at the midpoint of the track, tinted the fill of every name
+    that was really firing, and captioned them "below the 0.50 bar".
+
+    A wrong number here is worse than no number, because the panel exists to
+    answer exactly this question."""
+    body = _script_body()
+    assert "current_strategy.signal_confidence_threshold" in body, \
+        "the dashboard never reads the configured bar"
+    # No comparison against a bare 0.5 anywhere a score is judged.
+    assert not re.search(r"sc\s*>=\s*0?\.5\b", body), \
+        "a fires/does-not-fire test is still hard-coded to 0.5"
+    # No caption asserting a threshold the config may not be set to.
+    assert "0.50 bar" not in body and "fires at 0.50" not in body, \
+        "a hard-coded 0.50 caption survives; it will lie when the bar is moved"
+    # The rule's x-position must track the same value, not sit at the
+    # geometric midpoint of the plot the way `.../2` did.
+    assert "* var(--lad-bar)" in _INDEX_HTML, \
+        "the conviction rule is not positioned from the configured bar"
+    assert 'style="--lad-bar:' in body, "nothing sets --lad-bar at render time"
