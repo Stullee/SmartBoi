@@ -142,8 +142,12 @@ class FakeSkeptic(_ScriptedCallable):
 
 
 class FakeSynthesizer(_ScriptedCallable):
-    async def synthesize(self, dossier, ecosystem="", now=None):
-        self.calls.append({"symbol": dossier.symbol, "ecosystem": ecosystem})
+    async def synthesize(self, dossier, ecosystem="", now=None, price_context=""):
+        # price_context is recorded, not ignored: whether the tape actually
+        # reaches the pass that judges already_priced_in is a property worth
+        # asserting on, and a fake that silently swallows it cannot.
+        self.calls.append({"symbol": dossier.symbol, "ecosystem": ecosystem,
+                           "price_context": price_context})
         return self._next()
 
     async def aclose(self):

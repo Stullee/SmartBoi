@@ -482,3 +482,76 @@ def format_report(
         lines.append(f"{s['symbol']:<8}{s['count']:<8}{s['mean_return_pct']:<16.2f}")
 
     return "\n".join(lines)
+
+
+# How many marked sessions BEFORE the earliest evidence to show. The
+# question the synthesis pass has to answer is "has the market already
+# absorbed this", and that is unanswerable from post-news prices alone: a
+# stock at 36 tells you nothing, a stock that went 32 -> 36 the session the
+# 8-K landed tells you the move already happened. Three sessions is enough
+# to see the pre-news level without burying the reaction in history.
+PRICE_CONTEXT_LEAD_SESSIONS = 3
+# Cap on rows so an old thesis with month-old evidence cannot crowd the
+# evidence digest out of the prompt.
+PRICE_CONTEXT_MAX_ROWS = 22
+
+
+def price_context(
+    marks: dict[str, float],
+    earliest_evidence_date: str,
+    lead_sessions: int = PRICE_CONTEXT_LEAD_SESSIONS,
+    max_rows: int = PRICE_CONTEXT_MAX_ROWS,
+) -> str:
+    """The daily closes bracketing a dossier's earliest live evidence, as a
+    block for the synthesis prompt. Empty string when there is nothing
+    useful to say, so the caller can concatenate it unconditionally.
+
+    Exists because `already_priced_in` is the single most consequential
+    judgement in this system -- it zeroes a thesis -- and it was being made
+    with no price in the prompt at all. The model was inferring "the market
+    has absorbed this" from how OLD and how widely covered the story was,
+    which is precisely the wrong proxy for this strategy: a heavily covered
+    story about an anchor is the setup where the thinly-covered supplier has
+    NOT moved yet. Showing the tape turns a guess into a reading.
+
+    Anchored to the evidence rather than to a fixed lookback, and started
+    BEFORE it, because the interesting comparison is the pre-news level
+    against now -- not an arbitrary trailing window that may begin after the
+    reaction it is supposed to reveal."""
+    if not marks or not earliest_evidence_date:
+        return ""
+    days = sorted(marks)
+    if not days:
+        return ""
+    # Index of the first marked session at or after the earliest evidence.
+    # A dossier whose evidence predates every mark starts at the beginning.
+    start_idx = 0
+    for i, d in enumerate(days):
+        if d >= earliest_evidence_date:
+            start_idx = i
+            break
+    else:
+        # All marks predate the evidence -- nothing after the news to show.
+        return ""
+    lead = max(0, start_idx - lead_sessions)
+    window = days[lead:][-max_rows:]
+    if len(window) < 2:
+        return ""
+    lines = []
+    for d in window:
+        tag = ""
+        if d == days[start_idx]:
+            tag = "   <- first evidence in this dossier is dated here"
+        elif d == window[-1]:
+            tag = "   <- latest"
+        lines.append(f"  {d}  {marks[d]:>10.2f}{tag}")
+    first, last = marks[window[0]], marks[window[-1]]
+    move = (last / first - 1.0) * 100.0 if first else 0.0
+    at_news = marks[days[start_idx]]
+    since_news = (last / at_news - 1.0) * 100.0 if at_news else 0.0
+    return (
+        "\nPRICE (daily closes; use this to judge already_priced_in):\n"
+        + "\n".join(lines)
+        + f"\n  {move:+.1f}% across this window"
+        + f"; {since_news:+.1f}% since the first evidence is dated.\n"
+    )

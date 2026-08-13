@@ -3715,3 +3715,94 @@ def test_real_counterparties_survive_the_filters(symbol, name, tmp_path, monkeyp
 
     assert not engine._is_professional_services(rel)
     assert not engine._is_self_reference(symbol, rel)
+
+
+# --- The tape must reach the pass that judges already_priced_in ------------
+#
+# already_priced_in ZEROES a thesis, and its own tool description calls it "a
+# claim about the PRICE" -- yet the synthesis prompt carried no price of any
+# kind. The model was inferring "the market has absorbed this" from how old
+# and how widely covered the story was, which is the wrong proxy for this
+# strategy: a heavily covered story about an ANCHOR is precisely the setup
+# where the thinly-covered supplier has not moved yet.
+
+async def test_synthesis_is_shown_the_price_around_its_earliest_evidence(engine):
+    from smartboi.dossier import Dossier, merge_evidence, recompute_decay
+
+    now = datetime.now(timezone.utc)
+    marks = [
+        ("2026-08-04", 32.10), ("2026-08-05", 32.44), ("2026-08-06", 32.29),
+        ("2026-08-07", 33.33), ("2026-08-10", 34.90), ("2026-08-11", 36.28),
+    ]
+    path = Path(engine.settings.log_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    path = path / "price_marks.jsonl"
+    path.write_text("".join(
+        __import__("json").dumps({"symbol": "BWEN", "marked_at": d + "T04:00:00+00:00",
+                                  "price": p}) + "\n"
+        for d, p in marks
+    ))
+
+    dossier = Dossier(symbol="BWEN")
+    for n in range(8):
+        merge_evidence(dossier, EvidenceRecord(
+            f"e{n}", "news", f"outlet{n}.com", "u", "h", "2026-08-07T13:00:00+00:00",
+            "BWEN", False, "", "LONG", 0.45, 0.60, 20, "reason", "skeptic",
+        ), now=now)
+    recompute_decay(dossier, now)
+
+    context = engine._price_context_for(dossier, now)
+    assert "PRICE" in context, "the synthesis prompt carries no price block"
+    # Starts BEFORE the news, or the reaction it exists to reveal is invisible.
+    assert "2026-08-04" in context
+    assert "first evidence in this dossier is dated here" in context
+    # ...and states the move, which is the number the judgement turns on.
+    assert "+8.9% since the first evidence is dated" in context
+
+
+async def test_price_context_is_absent_rather_than_wrong_when_unpriceable(engine):
+    """A symbol no price source could mark must leave the pass judging exactly
+    as it did before -- never a fabricated or empty-looking series."""
+    from smartboi.dossier import Dossier, merge_evidence, recompute_decay
+
+    now = datetime.now(timezone.utc)
+    Path(engine.settings.log_dir).mkdir(parents=True, exist_ok=True)
+    (Path(engine.settings.log_dir) / "price_marks.jsonl").write_text("")
+    dossier = Dossier(symbol="BWEN")
+    merge_evidence(dossier, EvidenceRecord(
+        "e0", "news", "outlet.com", "u", "h", now.isoformat(), "BWEN", False, "",
+        "LONG", 0.45, 0.60, 20, "reason", "skeptic",
+    ), now=now)
+    recompute_decay(dossier, now)
+
+    assert engine._price_context_for(dossier, now) == ""
+
+
+async def test_the_price_block_actually_reaches_the_synthesizer(engine):
+    """End-to-end: built, and passed through _apply_synthesis. The builder
+    working while the call site drops it is exactly the shape of bug that put
+    fact_key at 0% for a whole scoring version."""
+    from smartboi.dossier import Dossier, merge_evidence, recompute_decay
+
+    now = datetime.now(timezone.utc)
+    path = Path(engine.settings.log_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    path = path / "price_marks.jsonl"
+    path.write_text("".join(
+        __import__("json").dumps({"symbol": "BWEN", "marked_at": d + "T04:00:00+00:00",
+                                  "price": p}) + "\n"
+        for d, p in [("2026-08-04", 30.0), ("2026-08-07", 33.0), ("2026-08-11", 36.0)]
+    ))
+    dossier = Dossier(symbol="BWEN")
+    for n in range(8):
+        merge_evidence(dossier, EvidenceRecord(
+            f"e{n}", "news", f"outlet{n}.com", "u", "h", "2026-08-07T13:00:00+00:00",
+            "BWEN", False, "", "LONG", 0.9, 0.9, 20, "reason", "skeptic",
+        ), now=now)
+    recompute_decay(dossier, now)
+    engine.synthesizer = FakeSynthesizer(default=None)  # verdict irrelevant here
+
+    await engine._apply_synthesis(dossier, now)
+
+    assert engine.synthesizer.calls, "synthesis never ran"
+    assert "PRICE" in engine.synthesizer.calls[0]["price_context"]
