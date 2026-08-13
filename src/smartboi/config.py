@@ -636,6 +636,24 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
     log_dir: str = "logs"
+    # --- LLM tracing (logs/llm_trace.jsonl) ---
+    #
+    # The system records what every pass DECIDED and none of what it was
+    # SHOWN, which is the wrong half when a judgement looks wrong. The
+    # fact_key outage is the worked example: 970 items came back with an
+    # empty label and the stored output could not distinguish a model that
+    # never emitted it from a pipeline that dropped it (it was the pipeline).
+    # One traced call answers that in seconds.
+    enable_llm_trace: bool = True
+    # Synthesis is traced in full -- ~30 calls a day, it is the only pass
+    # that can veto a thesis to zero, and its prompt changes most often.
+    # The per-item updater and skeptic run ~700 times a day between them and
+    # only need enough coverage to answer "is the field arriving at all", so
+    # they are sampled. Set to 1 to trace every call while tuning a prompt.
+    llm_trace_sample_dossier: int = 20
+    # Two generations of this size, so the trace is bounded on disk. Prompts
+    # are the bulkiest thing in a diagnostics bundle by a wide margin.
+    llm_trace_max_mb: float = 20.0
     # Optional: a JSON payload is POSTed here on every signal and paper
     # trade open/close (see alerts.py) -- point it at a Home Assistant
     # webhook trigger or any HTTP endpoint. Empty disables alerts.

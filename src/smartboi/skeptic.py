@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 
 from anthropic import AsyncAnthropic
 
-from smartboi.llm import cacheable_system, first_tool_use, request_kwargs
+from smartboi.llm import LLMTrace, cacheable_system, first_tool_use, request_kwargs
 from smartboi.usage import CAT_DOSSIER, UsageTracker
 
 log = logging.getLogger(__name__)
@@ -146,10 +146,12 @@ _SYSTEM_PROMPT = (
 
 
 class Skeptic:
-    def __init__(self, api_key: str, model: str, usage: UsageTracker):
+    def __init__(self, api_key: str, model: str, usage: UsageTracker,
+                 trace: LLMTrace | None = None):
         self._client = AsyncAnthropic(api_key=api_key)
         self._model = model
         self._usage = usage
+        self._trace = trace
 
     async def review(
         self, evidence_text: str, proposed: dict, relationship_note: str = "",
@@ -216,6 +218,10 @@ class Skeptic:
         self._usage.record(response.usage.input_tokens, response.usage.output_tokens,
                            model=self._model, category=CAT_DOSSIER)
         verdict = first_tool_use(response)
+        if self._trace is not None:
+            self._trace.record(CAT_DOSSIER, self._model, "", prompt, verdict,
+                               response.usage.input_tokens, response.usage.output_tokens,
+                               system=_SYSTEM_PROMPT)
         if verdict is not None:
             return verdict
         return {"refuted": True, "reasoning": "model returned no verdict", "adjusted_confidence": 0.0, "adjusted_magnitude": 0.0}
