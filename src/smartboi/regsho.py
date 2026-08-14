@@ -24,6 +24,8 @@ from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
+from smartboi.state import JsonState
+
 log = logging.getLogger(__name__)
 
 # Nasdaq publishes the consolidated file covering all listing venues, so one
@@ -48,13 +50,39 @@ class RegShoClient:
     fetch that does not resolve leaves the list EMPTY, and an empty list makes
     is_threshold() return False for everything, which sends the caller back to
     the market-cap proxy rather than silently declaring every short borrowable.
+
+    PERSISTED, because the refresh that fills it is not. The engine schedules
+    that refresh off `periodic_pass_state` -- a wall-clock timestamp on disk,
+    chosen precisely so a restart cannot re-run a daily pass (see
+    engine._daily_pass_due). This client held its list in memory only, so the
+    two disagreed after every restart: the list was empty and the persisted
+    marker still said "fetched today", which blocks the re-fetch for the rest
+    of the day. Live effect on a deployment restarting several times a day --
+    24 process starts against 2 successful fetches -- was a threshold list
+    present for about 7% of uptime, with every SHORT in the other 93% stamped
+    assumes_borrow off the market-cap proxy instead of the observed list. That
+    flag exists so the forward record can be split into "a real account could
+    have borrowed this" and "probably not", and an unpersisted list quietly
+    made the whole column mean the same thing.
     """
 
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(self, client: httpx.AsyncClient | None = None,
+                 state: JsonState | None = None) -> None:
         self._client = client
         self._owns_client = client is None
+        self._state = state
         self._symbols: set[str] = set()
         self._as_of: str = ""
+        if state is not None:
+            # Restored, not re-fetched: the whole point is to survive the
+            # restart without spending a request the daily gate would refuse.
+            stored = state.get("symbols") or []
+            if isinstance(stored, list):
+                self._symbols = {str(x).upper() for x in stored}
+            self._as_of = str(state.get("as_of") or "")
+            if self._symbols:
+                log.info("[REGSHO] Restored %d threshold securities as of %s from %s.",
+                         len(self._symbols), self._as_of or "unknown", state.path)
 
     async def _get(self, url: str) -> httpx.Response | None:
         client = self._client
@@ -170,6 +198,10 @@ class RegShoClient:
                 continue
             self._symbols = symbols
             self._as_of = day.isoformat()
+            if self._state is not None:
+                # Written before the log line, so a crash between them leaves
+                # the list on disk rather than only in the record of it.
+                self._state.update({"as_of": self._as_of, "symbols": sorted(symbols)})
             log.info("[REGSHO] Loaded %d threshold securities as of %s (%s).",
                      len(symbols), self._as_of, url)
             return True

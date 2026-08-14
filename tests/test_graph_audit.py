@@ -248,3 +248,82 @@ def test_summarize_counts_actionable_and_names_the_symbols():
     assert summary["total"] == 2
     assert summary["actionable"] == 1          # the self-edge is reported, not actioned
     assert summary["symbols_at_fault"] == ["SPWR"]
+
+
+# --- Maintenance must not advise undoing its own work ---------------------
+
+def _edge(a, b, rel_type="customer"):
+    from smartboi.graph import Relationship
+    return Relationship(from_symbol=a, to_symbol=b, rel_type=rel_type,
+                        description="d", source="s", confidence=0.9,
+                        extracted_at=datetime.now(timezone.utc).isoformat())
+
+
+def _run_audit(**kw):
+    from smartboi.graph_audit import audit
+    base = dict(accepted={}, candidates={}, relationships=[], universe_symbols=set(),
+                curated_symbols=set(), open_positions=set(), live_tickers=None,
+                name_verified={}, is_common_equity=lambda s: True)
+    base.update(kw)
+    return audit(**base)
+
+
+def test_an_edge_orphaned_by_quarantine_is_not_reported_as_a_lead():
+    """Quarantine removes a symbol but leaves its edges, so they go dangling.
+    Reported as dangling, the advice reads 'accept the endpoint' -- i.e.
+    re-admit exactly what was just removed. 106 live edges said that."""
+    from smartboi.graph_audit import KIND_DANGLING_EDGE, KIND_ORPHANED_EDGE
+
+    findings = _run_audit(relationships=[_edge("WLDN", "SCE-PN")],
+                      universe_symbols={"WLDN"}, quarantined={"SCE-PN"})
+
+    kinds = {f.kind for f in findings}
+    assert KIND_ORPHANED_EDGE in kinds
+    assert KIND_DANGLING_EDGE not in kinds
+    orphan = next(f for f in findings if f.kind == KIND_ORPHANED_EDGE)
+    assert "do NOT re-accept" in orphan.blocked_reason
+    assert orphan.actionable is False
+
+
+def test_a_genuinely_undiscovered_endpoint_is_still_a_lead():
+    from smartboi.graph_audit import KIND_DANGLING_EDGE
+
+    findings = _run_audit(relationships=[_edge("DCO", "QCOM")],
+                      universe_symbols={"DCO"}, quarantined=set())
+    assert [f.kind for f in findings] == [KIND_DANGLING_EDGE]
+
+
+def test_agency_endpoints_are_not_reported_as_dangling():
+    """federal_register.py writes BIS/EPA/ITC/NHTSA into to_symbol on
+    purpose. They are not tickers, can never be accepted, and so produced
+    findings that could never be cleared and re-fired every single day."""
+    findings = _run_audit(relationships=[_edge("HDSN", "EPA", "regulator"),
+                                     _edge("STRT", "NHTSA", "regulator")],
+                      universe_symbols={"HDSN", "STRT"})
+    assert findings == []
+
+
+def test_a_ticker_to_ticker_regulator_edge_is_still_checked():
+    """The exemption is keyed on the agency SYMBOL, not on rel_type -- three
+    live dangling regulator edges are ticker-to-ticker and are real."""
+    from smartboi.graph_audit import KIND_DANGLING_EDGE
+
+    findings = _run_audit(relationships=[_edge("CTVA", "DOW", "regulator")],
+                      universe_symbols={"CTVA"})
+    assert [f.kind for f in findings] == [KIND_DANGLING_EDGE]
+
+
+def test_a_curated_symbol_in_both_stores_is_never_quarantinable():
+    """TM was code-seeded AND sat in accepted_candidates. The old order
+    checked `not in accepted` and passed it as actionable, so quarantine
+    deleted the accepted row, the universe rebuild put TM straight back --
+    and its fault became unreportable, because name verification only walks
+    accepted_candidates. A recorded removal that never happened."""
+    findings = _run_audit(accepted={"TM": {"as": "anchor"}}, curated_symbols={"TM"},
+                          candidates={"TM": {"name": "Toyota Motor Manufacturing"}},
+                          universe_symbols={"TM"}, name_verified={"TM": False})
+
+    tm = [f for f in findings if f.subject == "TM"]
+    assert tm, "the name-mismatch fault should still be REPORTED"
+    assert all(not f.actionable for f in tm), "a curated symbol must never be quarantinable"
+    assert all("universe.py" in f.blocked_reason for f in tm)

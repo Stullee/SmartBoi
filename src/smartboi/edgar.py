@@ -583,6 +583,44 @@ class EdgarClient:
             ))
         return events
 
+    async def latest_filing_result(self, symbol: str, form: str) -> tuple[FilingEvent | None, str]:
+        """`(filing, outcome)` where outcome is one of:
+
+          "ok"          -- found it
+          "absent"      -- this filer genuinely has no filing of this form in
+                           the recent block (foreign issuer, fresh IPO). The
+                           only PERMANENT answer of the three failures.
+          "no_cik"      -- the ticker did not resolve to a CIK
+          "fetch_error" -- EDGAR was unreachable or errored
+
+        The distinction exists because the caller writes a permanent "nothing
+        to extract, and never will be" marker on a miss, and the three cases
+        are not the same claim at all. A ticker that fails to resolve, or an
+        EDGAR outage, was being recorded as a structural impossibility --
+        forever, on the first attempt. Live consequence: 24 live-universe
+        symbols carrying that marker, including a cached CIK for XOM
+        (0002115436) that is not Exxon's (0000034088), so Exxon's own 10-K had
+        never been read while the state file said there was nothing to read."""
+        cik10 = await self.cik_for(symbol)
+        if cik10 is None:
+            log.warning("%s: no CIK found in EDGAR's ticker map -- cannot backfill.", symbol)
+            return None, "no_cik"
+        try:
+            response = await self._throttled_get(_SUBMISSIONS_URL.format(cik10=cik10))
+        except httpx.HTTPError as exc:
+            log.warning("%s: EDGAR submissions fetch failed: %s", symbol, exc)
+            return None, "fetch_error"
+        recent = response.json().get("filings", {}).get("recent", {})
+        for filing_form, filing_date, accession, primary_doc in zip(
+            recent.get("form", []),
+            recent.get("filingDate", []),
+            recent.get("accessionNumber", []),
+            recent.get("primaryDocument", []),
+        ):
+            if filing_form == form:
+                return FilingEvent(symbol, cik10, filing_form, filing_date, accession, primary_doc), "ok"
+        return None, "absent"
+
     async def latest_filing(self, symbol: str, form: str) -> FilingEvent | None:
         """The most recent filing of `form` for `symbol`, REGARDLESS of age
         (within the submissions endpoint's ~1000-filing recent block) --

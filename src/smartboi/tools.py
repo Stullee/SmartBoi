@@ -336,7 +336,11 @@ async def run_edgar_supplier_search(engine) -> str:
             f"{len(found)} with a concentration disclosure."
         )
         if found:
-            added, touched = merge_into_candidates(engine.candidates, found)
+            # The EDGAR pass stamps its OWN marker: sharing the web-research
+            # one made researched_anchors() skip anchors this pass merely
+            # found a filing for, permanently (see merge_into_candidates).
+            added, touched = merge_into_candidates(
+                engine.candidates, found, marker_key="last_edgar_searched_at")
             new += added
             updated += touched
 
@@ -1325,7 +1329,15 @@ def run_diagnostics(engine) -> str:
         backfill_state=engine.backfill_state.data,
         last_refresh=engine.periodic_state.get("graph_refresh", "") or "",
         last_research=engine.periodic_state.get("supplier_research", "") or "",
-        researched_anchor_count=len(researched_anchors(engine.candidates, engine.research_state)),
+        # Intersected with the CURRENT anchors, because the skip list is
+        # deliberately wider than them: researched_anchors() must keep
+        # remembering pruned symbols so a re-added anchor is not re-billed
+        # (tools.run_supplier_research uses the same set for selection).
+        # Displaying it raw counted ex-anchors and non-anchors and put the
+        # ratio past its own denominator -- 172/160 on the live board.
+        researched_anchor_count=len(
+            researched_anchors(engine.candidates, engine.research_state)
+            & {c.symbol for c in engine.universe if c.signal_source_only}),
         refresh_per_day=(s.graph_refresh_symbols_per_day if s.enable_graph_refresh else 0),
         candidates=engine.candidates.data,
     )
@@ -1362,7 +1374,8 @@ def run_diagnostics(engine) -> str:
         f"({gh['anchors_inert']} inert -- their news reaches nothing)")
     stalest = gh["stalest_days"]
     add(f"  extraction age: median {gh['median_extraction_age_days']}d, stalest "
-        f"{'-' if stalest is None else f'{stalest:.0f}d'}, never extracted {gh['never_extracted']}")
+        f"{'-' if stalest is None else f'{stalest:.0f}d'}, never extracted {gh['never_extracted']}"
+        + (f", no 10-K on record {gh['no_filing_available']}" if gh.get('no_filing_available') else ""))
     refresh_age = gh["last_refresh_days"]
     research_age = gh["last_research_days"]
     if gh["refresh_per_day"]:

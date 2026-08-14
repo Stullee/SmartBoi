@@ -145,3 +145,56 @@ async def test_an_open_breaker_leaves_every_anchor_unmarked(tmp_path, monkeypatc
     await tools_module.run_supplier_research(engine)
 
     assert engine.research_state.data == {}, "a suppressed run must mark nothing"
+
+
+# --- The skip list must record who was actually researched ----------------
+#
+# researched_anchors() builds the SKIP LIST that run_supplier_research filters
+# on, so anything wrongly in it is an anchor that never gets a paid call
+# again. Two mechanisms put anchors there that were never researched: the
+# EDGAR full-text pass shared the web-research marker, and the candidate scan
+# credited every symbol in `related_to` -- a shared accumulator, not the
+# anchor the run was for. Live: 35 of 160 anchors locked out, ratio 172/160.
+
+def test_the_edgar_pass_does_not_mark_anchors_as_web_researched(tmp_path):
+    from smartboi.state import JsonState
+
+    cands = JsonState(tmp_path / "c.json")
+    merge_into_candidates(cands, [ResearchedSupplier(
+        anchor="NOC", name="Some Supplier", ticker="SUP", rel_type="supplier",
+        description="d", confidence=0.8, evidence_url="u")],
+        marker_key="last_edgar_searched_at")
+
+    entry = cands.get("SUP")
+    assert entry["last_edgar_searched_at"], "the EDGAR pass wrote no marker of its own"
+    assert "last_researched_at" not in entry, "EDGAR stamped the web-research marker"
+    assert researched_anchors(cands, None) == set(), \
+        "an EDGAR find marked its anchor as web-researched -- it is now skipped forever"
+
+
+def test_web_research_credits_only_the_anchor_it_ran_for(tmp_path):
+    """`related_to` accumulates every symbol that ever named a candidate, so
+    crediting it counted co-occurring anchors as researched too."""
+    from smartboi.state import JsonState
+
+    cands = JsonState(tmp_path / "c.json")
+    cands.set("SKYW", {"name": "SkyWest", "related_to": ["UAL", "DAL", "AAL"], "seen_count": 1})
+    merge_into_candidates(cands, [ResearchedSupplier(
+        anchor="AAL", name="SkyWest", ticker="SKYW", rel_type="supplier",
+        description="d", confidence=0.8, evidence_url="u")])
+
+    assert researched_anchors(cands, None) == {"AAL"}, \
+        "UAL and DAL were credited for a run that only covered AAL"
+
+
+def test_an_attempt_that_found_nothing_still_counts(tmp_path):
+    """The reason research_state exists: 'searched, found nothing' writes no
+    candidate, and without the attempt being recorded that anchor is
+    reselected and re-billed on every future run."""
+    from smartboi.state import JsonState
+
+    cands = JsonState(tmp_path / "c.json")
+    state = JsonState(tmp_path / "r.json")
+    state.set("GEV", {"researched_at": "2026-08-12T00:00:00+00:00", "found": 0})
+
+    assert researched_anchors(cands, state) == {"GEV"}

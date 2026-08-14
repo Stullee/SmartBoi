@@ -419,6 +419,17 @@ _NON_COMPANY_KEYWORDS = (
 )
 
 
+# Backoff for a 10-K lookup that FAILED rather than came back empty (see
+# _run_relationship_backfill). The backfill loop runs on every tick, so an
+# unresolvable ticker or a sustained EDGAR fault would otherwise be re-asked
+# every 30 seconds -- ~2,880 requests a day for one bad symbol, against an
+# endpoint with a published rate limit. Doubling, capped at a day: a transient
+# error clears on the next pass or two, a permanent one costs one request a day
+# and stays visible instead of being written off as "this filer has no 10-K".
+def _backfill_retry_hours(attempts: int) -> int:
+    return min(24, 2 ** max(1, attempts))
+
+
 class Engine:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -580,7 +591,8 @@ class Engine:
         # the list empty, the borrow flag falls back to the market-cap proxy
         # (see paper_journal.assumes_borrow).
         self.regsho: RegShoClient | None = (
-            RegShoClient() if settings.enable_regsho else None
+            RegShoClient(state=JsonState(DATA_DIR / "regsho.json"))
+            if settings.enable_regsho else None
         )
         # Also free and unauthenticated. Scoped to a handful of hand-written
         # searches -- the Federal Register publishes ~200 documents a business
@@ -1384,7 +1396,14 @@ class Engine:
             self.regsho is not None
             and is_trading_day()
             and now >= self._regsho_retry_after
-            and self._daily_pass_due("regsho")
+            # `or count == 0` covers the gap the persisted marker opens on its
+            # own: a build whose stored list is missing or was written before
+            # regsho.json existed starts empty with the marker already fresh,
+            # and would then wait a full day holding nothing. Cannot spin --
+            # refresh() never returns True on an empty parse (it `continue`s
+            # to the next day and finally returns False), and a False sets
+            # _regsho_retry_after.
+            and (self._daily_pass_due("regsho") or self.regsho.count == 0)
         ):
             if await self.regsho.refresh():
                 self._mark_daily_pass_done("regsho")
@@ -2258,6 +2277,27 @@ class Engine:
                         "relevance filters, which had only applied to newly-extracted ones.", blocked)
         return blocked
 
+    def _filing_seen_count(self, entry: dict) -> int:
+        """How many independent FILING disclosures named this company, counted
+        across every spelling of its name rather than per candidate row.
+
+        The duplicate-name audit reports these splits and is deliberately
+        non-actionable -- merging rewrites discovery history. Counting across
+        the group at the gate removes the harm without the rewrite."""
+        name = (entry.get("name") or "").strip()
+        if not name:
+            return int(entry.get("seen_count", 0) or 0)
+        target = normalize_company_name(name)
+        if not target:
+            return int(entry.get("seen_count", 0) or 0)
+        total = 0
+        for other in self.candidates.data.values():
+            if not isinstance(other, dict) or other.get("researched_only"):
+                continue
+            if normalize_company_name((other.get("name") or "").strip()) == target:
+                total += int(other.get("seen_count", 0) or 0)
+        return total
+
     async def _auto_accept_candidates(self) -> None:
         """Acts on the tradeable-vs-anchor recommendation the engine already
         computed for each discovered candidate (see
@@ -2356,7 +2396,15 @@ class Engine:
             else:
                 if not self.settings.auto_accept_tradeables:
                     continue
-                if entry.get("seen_count", 0) < self.settings.auto_accept_min_seen_count:
+                # Summed across every spelling of the same company, because
+                # the same disclosure arriving as "TENNECO INC." and as "TEN"
+                # splits one count into two 1s and neither clears the bar.
+                # FILING-sourced sightings only: merge_into_candidates
+                # deliberately refuses to increment seen_count for a research
+                # sighting, since letting web sourcing inflate it would admit
+                # a trade target on nothing but a search result -- and summing
+                # a group blindly would do exactly that through the back door.
+                if self._filing_seen_count(entry) < self.settings.auto_accept_min_seen_count:
                     continue
                 if self.edgar_client is None:
                     continue
@@ -2390,6 +2438,27 @@ class Engine:
             )
 
     # --- One-time relationship backfill ---
+
+    def _backfill_due(self, symbol: str) -> bool:
+        """Whether this symbol's 10-K still needs reading.
+
+        A marker means "settled" only when it records a real outcome -- a read
+        (`backfilled_at` with an accession) or a filer that genuinely has no
+        10-K (`reason: no_10k`). A marker recording a FAILED lookup is a note
+        to try again later, not a result, and must not retire the symbol."""
+        marker = self.backfill_state.get(symbol)
+        if not marker:
+            return True
+        if not isinstance(marker, dict) or not marker.get("error"):
+            return False
+        try:
+            last = datetime.fromisoformat(str(marker.get("last_attempt_at") or ""))
+        except ValueError:
+            return True
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        due_after = _backfill_retry_hours(int(marker.get("attempts", 0) or 0))
+        return (datetime.now(timezone.utc) - last).total_seconds() >= due_after * 3600
 
     async def _run_relationship_backfill(self) -> None:
         """Extracts relationships from each tradeable symbol's MOST RECENT
@@ -2435,11 +2504,11 @@ class Engine:
             return
         tradeables = [
             spec.symbol for spec in self.universe
-            if not spec.signal_source_only and not self.backfill_state.get(spec.symbol)
+            if not spec.signal_source_only and self._backfill_due(spec.symbol)
         ]
         anchors = [
             spec.symbol for spec in self.universe
-            if spec.signal_source_only and not self.backfill_state.get(spec.symbol)
+            if spec.signal_source_only and self._backfill_due(spec.symbol)
         ] if self.settings.backfill_anchors else []
         pending = tradeables + anchors
         if not pending:
@@ -2450,13 +2519,30 @@ class Engine:
         done = 0
         for symbol in pending:
             try:
-                filing = await self.edgar_client.latest_filing(symbol, "10-K")
+                filing, outcome = await self.edgar_client.latest_filing_result(symbol, "10-K")
                 if filing is None:
-                    # No 10-K on record (foreign issuer, fresh IPO) -- mark done,
-                    # there is nothing to extract from and never will be here.
-                    log.info("%s: no 10-K available to backfill from.", symbol)
-                    self.backfill_state.set(symbol, {"backfilled_at": datetime.now(timezone.utc).isoformat(),
-                                                     "accession": None})
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    if outcome == "absent":
+                        # Genuinely no 10-K on record (foreign issuer, fresh
+                        # IPO) -- nothing to extract from and never will be.
+                        log.info("%s: no 10-K available to backfill from.", symbol)
+                        self.backfill_state.set(symbol, {"backfilled_at": now_iso,
+                                                         "accession": None, "reason": "no_10k"})
+                    else:
+                        # A failed ticker resolution or an EDGAR error is not a
+                        # fact about the filer, so it must not write the
+                        # permanent marker -- that is how XOM's mis-cached CIK
+                        # became "Exxon has no 10-K" forever. Recorded as a
+                        # RETRYABLE failure instead: this loop runs every tick,
+                        # so leaving the symbol simply pending would re-ask
+                        # EDGAR every 30s for as long as the fault lasts.
+                        marker = self.backfill_state.get(symbol) or {}
+                        attempts = int(marker.get("attempts", 0) or 0) + 1
+                        self.backfill_state.set(symbol, {
+                            "error": outcome, "attempts": attempts, "last_attempt_at": now_iso,
+                        })
+                        log.warning("%s: 10-K lookup failed (%s, attempt %d) -- will retry in %dh.",
+                                    symbol, outcome, attempts, _backfill_retry_hours(attempts))
                     continue
                 text = await self.edgar_client.fetch_text(filing)
                 if not text:
@@ -4531,6 +4617,7 @@ class Engine:
             universe_symbols=set(self.symbol_list),
             curated_symbols={c.symbol for c in self.settings.universe},
             open_positions=set(self.journal.open_trades),
+            quarantined=set(self.quarantine.data),
             live_tickers=live_tickers,
             name_verified=name_verified,
             is_common_equity=is_common_equity,

@@ -10,6 +10,7 @@ class FakeEdgarClient:
         self.filings_by_symbol: dict[str, list] = {}
         self.text_by_accession: dict[str, str] = {}
         self.latest_filings: dict[tuple[str, str], object] = {}
+        self.latest_filing_outcomes: dict[tuple[str, str], str] = {}
         self.ticker_by_name: dict[str, str] = {}
         # Whether a resolved ticker's registered SEC name verifies against the
         # disclosed counterparty name. Defaults to True so tests opt IN to the
@@ -33,6 +34,16 @@ class FakeEdgarClient:
 
     async def latest_filing(self, symbol, form):
         return self.latest_filings.get((symbol, form))
+
+    async def latest_filing_result(self, symbol: str, form: str):
+        """Mirrors the real client's three-way outcome. Defaults a miss to
+        "absent" so existing tests keep their meaning; set
+        `latest_filing_outcomes[(symbol, form)]` to model a lookup FAILURE,
+        which must not retire the symbol."""
+        filing = self.latest_filings.get((symbol, form))
+        if filing is not None:
+            return filing, "ok"
+        return None, self.latest_filing_outcomes.get((symbol, form), "absent")
 
     async def fetch_evidence_text(self, filing):
         return self.text_by_accession.get(filing.accession_number, "")
