@@ -221,3 +221,81 @@ async def test_a_200_that_parses_to_nothing_says_so_with_the_body(caplog):
 
     assert "0 symbols parsed" in caplog.text
     assert "Maintenance" in caplog.text
+
+
+# --- Surviving the restart the daily gate assumes did not happen ----------
+#
+# The refresh is scheduled off periodic_pass_state -- a wall-clock timestamp
+# on DISK, so a restart cannot re-run a daily pass. This client kept its list
+# in memory only, so after a restart the list was empty while the marker still
+# said "fetched today", and the re-fetch stayed blocked for the rest of the
+# day. Live: 24 process starts against 2 successful fetches, a threshold list
+# present ~7% of uptime, and every SHORT in the other 93% stamped
+# assumes_borrow off the market-cap proxy instead of the observed list.
+
+def test_the_threshold_list_survives_a_restart(tmp_path):
+    from smartboi.state import JsonState
+
+    path = tmp_path / "regsho.json"
+    client = RegShoClient(state=JsonState(path))
+    client._symbols = {"AAPL", "GME"}
+    client._as_of = "2026-08-11"
+    client._state.update({"as_of": client._as_of, "symbols": sorted(client._symbols)})
+
+    restarted = RegShoClient(state=JsonState(path))   # a fresh process
+
+    assert restarted.count == 2
+    assert restarted.as_of == "2026-08-11"
+    assert restarted.is_threshold("gme") is True
+    assert restarted.is_threshold("MSFT") is False
+
+
+@pytest.mark.regsho_network
+@pytest.mark.asyncio
+async def test_a_successful_refresh_writes_the_list_to_disk(tmp_path):
+    from smartboi.state import JsonState
+
+    path = tmp_path / "regsho.json"
+    client = RegShoClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, text=_FILE))),
+        state=JsonState(path),
+    )
+
+    assert await client.refresh(today=date(2026, 8, 7)) is True
+
+    reloaded = JsonState(path)
+    assert set(reloaded.get("symbols")) == {"ABCD", "WXYZ", "BRK.A"}
+    assert reloaded.get("as_of") == "2026-08-07"
+    # ...and a fresh client reads it back without a request.
+    assert RegShoClient(state=JsonState(path)).is_threshold("ABCD") is True
+
+
+@pytest.mark.regsho_network
+@pytest.mark.asyncio
+async def test_a_failed_refresh_leaves_the_stored_list_alone(tmp_path):
+    """The list on disk is the last GOOD one. A 404 walk that resolves
+    nothing must not erase it -- that would turn one bad fetch into the same
+    all-shorts-on-the-proxy outage the persistence exists to end."""
+    from smartboi.state import JsonState
+
+    path = tmp_path / "regsho.json"
+    JsonState(path).update({"as_of": "2026-08-06", "symbols": ["ABCD"]})
+    client = RegShoClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404))),
+        state=JsonState(path),
+    )
+
+    assert await client.refresh(today=date(2026, 8, 7)) is False
+
+    assert JsonState(path).get("symbols") == ["ABCD"]
+    assert client.is_threshold("ABCD") is True   # restored copy still stands
+
+
+def test_no_state_configured_still_works():
+    """Persistence is optional -- with no state handed to it the client must
+    behave exactly as it always did (every pre-existing test builds it that
+    way, and so does any embedding that does not want a file)."""
+    client = RegShoClient()
+    assert client.count == 0
+    assert client.as_of == ""
+    assert client.is_threshold("ABCD") is False

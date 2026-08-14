@@ -3806,3 +3806,70 @@ async def test_the_price_block_actually_reaches_the_synthesizer(engine):
 
     assert engine.synthesizer.calls, "synthesis never ran"
     assert "PRICE" in engine.synthesizer.calls[0]["price_context"]
+
+
+# --- A failed lookup is not a fact about the filer -------------------------
+#
+# The backfill wrote one permanent "nothing to extract, and never will be"
+# marker for all three ways latest_filing can come back empty. A mis-cached
+# CIK therefore became "this company has no 10-K" forever: XOM's cached CIK
+# (0002115436) is not Exxon's (0000034088), so Exxon's own 10-K had never
+# been read while the state file said there was nothing to read.
+
+async def test_a_filer_with_no_10k_is_settled_permanently(engine):
+    engine.edgar_client.latest_filing_outcomes[("FORM", "10-K")] = "absent"
+    await engine._run_relationship_backfill()
+    marker = engine.backfill_state.get("FORM")
+    assert marker["backfilled_at"] and marker["accession"] is None
+    assert engine._backfill_due("FORM") is False, "a real 'no 10-K' must retire the symbol"
+
+
+async def test_a_failed_lookup_does_not_retire_the_symbol(engine):
+    engine.edgar_client.latest_filing_outcomes[("FORM", "10-K")] = "no_cik"
+    await engine._run_relationship_backfill()
+    marker = engine.backfill_state.get("FORM")
+    assert marker.get("error") == "no_cik"
+    assert "backfilled_at" not in marker, "a lookup failure was recorded as a completed read"
+
+
+async def test_a_failed_lookup_backs_off_instead_of_retrying_every_tick(engine):
+    """The backfill runs on EVERY tick. Simply leaving a permanently broken
+    symbol pending would re-ask EDGAR every 30s -- ~2,880 requests a day for
+    one bad ticker, against a rate-limited endpoint."""
+    from smartboi.engine import _backfill_retry_hours
+
+    engine.edgar_client.latest_filing_outcomes[("FORM", "10-K")] = "fetch_error"
+    await engine._run_relationship_backfill()
+    assert engine._backfill_due("FORM") is False, "retried immediately on the next tick"
+
+    # ...but it IS due again once the backoff has elapsed.
+    marker = dict(engine.backfill_state.get("FORM"))
+    hours = _backfill_retry_hours(marker["attempts"])
+    marker["last_attempt_at"] = (
+        datetime.now(timezone.utc) - timedelta(hours=hours + 1)
+    ).isoformat()
+    engine.backfill_state.set("FORM", marker)
+    assert engine._backfill_due("FORM") is True
+    assert _backfill_retry_hours(99) == 24, "backoff must stay bounded"
+
+
+# --- seen_count is split across spellings of one company ------------------
+
+async def test_auto_accept_counts_filing_sightings_across_name_variants(engine):
+    """"TENNECO INC." and "TEN" are one company disclosed twice, but the count
+    splits into two 1s and neither clears auto_accept_min_seen_count."""
+    engine.candidates.set("TENNECO INC.", {"name": "Tenneco Inc.", "seen_count": 1})
+    engine.candidates.set("TEN", {"name": "Tenneco", "seen_count": 1, "ticker": "TEN"})
+
+    assert engine._filing_seen_count(engine.candidates.get("TEN")) == 2
+
+
+async def test_a_web_sighting_never_helps_clear_the_auto_accept_bar(engine):
+    """merge_into_candidates refuses to increment seen_count for a research
+    sighting on purpose -- letting web sourcing admit a trade target. Summing
+    the group blindly would reinstate that through the back door."""
+    engine.candidates.set("SERVOTRONICS, INC.", {"name": "Servotronics, Inc.", "seen_count": 1})
+    engine.candidates.set("SVT", {"name": "Servotronics, Inc.", "seen_count": 1,
+                                  "ticker": "SVT", "researched_only": True})
+
+    assert engine._filing_seen_count(engine.candidates.get("SVT")) == 1

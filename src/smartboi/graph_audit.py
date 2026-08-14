@@ -42,6 +42,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from smartboi.federal_register import REGULATOR_SYMBOLS
+
 # A finding is one of these kinds. Ordered by how decisively it disqualifies
 # a symbol, because that is the order an operator should read them in.
 KIND_DEAD_LISTING = "dead_listing"
@@ -52,6 +54,11 @@ KIND_SELF_EDGE = "self_edge"
 KIND_DANGLING_EDGE = "dangling_edge"
 KIND_STALE_EDGE = "stale_edge"
 KIND_DUPLICATE_NAME = "duplicate_name"
+# An edge left pointing at a symbol a maintenance pass REMOVED. Split from
+# dangling_edge because the advice inverts: a dangling edge invites accepting
+# the endpoint, and for these that means re-admitting exactly what was just
+# quarantined -- which the audit was telling the operator to do for 106 edges.
+KIND_ORPHANED_EDGE = "orphaned_edge"
 
 # Symbol-level kinds are the ones a quarantine can act on; edge-level and
 # store-level kinds are reported for a human, since dropping an edge is a
@@ -110,6 +117,9 @@ def audit(
     lender_phrases=(),
     normalize_name=None,
     stale_edge_days: int = 120,
+    # Symbols a maintenance pass has already removed. Their edges are
+    # ORPHANED, not merely dangling -- see KIND_ORPHANED_EDGE.
+    quarantined: set[str] = frozenset(),
     now: datetime | None = None,
 ) -> list[Finding]:
     """Every structural fault found, most decisive first.
@@ -138,10 +148,21 @@ def audit(
         paper trade is the hard one: removing the symbol would strand a
         position that can never be marked out, so the position has to close on
         its own terms first."""
+        # Curated FIRST. A symbol can be in both stores -- code-seeded in
+        # universe.py and also sitting in accepted_candidates from an earlier
+        # discovery -- and the old order let that case pass as actionable.
+        # Quarantine then deleted the accepted row and rebuilt the universe
+        # from settings.universe, which put the symbol straight back: TM was
+        # recorded as quarantined on 2026-08-11 and is still live and still
+        # polled. Worse, its fault became unreportable -- name verification
+        # only walks accepted_candidates, which it had just been deleted from,
+        # so the very finding that triggered the quarantine can no longer fire.
+        if symbol in curated_symbols:
+            return False, "curated universe symbol -- edit universe.py, a runtime pass cannot remove it"
         if symbol in open_positions:
             return False, "has an OPEN paper trade -- close or expire it first"
         if symbol not in accepted:
-            return False, "curated universe symbol -- edit universe.py, a runtime pass cannot remove it"
+            return False, "not in the accepted store -- nothing for a runtime pass to remove"
         return True, ""
 
     # --- Symbol faults, over the accepted set AND the curated seeds ---
@@ -210,7 +231,25 @@ def audit(
             ))
             continue
         missing = [s for s in (rel.from_symbol, rel.to_symbol) if s not in universe_symbols]
+        # Agency pseudo-symbols are endpoints BY DESIGN -- federal_register.py
+        # writes BIS/EPA/ITC/NHTSA into to_symbol deliberately. They are not
+        # tickers, can never be accepted, and so produced findings that could
+        # never be cleared and were re-emitted on every daily pass (13 of them
+        # live, 16 of the graph's 17 regulator edges). Keyed on the symbol, not
+        # on rel_type == "regulator": three dangling regulator edges are
+        # ticker-to-ticker and are real findings.
+        missing = [s for s in missing if s not in REGULATOR_SYMBOLS]
         if missing:
+            orphaned = [s for s in missing if s in quarantined]
+            if orphaned:
+                findings.append(Finding(
+                    KIND_ORPHANED_EDGE, pair,
+                    f"endpoint(s) quarantined by a maintenance pass: {', '.join(orphaned)}. "
+                    f"This edge was orphaned BY that removal, not by a discovery gap.",
+                    False,
+                    "do NOT re-accept -- the endpoint was removed on purpose; drop the edge instead",
+                ))
+                continue
             findings.append(Finding(
                 KIND_DANGLING_EDGE, pair,
                 f"endpoint(s) not in the universe: {', '.join(missing)}. The edge cannot "

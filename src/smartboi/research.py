@@ -291,7 +291,8 @@ def _to_suppliers(anchor: str, payload: dict) -> list[ResearchedSupplier]:
     return found
 
 
-def merge_into_candidates(candidates, suppliers: list[ResearchedSupplier]) -> tuple[int, int]:
+def merge_into_candidates(candidates, suppliers: list[ResearchedSupplier],
+                          marker_key: str = "last_researched_at") -> tuple[int, int]:
     """Folds researched suppliers into the universe-candidate store the
     filing path already writes to (a JsonState), so they inherit ticker
     resolution, the market-cap screen, the tradeable/anchor recommendation
@@ -313,6 +314,18 @@ def merge_into_candidates(candidates, suppliers: list[ResearchedSupplier]) -> tu
       TRADEABLE (auto_accept_min_seen_count), and it is meant to count
       independent FILING disclosures. Letting research inflate it would let
       a name be auto-added as a trade target on nothing but web sourcing.
+
+    `marker_key` names the field stamped to record WHICH pass produced this
+    entry, and the EDGAR full-text search must not stamp the web-research
+    one. engine.py's own comment on the two state files says a shared marker
+    would let whichever pass ran first permanently suppress the other -- and
+    that is exactly what happened here, one level down, because both passes
+    funnel through this function. research.researched_anchors() scans the
+    web-research marker to build the SKIP LIST for future selection, so every
+    anchor the free EDGAR pass happened to find a disclosure for was recorded
+    as web-researched and never selected again. Live: 35 of 160 anchors
+    credited without a single paid call ever being made for them, and the
+    displayed ratio past its own denominator at 172/160.
     """
     new = updated = 0
     now = datetime.now(timezone.utc).isoformat()
@@ -343,7 +356,15 @@ def merge_into_candidates(candidates, suppliers: list[ResearchedSupplier]) -> tu
         # candidate no filing has ever named is a lead, not a disclosure.
         entry["researched_only"] = not entry.get("pending_edges")
         entry["research_confidence"] = supplier.confidence
-        entry["last_researched_at"] = now
+        entry[marker_key] = now
+        # The anchor this pass actually RAN FOR, which `related_to` is not:
+        # that field is a shared accumulator (the filing extractor appends to
+        # it, ticker resolution unions two lists), so crediting all of it
+        # counted every co-occurring anchor as researched too.
+        if marker_key == "last_researched_at":
+            researched_for = set(entry.get("researched_for") or [])
+            researched_for.add(supplier.anchor)
+            entry["researched_for"] = sorted(researched_for)
         candidates.set(key, entry)
         new, updated = (new + 1, updated) if is_new else (new, updated + 1)
     return new, updated
@@ -392,8 +413,14 @@ def researched_anchors(candidates, research_state=None) -> set[str]:
     attempt itself, which is the thing that actually cost money."""
     seen: set[str] = set()
     for entry in candidates.data.values():
-        if entry.get("last_researched_at"):
-            seen.update(entry.get("related_to") or [])
+        # `researched_for`, never `related_to`. See merge_into_candidates:
+        # related_to accumulates every symbol that ever named this candidate,
+        # so scanning it credited each co-occurring anchor as researched.
+        # Entries written before this field existed contribute nothing and
+        # their anchors are re-queued, which is the correct outcome -- the
+        # attempt itself is what research_state records, and an anchor absent
+        # from both stores has no evidence of ever having been researched.
+        seen.update(entry.get("researched_for") or [])
     if research_state is not None:
         seen.update(research_state.data.keys())
     return seen

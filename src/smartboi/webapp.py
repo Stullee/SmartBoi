@@ -963,7 +963,11 @@ function renderGraphHealth(d){
     ["Supplier research", g.researched_anchors+" / "+g.anchors+" anchors done", ago(sa)],
     ["Extraction age", (g.median_extraction_age_days===null?"&mdash;":"median "+Math.round(g.median_extraction_age_days)+"d")+
        (g.stalest_days!==null&&g.stalest_days!==undefined?" &middot; stalest "+Math.round(g.stalest_days)+"d":""),
-       g.never_extracted?(g.never_extracted+" never"):"all read"]
+       // Three states: "all read" is the only one that means what it says.
+       // A symbol whose 10-K does not exist has a marker but no filing behind
+       // it, and used to render as read.
+       g.never_extracted?(g.never_extracted+" never")
+         :(g.no_filing_available?(g.no_filing_available+" no 10-K"):"all read")]
   ].map(function(r){
     return '<div class="gen"><div class="gen-name"><b>'+r[0]+'</b></div><div class="mono" style="text-align:right;color:var(--muted)">'+r[1]+
       '</div><div class="mono" style="text-align:right">'+r[2]+"</div></div>";
@@ -1842,7 +1846,15 @@ async def _status_payload(engine) -> dict:
             backfill_state=engine.backfill_state.data,
             last_refresh=engine.periodic_state.get("graph_refresh", "") or "",
             last_research=engine.periodic_state.get("supplier_research", "") or "",
-            researched_anchor_count=len(researched_anchors(engine.candidates, engine.research_state)),
+            # Intersected with the CURRENT anchors, because the skip list is
+            # deliberately wider than them: researched_anchors() must keep
+            # remembering pruned symbols so a re-added anchor is not re-billed
+            # (tools.run_supplier_research uses the same set for selection).
+            # Displaying it raw counted ex-anchors and non-anchors and put the
+            # ratio past its own denominator -- 172/160 on the live board.
+            researched_anchor_count=len(
+                researched_anchors(engine.candidates, engine.research_state)
+                & {c.symbol for c in engine.universe if c.signal_source_only}),
             refresh_per_day=(settings.graph_refresh_symbols_per_day
                              if settings.enable_graph_refresh else 0),
             audit=engine.audit_state.get("last"),

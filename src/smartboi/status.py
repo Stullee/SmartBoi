@@ -455,13 +455,33 @@ def gather_graph_health(
             with_thesis.append(symbol)
 
     # Symbol-level extraction age: when each symbol's filing was last read.
+    # Three states, not two. A marker is not proof a filing was READ: the
+    # backfill stamps one when the filer genuinely has no 10-K, and the badge
+    # rendered that as "all read" -- 24 live symbols on this deployment,
+    # including two tradeables, whose filings had never been fetched. They are
+    # counted separately and excluded from the ages, because an age measured
+    # off "the day we established there is nothing to read" is not an
+    # extraction age. A marker recording a failed LOOKUP is not settled at
+    # all (see engine._backfill_due) and counts as never-extracted.
     state = backfill_state or {}
     ages: list[float] = []
     never = 0
+    no_filing = 0
     for symbol in tradeables + anchors:
-        marker = state.get(symbol)
-        stamp = marker.get("backfilled_at", "") if isinstance(marker, dict) else ""
-        age = _days_since(stamp)
+        marker = state.get(symbol) if isinstance(state.get(symbol), dict) else None
+        if marker is not None and marker.get("error"):
+            never += 1
+            continue
+        # `accession` present and explicitly None is the backfill saying it
+        # looked and there is no filing. A marker with no `accession` KEY is
+        # simply an older format and was read -- conflating the two would
+        # reclassify every pre-existing marker as unread.
+        if marker is not None and marker.get("backfilled_at") and (
+                marker.get("reason") == "no_10k"
+                or ("accession" in marker and marker["accession"] is None)):
+            no_filing += 1
+            continue
+        age = _days_since(marker.get("backfilled_at", "") if marker else "")
         if age is None:
             never += 1
         else:
@@ -498,6 +518,8 @@ def gather_graph_health(
         "stalest_days": round(ages[-1], 1) if ages else None,
         "median_extraction_age_days": round(ages[len(ages) // 2], 1) if ages else None,
         "never_extracted": never,
+        # Has a marker, but the marker says there was no filing to read.
+        "no_filing_available": no_filing,
         "last_refresh": last_refresh,
         "last_refresh_days": _days_since(last_refresh),
         "last_research": last_research,
