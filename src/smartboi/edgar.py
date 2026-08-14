@@ -62,6 +62,16 @@ _LEGAL_SUFFIXES = frozenset({
     "ag", "sa", "nv", "se", "spa", "srl", "gmbh", "kk", "ab",
 })
 
+# US state (and DC) abbreviations, for SEC's state-of-incorporation marker --
+# see strip_state_of_incorporation.
+_STATE_OF_INCORPORATION = frozenset({
+    "ak", "al", "ar", "az", "ca", "co", "ct", "dc", "de", "del", "fl", "ga",
+    "hi", "ia", "id", "il", "in", "ks", "ky", "la", "ma", "md", "me", "mi",
+    "mn", "mo", "ms", "mt", "nc", "nd", "ne", "nh", "nj", "nm", "nv", "ny",
+    "oh", "ok", "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut", "va", "vt",
+    "wa", "wi", "wv", "wy",
+})
+
 # Form 4 transaction codes worth spelling out for the dossier engine -- the
 # raw code is kept alongside so nothing is lost for unmapped ones.
 _FORM4_TRANSACTION_CODES = {
@@ -231,6 +241,36 @@ def normalize_company_name(name: str) -> str:
         words.pop()
     while words and words[0] in _LEGAL_SUFFIXES:
         words.pop(0)
+    return " ".join(words)
+
+
+def strip_state_of_incorporation(normalized: str) -> str:
+    """An already-normalized SEC title with its state-of-incorporation marker
+    removed -- "danaher corp de" -> "danaher corp".
+
+    SEC's registered titles carry the state of incorporation as a trailing
+    "/DE/" ("DANAHER CORP /DE/", "DIODES INC /DEL/", "TRACTOR SUPPLY CO /DE/").
+    normalize_company_name drops the slashes, leaving a bare "de"/"del" token
+    that no filing's free-text name ever contains -- so the two sides can never
+    match, however correct the pair is. Live, that refused seven verified pairs
+    outright (BAC CLB DHR DIOD DVN IEX TSCO), all of which become EXACT matches
+    once the marker is gone.
+
+    Only stripped where it FOLLOWS a legal-form token, because that is the only
+    shape SEC emits. The guard matters: "in", "co", "de", "or", "ok", "hi" and
+    "me" are all real words as well as state codes, and an unconditional strip
+    would quietly truncate a company genuinely named for one.
+
+    Deliberately a separate function rather than a change to
+    normalize_company_name, which builds the name INDEX. Folding it in there
+    collapses "INDEPENDENT BANK CORP /MI/" and "INDEPENDENT BANK CORP" onto one
+    key -- measured against the live filer list, two such collisions (IBCP/INDB
+    and CIA/CIZN) -- and a collision DROPS a ticker from the index, which is the
+    wrong-ticker outcome this whole guard exists to prevent. Applied at
+    comparison time it can only ever ADD a match, never lose an entry."""
+    words = normalized.split()
+    if len(words) >= 2 and words[-1] in _STATE_OF_INCORPORATION and words[-2] in _LEGAL_SUFFIXES:
+        words.pop()
     return " ".join(words)
 
 
@@ -489,8 +529,17 @@ class EdgarClient:
             return None
         if normalized in name_map:
             return name_map[normalized]
+        # Exact-on-the-stripped-title before any prefix allowance: an exact
+        # match is the strongest evidence available, and taking it first stops
+        # a weaker prefix hit on an unrelated filer from winning the race
+        # through a dict whose order is arbitrary.
+        for title, ticker in name_map.items():
+            if strip_state_of_incorporation(title) == normalized:
+                return ticker
         for title, ticker in name_map.items():
             if boilerplate_only_prefix(title, normalized):
+                return ticker
+            if boilerplate_only_prefix(strip_state_of_incorporation(title), normalized):
                 return ticker
         return None
 
@@ -538,10 +587,17 @@ class EdgarClient:
         ticker = ticker.upper()
         registered = [title for title, mapped in name_map.items() if mapped == ticker]
         for title in registered:
-            if title == normalized:
-                return True
-            if boilerplate_only_prefix(title, normalized):
-                return True
+            # Each registered title is tried both as SEC wrote it and with the
+            # state-of-incorporation marker removed. The stripped form is only
+            # ever MORE permissive by exactly that marker, so this cannot admit
+            # a pair the boilerplate rule would otherwise refuse on identifying
+            # words -- "total" still fails against "total return securities
+            # fund", which has no marker to strip.
+            for candidate in {title, strip_state_of_incorporation(title)}:
+                if candidate == normalized:
+                    return True
+                if boilerplate_only_prefix(candidate, normalized):
+                    return True
         return False
 
     async def recent_filings(self, symbol: str, forms: set[str], since_date: str) -> list[FilingEvent]:
