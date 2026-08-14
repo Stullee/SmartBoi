@@ -88,7 +88,8 @@ def test_raw_document_url_strips_xsl_rendering_prefix():
 
 import json
 
-from smartboi.edgar import EdgarClient, normalize_company_name
+from smartboi.edgar import (EdgarClient, normalize_company_name,
+                            strip_state_of_incorporation)
 
 
 def test_normalize_company_name_strips_legal_suffixes():
@@ -558,3 +559,54 @@ async def test_a_404_is_never_retried(tmp_path, monkeypatch):
         await client._throttled_get("https://www.sec.gov/nope")
     assert len(attempts) == 1
     assert 404 not in _RETRYABLE_STATUS
+
+
+# --- SEC's state-of-incorporation marker must not refuse a verified pair ---
+# SEC writes the state of incorporation into the registered title as a
+# trailing "/DE/", which normalizes to a bare "de"/"del" token that no
+# filing's free-text name ever carries. Measured against the live filer list,
+# that alone refused seven correct pairs, and the 2026-08-11 name-match sweep
+# quarantined every one of them -- taking DHR, DIOD and TSCO out of the
+# universe and their edges with them. See edgar.strip_state_of_incorporation.
+
+@pytest.mark.parametrize("disclosed, registered", [
+    ("Danaher Corporation", "danaher corp de"),
+    ("Diodes Incorporated", "diodes inc del"),
+    ("Tractor Supply", "tractor supply co de"),
+    ("Bank of America", "bank of america corp de"),
+    ("Core Laboratories Inc.", "core laboratories inc de"),
+    ("Devon Energy Corporation", "devon energy corp de"),
+    ("IDEX Corporation", "idex corp de"),
+])
+async def test_name_matches_ticker_ignores_the_state_of_incorporation(disclosed, registered):
+    client = _StubbedNameMap({registered: "XXXX"})
+    assert await client.name_matches_ticker(disclosed, "XXXX") is True
+
+
+async def test_state_marker_allowance_does_not_loosen_the_identifying_remainder():
+    """The allowance is worth exactly one boilerplate token and nothing more.
+
+    Both of these were quarantined by the same sweep and both are GENUINELY
+    wrong -- "Total S.A." is the French oil company and the registered title is
+    a closed-end fund; Siemens AG and Siemens Energy are different issuers.
+    Neither title carries a state marker, so neither is rescued."""
+    client = _StubbedNameMap({"total return securities fund": "SWZ"})
+    assert await client.name_matches_ticker("Total S.A.", "SWZ") is False
+    client = _StubbedNameMap({"siemens energy ag adr": "SMERY"})
+    assert await client.name_matches_ticker("Siemens", "SMERY") is False
+    # "Dell Inc." vs "Dell Technologies" is the same shape: "technologies" is
+    # an identifying word, not boilerplate, so this stays a human decision.
+    client = _StubbedNameMap({"dell technologies": "DELL"})
+    assert await client.name_matches_ticker("Dell Inc.", "DELL") is False
+
+
+def test_strip_state_of_incorporation_requires_a_legal_form_token():
+    """"in", "co", "or" and "me" are real words as well as state codes, so the
+    marker is only stripped where SEC actually puts it -- behind the legal
+    form."""
+    assert strip_state_of_incorporation("danaher corp de") == "danaher corp"
+    assert strip_state_of_incorporation("diodes inc del") == "diodes inc"
+    # No legal-form token in front: left alone.
+    assert strip_state_of_incorporation("shipping co of maine me") == "shipping co of maine me"
+    assert strip_state_of_incorporation("danaher") == "danaher"
+    assert strip_state_of_incorporation("") == ""
