@@ -634,6 +634,50 @@ class Settings(BaseSettings):
     # bounds is polling cost, and the daily LLM budget runs under 2% used.
     auto_accept_max_per_day: int = 20
 
+    # --- Connector growth: admitting tradeables that revive an inert anchor ---
+    # The universe grows anchors well and tradeables barely at all, and the
+    # asymmetry is structural rather than accidental. Discovery is filing
+    # extraction, and filing extraction runs UPWARD: a small company discloses
+    # its big customers because customer concentration is a material risk, so
+    # what a tradeable's 10-K yields is more ANCHORS. Nothing runs the other
+    # way. Measured on the live board: 59 of 160 anchors carried no edge to any
+    # tradeable, and only 4 of 87 tradeable-screened candidates touched one of
+    # them.
+    #
+    # reconcile_universe_connectivity already grows the anchor side, admitting
+    # a candidate when it would land connected to a current tradeable. This is
+    # the mirror: admit a candidate when it would land connected to a current
+    # INERT ANCHOR, which is the only move that shrinks that 59.
+    #
+    # Safe to leave on because admission is to PROBATION, not to the book (see
+    # CompanySpec.probationary): a connector-admitted symbol is polled and
+    # analysed but cannot open a position until its own 10-K discloses the
+    # relationship that got it admitted.
+    enable_connector_growth: bool = True
+    # Admissions per UTC day. Deliberately far below auto_accept_max_per_day:
+    # each one starts a probation that costs polling and dossier work for
+    # connector_probation_days before it resolves, so the steady-state load is
+    # this number times that window, not this number.
+    connector_max_per_day: int = 3
+    # Probations open at once, across the whole universe. The real bound on
+    # cost, and the reason a bad research run cannot quietly double the book's
+    # analysis load.
+    connector_max_probationary: int = 12
+    # How long a probationary symbol has to produce a filing-disclosed edge to
+    # the anchor it was admitted for. The relationship backfill reads a
+    # symbol's most recent 10-K within a day or two of admission, so this is
+    # not a race -- it is long enough to survive a stalled backfill, an EDGAR
+    # outage or a deferred daily budget, and short enough that a lead which was
+    # simply wrong does not linger a quarter.
+    connector_probation_days: int = 30
+    # Relationship kinds that justify an admission. customer/supplier is the
+    # supply-chain link this strategy trades; competitor is not one (two rivals
+    # do not move on each other's contract wins the way a supplier does), and
+    # regulator is not a company relationship at all. Live, dropping the other
+    # two is what excludes an investment bank admitted as a "placement agent"
+    # and a pair sharing only a board member.
+    connector_rel_types: tuple[str, ...] = ("customer", "supplier")
+
     log_level: str = "INFO"
     log_dir: str = "logs"
     # --- LLM tracing (logs/llm_trace.jsonl) ---

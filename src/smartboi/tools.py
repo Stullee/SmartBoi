@@ -612,6 +612,8 @@ _DIAGNOSTIC_SETTINGS = (
     "universe_max_analyst_count", "universe_screen_interval_days",
     "enable_auto_accept_candidates", "auto_accept_anchors", "auto_accept_tradeables",
     "auto_accept_min_seen_count", "auto_accept_max_per_day",
+    "enable_connector_growth", "connector_max_per_day", "connector_max_probationary",
+    "connector_probation_days", "connector_rel_types",
     "enable_relationship_backfill", "backfill_anchors",
     "enable_graph_refresh", "graph_refresh_symbols_per_day", "enable_auto_supplier_research",
     "enable_auto_edgar_search", "edgar_search_anchors_per_run",
@@ -1372,6 +1374,22 @@ def run_diagnostics(engine) -> str:
             add("        not going to reach them.")
     add(f"  anchors linked to a tradeable: {gh['anchors_live']}/{gh['anchors']} "
         f"({gh['anchors_inert']} inert -- their news reaches nothing)")
+    # The inert count above is the connector arm's backlog, so its progress
+    # belongs next to it rather than in a section of its own -- an open
+    # probation is one of those anchors currently being worked on.
+    probation = getattr(engine, "probation_state", None)
+    probation = probation.data if probation is not None else {}
+    if probation:
+        add(f"  connector probations open: {len(probation)}/"
+            f"{s.connector_max_probationary} (admitted to revive an inert anchor; "
+            f"polled and analysed, but CANNOT open a position until a filing confirms)")
+        for symbol, record in sorted(probation.items()):
+            anchors = ", ".join(record.get("anchors") or []) or "?"
+            add(f"    {symbol:<6} -> {anchors:<18} admitted {_ago(record.get('admitted_at'), now)} ago, "
+                f"{record.get('source', '?')}-sourced")
+    elif s.enable_connector_growth:
+        add("  connector probations open: none -- either every inert anchor's candidates are "
+            "exhausted, or the daily cap is spent.")
     stalest = gh["stalest_days"]
     add(f"  extraction age: median {gh['median_extraction_age_days']}d, stalest "
         f"{'-' if stalest is None else f'{stalest:.0f}d'}, never extracted {gh['never_extracted']}"

@@ -138,6 +138,22 @@ class CompanySpec:
     ecosystem: str
     signal_source_only: bool = False
     notes: str = ""
+    # A third state between anchor and tradeable, and the reason the connector
+    # arm can run unattended (see engine._grow_connectors).
+    #
+    # The arm admits a small-cap because it would connect an INERT anchor --
+    # an anchor whose news currently reaches nothing. That lead is usually
+    # web-sourced, and a web-sourced relationship must never fire a trade
+    # (research.py's docstring is the long form of why). So the symbol is
+    # admitted, polled and given a dossier -- all cheap, all reversible -- but
+    # _is_tradeable returns False for it, so it cannot open a position.
+    #
+    # It leaves probation in one of two directions, automatically: its own
+    # 10-K discloses the anchor relationship and it is promoted to a full
+    # tradeable, or the disclosure never arrives and it is dropped again. The
+    # graph edge is the referee, which is the same standard every other edge
+    # in this system is held to.
+    probationary: bool = False
 
 
 DEFAULT_UNIVERSE: list[CompanySpec] = [

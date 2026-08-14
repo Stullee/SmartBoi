@@ -479,6 +479,18 @@ class Engine:
         # SEC's ticker map and a name check per accepted symbol -- cheap on a
         # daily cadence, wasteful on every 30-second dashboard poll.
         self.audit_state = JsonState(DATA_DIR / "graph_audit.json")
+        # Open probations: symbol -> {admitted_at, anchors, source}. Loaded
+        # BEFORE _apply_accepted_candidates, which rebuilds runtime acceptances
+        # into the live universe and needs this to know which of them come back
+        # probationary. Without it a restart would silently promote every open
+        # probation into a full trade target -- the one thing this whole
+        # mechanism exists to prevent, delivered through the restart door.
+        self.probation_state = JsonState(DATA_DIR / "probation_state.json")
+        # {date, count} for the connector arm's daily admission cap, persisted
+        # for the same reason auto-accept's is: this deployment restarts
+        # several times a day, and an in-memory counter would let each restart
+        # hand out a fresh day's worth of admissions.
+        self.connector_state = JsonState(DATA_DIR / "connector_state.json")
         # Per-accession "relationship extraction already ran" markers for the
         # POLL path. Extraction (a paid ~150k-char call) runs before dossier
         # scoring in _process_filing, and the filing's dedup fingerprint is
@@ -690,7 +702,8 @@ class Engine:
             as_type, source, ecosystem = self._accepted_entry(value)
             self.universe.append(
                 CompanySpec(symbol, symbol, ecosystem, signal_source_only=(as_type == "anchor"),
-                            notes=f"Accepted ({source}) from a discovered universe candidate")
+                            notes=f"Accepted ({source}) from a discovered universe candidate",
+                            probationary=symbol in self.probation_state.data)
             )
             known.add(symbol)
 
@@ -727,6 +740,7 @@ class Engine:
                     updated = CompanySpec(
                         spec.symbol, spec.name, guessed,
                         signal_source_only=spec.signal_source_only, notes=spec.notes,
+                        probationary=spec.probationary,
                     )
                     self.universe = [updated if c.symbol == symbol else c for c in self.universe]
                     self.spec_by_symbol[symbol] = updated
@@ -742,7 +756,8 @@ class Engine:
             )
         return repaired
 
-    def accept_candidate(self, symbol: str, as_type: str, source: str = "manual") -> CompanySpec:
+    def accept_candidate(self, symbol: str, as_type: str, source: str = "manual",
+                         probationary: bool = False) -> CompanySpec:
         """Adds a discovered universe candidate (see
         _record_universe_candidate) into the LIVE universe, no restart
         required: EDGAR/news polling picks it up on their next due tick
@@ -804,7 +819,8 @@ class Engine:
         if ecosystem in ("?", ""):
             ecosystem = "accepted"
         spec = CompanySpec(symbol, symbol, ecosystem, signal_source_only=(as_type == "anchor"),
-                            notes=f"Accepted ({source}) from a discovered universe candidate")
+                            notes=f"Accepted ({source}) from a discovered universe candidate",
+                            probationary=probationary)
         self.universe.append(spec)
         self.spec_by_symbol[symbol] = spec
         # Stored as a dict (not a bare type string) once a source is
@@ -1431,6 +1447,15 @@ class Engine:
             # daily auto-accept budget is spent.
             self._reconcile_accepted_types()
             await self._auto_accept_candidates()
+            # Connector growth runs LAST of the three, and its review runs
+            # before its admissions. Last because the two above can change
+            # which anchors are inert -- an auto-accept that lands connected
+            # revives one, and admitting a probationer for an anchor that was
+            # just revived is wasted work. Review-before-admit so a promotion
+            # or a reversion frees its probation slot in the same pass rather
+            # than a tick later.
+            await self._review_probation()
+            await self._grow_connectors()
         # Graph maintenance. Both are marked done unconditionally: they are
         # daily passes whose failure mode is "nothing happened today", and
         # retrying an expensive extraction/web-search pass every 30-second
@@ -2436,6 +2461,243 @@ class Engine:
                 f"{entry.get('recommendation_reason', '')}. Remove it from accepted_candidates.json to undo.",
                 {"symbol": spec.symbol, "as": recommendation, "reason": entry.get("recommendation_reason", "")},
             )
+
+    # --- Connector growth: tradeables that revive an inert anchor ---
+
+    def _anchor_adjacency(self) -> dict[str, set[str]]:
+        """symbol -> every symbol it shares a graph edge with, both directions.
+        Undirected on purpose: linked_symbols reads edges both ways too, so a
+        one-way edge still makes both ends reachable."""
+        adj: dict[str, set[str]] = {}
+        for rel in self.graph.relationships:
+            adj.setdefault(rel.from_symbol, set()).add(rel.to_symbol)
+            adj.setdefault(rel.to_symbol, set()).add(rel.from_symbol)
+        return adj
+
+    def inert_anchors(self) -> set[str]:
+        """Anchors with no edge to any FULL tradeable -- the standing want-list
+        this arm works from.
+
+        Probationary symbols are excluded from the tradeable side deliberately.
+        Counting them would let an anchor look revived the instant a probation
+        opened against it, which would retire it from the want-list and then
+        leave it inert again when that probation reverted -- and, worse, would
+        stop a second candidate being admitted for it in the meantime. An
+        anchor is revived when a CONFIRMED tradeable links to it, not when one
+        is being tried."""
+        tradeables = {c.symbol for c in self.universe
+                      if not c.signal_source_only and not c.probationary}
+        adj = self._anchor_adjacency()
+        return {c.symbol for c in self.universe
+                if c.signal_source_only and not (adj.get(c.symbol, set()) & tradeables)}
+
+    def _connector_targets(self, entry: dict, inert: set[str]) -> list[str]:
+        """The inert anchors this candidate would revive, from the disclosures
+        that discovered it -- [] when it would revive none.
+
+        Reads `related_to` (every symbol whose filing or research named it)
+        intersected with the CURRENT inert set, then keeps only the anchors
+        whose relationship is a supply-chain kind. Both halves matter: the
+        first is what makes this arm grow the scarce side of the universe
+        rather than adding another disconnected name, and the second is what
+        keeps it from admitting on a relationship that does not transmit. Live,
+        the rel_type filter is the difference between admitting a component
+        maker and admitting an investment bank that once acted as a placement
+        agent."""
+        related = set(entry.get("related_to") or []) & inert
+        if not related:
+            return []
+        allowed = set(self.settings.connector_rel_types)
+        # pending_edges carry the per-anchor rel_type; rel_types is the flat
+        # union across every disclosure and is the only thing a research-only
+        # candidate has. Prefer the precise one, fall back to the union.
+        pending = entry.get("pending_edges") or []
+        if pending:
+            precise = {p.get("from_symbol") for p in pending
+                       if p.get("rel_type") in allowed} | {
+                       p.get("to_symbol") for p in pending
+                       if p.get("rel_type") in allowed}
+            return sorted(related & precise)
+        if not (set(entry.get("rel_types") or []) & allowed):
+            return []
+        return sorted(related)
+
+    async def _grow_connectors(self) -> None:
+        """Admits, on probation, tradeable-screened candidates that would
+        connect an inert anchor.
+
+        This is the mirror of reconcile_universe_connectivity's GROW arm. That
+        one admits a candidate that lands connected to a current TRADEABLE,
+        which grows the anchor side; nothing grew the tradeable side, so the
+        inert-anchor count could only ever fall by deleting anchors. Measured
+        before this existed: 59 of 160 anchors inert, and the only mechanism
+        that could have fixed it (_tradeable_links) refuses anchor-only
+        disclosure by design, because admitting on that basis is what produced
+        a 322-anchor universe with 221 inert members in the first place.
+
+        Every guard the anchor arm applies is applied here too -- resolved
+        ticker, not already a member, not quarantined, common equity, and a
+        live SEC name check -- because the failure they exist to stop is the
+        same one and it is worse on this side. Live, the name check alone is
+        what stops "xAI" being admitted as XFLT (a closed-end fund) and a Thai
+        refiner being admitted as Star Group.
+
+        Two things it does NOT do. It does not lower the screen: a candidate
+        must already carry recommended_as == "tradeable" from the live
+        market-cap/analyst screen, so this cannot smuggle in a mega-cap. And it
+        does not grant trading rights -- admission is to PROBATION, and the
+        promotion to a real trade target is earned from the symbol's own 10-K
+        (see _review_probation). That is what makes running this unattended
+        defensible: the arm acts on a web-grade lead, and a filing still
+        decides."""
+        if not self.settings.enable_connector_growth or self.edgar_client is None:
+            return
+        today = datetime.now(timezone.utc).date().isoformat()
+        if self.connector_state.get("date") != today:
+            self.connector_state.set("date", today)
+            self.connector_state.set("count", 0)
+        admitted_today = self.connector_state.get("count", 0)
+        if admitted_today >= self.settings.connector_max_per_day:
+            return
+        open_probations = len(self.probation_state.data)
+        if open_probations >= self.settings.connector_max_probationary:
+            self._warn_once(
+                "connector-probation-full",
+                f"Connector growth paused: {open_probations} probation(s) open, at the "
+                f"connector_max_probationary ceiling. They resolve on their own within "
+                f"{self.settings.connector_probation_days}d; raise the ceiling to admit faster.",
+            )
+            return
+
+        inert = self.inert_anchors()
+        if not inert:
+            return
+        known = set(self.symbol_list)
+        for entry in list(self.candidates.data.values()):
+            if admitted_today >= self.settings.connector_max_per_day:
+                break
+            if open_probations >= self.settings.connector_max_probationary:
+                break
+            ticker = (entry.get("ticker") or "").upper()
+            if not ticker or ticker in known or ticker in self.accepted_candidates.data:
+                continue
+            if ticker in self.quarantine.data:
+                continue
+            if entry.get("recommended_as") != "tradeable":
+                continue
+            if not is_common_equity(ticker):
+                continue
+            targets = self._connector_targets(entry, inert)
+            if not targets:
+                continue
+            if not await self.edgar_client.name_matches_ticker(entry.get("name") or "", ticker):
+                log.info("[CONNECTOR] %s skipped -- name %r does not verify against SEC's filer "
+                         "list.", ticker, entry.get("name"))
+                continue
+            spec = self.accept_candidate(ticker, "tradeable", source="connector",
+                                         probationary=True)
+            self.probation_state.set(ticker, {
+                "admitted_at": datetime.now(timezone.utc).isoformat(),
+                "anchors": targets,
+                "source": "research" if entry.get("researched_only") else "filing",
+            })
+            admitted_today += 1
+            open_probations += 1
+            self.connector_state.set("count", admitted_today)
+            log.info(
+                "[CONNECTOR] %s admitted ON PROBATION to reconnect inert anchor(s) %s. It is polled "
+                "and analysed but CANNOT open a position until its own 10-K discloses the "
+                "relationship; unconfirmed after %dd it is dropped again.",
+                spec.symbol, ", ".join(targets), self.settings.connector_probation_days,
+            )
+            await self.alerts.send(
+                "connector_admitted",
+                f"{spec.symbol} admitted on probation to reconnect {', '.join(targets)}",
+                f"{entry.get('name')} would give {', '.join(targets)} its first edge to a trade "
+                f"target. It cannot trade until a filing confirms the relationship. Delete its "
+                f"probation_state.json entry and its accepted_candidates.json row to undo.",
+                {"symbol": spec.symbol, "anchors": targets},
+            )
+
+    async def _review_probation(self) -> None:
+        """Closes every open probation that has earned promotion or run out of
+        time. Runs BEFORE _grow_connectors so a resolution frees its slot in
+        the same pass.
+
+        The referee is the graph, not the clock: promotion needs an actual edge
+        between the probationary symbol and one of the anchors it was admitted
+        for. Since a web-sourced lead never writes an edge (research.py refuses
+        to, on purpose), the only thing that can produce one is the symbol's
+        own filing being extracted by the relationship backfill -- which is
+        exactly the confirmation standard wanted, arrived at without needing a
+        separate verification pass.
+
+        A reversion is not a punishment and does not blacklist the name: it
+        drops the symbol back to being an ordinary candidate, and records why
+        so the arm does not immediately re-admit the same unconfirmed lead on
+        the next tick."""
+        if not self.probation_state.data:
+            return
+        adj = self._anchor_adjacency()
+        now = datetime.now(timezone.utc)
+        for symbol, record in list(self.probation_state.data.items()):
+            anchors = record.get("anchors") or []
+            confirmed = sorted(set(adj.get(symbol, set())) & set(anchors))
+            if confirmed:
+                self.probation_state.delete(symbol)
+                self._set_probationary(symbol, False)
+                log.info(
+                    "[CONNECTOR] %s promoted to a full trade target -- its filing discloses the "
+                    "relationship to %s, which is now a live edge. %s is no longer inert.",
+                    symbol, ", ".join(confirmed), ", ".join(confirmed),
+                )
+                await self.alerts.send(
+                    "connector_promoted",
+                    f"{symbol} confirmed by filing -- now tradeable",
+                    f"A 10-K disclosed the relationship to {', '.join(confirmed)}, so {symbol} "
+                    f"leaves probation and may open positions.",
+                    {"symbol": symbol, "anchors": confirmed},
+                )
+                continue
+            try:
+                admitted = datetime.fromisoformat(record.get("admitted_at", ""))
+            except ValueError:
+                # An unparseable stamp must not make a probation immortal:
+                # treat it as due now and let the age check resolve it.
+                admitted = now - timedelta(days=self.settings.connector_probation_days + 1)
+            if (now - admitted).days < self.settings.connector_probation_days:
+                continue
+            self.probation_state.delete(symbol)
+            self._drop_symbol(symbol)
+            entry = dict(self.candidates.get(symbol) or {})
+            if entry:
+                entry["connector_unconfirmed_at"] = now.isoformat()
+                self.candidates.set(symbol, entry)
+            log.info(
+                "[CONNECTOR] %s dropped -- %dd on probation and no filing ever disclosed the "
+                "relationship to %s, so the lead is unconfirmed. It stays a candidate and can be "
+                "accepted by hand.", symbol, self.settings.connector_probation_days,
+                ", ".join(anchors),
+            )
+
+    def _set_probationary(self, symbol: str, value: bool) -> None:
+        spec = self.spec_by_symbol.get(symbol)
+        if spec is None or spec.probationary == value:
+            return
+        updated = CompanySpec(spec.symbol, spec.name, spec.ecosystem,
+                              signal_source_only=spec.signal_source_only, notes=spec.notes,
+                              probationary=value)
+        self.universe = [updated if c.symbol == symbol else c for c in self.universe]
+        self.spec_by_symbol[symbol] = updated
+
+    def _drop_symbol(self, symbol: str) -> None:
+        """Removes a runtime-accepted symbol from the live universe. Only ever
+        called for a connector admission, which by construction is never a
+        curated DEFAULT_UNIVERSE name -- those are skipped by the `ticker in
+        known` check at admission time."""
+        self.universe = [c for c in self.universe if c.symbol != symbol]
+        self.spec_by_symbol.pop(symbol, None)
+        self.accepted_candidates.delete(symbol)
 
     # --- One-time relationship backfill ---
 
@@ -3772,8 +4034,17 @@ class Engine:
         )
 
     def _is_tradeable(self, symbol: str) -> bool:
+        """Whether `symbol` may open a position.
+
+        The probationary check is deliberately HERE rather than at each call
+        site. This is the single chokepoint every entry path already runs
+        through, so one condition covers all of them -- and a future entry path
+        that forgets about probation inherits the guard instead of bypassing
+        it. A probationary symbol is a real universe member in every other
+        respect: polled, analysed, propagated to. It just cannot be traded on
+        the strength of the web-sourced lead that admitted it."""
         spec = self.spec_by_symbol.get(symbol)
-        return spec is not None and not spec.signal_source_only
+        return spec is not None and not spec.signal_source_only and not spec.probationary
 
     async def _mark_and_execute(self) -> None:
         pending = False
