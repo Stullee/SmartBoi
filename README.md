@@ -479,6 +479,59 @@ The audit half is read-only, so it also runs **daily** on its own and surfaces
 in the dashboard's Graph health panel with an alert on anything actionable. The
 destructive half stays behind the button.
 
+### Connector growth: the arm that points the other way
+
+Every growth mechanism above adds **anchors**, and that is not a bias anyone
+chose — it falls out of where relationships come from. Discovery is filing
+extraction, and filing extraction runs *upward*: a small company must disclose
+its big customers, because customer concentration is a material risk. So what a
+tradeable's 10-K yields is more large names. Nothing ran the other way, and the
+board showed it: **59 of 160 anchors carried no edge to any trade target**,
+which makes them inert — their news resolves to zero analysis targets and is
+discarded unread. Only 4 of 87 tradeable-screened candidates touched one of
+them, and three of those four were misresolutions.
+
+Neither existing arm can fix that. The connectivity reconcile's *grow* half
+admits a candidate only when it lands connected to a current **tradeable** —
+and it is right to, because admitting on anchor-only disclosure is precisely
+what grew a 322-anchor universe with 221 inert members. Its *prune* half cannot
+help either: 30 of the 59 are curated `universe.py` seeds it is forbidden to
+touch.
+
+**Connector growth** is the mirror: admit a candidate because it would connect
+an **inert anchor**. It applies every guard the anchor arm does — resolved
+ticker, not already a member, not quarantined, common equity, and a live check
+that the disclosed name verifies against SEC's filer list — plus two of its
+own. It will not lower the screen (a candidate must already carry a
+`tradeable` recommendation from the live market-cap/analyst check, so a
+mega-cap cannot slip in), and it only acts on `customer`/`supplier`
+relationships, because two rivals do not move on each other's contract wins the
+way a supplier does.
+
+**Admission grants membership, not trading rights.** The lead is usually
+web-sourced, and a web-sourced relationship must never fire a trade. So the
+symbol arrives **on probation**: polled, analysed and propagated to, but
+`_is_tradeable` returns false for it. It leaves probation on its own, in one of
+two directions — its own 10-K discloses the relationship and it is promoted to
+a real trade target, or nothing discloses it within
+`CONNECTOR_PROBATION_DAYS` (30) and it is dropped back to being an ordinary
+candidate. The graph edge is the referee, which is the standard every other
+edge here is held to, and it arrives through the relationship backfill that
+already runs.
+
+That the arm admits some bad leads is the design working rather than a gap in
+it. A dry run against the live board admits Oppenheimer for `ONDS` on a
+*placement-agent* relationship — correctly resolved ticker, real disclosure,
+useless link. It cannot trade, no filing will ever confirm it, and it reverts
+in a month having cost some polling. **A wrong admission costs thirty days of
+cheap work; a wrong trade does not come back.** The asymmetry is the point.
+
+Bounded by `CONNECTOR_MAX_PER_DAY` (3) and `CONNECTOR_MAX_PROBATIONARY` (12),
+both persisted so a restart cannot hand out a fresh day's worth. Open
+probations are reported in diagnostics directly beneath the inert-anchor count
+they are working down. Set `ENABLE_CONNECTOR_GROWTH=false` to switch the arm
+off entirely.
+
 ## Entry timing: are we too late?
 
 A signal firing (evidence crossed the confidence/magnitude/corroboration

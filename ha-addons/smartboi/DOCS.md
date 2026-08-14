@@ -110,6 +110,17 @@ discovered and surfaced as a candidate, never an arbitrary ticker, and
 widening the universe can't place an order or directly create a trade --
 a dossier/signal still has to form independently for the new symbol.
 
+The add-on also grows the universe by itself, toward the large "anchor"
+companies whose news currently reaches none of the small names it can
+trade. A symbol added that way arrives **on probation**: it is polled and
+analysed like any other, but it cannot open a position until its own SEC
+filing confirms the relationship it was added for. It is promoted
+automatically when that filing arrives, and dropped again if none does
+within 30 days -- so a symbol appearing and later disappearing on its own
+is the mechanism working, not a fault. Open probations are listed in the
+diagnostics bundle under Graph health. Set `enable_connector_growth` to
+`false` to turn it off.
+
 ## Where things are stored
 
 Everything (logs, the relationship graph, dossiers, dedup index) is
