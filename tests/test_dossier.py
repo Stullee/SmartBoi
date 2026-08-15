@@ -1004,6 +1004,38 @@ def test_a_label_can_never_split_what_the_channel_already_merged():
     assert d.independent_source_count == 1
 
 
+def test_the_guard_never_raises_a_slot_count_above_the_channel_key():
+    """The guard's safety property, asserted directly rather than inferred
+    from the two cases above: whatever the labels say, the slot count can only
+    ever be at or below what the channel key alone would have produced. This
+    is what makes the change unable to start a dossier signalling -- it is
+    monotone in one direction, over any mix of labelled and unlabelled
+    evidence, including the decayed states the contributing set passes through."""
+    from smartboi.dossier import (
+        _ECOSYSTEM_SLOT_KEY, _keys_of, channel_key, is_ecosystem_association,
+    )
+    mixes = [
+        [_from_anchor("F", "Yahoo", "ford china exit", evidence_id="a"),
+         _from_anchor("F", "Yahoo", "ford us production up", evidence_id="b"),
+         _from_anchor("GM", "Yahoo", "gm battery jv exit", evidence_id="c")],
+        [_from_anchor("MSFT", "Yahoo", "ai capex", evidence_id="d"),
+         _from_anchor("META", "Benzinga", "ai capex", evidence_id="e")],
+        [_from_anchor("RTX", "Yahoo", "", evidence_id="f"),
+         _from_anchor("LMT", "Benzinga", "lmt award", evidence_id="g"),
+         _evidence(source_name="CNBC", evidence_id="h")],
+    ]
+    for records in mixes:
+        # Every prefix, which is what the contributing set looks like as items
+        # decay out from the front.
+        for cut in range(1, len(records) + 1):
+            subset = records[:cut]
+            baseline = {
+                _ECOSYSTEM_SLOT_KEY if is_ecosystem_association(e) else channel_key(e)
+                for e in subset
+            }
+            assert len(_keys_of(subset)) <= len(baseline)
+
+
 def test_the_guard_still_lets_a_label_merge_across_channels():
     """The guard takes the SMALLER partition, so the merge the fact key was
     built for is untouched: three origins, three channels, one label -> one

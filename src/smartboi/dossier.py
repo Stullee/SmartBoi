@@ -663,6 +663,37 @@ COMPETITOR_SATISFIES_DISCLOSED_LINK = False
 #     delisting forms, so filing evidence now reaches foreign private issuers
 #     that could previously never produce a single filing item.
 #
+# 10: the fact key may MERGE but no longer SPLIT (see _keys_of). 9 made the
+# mechanism live; this is the first measurement of what it actually did, and
+# it ran backwards. The key was introduced to collapse one event restated
+# across many outlets into a single slot. On the first labelled cohort -- 108
+# items, everything merged after the 2026-08-13 cutover -- it produced 92
+# independence slots against the channel key's 64: a +43.8% SPLIT, with 13
+# dossiers splitting, 18 holding and NOT ONE collapsing. 9's own prediction
+# (23 fall / 5 hold / 1 rise) is inverted, and the canonical BWEN case the
+# mechanism was built for goes from 1 slot to 3.
+#
+# The failure is that a model writes two labels for one event. One Ford
+# announcement arrived as "ford phases out china lincoln imports" and "ford
+# increases lincoln us production 2030" -- two slots where F|Yahoo minted one.
+# Normalisation cannot catch this: the strings are genuinely different, and
+# the updater being shown existing labels is a prompt-level defence with no
+# floor under it. The corroboration bonus is convex in the slot count
+# (_corroboration_doublings), so every such split inflates a score.
+#
+# _keys_of now takes whichever of the two partitions has FEWER slots. The
+# upside is untouched -- a genuine cross-channel merge still counts once --
+# while the failure mode becomes unreachable. It can only ever LOWER a slot
+# count relative to 9, never raise one, so nothing starts signalling because
+# of this. Some dossiers will stop: independent_source_count is also the hard
+# gate (min_independent_sources), which is the intended direction and the
+# reason rows must split here rather than pool with 9.
+#
+# Carries 9's FORWARD-ONLY caveat unchanged, and one of its own: the guard
+# compares partition CARDINALITY, not refinement, and it runs over the
+# contributing set, which shrinks as evidence decays. The winning partition
+# can therefore change between passes on the same dossier.
+#
 # 9: what 8 SAID it did, actually happening. The fact key never survived the
 # engine's proposal validator -- engine._validated_proposal is a whitelist and
 # did not name the field -- so every item merged under 8 carried fact_key="",
@@ -733,7 +764,7 @@ COMPETITOR_SATISFIES_DISCLOSED_LINK = False
 # same evidence. Routing those to the trim alone would have changed nothing --
 # none of the 23 clears the bar on its trimmed score either -- which is what
 # says the gap, not the routing, was the defect.
-SCORING_VERSION = 9
+SCORING_VERSION = 10
 
 # How long a persisted synthesis verdict is honoured -- as a cap on the merge
 # path (engine._cap_with_synthesis) and as the corroboration ceiling in
