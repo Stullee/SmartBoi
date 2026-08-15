@@ -261,21 +261,43 @@ _INDEX_HTML = """<!doctype html>
   .bcat .bmeter > span { position:absolute; inset:0 auto 0 0; border-radius:3px; }
 
   /* live wire */
-  .wire { grid-template-columns:1fr 320px; align-items:stretch; }
-  @media (max-width:860px){ .wire{ grid-template-columns:1fr; } }
+  /* ONE COLUMN, canvas first, feed underneath. The canvas used to share the
+     row with a fixed 320px feed, which cost it ~30% of the page width for a
+     panel whose content is a vertical list -- and the list reads no better in
+     a narrow column than in a wide one. The canvas is the opposite: it is the
+     only thing on the page that renders the mechanism the whole strategy runs
+     on, and it is bounded by AREA. Every node the trim drops is an edge that
+     becomes invisible everywhere.
+     Full width plus a taller canvas is ~60% more area, which is what pays for
+     the raised WIRE_MAX_NODES (see focusGraph). */
+  .wire { grid-template-columns:1fr; align-items:stretch; }
   /* Below this the canvas is ~348x195: 4.5px nodes and 3.8px labels, under a
      legend that renders at full CSS size -- the caption is legible and the
      thing it captions is not. The feed carries the panel instead; it holds
      the same signals, in the same order, with the thesis text readable. */
   @media (max-width:620px){ .wire .stagewrap{ display:none; } }
   .stagewrap { position:relative; overflow:hidden; }
+  /* Height is set inline by resizeWire (it derives from the panel's width and
+     the VIRTUAL canvas aspect), so this is only the pre-script placeholder --
+     a CSS height or aspect-ratio here would be overwritten on first paint. */
   canvas#wireCanvas { display:block; width:100%; height:460px; }
   .tip { position:fixed; pointer-events:none; background:var(--ink); color:var(--ground); font-size:0.74rem;
          border-radius:8px; padding:0.45rem 0.6rem; opacity:0; transition:opacity 0.1s; max-width:250px; z-index:40;
          box-shadow:0 8px 26px -8px rgba(0,0,0,0.55); line-height:1.4; }
   .tip .h { font-weight:700; margin-bottom:0.1rem; }
   .tip .d { opacity:0.9; }
+  /* Under the canvas rather than beside it, so the list runs ACROSS instead of
+     down: at full width a 320px column of signal cards was a tall scroller
+     showing four of fifteen. Auto-fill keeps it one column on a phone without
+     a second breakpoint. */
   .feed { display:flex; flex-direction:column; overflow:hidden; }
+  /* flex:0 1 auto, overriding the base rule. That rule's flex-basis:0 exists so
+     the list contributes NOTHING to its panel's natural height -- correct when
+     the feed sat in a row beside the canvas and stretched to match it, and a
+     collapse to zero now that it is stacked underneath with no sibling setting
+     the row height. */
+  .wire .feed-list { display:grid; grid-template-columns:repeat(auto-fill, minmax(290px, 1fr));
+                     gap:4px; align-content:start; flex:0 1 auto; max-height:440px; }
   .feed-h { padding:12px 15px 10px; border-bottom:1px solid var(--line-soft); display:flex; align-items:center; gap:8px; }
   .feed-h .t { font-size:12px; font-weight:600; }
   .feed-h .dotlive { width:7px; height:7px; border-radius:50%; background:var(--pos); animation:pulse 2s infinite; }
@@ -1544,7 +1566,23 @@ function resizeWire(){ if(!cv) return;
   // dragged to a different-density display keeps its old backing store and
   // renders soft until something else forces a resize.
   var d=Math.max(1,Math.min(2,window.devicePixelRatio||1));
-  var w=cv.parentNode.clientWidth, h=Math.round(w*VH/VW); if(h>520){h=520;}
+  // The virtual canvas is a FIXED 1000x560, and `scale` is cw/VW -- so the
+  // physical height must track the panel's width at that same aspect or the
+  // bottom of the virtual space is simply not on screen. `vh` below measures
+  // exactly how much is: at the old 520 cap, a panel 1200px wide showed
+  // 520/1.2 = 433 of 560 virtual rows, and a full-bleed 2000px one showed 260
+  // -- under half. layoutWire then packed every node into that surviving strip
+  // and clamped the overflow to the margins, which is why widening the panel
+  // made the graph LOOK broken while the graph itself was growing.
+  //
+  // So the cap rises with the panel it is capping. 760 clears a full-width
+  // in-.wrap canvas (1200px -> 672) with room to spare, and the viewport term
+  // stops a short window from getting a canvas taller than the screen. Kept as
+  // a cap rather than removed: without one an ultrawide asks for 1100px+ of
+  // height and the legend leaves the fold.
+  var w=cv.parentNode.clientWidth, h=Math.round(w*VH/VW);
+  var hMax=Math.max(360, Math.min(760, Math.round((window.innerHeight||900)*0.72)));
+  if(h>hMax){h=hMax;}
   // Idempotent, because the observer below can be triggered by this function's
   // own effect on the panel's height -- and re-assigning canvas.width clears
   // the bitmap, so a non-guarded version would repaint in a loop.
@@ -1597,7 +1635,18 @@ function renderFeed(scrollToActive){
 // The full graph is the whole universe (~200 names, hundreds of edges) -- a
 // hairball. Focus on what actually drives trades: tradeables carrying a thesis
 // (a dossier direction/score) or on the live wire, plus the anchors one hop out
-// that feed them. That is the "news -> supply chain" subgraph, ~30 nodes.
+// that feed them. That is the "news -> supply chain" subgraph.
+//
+// Bounded by canvas AREA, not by taste: the panel went full-width at 560px tall
+// (see .wire), which is ~60% more room than the old 1fr-beside-a-320px-feed
+// layout, so the ceiling rises with it. Still a ceiling -- 47 thesis names pull
+// in 141 adjacent anchors on the live board, and 188 labelled nodes is a
+// hairball at any width.
+var WIRE_MAX_NODES = 84;
+// ...of which this many are RESERVED for anchors. See the trim below for why
+// the reservation has to exist rather than anchors simply taking what is left.
+var WIRE_MIN_ANCHORS = 30;
+
 function focusGraph(g){
   var nodes=g.nodes||[], edges=g.edges||[], keep={};
   nodes.forEach(function(n){ if(n.kind==="tradeable" && (n.dir || n.score!=null)) keep[n.id]="t"; });
@@ -1609,11 +1658,38 @@ function focusGraph(g){
     var deg={}; edges.forEach(function(e){ deg[e[0]]=(deg[e[0]]||0)+1; deg[e[1]]=(deg[e[1]]||0)+1; });
     fnodes=nodes.slice().sort(function(a,b){ return (deg[b.id]||0)-(deg[a.id]||0); }).slice(0,40);
     fnodes.forEach(function(n){ keep[n.id]=keep[n.id]||"a"; });
-  } else if(fnodes.length>52){
-    // still dense -- keep every thesis name, trim anchors to the best-connected
+  } else if(fnodes.length>WIRE_MAX_NODES){
+    // Still dense. Thesis names sorted first, anchors after by degree WITHIN
+    // the kept set -- but with a reserved floor for anchors, which is the part
+    // that was missing and the reason this panel emptied out.
+    //
+    // The old rule was "keep every thesis name, trim anchors": a pure
+    // thesis-first sort into a fixed slice. That is stable only while the
+    // board is small, and it degrades in exactly the direction the system is
+    // designed to move. Measured across two bundles five hours apart, with the
+    // universe growing normally: 45 thesis names in the graph left 7 anchor
+    // slots of 52, then 47 left 5 -- against 141 anchors adjacent to a thesis
+    // name and competing for them. The canvas showed three anchors and thirty
+    // edgeless dots, and read as though the graph had collapsed when it had in
+    // fact GROWN (1186 -> 1201 edges).
+    //
+    // An anchor is not the less important half here. A trimmed tradeable is
+    // still in the dossier table, still signalling, still visible everywhere
+    // else on the page; a trimmed anchor takes every edge it carried out of
+    // the only view that draws them, and the panel is captioned "thesis + the
+    // anchors feeding them" precisely because one without the other shows no
+    // mechanism at all. So anchors get a guaranteed share and thesis names
+    // yield -- lowest-scoring first, since they are the ones whose absence
+    // costs the picture least.
     var dk={}; edges.forEach(function(e){ if(keep[e[0]]&&keep[e[1]]){ dk[e[0]]=(dk[e[0]]||0)+1; dk[e[1]]=(dk[e[1]]||0)+1; } });
-    fnodes.sort(function(a,b){ var pa=keep[a.id]==="t"?0:1, pb=keep[b.id]==="t"?0:1; return pa!==pb?pa-pb:((dk[b.id]||0)-(dk[a.id]||0)); });
-    fnodes=fnodes.slice(0,52);
+    var ts=fnodes.filter(function(n){ return keep[n.id]==="t"; })
+                 .sort(function(a,b){ return (b.score||0)-(a.score||0) || (dk[b.id]||0)-(dk[a.id]||0); });
+    var as=fnodes.filter(function(n){ return keep[n.id]!=="t"; })
+                 .sort(function(a,b){ return (dk[b.id]||0)-(dk[a.id]||0); });
+    // Anchors take their floor or whatever thesis names leave spare, whichever
+    // is larger -- so a small board still shows every thesis name it has.
+    var aTake=Math.min(as.length, Math.max(WIRE_MIN_ANCHORS, WIRE_MAX_NODES-ts.length));
+    fnodes=ts.slice(0, WIRE_MAX_NODES-aTake).concat(as.slice(0, aTake));
   }
   var ids={}; fnodes.forEach(function(n){ ids[n.id]=1; });
   // A signalled tradeable with NO graph edge has no node in the payload at all:
