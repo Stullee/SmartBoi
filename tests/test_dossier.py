@@ -985,6 +985,37 @@ def test_two_publishers_on_one_company_event_are_one_fact():
     assert labelled.independent_source_count == 1
 
 
+def test_a_label_can_never_split_what_the_channel_already_merged():
+    """THRM/STRT/ULH, live: one Ford announcement labelled "ford phases out
+    china lincoln imports" and "ford increases lincoln us production 2030" --
+    two labels, one event. Both arrive via F|Yahoo, so the channel key minted
+    ONE slot and the fact key minted two.
+
+    Measured across the whole first labelled cohort (108 items, everything
+    merged after the 2026-08-13 cutover), the fact key produced 92 slots
+    against the channel key's 64: a +43.8% split, 13 dossiers splitting, 18
+    holding, none collapsing. The corroboration bonus is convex in the slot
+    count, so every split inflates a score. The mechanism was introduced to
+    MERGE; it must never be allowed to shatter."""
+    d = _scored([
+        _from_anchor("F", "Yahoo", "ford phases out china lincoln imports", evidence_id="a"),
+        _from_anchor("F", "Yahoo", "ford increases lincoln us production 2030", evidence_id="b"),
+    ])
+    assert d.independent_source_count == 1
+
+
+def test_the_guard_still_lets_a_label_merge_across_channels():
+    """The guard takes the SMALLER partition, so the merge the fact key was
+    built for is untouched: three origins, three channels, one label -> one
+    slot. Only splitting is unreachable."""
+    d = _scored([
+        _from_anchor("MSFT", "Yahoo", "ai datacenter capex q2 2026"),
+        _from_anchor("META", "Benzinga", "ai datacenter capex q2 2026"),
+        _from_anchor("EQIX", "SeekingAlpha", "ai datacenter capex q2 2026"),
+    ])
+    assert d.independent_source_count == 1
+
+
 def test_a_paraphrased_label_still_collapses():
     """The updater is shown the existing labels and told to reuse them, which
     is the real mechanism -- but normalisation is the backstop for when it

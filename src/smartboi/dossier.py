@@ -314,11 +314,36 @@ DISCLOSED_LINK_CONFIDENCE = 0.85
 
 def _keys_of(contributing: list[EvidenceRecord]) -> set[str]:
     """The independent-source slots a set of contributing evidence claims --
-    the single definition of that accounting, so nothing can drift from it."""
-    return {
+    the single definition of that accounting, so nothing can drift from it.
+
+    NON-SHATTERING: a fact label may MERGE items the channel key kept apart,
+    never split ones it had already merged. Whichever partition yields fewer
+    slots wins.
+
+    The fact key (SCORING_VERSION 8) was introduced to collapse one event
+    restated across many outlets into a single slot. Measured on the first
+    labelled cohort -- 108 items, everything merged after the 2026-08-13
+    cutover -- it did the opposite: 92 slots against the channel key's 64, a
+    +43.8% SPLIT, with 13 dossiers splitting, 18 holding and not one
+    collapsing. Two model-written labels for one underlying event ("ford
+    phases out china lincoln imports" and "ford increases lincoln us
+    production 2030", from a single announcement) mint two slots where the
+    channel key minted one, and the corroboration bonus is convex in the slot
+    count, so every such split inflates the score.
+
+    Taking the smaller partition keeps the mechanism's upside -- a genuine
+    merge still counts once -- while making its failure mode unreachable. It
+    can only ever LOWER a slot count relative to today, never raise one, so no
+    dossier can start signalling because of this."""
+    fact = {
         _ECOSYSTEM_SLOT_KEY if is_ecosystem_association(e) else independence_key(e)
         for e in contributing
     }
+    channel = {
+        _ECOSYSTEM_SLOT_KEY if is_ecosystem_association(e) else channel_key(e)
+        for e in contributing
+    }
+    return fact if len(fact) <= len(channel) else channel
 
 
 def slot_keys(dossier: Dossier, now: datetime) -> set[str]:
@@ -448,6 +473,14 @@ def independence_key(record: EvidenceRecord) -> str:
     or a model that omitted it) the previous behaviour stands unchanged."""
     if record.fact_key:
         return f"fact:{normalized_fact_key(record.fact_key)}"
+    return channel_key(record)
+
+
+def channel_key(record: EvidenceRecord) -> str:
+    """The pre-fact-key independence unit: the DISCLOSURE CHANNEL an item
+    arrived through. Split out of independence_key so the fact key can be
+    measured against what it replaced -- see _keys_of, which refuses to let a
+    label split what the channel already merged."""
     if record.is_propagated and record.origin_symbol:
         return f"{record.origin_symbol}|{record.source_name}"
     # Direct EDGAR filings were collapsed to one slot per FORM ("SEC EDGAR
