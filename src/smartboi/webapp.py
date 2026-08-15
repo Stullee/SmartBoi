@@ -260,27 +260,42 @@ _INDEX_HTML = """<!doctype html>
   .bcat .bmeter { height:5px; border-radius:3px; background:var(--sunk); overflow:hidden; position:relative; }
   .bcat .bmeter > span { position:absolute; inset:0 auto 0 0; border-radius:3px; }
 
-  /* live wire */
-  /* ONE COLUMN, canvas first, feed underneath. The canvas used to share the
-     row with a fixed 320px feed, which cost it ~30% of the page width for a
-     panel whose content is a vertical list -- and the list reads no better in
-     a narrow column than in a wide one. The canvas is the opposite: it is the
-     only thing on the page that renders the mechanism the whole strategy runs
-     on, and it is bounded by AREA. Every node the trim drops is an edge that
-     becomes invisible everywhere.
-     Full width plus a taller canvas is ~60% more area, which is what pays for
-     the raised WIRE_MAX_NODES (see focusGraph). */
+  /* live wire -- one card per name on the board, feed underneath */
   .wire { grid-template-columns:1fr; align-items:stretch; }
-  /* Below this the canvas is ~348x195: 4.5px nodes and 3.8px labels, under a
-     legend that renders at full CSS size -- the caption is legible and the
-     thing it captions is not. The feed carries the panel instead; it holds
-     the same signals, in the same order, with the thesis text readable. */
-  @media (max-width:620px){ .wire .stagewrap{ display:none; } }
-  .stagewrap { position:relative; overflow:hidden; }
-  /* Height is set inline by resizeWire (it derives from the panel's width and
-     the VIRTUAL canvas aspect), so this is only the pre-script placeholder --
-     a CSS height or aspect-ratio here would be overwritten on first paint. */
-  canvas#wireCanvas { display:block; width:100%; height:460px; }
+  .stagewrap { position:relative; }
+  /* Column flow, not a row grid. A name with one disclosed counterparty and one
+     with nine are both honest card heights; a row grid stretches every card in
+     a row to the tallest and prints acres of empty panel between them. */
+  .bgrid { columns:236px; column-gap:8px; padding:11px 12px 3px; }
+  .bcard { break-inside:avoid; margin:0 0 8px; width:100%; display:block; text-align:left;
+           font:inherit; color:inherit; cursor:pointer;
+           background:var(--panel); border:1px solid var(--line-soft); border-radius:9px;
+           padding:8px 10px 9px; }
+  .bcard:hover { border-color:var(--line); }
+  .bcard.hot { background:var(--panel-hi); border-color:var(--line); }
+  .bcard.on { border-color:var(--accent); }
+  .bcard:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .bh { display:flex; align-items:center; gap:5px; margin-bottom:6px; }
+  .bh .dot { width:9px; height:9px; border-radius:50%; flex:none; }
+  .bh .dot.pos { background:var(--pos); } .bh .dot.neg { background:var(--neg); }
+  .bh .sym { font-weight:700; font-size:12.5px; letter-spacing:.02em; }
+  .eco { font-size:9px; letter-spacing:.06em; text-transform:uppercase; color:var(--faint);
+         border:1px solid var(--line); border-radius:3px; padding:1px 4px; }
+  .st { font-size:8.5px; letter-spacing:.06em; text-transform:uppercase; border-radius:3px;
+        padding:1px 5px; font-weight:600; }
+  .st-open { background:color-mix(in srgb, var(--accent) 18%, transparent); color:var(--accent); }
+  .st-sig { background:color-mix(in srgb, var(--muted) 18%, transparent); color:var(--muted); }
+  .bscore { margin-left:auto; font-size:11.5px; color:var(--muted); }
+  .feeds { display:flex; flex-direction:column; gap:1px; }
+  .fd { display:flex; align-items:center; gap:6px; font-size:11.5px; }
+  /* The line swatch is the only place colour carries the relationship type, and
+     it never carries it alone -- the type is written beside it on every row. */
+  .lk { width:14px; height:2.5px; border-radius:2px; flex:none; }
+  .cp { font-size:11.5px; }
+  .fan { font-size:9px; color:var(--accent); }
+  .rt { color:var(--faint); font-size:10.5px; }
+  .cf { margin-left:auto; font-size:10.5px; color:var(--faint); }
+  .cnone { font-size:10.5px; color:var(--faint); font-style:italic; }
   .tip { position:fixed; pointer-events:none; background:var(--ink); color:var(--ground); font-size:0.74rem;
          border-radius:8px; padding:0.45rem 0.6rem; opacity:0; transition:opacity 0.1s; max-width:250px; z-index:40;
          box-shadow:0 8px 26px -8px rgba(0,0,0,0.55); line-height:1.4; }
@@ -531,7 +546,7 @@ _INDEX_HTML = """<!doctype html>
 
   <div class="eyebrow">News &rarr; supply chain &mdash; the live wire</div>
   <div class="grid wire">
-    <div class="panel stagewrap"><canvas id="wireCanvas"></canvas><div class="gviz-leg" id="wireLeg"></div></div>
+    <div class="panel stagewrap"><div id="wireCards" class="bgrid"></div><div class="gviz-leg" id="wireLeg"></div></div>
     <div class="panel feed">
       <div class="feed-h"><span class="dotlive" id="feedDot"></span><span class="t">Live wire</span><span class="c" id="feedCount"></span></div>
       <div class="feed-list" id="feed"></div>
@@ -1272,7 +1287,7 @@ function renderDetail(d){
 // updateWire(data). Signals flow as pulses from the signaled tradeable out to
 // its graph neighbours; the active ticker item lights its path.
 // ===========================================================================
-var WIRE = { nodes:[], edges:[], pos:{}, feed:[], activeKey:"", t0:0, layoutKey:"", dirty:true,
+var WIRE = { nodes:[], edges:[], feed:[], activeKey:"",
              // Edge classes hidden from the canvas. Competitor starts OFF, and
              // that is a claim about the mechanism rather than about tidiness.
              //
@@ -1305,174 +1320,8 @@ var WIRE = { nodes:[], edges:[], pos:{}, feed:[], activeKey:"", t0:0, layoutKey:
 // row still moves the selection, so nothing becomes unreachable.
 var RMQ = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
 var REDUCED = !!(RMQ && RMQ.matches);
-if (RMQ && RMQ.addEventListener) RMQ.addEventListener("change", function(e){ REDUCED = e.matches; WIRE.dirty = true; });
-var cv, ctx, dpr=Math.max(1,Math.min(2,window.devicePixelRatio||1)), cw=700, ch=460, scale=1, VW=1000, VH=560;
-// The virtual height actually ON SCREEN, which is not always VH.
-//
-// resizeWire sizes the canvas to the panel's width at the VW:VH aspect but
-// caps it at 520px tall, while scale stays cw/VW -- so past a panel width of
-// ~929px the cap engages and VH*scale exceeds the canvas. Everything laid out
-// below ch/scale was then drawn past the bottom edge: 7% of the virtual canvas
-// invisible at 1000px wide, 23% at 1200, 34% at 1400, with the labels straddling
-// the boundary sliced in half. The layout has to be told how much of its own
-// canvas is being shown rather than assuming all of it, so this is what
-// layoutWire places, centres and clamps against.
-var VHv=VH;
+if (RMQ && RMQ.addEventListener) RMQ.addEventListener("change", function(e){ REDUCED = e.matches; });
 
-var TCK = {};
-function tok(name){ return TCK[name] !== undefined ? TCK[name] : getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
-function refreshTokens(){ ["--gc-cust","--gc-supp","--gc-comp","--gc-reg","--gc-eco","--gn-anchor","--pos","--neg","--faint","--gn-stroke","--gn-txt","--warn","--muted"]
-  .forEach(function(k){ TCK[k]=getComputedStyle(document.documentElement).getPropertyValue(k).trim(); }); }
-// The four REL_TYPES and their channel colours. Anything else cannot reach the
-// canvas today -- RelationshipGraph drops an unknown rel_type on load -- but it
-// is drawn dashed in the fallback colour below rather than silently borrowing a
-// real channel's, so a new relationship type shows up as obviously unkeyed.
-var GC={customer:"--gc-cust",supplier:"--gc-supp",competitor:"--gc-comp",regulator:"--gc-reg"};
-function gvColorTok(type){ return GC[type]||"--gc-eco"; }
-function gvR(n){ if(n.kind==="anchor") return 13; if(n.score!=null) return 6+n.score*10; return 6; }
-// The half-extents of everything a node PAINTS, which for almost every name is
-// the label rather than the disc: a disc is 12-32px across and "SCE-PN" sets
-// 40px wide next to it. Separation and edge-clamping both have to work on this
-// box, not on gvR, or labels collide and run off the canvas while the discs
-// they belong to sit comfortably clear of each other.
-//
-// 11px bold sans averages ~6.6px per character; halved, plus a small margin.
-// The label is drawn at y-r-6 with textBaseline "middle", so the ink reaches
-// about r+12 above the centre and only r below it -- deliberately asymmetric,
-// because treating it as symmetric wastes half the vertical budget.
-function gvHW(n){ return Math.max(gvR(n), n.id.length*3.3+4); }
-function gvTop(n){ return gvR(n)+13; }
-function gvBot(n){ return gvR(n); }
-function gvFill(n){ if(n.kind==="anchor") return "--gn-anchor"; if(n.dir==="LONG") return "--pos"; if(n.dir==="SHORT") return "--neg"; return "--faint"; }
-
-function layoutWire(){
-  var nodes=WIRE.nodes, edges=WIRE.edges, i,j, seed=1234567;
-  function rnd(){ seed=(seed*1664525+1013904223)%4294967296; return seed/4294967296; }
-  var pos={};
-  // Half this panel's names have no edge at all -- they carry a thesis from
-  // their own filings and the graph never reached them (the population
-  // gather_graph_health calls disconnected_with_thesis). A force simulation
-  // has nothing to say about such a node: it is repelled by everything and
-  // attracted by nothing, so it travels outward until the boundary stops it.
-  // That is why they arrived in columns welded to the margins with the middle
-  // left empty -- 15 of 52 pinned against the clamp on the live board -- and
-  // why no repulsion-to-centering ratio fixes it. Turning repulsion down
-  // clumps them; turning centering up leaves a blob ringed by dead space.
-  // Neither is a layout, because no force in the model WANTS them anywhere.
-  //
-  // So they are placed rather than simulated: an even lattice in a band at
-  // the foot of the canvas, strongest score first. The simulation then runs
-  // on the connected names alone, in the room above, where every force in it
-  // means something. It also stops being a lie by omission -- "this name
-  // reached the board without the graph" is the single most important thing
-  // about those rows, and scattering them among the linked ones hid it.
-  var deg={}; nodes.forEach(function(n){ deg[n.id]=0; });
-  edges.forEach(function(e){ if(deg[e[0]]!=null) deg[e[0]]++; if(deg[e[1]]!=null) deg[e[1]]++; });
-  var linked=nodes.filter(function(n){ return deg[n.id]>0; });
-  var loose=nodes.filter(function(n){ return !deg[n.id]; });
-
-  var bandTop=VHv;
-  if(loose.length){
-    var cellW=Math.max.apply(null,loose.map(gvHW))*2+26;
-    var cols=Math.max(1,Math.min(loose.length,Math.floor(VW/cellW)));
-    var rows=Math.ceil(loose.length/cols);
-    var rowH=Math.max.apply(null,loose.map(function(n){ return gvTop(n)+gvBot(n); }))+22;
-    // Never take more than half the canvas: with everything unlinked the
-    // lattice IS the picture, but the linked graph must stay the bigger half
-    // whenever there is one.
-    bandTop=linked.length?Math.max(VHv*0.5,VHv-rows*rowH-6):18;
-    loose.slice().sort(function(a,b){ return (b.score||0)-(a.score||0); })
-      .forEach(function(n,k){
-        var r=Math.floor(k/cols), c=k%cols, inRow=Math.min(cols,loose.length-r*cols);
-        pos[n.id]={x:VW*(c+1)/(inRow+1), y:bandTop+rowH*(r+0.62), vx:0, vy:0};
-      });
-  }
-  WIRE.bandTop=(loose.length&&linked.length)?bandTop:null;
-
-  var H=Math.max(140,bandTop-10);
-  // ECOSYSTEM ANCHORING. 70% of this graph's edges join two names in the same
-  // ecosystem -- that is what the universe is built to be, ecosystems of an
-  // anchor and the thin names downstream of it -- and a plain centring force
-  // throws all of it away, then spends the simulation pulling nine communities
-  // through each other toward one point. Replacing the centring term with a
-  // pull toward each node's OWN ecosystem centroid makes the majority of edges
-  // short and local, and leaves the cross-ecosystem minority as the long lines
-  // they actually are: the second-order reach worth looking at.
-  //
-  // Weak on purpose (see the pull constant below). Measured by crossing count,
-  // a hard cluster pull is WORSE than no clustering -- it packs each community
-  // so tightly that its own internal edges tangle. This is a bias applied to a
-  // force layout, not a partition of the canvas.
-  var ecoOf={}, ecoIdx={}, nEco=0;
-  nodes.forEach(function(n){ var s=n.sector||"?";
-    if(ecoIdx[s]===undefined){ ecoIdx[s]=nEco++; } ecoOf[n.id]=s; });
-  var ecoCols=Math.max(1,Math.ceil(Math.sqrt(nEco*VW/Math.max(H,1))));
-  var ecoRows=Math.max(1,Math.ceil(nEco/ecoCols));
-  function ecoCx(s){ return VW*((ecoIdx[s]%ecoCols)+0.5)/ecoCols; }
-  function ecoCy(s){ return H*(Math.floor(ecoIdx[s]/ecoCols)+0.5)/ecoRows; }
-  if(linked.length){
-    // Seeded AT the ecosystem centroid (jittered) rather than on a blind grid:
-    // the simulation then starts from the arrangement it is being biased
-    // toward, instead of spending its first hundred steps unwinding a layout
-    // that crosses every community over every other one.
-    linked.forEach(function(n){ var s=ecoOf[n.id];
-      pos[n.id]={x:ecoCx(s)+(rnd()-0.5)*VW/ecoCols*0.7,
-                 y:ecoCy(s)+(rnd()-0.5)*H/ecoRows*0.7, vx:0, vy:0}; });
-    for(var it=0;it<250;it++){
-      for(i=0;i<linked.length;i++) for(j=i+1;j<linked.length;j++){ var pa=pos[linked[i].id],pb=pos[linked[j].id];
-        var dx=pa.x-pb.x,dy=pa.y-pb.y,d2=dx*dx+dy*dy+0.01,d=Math.sqrt(d2),rep=5200/d2,ux=dx/d,uy=dy/d;
-        pa.vx+=ux*rep;pa.vy+=uy*rep;pb.vx-=ux*rep;pb.vy-=uy*rep; }
-      edges.forEach(function(e){ var pa=pos[e[0]],pb=pos[e[1]]; if(!pa||!pb) return;
-        var dx=pb.x-pa.x,dy=pb.y-pa.y,d=Math.sqrt(dx*dx+dy*dy)+0.01,f=(d-92)*0.02*(0.5+e[3]),ux=dx/d,uy=dy/d;
-        pa.vx+=ux*f;pa.vy+=uy*f;pb.vx-=ux*f;pb.vy-=uy*f; });
-      // 0.012 toward the node's own ecosystem centroid, replacing 0.006 toward
-      // the canvas centre. Swept over the live board at 0.010/0.020/0.035/0.055:
-      // crossings 1211/1836/1797/2223 against 1497 for plain centring -- only
-      // the weakest setting wins, and everything past it is worse than doing
-      // nothing. A single ecosystem still degenerates to plain centring, since
-      // its centroid IS the middle.
-      linked.forEach(function(n){ var p=pos[n.id], s=ecoOf[n.id];
-        p.vx+=(ecoCx(s)-p.x)*0.012;p.vy+=(ecoCy(s)-p.y)*0.012;p.vx*=0.85;p.vy*=0.85;p.x+=p.vx;p.y+=p.vy;
-        p.x=Math.max(gvHW(n)+2,Math.min(VW-gvHW(n)-2,p.x));
-        p.y=Math.max(gvTop(n)+2,Math.min(H-gvBot(n)-2,p.y)); });
-    }
-  }
-  // Final de-overlap, on each node's INK BOX rather than its disc, re-clamped
-  // on every pass.
-  //
-  // Two faults lived in the version this replaces, and they compounded. It
-  // demanded only gvR(a)+gvR(b)+13 between CENTRES -- ample for two 12px discs
-  // and nowhere near enough for the labels above them, so "TCPA" and "SCRNY"
-  // printed straight through each other while their discs were 13px clear.
-  // And it ran AFTER the simulation loop's clamp without ever re-clamping, so
-  // its own pushes could walk a node off the canvas: MVST came to rest at
-  // y=19, where a label drawn at y-r-6 is cut off by the top edge, and names
-  // shoved past the right edge piled into an unreadable stack.
-  //
-  // Axis-aligned, because the ink is a box and circular separation over-pushes
-  // on the axis that was already clear. Resolving along whichever axis
-  // overlaps LEAST moves each node the shortest distance that actually
-  // separates the pair, which keeps the force-directed shape intact.
-  for(var pass=0;pass<12;pass++){
-    for(i=0;i<nodes.length;i++) for(j=i+1;j<nodes.length;j++){
-      var na=nodes[i],nb=nodes[j],qa=pos[na.id],qb=pos[nb.id];
-      var ex=qb.x-qa.x,ey=qb.y-qa.y;
-      var needX=gvHW(na)+gvHW(nb)+6;
-      // Asymmetric: whichever node is lower needs its LABEL clear of the
-      // other's disc, not its disc clear of the other's disc.
-      var needY=(ey>=0?gvBot(na)+gvTop(nb):gvBot(nb)+gvTop(na))+3;
-      var ovX=needX-Math.abs(ex),ovY=needY-Math.abs(ey);
-      if(ovX<=0||ovY<=0) continue;
-      if(ovX<ovY){ var px=(ex>=0?1:-1)*ovX/2; qa.x-=px;qb.x+=px; }
-      else       { var py=(ey>=0?1:-1)*ovY/2; qa.y-=py;qb.y+=py; }
-    }
-    // Clamped to the INK box, so a label never runs off an edge either.
-    nodes.forEach(function(n){ var p=pos[n.id];
-      p.x=Math.max(gvHW(n)+2,Math.min(VW-gvHW(n)-2,p.x));
-      p.y=Math.max(gvTop(n)+2,Math.min(VHv-gvBot(n)-2,p.y)); });
-  }
-  WIRE.pos=pos;
-}
 
 // ---- the feed's derived list ----------------------------------------------
 // ONE ordered, de-duplicated list drives the ticker, the feed highlight and the
@@ -1510,153 +1359,6 @@ function activeIndex(){
   return -1;
 }
 function activeSig(){ var i=activeIndex(); return i<0?(WIRE.feed[0]||null):WIRE.feed[i]; }
-function sigEdges(sym){ return WIRE.edges.filter(function(e){ return e[0]===sym||e[1]===sym; }); }
-// Whether anything on the canvas is actually in motion this frame. Only the
-// pulses and the selection ring ever move, and both need a selected node with
-// at least one edge to travel along -- so a wire showing an unconnected signal,
-// or no signal at all, has nothing to redraw and is left alone until something
-// marks it dirty. This is the difference between a dashboard left open on a
-// wall repainting 60 times a second forever and repainting when there is news.
-function wireAnimating(){
-  if(REDUCED) return false;
-  var sig=activeSig();
-  return !!(sig && WIRE.pos[sig.symbol] && sigEdges(sig.symbol).length);
-}
-
-function drawWire(now){
-  if(!ctx) return;
-  ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,cw,ch);
-  // A deployment with no graph yet (a custom SYMBOLS universe whose filings have
-  // not been read, or a first run) has nothing to draw. Two empty rectangles
-  // under a pulsing "live" dot read as a broken page -- every table on this
-  // dashboard carries an empty-state line and this panel carried none.
-  if(!WIRE.nodes.length){
-    var es=Math.max(scale,0.6);
-    ctx.textAlign="center"; ctx.textBaseline="middle";
-    ctx.fillStyle=tok("--muted"); ctx.font="600 "+(13*es)+"px -apple-system,sans-serif";
-    ctx.fillText("No relationships extracted yet", cw/2, ch/2-9*es);
-    ctx.fillStyle=tok("--faint"); ctx.font=(11.5*es)+"px -apple-system,sans-serif";
-    ctx.fillText("Edges appear as the engine reads each symbol's latest filings.", cw/2, ch/2+10*es);
-    return;
-  }
-  var s=scale, sig=activeSig(), hotSym=sig?sig.symbol:null, hot={};
-  if(hotSym) sigEdges(hotSym).forEach(function(e){ hot[e[0]+">"+e[1]]=1; });
-  // The rule under the graph, above the lattice of names the graph never
-  // reached. Without it the lattice reads as more scatter; with it the split
-  // states the finding -- these carry a thesis their own filings produced and
-  // no relationship carried.
-  if(WIRE.bandTop!=null){ var by=(WIRE.bandTop-9)*s;
-    ctx.save(); ctx.setLineDash([4*s,5*s]); ctx.strokeStyle=tok("--line-soft"); ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(10*s,by); ctx.lineTo(cw-10*s,by); ctx.stroke(); ctx.restore();
-    ctx.fillStyle=tok("--faint"); ctx.textAlign="right"; ctx.textBaseline="bottom";
-    ctx.font=(9.5*s)+"px -apple-system,sans-serif";
-    ctx.fillText("no disclosed link \\u2014 thesis from their own filings", cw-12*s, by-3*s); }
-  // edges
-  WIRE.edges.forEach(function(e){ var pa=WIRE.pos[e[0]],pb=WIRE.pos[e[1]]; if(!pa||!pb) return;
-    var isHot=hot[e[0]+">"+e[1]], col=tok(gvColorTok(e[2]));
-    ctx.globalAlpha=isHot?0.95:0.34; ctx.strokeStyle=col; ctx.lineWidth=Math.max(0.6,(0.6+e[3]*2.2))*s*(isHot?1.3:1);
-    if(!GC[e[2]]) ctx.setLineDash([3.2*s,4.5*s]); else ctx.setLineDash([]);
-    ctx.beginPath(); ctx.moveTo(pa.x*s,pa.y*s); ctx.lineTo(pb.x*s,pb.y*s); ctx.stroke();
-  });
-  ctx.setLineDash([]); ctx.globalAlpha=1;
-  // pulses along hot edges
-  // Pulses travel INWARD -- from the counterparty to the signalled name. This
-  // band is titled "News -> supply chain" and that is the direction the
-  // mechanism runs: an anchor's news propagates across an edge into a thinly
-  // covered tradeable, accumulates as evidence, and eventually crosses the
-  // conviction bar. Running the dots outward drew the opposite claim -- a
-  // small-cap broadcasting at the giants that actually fed it.
-  if(hotSym && !REDUCED){ var pn=WIRE.pos[hotSym]; sigEdges(hotSym).forEach(function(e){ var other=e[0]===hotSym?e[1]:e[0], po=WIRE.pos[other]; if(!pn||!po) return;
-    var col=tok(gvColorTok(e[2]));
-    for(var k=0;k<3;k++){ var t=((now/1200)+k/3)%1, px=(po.x+(pn.x-po.x)*t)*s, py=(po.y+(pn.y-po.y)*t)*s, al=Math.sin(t*Math.PI);
-      ctx.globalAlpha=al; ctx.fillStyle=col; ctx.shadowColor=col; ctx.shadowBlur=8*s; ctx.beginPath(); ctx.arc(px,py,3*s,0,7); ctx.fill(); }
-  }); ctx.shadowBlur=0; ctx.globalAlpha=1; }
-  // nodes
-  WIRE.nodes.forEach(function(n){ var p=WIRE.pos[n.id]; if(!p) return; var x=p.x*s,y=p.y*s,r=gvR(n)*s;
-    var isHot=(n.id===hotSym);
-    // The selection ring clears the unlinked marker below rather than beating
-    // through it -- two rings at the same radius read as one smeared ring.
-    if(isHot){ var beat=REDUCED?0.5:(0.5+0.5*Math.sin(now/260)), gap=(n.kind==="unlinked"?9.5:4);
-      ctx.globalAlpha=0.9; ctx.strokeStyle=tok(gvFill(n)); ctx.lineWidth=2;
-      ctx.beginPath(); ctx.arc(x,y,r+(gap+beat*5)*s,0,7); ctx.stroke(); ctx.globalAlpha=1; ctx.shadowColor=tok(gvFill(n)); ctx.shadowBlur=(8+beat*10)*s; }
-    // An `external` node is a graph endpoint that is not a universe member at
-    // all -- today that is exclusively the regulator pseudo-symbols. Drawn
-    // hollow so it cannot be mistaken for a thesis-less tradeable, which shares
-    // its size and its grey.
-    var isExt=(n.kind==="external");
-    ctx.beginPath(); ctx.arc(x,y,r,0,7);
-    ctx.fillStyle=isExt?tok("--gn-stroke"):tok(gvFill(n)); ctx.globalAlpha=n.kind==="anchor"?0.92:1; ctx.fill(); ctx.globalAlpha=1;
-    ctx.shadowBlur=0; ctx.lineWidth=1.5*s; ctx.strokeStyle=isExt?tok("--faint"):tok("--gn-stroke"); ctx.stroke();
-    // A signal with no disclosed path is MARKED, not merely drawn alone -- an
-    // isolated dot reads as a layout accident, a dashed warning ring reads as the
-    // statement it is: this thesis came from the company's own filings and no
-    // relationship carried it.
-    if(n.kind==="unlinked"){ ctx.save(); ctx.setLineDash([3*s,3*s]); ctx.lineWidth=1.5*s;
-      ctx.strokeStyle=tok("--warn"); ctx.beginPath(); ctx.arc(x,y,r+4.5*s,0,7); ctx.stroke(); ctx.restore(); }
-    // Every label sits ABOVE its node, anchors included. Printing the anchor's
-    // name inside the disc put --gn-txt (a token tuned for the panel ground) on
-    // --gn-anchor grey: 2.6:1 in dark and 3.1:1 in light, against the 4.5:1 that
-    // 11px bold text needs to be legible. Above the disc the same text reads
-    // 15:1 and up, and it no longer paints over the edges passing behind it.
-    ctx.fillStyle=tok("--gn-txt"); ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.font="700 "+(11*s)+"px -apple-system,sans-serif";
-    ctx.fillText(n.id, x, y-r-6*s);
-    if(n.kind!=="anchor"&&n.score!=null&&r>9*s){ ctx.fillStyle=tok("--gn-stroke"); ctx.font="700 "+(8*s)+"px ui-monospace,monospace"; ctx.fillText(n.score.toFixed(2),x,y); }
-  });
-  // ...and say it in words when that is the name currently being shown, so a
-  // canvas with nothing moving on it is explained rather than just empty.
-  if(hotSym){
-    var hn=null; WIRE.nodes.forEach(function(n){ if(n.id===hotSym) hn=n; });
-    var hp=WIRE.pos[hotSym];
-    if(hn&&hp&&hn.kind==="unlinked"){
-      ctx.fillStyle=tok("--warn"); ctx.textAlign="center"; ctx.textBaseline="top";
-      ctx.font="600 "+(10*s)+"px -apple-system,sans-serif";
-      ctx.fillText("no disclosed path \\u2014 own filings only", hp.x*s, hp.y*s+(gvR(hn)+9)*s);
-    }
-  }
-}
-
-// Setting canvas.width/height CLEARS the canvas, so a resize must always be
-// followed by a repaint -- with the idle skip in frame() a still wire would
-// otherwise stay blank until the next signal.
-function resizeWire(){ if(!cv) return;
-  // devicePixelRatio is re-read rather than sampled once at load: a window
-  // dragged to a different-density display keeps its old backing store and
-  // renders soft until something else forces a resize.
-  var d=Math.max(1,Math.min(2,window.devicePixelRatio||1));
-  // The virtual canvas is a FIXED 1000x560, and `scale` is cw/VW -- so the
-  // physical height must track the panel's width at that same aspect or the
-  // bottom of the virtual space is simply not on screen. `vh` below measures
-  // exactly how much is: at the old 520 cap, a panel 1200px wide showed
-  // 520/1.2 = 433 of 560 virtual rows, and a full-bleed 2000px one showed 260
-  // -- under half. layoutWire then packed every node into that surviving strip
-  // and clamped the overflow to the margins, which is why widening the panel
-  // made the graph LOOK broken while the graph itself was growing.
-  //
-  // So the cap rises with the panel it is capping. 760 clears a full-width
-  // in-.wrap canvas (1200px -> 672) with room to spare, and the viewport term
-  // stops a short window from getting a canvas taller than the screen. Kept as
-  // a cap rather than removed: without one an ultrawide asks for 1100px+ of
-  // height and the legend leaves the fold.
-  var w=cv.parentNode.clientWidth, h=Math.round(w*VH/VW);
-  var hMax=Math.max(360, Math.min(760, Math.round((window.innerHeight||900)*0.72)));
-  if(h>hMax){h=hMax;}
-  // Idempotent, because the observer below can be triggered by this function's
-  // own effect on the panel's height -- and re-assigning canvas.width clears
-  // the bitmap, so a non-guarded version would repaint in a loop.
-  if(w===cw && h===ch && d===dpr) return;
-  dpr=d; cw=w; ch=h; scale=cw/VW;
-  // How much of the virtual canvas this size actually shows. Equal to VH
-  // whenever the 520 cap above is not engaged; below it once the panel is
-  // wide enough for the cap to bite, which is where the bottom of the layout
-  // used to be drawn past the edge. Re-laying out when it moves materially is
-  // what stops nodes from being placed into the invisible strip -- guarded by
-  // a rounded comparison so an ordinary drag-resize does not re-run the sim
-  // on every pixel.
-  var vh=Math.min(VH, ch/scale);
-  if(Math.round(vh/8)!==Math.round(VHv/8)){ VHv=vh; WIRE.layoutKey=""; }
-  else VHv=vh;
-  cv.width=Math.round(cw*dpr); cv.height=Math.round(ch*dpr); cv.style.height=ch+"px"; WIRE.dirty=true; }
-
 function renderFeed(scrollToActive){
   var s=WIRE.feed; el("feedCount").textContent=s.length+(s.length===1?" signal":" signals");
   var act=activeIndex(); if(act<0) act=0;
@@ -1669,7 +1371,7 @@ function renderFeed(scrollToActive){
       '</span></div><div class="ev-body">'+esc(x.thesis_summary)+"</div></button>";
   }).join("");
   Array.prototype.forEach.call(el("feed").querySelectorAll(".ev"),function(b){ b.addEventListener("click",function(){
-    WIRE.activeKey=sigKeyOf(WIRE.feed[+b.dataset.i]); WIRE.t0=performance.now(); WIRE.dirty=true; renderFeed(true); }); });
+    WIRE.activeKey=sigKeyOf(WIRE.feed[+b.dataset.i]); renderFeed(true); updateWire(data); }); });
   // The list holds ~4 rows and the ticker walks all 25, so from the fifth item
   // on the canvas was pulsing a name whose feed row was below the fold. Done on
   // every selection CHANGE but never on a plain re-render: a refresh landing
@@ -1689,221 +1391,167 @@ function renderFeed(scrollToActive){
   }
 }
 
-// The full graph is the whole universe (~200 names, hundreds of edges) -- a
-// hairball. Focus on what actually drives trades: tradeables carrying a thesis
-// (a dossier direction/score) or on the live wire, plus the anchors one hop out
-// that feed them. That is the "news -> supply chain" subgraph.
+// One card per name on the board, not one diagram of all of them.
 //
-// Bounded by canvas AREA, not by taste: the panel went full-width at 560px tall
-// (see .wire), which is ~60% more room than the old 1fr-beside-a-320px-feed
-// layout, so the ceiling rises with it. Still a ceiling -- 47 thesis names pull
-// in 141 adjacent anchors on the live board, and 188 labelled nodes is a
-// hairball at any width.
-var WIRE_MAX_NODES = 84;
-// ...of which this many are RESERVED for anchors. See the trim below for why
-// the reservation has to exist rather than anchors simply taking what is left.
-var WIRE_MIN_ANCHORS = 30;
-
-function focusGraph(g){
-  var nodes=g.nodes||[], keep={};
-  // Applied BEFORE selection, not just before drawing, so a hidden class cannot
-  // pull an anchor into the panel that then sits there with no visible edge --
-  // which is what produced the row of unexplained loose dots.
-  var edges=(g.edges||[]).filter(function(e){ return !WIRE.hideTypes[e[2]]; });
-  nodes.forEach(function(n){ if(n.kind==="tradeable" && (n.dir || n.score!=null)) keep[n.id]="t"; });
-  WIRE.feed.forEach(function(s){ keep[s.symbol]="t"; });
-  edges.forEach(function(e){ if(keep[e[0]]==="t" && !keep[e[1]]) keep[e[1]]="a"; if(keep[e[1]]==="t" && !keep[e[0]]) keep[e[0]]="a"; });
-  var fnodes=nodes.filter(function(n){ return keep[n.id]; });
-  if(fnodes.length<6){
-    // nothing has a thesis yet (fresh deploy) -- show the most-connected slice so it isn't blank
-    var deg={}; edges.forEach(function(e){ deg[e[0]]=(deg[e[0]]||0)+1; deg[e[1]]=(deg[e[1]]||0)+1; });
-    fnodes=nodes.slice().sort(function(a,b){ return (deg[b.id]||0)-(deg[a.id]||0); }).slice(0,40);
-    fnodes.forEach(function(n){ keep[n.id]=keep[n.id]||"a"; });
-  } else if(fnodes.length>WIRE_MAX_NODES){
-    // Still dense. Thesis names sorted first, anchors after by degree WITHIN
-    // the kept set -- but with a reserved floor for anchors, which is the part
-    // that was missing and the reason this panel emptied out.
-    //
-    // The old rule was "keep every thesis name, trim anchors": a pure
-    // thesis-first sort into a fixed slice. That is stable only while the
-    // board is small, and it degrades in exactly the direction the system is
-    // designed to move. Measured across two bundles five hours apart, with the
-    // universe growing normally: 45 thesis names in the graph left 7 anchor
-    // slots of 52, then 47 left 5 -- against 141 anchors adjacent to a thesis
-    // name and competing for them. The canvas showed three anchors and thirty
-    // edgeless dots, and read as though the graph had collapsed when it had in
-    // fact GROWN (1186 -> 1201 edges).
-    //
-    // An anchor is not the less important half here. A trimmed tradeable is
-    // still in the dossier table, still signalling, still visible everywhere
-    // else on the page; a trimmed anchor takes every edge it carried out of
-    // the only view that draws them, and the panel is captioned "thesis + the
-    // anchors feeding them" precisely because one without the other shows no
-    // mechanism at all. So anchors get a guaranteed share and thesis names
-    // yield -- lowest-scoring first, since they are the ones whose absence
-    // costs the picture least.
-    var dk={}; edges.forEach(function(e){ if(keep[e[0]]&&keep[e[1]]){ dk[e[0]]=(dk[e[0]]||0)+1; dk[e[1]]=(dk[e[1]]||0)+1; } });
-    var ts=fnodes.filter(function(n){ return keep[n.id]==="t"; })
-                 .sort(function(a,b){ return (b.score||0)-(a.score||0) || (dk[b.id]||0)-(dk[a.id]||0); });
-    var as=fnodes.filter(function(n){ return keep[n.id]!=="t"; })
-                 .sort(function(a,b){ return (dk[b.id]||0)-(dk[a.id]||0); });
-    // Anchors take their floor or whatever thesis names leave spare, whichever
-    // is larger -- so a small board still shows every thesis name it has.
-    var aTake=Math.min(as.length, Math.max(WIRE_MIN_ANCHORS, WIRE_MAX_NODES-ts.length));
-    fnodes=ts.slice(0, WIRE_MAX_NODES-aTake).concat(as.slice(0, aTake));
-  }
-  var ids={}; fnodes.forEach(function(n){ ids[n.id]=1; });
-  // A signalled tradeable with NO graph edge has no node in the payload at all:
-  // status.gather_graph_stats builds its node list purely from edge endpoints, so
-  // a name that reaches nothing is simply absent, and filtering `nodes` above can
-  // only ever drop it. Synthesizing it here is not cosmetic. That is exactly the
-  // population gather_graph_health counts as `disconnected_with_thesis` and warns
-  // about two bands down ("their dossier came only from their own filings, so the
-  // cross-company mechanism never fired for them") -- the case an operator most
-  // needs to see, because it is the one where this system's whole premise did not
-  // hold. Without a node the wire went silent precisely when the ticker reached
-  // one: no dot, no pulse, and -- having no hot edges either -- a frozen canvas
-  // with nothing to explain it.
-  //
-  // Appended AFTER the trim above on purpose: a name that actually fired must
-  // never be dropped for being poorly connected, which is the one property that
-  // guarantees it loses a degree-ranked cut. Built from the signal row itself,
-  // which already carries the direction and both factors of the score.
-  var unlinked=0;
-  WIRE.feed.forEach(function(s){
-    if(!s.symbol || ids[s.symbol]) return;
-    ids[s.symbol]=1; unlinked++;
-    fnodes.push({ id:s.symbol, kind:"unlinked", dir:s.direction, name:"", sector:"",
-      score:(s.confidence!=null&&s.magnitude!=null)?Math.round(s.confidence*s.magnitude*1000)/1000:null });
+// The panel spent three iterations as a force-directed node-link canvas and was
+// never readable at this size. The measurement that settled it: a name on this
+// board has a MEDIAN OF 2 disclosed counterparties and a maximum of 9. The data
+// was never a hairball -- it is ~50 tiny stars with two spokes each, and drawing
+// them superimposed in one box manufactured every crossing. Faceting is what the
+// shape of the data asked for from the start.
+//
+// What the canvas could not show, and this does: every link's TYPE and its
+// disclosure CONFIDENCE, in text, for all of them at once; which names have no
+// disclosed link at all rather than leaving them as unexplained loose dots; and
+// -- via the xN badge -- when one anchor is feeding many theses simultaneously,
+// which is the "one macro fact restated" pattern the synthesis pass vetoes on.
+// On the board this was built against, BIS fed all five semis names and NHTSA
+// all four auto names, both as 0.60 regulator edges. That is a sector-wide
+// backdrop wearing the costume of five independent corroborations, and it was
+// invisible in the graph.
+//
+// Competitor edges stay out: this panel draws the supply chain, and
+// dossier.COMPETITOR_SATISFIES_DISCLOSED_LINK is False because a competitor edge
+// is sign-ambiguous and never buys the corroboration discount. The legend key
+// toggles them back.
+function boardCards(g, dossiers){
+  var nodes=(g.nodes||[]).slice(), edges=g.edges||[];
+  // gather_graph_stats builds its node list purely from EDGE ENDPOINTS, so a
+  // name that reaches nothing has no node at all and filtering `nodes` can only
+  // ever drop it. That population -- gather_graph_health's
+  // disconnected_with_thesis -- is the one an operator most needs to see,
+  // because it is where this system's whole premise did not hold: the thesis
+  // came from the company's own filings and the cross-company mechanism never
+  // fired. Five of them were missing from the first build of this panel.
+  // Synthesised from the dossier rows, which already carry direction and both
+  // score factors.
+  var have={}; nodes.forEach(function(n){ have[n.id]=1; });
+  (dossiers||[]).forEach(function(r){
+    if(have[r.symbol] || !(r.direction==="LONG"||r.direction==="SHORT")) return;
+    have[r.symbol]=1;
+    nodes.push({ id:r.symbol, kind:"tradeable", dir:r.direction, sector:r.sector||"",
+                 score:Math.round(r.confidence*r.magnitude*1000)/1000 });
   });
-  return { nodes:fnodes, edges:edges.filter(function(e){ return ids[e[0]]&&ids[e[1]]; }),
-           total:nodes.length+unlinked, unlinked:unlinked };
+  var meta={}; nodes.forEach(function(n){ meta[n.id]=n; });
+  var feeds={};
+  edges.forEach(function(e){
+    if(WIRE.hideTypes[e[2]]) return;
+    [[e[0],e[1]],[e[1],e[0]]].forEach(function(p){
+      var me=p[0], them=p[1], m=meta[me];
+      if(!m || m.kind!=="tradeable") return;
+      if(!feeds[me]) feeds[me]={};
+      // Keep the STRONGEST disclosure when a pair is linked more than once --
+      // two filings can disclose the same counterparty as both customer and
+      // supplier, and showing the row twice reads as two relationships.
+      var prev=feeds[me][them];
+      if(!prev || e[3]>prev[1]) feeds[me][them]=[e[2], e[3]];
+    });
+  });
+  var live={}; WIRE.feed.forEach(function(x){ live[x.symbol]=1; });
+  var board=nodes.filter(function(n){
+    return n.kind==="tradeable" && (n.dir || n.score!=null || live[n.id]);
+  });
+  // How many BOARD names each counterparty feeds -- the one cross-card fact a
+  // grid of separate cards would otherwise lose.
+  var shared={};
+  board.forEach(function(n){ for(var k in (feeds[n.id]||{})) shared[k]=(shared[k]||0)+1; });
+  board.sort(function(a,b){
+    var sa=a.sector||"zz", sb=b.sector||"zz";
+    return sa<sb?-1:sa>sb?1:((b.score||0)-(a.score||0));
+  });
+  return { board:board, feeds:feeds, shared:shared, total:nodes.length };
 }
 
+// The four REL_TYPES and their channel colours. Anything else cannot reach the
+// panel today -- RelationshipGraph drops an unknown rel_type on load -- but it
+// falls back to the neutral token rather than silently borrowing a real
+// channel's, so a new relationship type shows up as obviously unkeyed.
+var GC={customer:"--gc-cust",supplier:"--gc-supp",competitor:"--gc-comp",regulator:"--gc-reg"};
+
+var ECO_SHORT={semi_equipment:"semis",defense_tier2:"defense",grid_datacenter:"grid",
+  battery_storage:"battery",medtech_supply:"medtech",auto_supply:"auto",
+  energy_services:"energy",industrial_machinery:"machinery",transport_logistics:"transport"};
+
 function updateWire(d){
-  // Built BEFORE focusGraph: the focus set includes every signalled symbol, so
-  // the ticker, the highlight and the canvas must all read the same list.
   WIRE.feed=feedRows(d.recent_signals);
-  // Only when the selected episode has fallen out of the window entirely does
-  // the selection move -- and then to the newest, not to whatever now occupies
-  // the old index.
   if(activeIndex()<0) WIRE.activeKey=sigKeyOf(WIRE.feed[0]);
-  var f=focusGraph(d.graph||{});
-  var key=JSON.stringify(f.nodes.map(function(n){return n.id;}));
-  WIRE.nodes=f.nodes; WIRE.edges=f.edges;
-  if(key!==WIRE.layoutKey){ WIRE.layoutKey=key; layoutWire(); }
-  // The legend keys exactly what is on screen -- nothing more, nothing less.
-  //
-  // It used to be a fixed list that named "ecosystem", which is not a
-  // relationship type at all (it is an evidence class elsewhere in the system,
-  // and RelationshipGraph drops any rel_type outside REL_TYPES on load), while
-  // supplier and regulator edges -- drawn constantly -- had no key. It also gave
-  // one word, "anchor", to three visually distinct node classes. A legend that
-  // describes a channel which cannot occur, and omits two that do, is worse than
-  // no legend: the panel's whole claim is that the mechanism can be read off it.
-  //
-  // Derived rather than hard-coded so it cannot drift again, and so an empty
-  // canvas is not captioned with six keys for things it is not drawing.
-  WIRE.dirty=true;
+  var f=boardCards(d.graph||{}, d.dossiers);
+  WIRE.nodes=f.board; WIRE.edges=[];
+  var openSyms={}; (d.open_paper_trades||[]).forEach(function(t){ openSyms[t.symbol]=1; });
+  var liveSyms={}; WIRE.feed.forEach(function(x){ liveSyms[x.symbol]=1; });
+  var sel=(activeSig()||{}).symbol;
+
+  var html=f.board.map(function(n){
+    var fd=f.feeds[n.id]||{}, keys=Object.keys(fd);
+    keys.sort(function(a,b){ return fd[b][1]-fd[a][1]; });
+    var rows=keys.map(function(cp){
+      var rt=fd[cp][0], conf=fd[cp][1], k=f.shared[cp]||1;
+      return '<div class="fd"><i class="lk" style="background:var('+(GC[rt]||"--gc-eco")+
+        ');opacity:'+(0.35+0.65*conf).toFixed(2)+'"></i><span class="cp mono">'+esc(cp)+"</span>"+
+        (k>1?'<span class="fan mono" title="also feeds '+(k-1)+' other name(s) on the board">&times;'+k+"</span>":"")+
+        '<span class="rt">'+esc(rt)+'</span><span class="cf mono">'+fx(conf)+"</span></div>";
+    }).join("");
+    if(!rows) rows='<div class="cnone">no disclosed link &mdash; thesis from its own filings</div>';
+    var badge = openSyms[n.id] ? '<span class="st st-open">position</span>'
+              : liveSyms[n.id] ? '<span class="st st-sig">signalled</span>' : "";
+    return '<button class="bcard'+(badge?" hot":"")+(n.id===sel?" on":"")+'" data-sym="'+escAttr(n.id)+'">'+
+      '<span class="bh"><i class="dot '+(n.dir==="SHORT"?"neg":"pos")+'"></i>'+
+      '<span class="sym mono">'+esc(n.id)+"</span>"+
+      (n.sector&&n.sector!=="custom"?'<span class="eco">'+esc(ECO_SHORT[n.sector]||n.sector)+"</span>":"")+badge+
+      '<span class="bscore mono">'+(n.score==null?"&ndash;":fx(n.score))+"</span></span>"+
+      '<span class="feeds">'+rows+"</span></button>";
+  }).join("");
+  el("wireCards").innerHTML=html||'<div class="ev-empty">No names on the board yet.</div>';
+  Array.prototype.forEach.call(el("wireCards").querySelectorAll(".bcard"),function(b){
+    b.addEventListener("click",function(){
+      // Selecting a card selects that symbol's newest signal, so the card grid
+      // and the feed below it are always describing the same name.
+      for(var i=0;i<WIRE.feed.length;i++) if(WIRE.feed[i].symbol===b.getAttribute("data-sym")){
+        WIRE.activeKey=sigKeyOf(WIRE.feed[i]); renderFeed(true); updateWire(data); return; }
+      openDossier(b.getAttribute("data-sym"), null);
+    });
+  });
+
   var have={};
-  f.edges.forEach(function(e){ have[GC[e[2]]?e[2]:"other"]=1; });
-  f.nodes.forEach(function(n){
-    if(n.kind==="anchor"){ have.anchor=1; return; }
-    if(n.kind==="external"){ have.external=1; return; }
-    if(n.kind==="unlinked") have.unlinked=1;
-    if(n.dir==="LONG") have.long=1; else if(n.dir==="SHORT") have.short=1; else have.none=1;
-  });
-  var KEYS=[
-    ["customer",  '<i class="gl-l" style="background:var(--gc-cust)"></i>customer'],
-    ["supplier",  '<i class="gl-l" style="background:var(--gc-supp)"></i>supplier'],
-    ["competitor",'<i class="gl-l" style="background:var(--gc-comp)"></i>competitor'],
-    ["regulator", '<i class="gl-l" style="background:var(--gc-reg)"></i>regulator'],
-    ["other",     '<i class="gl-l" style="background:var(--gc-eco)"></i>other'],
-    ["anchor",    '<i class="gl-d" style="background:var(--gn-anchor)"></i>anchor'],
-    ["long",      '<i class="gl-d" style="background:var(--pos)"></i>long'],
-    ["short",     '<i class="gl-d" style="background:var(--neg)"></i>short'],
-    ["none",      '<i class="gl-d small" style="background:var(--faint)"></i>no thesis yet'],
-    ["external",  '<i class="gl-d hollow"></i>off-universe'],
-    ["unlinked",  '<i class="gl-d none"></i>no disclosed path']
-  ];
-  // Edge-class keys are BUTTONS. The legend derives from what is drawn, so a
-  // hidden class would otherwise vanish from the legend too and the panel would
-  // silently omit a whole relationship type with nothing on screen saying so.
-  // Forcing the four edge keys to always render, styled off when hidden, is
-  // what keeps "competitor is not shown" a visible statement rather than an
-  // absence -- and makes it one click to disagree with.
-  var EDGEKEYS={customer:1,supplier:1,competitor:1,regulator:1};
-  el("wireLeg").innerHTML=KEYS.filter(function(k){ return have[k[0]]||EDGEKEYS[k[0]]; })
-      .map(function(k){
-        if(!EDGEKEYS[k[0]]) return '<span class="gl">'+k[1]+"</span>";
-        var off=!!WIRE.hideTypes[k[0]];
-        return '<button class="gl gl-t'+(off?" off":"")+'" data-etype="'+k[0]+'" '+
-               'aria-pressed="'+(!off)+'" title="'+(off?"Show":"Hide")+" "+k[0]+' edges">'+k[1]+"</button>";
-      }).join("")+
-    '<span class="gl" style="margin-left:auto;color:var(--faint)">'+
-      f.nodes.length+' of '+f.total+' names &middot; thesis + the anchors feeding them</span>';
-  // Re-focus, not just re-draw: hiding a class can orphan an anchor that was
-  // only in the panel to carry it, so the SELECTION has to run again.
-  Array.prototype.forEach.call(el("wireLeg").querySelectorAll("[data-etype]"), function(b){
-    b.onclick=function(){ var t=b.getAttribute("data-etype");
+  f.board.forEach(function(n){ for(var k in (f.feeds[n.id]||{})) have[f.feeds[n.id][k][0]]=1; });
+  var KEYS=[["customer",'<i class="gl-l" style="background:var(--gc-cust)"></i>customer'],
+            ["supplier",'<i class="gl-l" style="background:var(--gc-supp)"></i>supplier'],
+            ["competitor",'<i class="gl-l" style="background:var(--gc-comp)"></i>competitor'],
+            ["regulator",'<i class="gl-l" style="background:var(--gc-reg)"></i>regulator']];
+  el("wireLeg").innerHTML=KEYS.map(function(k){
+      var off=!!WIRE.hideTypes[k[0]];
+      return '<button class="gl gl-t'+(off?" off":"")+'" data-etype="'+k[0]+'" aria-pressed="'+(!off)+
+             '" title="'+(off?"Show":"Hide")+" "+k[0]+' links">'+k[1]+"</button>";
+    }).join("")+
+    '<span class="gl"><i class="gl-d" style="background:var(--pos)"></i>long</span>'+
+    '<span class="gl"><i class="gl-d" style="background:var(--neg)"></i>short</span>'+
+    '<span class="gl" style="color:var(--faint)">opacity = disclosure confidence &middot; &times;N = anchor also feeds N&minus;1 others</span>'+
+    '<span class="gl" style="margin-left:auto;color:var(--faint)">'+f.board.length+' name(s) on the board</span>';
+  Array.prototype.forEach.call(el("wireLeg").querySelectorAll("[data-etype]"),function(b){
+    b.onclick=function(ev){ ev.stopPropagation(); var t=b.getAttribute("data-etype");
       if(WIRE.hideTypes[t]) delete WIRE.hideTypes[t]; else WIRE.hideTypes[t]=1;
-      WIRE.layoutKey=""; updateWire(data); };
+      updateWire(data); };
   });
-  // ...and no empty bordered strip under an empty canvas.
-  el("wireLeg").style.display=f.nodes.length?"":"none";
   renderFeed();
 }
 
-// wire hover
-(function(){ var tip=el("tip");
-  function nodeAt(mx,my){ var best=null,bd=1e9; WIRE.nodes.forEach(function(n){ var p=WIRE.pos[n.id]; if(!p) return;
-    var dx=mx-p.x*scale,dy=my-p.y*scale,d=Math.sqrt(dx*dx+dy*dy); if(d<gvR(n)*scale+5&&d<bd){bd=d;best=n;} }); return best; }
-  document.addEventListener("mousemove",function(ev){ if(!cv) return; var rect=cv.getBoundingClientRect();
-    if(ev.clientX<rect.left||ev.clientX>rect.right||ev.clientY<rect.top||ev.clientY>rect.bottom){ tip.style.opacity="0"; return; }
-    var n=nodeAt(ev.clientX-rect.left,ev.clientY-rect.top);
-    if(!n){ tip.style.opacity="0"; cv.style.cursor="default"; return; } cv.style.cursor="pointer";
-    function dirWord(x){ return x.dir==="LONG"?"long":(x.dir==="SHORT"?"short":"no"); }
-    var thesis = n.kind==="anchor" ? "anchor &middot; news source"
-      : n.kind==="external" ? "off-universe &middot; a graph endpoint that is neither a trade target nor an anchor"
-      : n.kind==="unlinked" ? (dirWord(n)+" thesis, score "+(n.score!=null?n.score.toFixed(2):"&ndash;")+
-          " &mdash; signalled with NO disclosed relationship path; this one came from its own filings")
-      : (n.score!=null?(dirWord(n)+" thesis, score "+n.score.toFixed(2)):"no thesis yet");
-    var name=n.name||"", info=DESC[n.id]||n.sector||"";
-    tip.innerHTML='<div class="h">'+esc(n.id)+(name?' &middot; '+esc(name):"")+"</div>"+(info?'<div class="d">'+esc(info)+"</div>":"")+'<div class="d">'+thesis+"</div>";
-    tip.style.opacity="1"; tip.style.left=(ev.clientX+14)+"px"; tip.style.top=(ev.clientY+12)+"px";
-  });
-})();
 
-// ===========================================================================
-// render everything + animation loop
-// ===========================================================================
-function renderAll(d){
-  // Before anything that asks "does this fire?" -- the ladder, the dossiers
-  // table and (via BAR) any dossier sheet opened afterwards all read it.
-  setBar(d);
-  renderCaps(d); renderPnl(d); renderWinRate(d); renderExposure(d); renderExpectancy(d);
-  renderGenrec(d); renderFunnel(d); renderBudget(d); renderGraphHealth(d); renderLadder(d);
-  renderOpen(d); renderSignals(d); renderDetail(d);
-  updateWire(d);
-}
 
-function frame(now){
+// The ticker, and nothing else. The rAF repaint went with the canvas: cards are
+// DOM, so the browser paints them and a 60fps loop over a static grid would be
+// pure waste. setInterval is enough for a 4.8s advance.
+function tickFeed(){
   var s=WIRE.feed;
-  if(!REDUCED && s.length && now-WIRE.t0>4800){
-    var i=activeIndex();
-    WIRE.activeKey=sigKeyOf(s[(i<0?0:i+1)%s.length]); WIRE.t0=now; WIRE.dirty=true; renderFeed(true);
-  }
-  // The rAF chain keeps ticking (an empty callback costs nothing, and a loop
-  // that stops has to be restarted correctly from six places -- a missed one
-  // leaves a permanently frozen canvas); it is the REPAINT that is skipped.
-  if(WIRE.dirty || wireAnimating()){ drawWire(now); WIRE.dirty=false; }
-  requestAnimationFrame(frame);
+  if(REDUCED || !s.length) return;
+  var i=activeIndex();
+  WIRE.activeKey=sigKeyOf(s[(i<0?0:i+1)%s.length]);
+  renderFeed(true); updateWire(data);
 }
 
 // theme toggle (2-state, seeded from OS)
 (function(){ var root=document.documentElement, btn=el("tgl");
   var dark=!!(window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches);
-  function apply(){ root.setAttribute("data-theme",dark?"dark":"light"); btn.textContent=dark?"☾ Dark":"☀ Light"; refreshTokens(); WIRE.dirty=true; }
+  function apply(){ root.setAttribute("data-theme",dark?"dark":"light"); btn.textContent=dark?"☾ Dark":"☀ Light"; }
   btn.addEventListener("click",function(){ dark=!dark; apply(); }); apply();
 })();
 
@@ -1923,13 +1571,7 @@ el("dossierBack").addEventListener("click", closeDossier);
 el("dossierClose").addEventListener("click", closeDossier);
 document.addEventListener("keydown", function(ev){ if(ev.key==="Escape") closeDossier(); });
 
-cv=el("wireCanvas"); ctx=cv.getContext("2d");
-window.addEventListener("resize",function(){ resizeWire(); });
-// A window resize is not the only thing that changes this panel's width: the
-// legend wrapping to a second line, the grid stacking at a breakpoint, or the
-// "Full detail" section opening all resize it with the window untouched.
-if(window.ResizeObserver){ new ResizeObserver(function(){ resizeWire(); }).observe(cv.parentNode); }
-refreshTokens(); resizeWire(); WIRE.t0=(window.performance&&performance.now)?performance.now():0; requestAnimationFrame(frame);
+setInterval(tickFeed, 4800);
 refresh(); setInterval(refresh, 10000);
 </script>
 

@@ -121,99 +121,83 @@ def test_every_button_the_script_binds_actually_exists_in_the_html():
         assert f'id="{element_id}"' in _INDEX_HTML, f'script binds #{element_id}, which the HTML never defines'
 
 
-def _layout_source() -> str:
-    """The wire layout's pure functions, lifted out of the dashboard script so
-    they can be run headless. Brace-matched rather than regexed, because these
-    bodies contain braces."""
+def _cards_source() -> str:
+    """boardCards, lifted out of the page so the selection and the fan-out count
+    can be exercised directly in node."""
     js = _script_body()
-
-    def grab(name: str) -> str:
-        start = js.index(f"function {name}(")
-        depth, i = 0, start
-        while True:
-            if js[i] == "{":
-                depth += 1
-            elif js[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    return js[start:i + 1]
-            i += 1
-
-    return "\n".join(grab(n) for n in ("gvR", "gvHW", "gvTop", "gvBot", "layoutWire"))
+    start = js.index("function boardCards(")
+    depth, i, seen = 0, start, False
+    while i < len(js):
+        if js[i] == "{":
+            depth += 1; seen = True
+        elif js[i] == "}":
+            depth -= 1
+            if seen and depth == 0:
+                return js[start:i + 1]
+        i += 1
+    raise AssertionError("boardCards never closes")
 
 
-def test_wire_layout_keeps_labels_apart_and_on_the_canvas():
-    """The graph's de-overlap pass separated DISCS, and node labels are far
-    wider than the discs they sit above -- a 12px dot carries a 40px name. So
-    "TCPA" and "SCRNY" printed straight through each other while their discs
-    were a comfortable 13px clear, and the panel read as corrupted.
+def test_a_card_is_built_for_every_name_on_the_board_and_shared_anchors_are_counted():
+    """The card grid replaced a force-directed canvas because the data is not a
+    hairball: a name on this board carries a MEDIAN OF 2 disclosed counterparties.
+    Two properties have to hold for the grid to be honest.
 
-    It also ran after the simulation loop's clamp without re-clamping, so its
-    own pushes could walk a node off the canvas, where the label was clipped
-    by the edge or piled into a stack with whatever else was shoved there.
-
-    Measured over the real node set at the time: 70 colliding label pairs
-    across 50 node-count/edge-density combinations. This runs the actual
-    shipped layout and asserts both properties hold."""
+    Every name on the board gets a card, including one with no disclosed link at
+    all -- those are the population gather_graph_health calls disconnected_with_
+    thesis, and the canvas used to drop them silently or strand them as unlabelled
+    dots. And an anchor feeding SEVERAL theses at once has to be counted, because
+    that is the "one macro fact restated through unrelated names" pattern the
+    synthesis pass vetoes on: on the live board BIS fed all five semis names as a
+    0.60 regulator edge, which read as five independent corroborations."""
     node = shutil.which("node")
     if node is None:
-        pytest.skip("node not available to run the wire layout")
+        pytest.skip("node not available to run the card builder")
 
-    # VHv is the VISIBLE virtual height, which resizeWire sets from the real
-    # canvas; at the design aspect it equals VH, which is what the layout is
-    # asserted against here.
-    harness = "var WIRE, VW=1000, VH=560, VHv=560;\n" + _layout_source() + """
-    // Deterministic stand-in for a live focus subgraph. Two properties matter
-    // and a uniform graph has neither: symbol lengths span the real range
-    // (3-6 chars, so labels are 2-4x wider than their discs), and the edges
-    // are HUB-AND-SPOKE. The real graph hangs dozens of tradeables off a
-    // handful of anchors -- BA, LMT, NOC, KTOS, BKR -- and it is that pull
-    // toward a few points that packs nodes tight enough for their labels to
-    // collide. A chain or a uniform mesh spreads out evenly and never
-    // reproduces it: an earlier version of this test used one and passed
-    // against the very layout it was written to catch.
-    const NAMES=["AOSL","BKTI","UFPT","KLXE","HTLD","SRI","PLPC","RFL","SPWR","STRT",
-                 "MVST","ESOA","CVV","PLAB","DCO","GTX","MLAB","EPAC","ACDC","ULH",
-                 "PUMP","WOLF","SES","SCE-PN","SCRNY","TCPA","NCSM","WLDN","MTRX","BWEN",
-                 "INTT","SIF","ASYS","KULR","LMB","NINE","OIS","RJET","VVX","RDW",
-                 "THRM","SLDP","IRMD","CDRE","HDSN","ULBI","KODK","TAYD","GRC","HURC",
-                 "CVLG","RLGT","MRTN","NVX","WBX","AMSC"];
-    const HUBS=["BA","LMT","NOC","KTOS","BKR"];
-    let worst={pairs:0,oob:0,at:""};
-    for(let count=20; count<=50; count+=5){
-      for(let dens=1; dens<=4; dens++){
-        const nodes=[];
-        for(let i=0;i<count;i++)
-          nodes.push({id:NAMES[i%NAMES.length], kind:"tradeable",
-                      dir:(i%3?"LONG":"SHORT"), score:((i*37)%100)/100});
-        HUBS.forEach(h=>nodes.push({id:h, kind:"anchor", dir:null, score:null}));
-        const edges=[];
-        for(let i=0;i<count;i++) for(let k=0;k<dens;k++)
-          edges.push([nodes[i].id, HUBS[(i+k)%HUBS.length], "customer", 0.8]);
-        WIRE={nodes,edges,pos:{}};
-        layoutWire();
-        const pos=WIRE.pos;
-        let oob=0, pairs=0;
-        nodes.forEach(n=>{ const p=pos[n.id];
-          if(p.x-gvHW(n)<0 || p.x+gvHW(n)>VW || p.y-gvTop(n)<0 || p.y+gvBot(n)>VH) oob++; });
-        for(let i=0;i<nodes.length;i++) for(let j=i+1;j<nodes.length;j++){
-          const a=nodes[i],b=nodes[j],pa=pos[a.id],pb=pos[b.id];
-          // Labels sit at y-r-6, ~11px tall, centred on x.
-          if(Math.abs(pa.x-pb.x) < gvHW(a)+gvHW(b) &&
-             Math.abs((pa.y-gvR(a))-(pb.y-gvR(b))) < 11){ pairs++; }
-        }
-        if(pairs>worst.pairs || oob>worst.oob) worst={pairs,oob,at:`n=${count} density=${dens}`};
-      }
-    }
-    console.log(JSON.stringify(worst));
+    harness = "var WIRE={hideTypes:{competitor:1},feed:[]};\n" + _cards_source() + """
+    const nodes=[
+      {id:"AOSL",kind:"tradeable",dir:"LONG",score:0.27,sector:"semi_equipment"},
+      {id:"PLAB",kind:"tradeable",dir:"LONG",score:0.15,sector:"semi_equipment"},
+      {id:"INTT",kind:"tradeable",dir:"LONG",score:0.00,sector:"semi_equipment"},
+      {id:"HURC",kind:"tradeable",dir:"LONG",score:0.02,sector:"industrial_machinery"},
+      {id:"BIS", kind:"anchor",   dir:null,  score:null,sector:"semi_equipment"},
+      {id:"DELL",kind:"anchor",   dir:null,  score:null,sector:"semi_equipment"}];
+    const edges=[
+      ["AOSL","BIS","regulator",0.80], ["PLAB","BIS","regulator",0.60],
+      ["INTT","BIS","regulator",0.60], ["AOSL","DELL","customer",0.85],
+      // A competitor edge, which is hidden by default and must not mint a row...
+      ["PLAB","DELL","competitor",0.95],
+      // ...and the same pair disclosed twice: the STRONGER one wins, one row.
+      ["AOSL","DELL","supplier",0.40]];
+    // MLAB has a thesis and no graph node at all -- gather_graph_stats builds
+    // its node list from edge endpoints, so it can only arrive via the dossier
+    // rows. It is the case the panel most needs to show.
+    const dossiers=[{symbol:"MLAB",direction:"LONG",confidence:0.6,magnitude:0.2},
+                    {symbol:"AOSL",direction:"LONG",confidence:0.9,magnitude:0.3}];
+    const f=boardCards({nodes,edges}, dossiers);
+    console.log(JSON.stringify({
+      cards:f.board.map(n=>n.id),
+      bis:f.shared["BIS"], dell:f.shared["DELL"],
+      aoslLinks:Object.keys(f.feeds["AOSL"]||{}).length,
+      aoslDell:(f.feeds["AOSL"]||{})["DELL"],
+      hurcLinks:Object.keys(f.feeds["HURC"]||{}).length,
+      mlabLinks:Object.keys(f.feeds["MLAB"]||{}).length,
+      plabDell:(f.feeds["PLAB"]||{})["DELL"]||null}));
     """
-    # layoutWire closes over WIRE/VW/VH as globals in the page; the harness
-    # declares the same three so it runs unmodified.
     result = subprocess.run([node, "-e", harness], capture_output=True, text=True)
-    assert result.returncode == 0, f"wire layout failed to run:\n{result.stderr}"
-    worst = json.loads(result.stdout.strip().splitlines()[-1])
-    assert worst["oob"] == 0, f'{worst["oob"]} node(s) laid out off-canvas at {worst["at"]}'
-    assert worst["pairs"] == 0, f'{worst["pairs"]} overlapping label pair(s) at {worst["at"]}'
+    assert result.returncode == 0, f"card builder failed to run:\n{result.stderr}"
+    out = json.loads(result.stdout.strip().splitlines()[-1])
+
+    assert sorted(out["cards"]) == ["AOSL", "HURC", "INTT", "MLAB", "PLAB"], \
+        "every tradeable with a thesis gets a card -- including one with no graph node"
+    assert out["hurcLinks"] == 0, "a name with no disclosed link still gets its card"
+    assert out["mlabLinks"] == 0, "a name absent from the graph entirely is still on the board"
+    assert out["bis"] == 3, "an anchor feeding three theses must be counted three times"
+    assert out["dell"] == 1, "the competitor edge must not add PLAB to DELL's fan-out"
+    assert out["plabDell"] is None, "a hidden class must not mint a row"
+    assert out["aoslLinks"] == 2, "one row per counterparty, not one per disclosure"
+    assert out["aoslDell"] == ["customer", 0.85], \
+        "the strongest disclosure wins when a pair is linked more than once"
 
 
 def test_the_signal_bar_is_read_from_config_not_hard_coded():
