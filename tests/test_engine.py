@@ -2192,6 +2192,58 @@ async def test_synthesis_cannot_inflate_a_score(engine):
     assert dossier.magnitude == before_m
 
 
+async def test_an_open_position_is_still_judged_by_synthesis(engine):
+    """The synthesis bypass: converting to a trade used to make a symbol
+    exempt from the only pass that reads its evidence as a body, for exactly
+    as long as capital was committed to it. Measured on the 2026-08-15 board,
+    three of four live positions had never been synthesised even once."""
+    engine.synthesizer = FakeSynthesizer(default=synthesis(confidence=0.4, magnitude=0.5,
+                                                           distinct_fact_count=1))
+    dossier = await _build_thesis(engine, confidence=0.9, magnitude=0.9)
+    engine.journal.open(
+        symbol="FORM", direction="LONG", entry_price=10.0, stop_loss_pct=50.0,
+        take_profit_pct=100.0, horizon_days=21, thesis_summary="t", confidence=0.9,
+        independent_source_count=2, citations=[],
+    )
+    assert engine.journal.has_open("FORM")
+    calls_before = len(engine.synthesizer.calls)
+
+    await engine._decay_one("FORM", datetime.now(timezone.utc))
+
+    assert len(engine.synthesizer.calls) > calls_before, "the open position was never judged"
+    assert engine.dossiers.load("FORM").synthesis_at != "", "the verdict never reached disk"
+
+
+async def test_a_verdict_on_an_open_position_never_acts_on_the_trade(engine):
+    """...but it is RECORDED, never acted on. An entry is a committed
+    decision: the trade resolves on its own stop, target and horizon, and a
+    mid-flight re-judgement must not contradict it."""
+    engine.synthesizer = FakeSynthesizer(
+        default=synthesis(confidence=0.0, magnitude=0.0, distinct_fact_count=1,
+                          already_priced_in=True))
+    dossier = await _build_thesis(engine, confidence=0.9, magnitude=0.9)
+    engine.journal.open(
+        symbol="FORM", direction="LONG", entry_price=10.0, stop_loss_pct=50.0,
+        take_profit_pct=100.0, horizon_days=21, thesis_summary="t", confidence=0.9,
+        independent_source_count=2, citations=[],
+    )
+    trade_before = engine.journal.open_trades["FORM"]
+    status_before = engine.dossiers.load("FORM").status
+    signals_log = Path(engine.settings.log_dir) / "signals.jsonl"
+    rows_before = len(signals_log.read_text().splitlines()) if signals_log.exists() else 0
+
+    await engine._decay_one("FORM", datetime.now(timezone.utc))
+
+    trade_after = engine.journal.open_trades["FORM"]
+    assert engine.journal.has_open("FORM"), "a veto closed a committed position"
+    assert trade_after.stop_price == trade_before.stop_price
+    assert trade_after.target_price == trade_before.target_price
+    assert trade_after.horizon_days == trade_before.horizon_days
+    assert engine.dossiers.load("FORM").status == status_before, "a veto expired a live signal"
+    rows_after = len(signals_log.read_text().splitlines()) if signals_log.exists() else 0
+    assert rows_after == rows_before, "the decay pass signalled on a symbol already in a position"
+
+
 def test_ecosystem_confidence_constants_match():
     """dossier._aggregate excludes ecosystem-association evidence from the
     independent-source count by comparing against its OWN copy of the ecosystem

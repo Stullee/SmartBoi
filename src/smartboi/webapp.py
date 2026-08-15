@@ -1183,14 +1183,28 @@ function dossierEvidence(x){
 
 function renderOpen(d){
   var open=d.open_paper_trades||[]; el("openCount").textContent=open.length+" open";
-  el("openTable").innerHTML='<thead><tr><th>Sym</th><th>Dir</th><th class="num">Entry</th><th class="num">Last</th><th class="num">Unreal R</th><th class="num">Unreal &euro;</th><th>Marked</th></tr></thead><tbody>'+
+  el("openTable").innerHTML='<thead><tr><th>Sym</th><th>Dir</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Last</th><th class="num">Stop</th><th class="num">To stop</th><th class="num">Target</th><th class="num">Unreal R</th><th class="num">Unreal &euro;</th><th>Marked</th></tr></thead><tbody>'+
     (open.length?open.map(function(t){ var fr=timeAgo(t.last_marked_at);
+      // Room left to the stop, from the LAST price and signed by direction.
+      // The stop level on its own says nothing without the live price beside
+      // it, and this is the number that was missing entirely: stops are and
+      // always were enforced in paper_journal.update() against the session's
+      // intraday extremes -- they were simply never rendered, so the panel
+      // read as though the system held positions with no stop at all.
+      var room=null;
+      if(t.last_price!=null && t.stop_price!=null && t.last_price>0){
+        room=(t.direction==="SHORT"?(t.stop_price-t.last_price):(t.last_price-t.stop_price))/t.last_price*100;
+      }
       return "<tr><td class=\\"sym mono\\">"+esc(t.symbol)+'</td><td><span class="dir '+CO[t.direction]+'">'+t.direction+"</span></td>"+
+        '<td class="num mono">'+(t.position_value==null?"–":"&euro;"+fx(t.position_value,0))+'</td>'+
         '<td class="num mono">'+fx(t.entry_price)+'</td><td class="num mono">'+fx(t.last_price)+'</td>'+
+        '<td class="num mono" style="color:var(--muted)">'+(t.stop_price==null?"–":fx(t.stop_price))+'</td>'+
+        '<td class="num mono" style="color:var(--muted)">'+(room==null?"–":fx(room,1)+"%")+'</td>'+
+        '<td class="num mono" style="color:var(--muted)">'+(t.target_price==null?"–":fx(t.target_price))+'</td>'+
         '<td class="num mono rcell '+cls(t.unrealized_r)+'">'+(t.unrealized_r==null?"–":sgn(t.unrealized_r))+"</td>"+
         '<td class="num mono '+cls(t.unrealized_currency)+'">'+(t.unrealized_currency==null?"–":sgn(t.unrealized_currency,0))+"</td>"+
         '<td class="'+(fr.stale?"stale":"fresh")+'">'+fr.t+"</td></tr>";
-    }).join(""):'<tr><td colspan="7" style="color:var(--faint)">None open.</td></tr>')+"</tbody>";
+    }).join(""):'<tr><td colspan="11" style="color:var(--faint)">None open.</td></tr>')+"</tbody>";
 }
 
 function renderSignals(d){

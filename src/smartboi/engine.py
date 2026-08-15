@@ -3639,13 +3639,45 @@ class Engine:
             # signal this system ever fired died exactly that way.
             self._last_price_poll = None
         log_signal(Path(self.settings.log_dir) / "signals.jsonl", signal, episode=dossier.signaled_at)
+        unjudged = self._synthesis_bypassed(dossier)
+        if unjudged:
+            log.warning(
+                "[UNJUDGED] %s %s signalled at score=%.3f on RAW ARITHMETIC -- %s. "
+                "effective_corroboration_count fails open without a verdict "
+                "(distinct_fact_count=%d), so no whole-body pass capped this score.",
+                signal.direction, signal.symbol,
+                signal.confidence * signal.magnitude, unjudged, dossier.distinct_fact_count,
+            )
         await self.alerts.send(
             "signal",
             f"{signal.direction} signal: {signal.symbol}",
             f"confidence={signal.confidence:.2f} magnitude={signal.magnitude:.2f} "
-            f"sources={signal.independent_source_count}. {signal.thesis_summary}",
-            asdict(signal),
+            f"sources={signal.independent_source_count}."
+            + (f" UNJUDGED: {unjudged}." if unjudged else "")
+            + f" {signal.thesis_summary}",
+            {**asdict(signal), "synthesis_bypassed": unjudged or ""},
         )
+
+    @staticmethod
+    def _synthesis_bypassed(dossier: Dossier) -> str:
+        """Why this dossier's score was never capped by the whole-body pass --
+        or "" when a verdict did govern it.
+
+        Not a diagnostic nicety. `effective_corroboration_count` deliberately
+        FAILS OPEN: absent a fresh verdict it returns the raw channel count, so
+        a dossier synthesis has never judged signals on uncapped arithmetic.
+        That is the right default -- the alternative zeroes every un-synthesised
+        thesis -- but it is silent, and silence is what let three of four live
+        positions on the 2026-08-15 board (AOSL, BKTI, SRI) open on evidence no
+        whole-body pass had ever read. This makes the bypass visible at the
+        moment it matters, without changing which signals fire."""
+        if not dossier.synthesis_at:
+            return "never synthesised"
+        if dossier.distinct_fact_count <= 0:
+            return "synthesised but no distinct_fact_count"
+        if not synthesis_verdict_fresh(dossier, datetime.now(timezone.utc)):
+            return f"verdict stale (last {dossier.synthesis_at})"
+        return ""
 
     async def _snapshot_signal_price(self, dossier: Dossier) -> None:
         """Records the price the moment a dossier becomes SIGNALED, so
@@ -4150,8 +4182,12 @@ class Engine:
         0.2 threshold with both source bars satisfied, sitting ACTIVE,
         waiting for an article that might never come.
 
-        Once a paper trade has actually opened, decay no longer touches that
-        dossier -- the open trade has its own stop/target/horizon."""
+        Once a paper trade has actually opened, that dossier is still decayed
+        and still SYNTHESISED -- so the verdict on a live thesis is on the
+        record -- but nothing the pass concludes is allowed to act: no signal,
+        no expiry. The open trade resolves on its own stop, target and
+        horizon, because an entry is a committed decision and a mid-flight
+        re-judgement must not contradict it (see _decay_one)."""
         now = datetime.now(timezone.utc)
         for symbol in self.dossiers.all_symbols():
             # Per-symbol isolation, matching _poll_edgar and _poll_news. This
@@ -4187,23 +4223,35 @@ class Engine:
         recompute_decay(dossier, now)
         changed = before != self._decay_fingerprint(dossier)
 
-        # Evaluated on EVERY pass, not only when the score moved. A
-        # dossier can sit above the bar with perfectly stable numbers --
-        # nothing decaying, no new evidence -- and it still needs to
-        # signal. Gating this on `changed` (as an earlier version did)
-        # reproduced the original bug in a subtler form: the one dossier
-        # that most obviously qualified was the one whose score had
-        # settled, so it was skipped every single day. evaluate() is a
-        # pure function over fields already in hand, so running it
-        # unconditionally costs nothing.
-        if self.journal.has_open(symbol):
-            if changed:
-                self.dossiers.save(dossier)
-            return
         # Synthesis runs here and nowhere else: once a day, only for a
         # dossier that has resolved a direction, so this is a few dozen
         # calls against a budget the deployment runs at a few percent of.
+        #
+        # It runs on dossiers with an OPEN POSITION too, and that placement is
+        # the point. This check used to sit above, so converting to a trade
+        # made a symbol exempt from the only pass that reads its evidence as a
+        # body -- for exactly as long as capital was committed to it. Measured
+        # on the 2026-08-15 board: three of four open positions (AOSL, BKTI,
+        # SRI) carried distinct_fact_count 0, having never once been judged,
+        # while every dossier synthesis DID judge was one that could not trade.
+        # The reviewer and the trader were looking at disjoint sets.
+        #
+        # Meanwhile decay and re-aggregation kept running underneath, so an
+        # open position's score moved with no whole-body pass to say whether
+        # it was falsification or evidence merely ageing out.
         synthesized = await self._apply_synthesis(dossier, now)
+
+        # ...but the verdict is RECORDED, never acted on, while the position
+        # is open. An entry is a committed decision: a mid-flight re-judgement
+        # must not contradict it, and the trade has its own stop, target and
+        # horizon to resolve it. So this returns before signal evaluation and
+        # before expiry, exactly as it did before -- what changed is only that
+        # the dossier is now judged and persisted rather than skipped, which
+        # is what makes "was the verdict right?" answerable at all.
+        if self.journal.has_open(symbol):
+            if changed or synthesized:
+                self.dossiers.save(dossier)
+            return
         # Saved once, AFTER synthesis, rather than only when the decay
         # fingerprint moved.
         #
@@ -4222,6 +4270,14 @@ class Engine:
         # or absent rather than the one that had just run.
         if changed or synthesized:
             self.dossiers.save(dossier)
+        # Evaluated on EVERY pass, not only when the score moved. A dossier
+        # can sit above the bar with perfectly stable numbers -- nothing
+        # decaying, no new evidence -- and it still needs to signal. Gating
+        # this on `changed` (as an earlier version did) reproduced the
+        # original bug in a subtler form: the one dossier that most obviously
+        # qualified was the one whose score had settled, so it was skipped
+        # every single day. evaluate() is a pure function over fields already
+        # in hand, so running it unconditionally costs nothing.
         signal = evaluate(dossier, self.settings.signal_confidence_threshold,
                           self.settings.min_independent_sources,
                           self.settings.min_independent_sources_news_only)

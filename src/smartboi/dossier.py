@@ -314,11 +314,36 @@ DISCLOSED_LINK_CONFIDENCE = 0.85
 
 def _keys_of(contributing: list[EvidenceRecord]) -> set[str]:
     """The independent-source slots a set of contributing evidence claims --
-    the single definition of that accounting, so nothing can drift from it."""
-    return {
+    the single definition of that accounting, so nothing can drift from it.
+
+    NON-SHATTERING: a fact label may MERGE items the channel key kept apart,
+    never split ones it had already merged. Whichever partition yields fewer
+    slots wins.
+
+    The fact key (SCORING_VERSION 8) was introduced to collapse one event
+    restated across many outlets into a single slot. Measured on the first
+    labelled cohort -- 108 items, everything merged after the 2026-08-13
+    cutover -- it did the opposite: 92 slots against the channel key's 64, a
+    +43.8% SPLIT, with 13 dossiers splitting, 18 holding and not one
+    collapsing. Two model-written labels for one underlying event ("ford
+    phases out china lincoln imports" and "ford increases lincoln us
+    production 2030", from a single announcement) mint two slots where the
+    channel key minted one, and the corroboration bonus is convex in the slot
+    count, so every such split inflates the score.
+
+    Taking the smaller partition keeps the mechanism's upside -- a genuine
+    merge still counts once -- while making its failure mode unreachable. It
+    can only ever LOWER a slot count relative to today, never raise one, so no
+    dossier can start signalling because of this."""
+    fact = {
         _ECOSYSTEM_SLOT_KEY if is_ecosystem_association(e) else independence_key(e)
         for e in contributing
     }
+    channel = {
+        _ECOSYSTEM_SLOT_KEY if is_ecosystem_association(e) else channel_key(e)
+        for e in contributing
+    }
+    return fact if len(fact) <= len(channel) else channel
 
 
 def slot_keys(dossier: Dossier, now: datetime) -> set[str]:
@@ -448,6 +473,14 @@ def independence_key(record: EvidenceRecord) -> str:
     or a model that omitted it) the previous behaviour stands unchanged."""
     if record.fact_key:
         return f"fact:{normalized_fact_key(record.fact_key)}"
+    return channel_key(record)
+
+
+def channel_key(record: EvidenceRecord) -> str:
+    """The pre-fact-key independence unit: the DISCLOSURE CHANNEL an item
+    arrived through. Split out of independence_key so the fact key can be
+    measured against what it replaced -- see _keys_of, which refuses to let a
+    label split what the channel already merged."""
     if record.is_propagated and record.origin_symbol:
         return f"{record.origin_symbol}|{record.source_name}"
     # Direct EDGAR filings were collapsed to one slot per FORM ("SEC EDGAR
@@ -630,6 +663,37 @@ COMPETITOR_SATISFIES_DISCLOSED_LINK = False
 #     delisting forms, so filing evidence now reaches foreign private issuers
 #     that could previously never produce a single filing item.
 #
+# 10: the fact key may MERGE but no longer SPLIT (see _keys_of). 9 made the
+# mechanism live; this is the first measurement of what it actually did, and
+# it ran backwards. The key was introduced to collapse one event restated
+# across many outlets into a single slot. On the first labelled cohort -- 108
+# items, everything merged after the 2026-08-13 cutover -- it produced 92
+# independence slots against the channel key's 64: a +43.8% SPLIT, with 13
+# dossiers splitting, 18 holding and NOT ONE collapsing. 9's own prediction
+# (23 fall / 5 hold / 1 rise) is inverted, and the canonical BWEN case the
+# mechanism was built for goes from 1 slot to 3.
+#
+# The failure is that a model writes two labels for one event. One Ford
+# announcement arrived as "ford phases out china lincoln imports" and "ford
+# increases lincoln us production 2030" -- two slots where F|Yahoo minted one.
+# Normalisation cannot catch this: the strings are genuinely different, and
+# the updater being shown existing labels is a prompt-level defence with no
+# floor under it. The corroboration bonus is convex in the slot count
+# (_corroboration_doublings), so every such split inflates a score.
+#
+# _keys_of now takes whichever of the two partitions has FEWER slots. The
+# upside is untouched -- a genuine cross-channel merge still counts once --
+# while the failure mode becomes unreachable. It can only ever LOWER a slot
+# count relative to 9, never raise one, so nothing starts signalling because
+# of this. Some dossiers will stop: independent_source_count is also the hard
+# gate (min_independent_sources), which is the intended direction and the
+# reason rows must split here rather than pool with 9.
+#
+# Carries 9's FORWARD-ONLY caveat unchanged, and one of its own: the guard
+# compares partition CARDINALITY, not refinement, and it runs over the
+# contributing set, which shrinks as evidence decays. The winning partition
+# can therefore change between passes on the same dossier.
+#
 # 9: what 8 SAID it did, actually happening. The fact key never survived the
 # engine's proposal validator -- engine._validated_proposal is a whitelist and
 # did not name the field -- so every item merged under 8 carried fact_key="",
@@ -700,7 +764,7 @@ COMPETITOR_SATISFIES_DISCLOSED_LINK = False
 # same evidence. Routing those to the trim alone would have changed nothing --
 # none of the 23 clears the bar on its trimmed score either -- which is what
 # says the gap, not the routing, was the defect.
-SCORING_VERSION = 9
+SCORING_VERSION = 10
 
 # How long a persisted synthesis verdict is honoured -- as a cap on the merge
 # path (engine._cap_with_synthesis) and as the corroboration ceiling in
