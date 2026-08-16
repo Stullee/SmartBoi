@@ -121,6 +121,58 @@ def test_every_button_the_script_binds_actually_exists_in_the_html():
         assert f'id="{element_id}"' in _INDEX_HTML, f'script binds #{element_id}, which the HTML never defines'
 
 
+def test_every_function_the_script_calls_is_actually_defined():
+    """`renderAll` was deleted by a careless range edit while the refresh
+    handler that calls it stayed, so the page loaded, fetched, and then died on
+    every payload with "Render error: Can't find variable: renderAll" -- the
+    whole dashboard blank behind one error line.
+
+    Nothing caught it. The syntax check passes (the file is valid JS), the
+    element-id check above passes (no id changed), and a browser check missed it
+    because the harness called the render entry point by hand instead of letting
+    the page's own refresh path run.
+
+    So: parse the top-level `function name(` declarations, collect every
+    `name(` call site, and assert the calls are a subset. Deliberately limited
+    to plain identifier calls -- method calls, constructors and locals are
+    filtered by the known-globals list rather than by parsing scope, because a
+    real JS parser is not worth carrying for this."""
+    # Comments and string literals first: this file carries more prose than code
+    # and "an anchor (see ...)" reads as a call to `anchor` otherwise.
+    body = _script_body()
+    body = re.sub(r"/\*.*?\*/", " ", body, flags=re.S)
+    body = re.sub(r"(?m)//.*$", " ", body)
+    # ONE alternating pass, so the scanner consumes whichever quote opens first.
+    # Three sequential passes do not work: this file is full of HTML fragments
+    # like "<div class='x'>", and stripping single-quoted spans first swallows
+    # everything between two apostrophes that live inside double-quoted strings
+    # -- including, when it happened here, half the function declarations.
+    body = re.sub(r"""'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`""", '""', body)
+
+    defined = set(re.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(", body))
+    defined |= set(re.findall(r"\bvar\s+([A-Za-z_$][\w$]*)\s*=\s*function\b", body))
+    # Anything that is not one of ours: DOM/JS built-ins, and the locally-scoped
+    # helpers declared inside other functions (which the regex above also picks
+    # up, so they are already in `defined`).
+    builtins = {
+        "if", "for", "while", "switch", "catch", "return", "function", "typeof",
+        "parseInt", "parseFloat", "isNaN", "String", "Number", "Boolean", "Array",
+        "Object", "JSON", "Math", "Date", "RegExp", "Error", "Promise", "Set", "Map",
+        "fetch", "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+        "requestAnimationFrame", "encodeURIComponent", "decodeURIComponent",
+        "getComputedStyle", "alert", "confirm", "matchMedia", "ResizeObserver",
+        "IntersectionObserver", "MutationObserver", "AbortController", "console",
+    }
+    called = set(re.findall(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(", body))
+    missing = sorted(c for c in called - defined - builtins if c[0].islower() and len(c) > 3)
+    # Whatever survives is either ours-and-undefined (the bug) or a built-in the
+    # list above has not met yet; both deserve a look, so the assertion names them.
+    assert not missing, (
+        "script calls function(s) it never defines: " + ", ".join(missing) +
+        " -- either a deleted definition or a built-in missing from `builtins` here"
+    )
+
+
 def _cards_source() -> str:
     """boardCards, lifted out of the page so the selection and the fan-out count
     can be exercised directly in node."""
