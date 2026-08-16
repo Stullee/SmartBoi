@@ -190,6 +190,32 @@ def _cards_source() -> str:
     raise AssertionError("boardCards never closes")
 
 
+def test_a_card_click_always_opens_the_dossier():
+    """Clicking a card is the panel's only interaction, and it used to `return`
+    early whenever the symbol was found in the signal feed -- moving the feed
+    highlight and opening nothing.
+
+    That was not an edge case. It was every open position and every recently
+    signalled name: 15 of 52 on the live board, and precisely the 15 an operator
+    most wants to open. Every OTHER card opened its dossier, so the panel taught
+    one rule and then broke it on exactly the important names.
+
+    Asserted on the source rather than in a browser because the failure is a
+    control-flow shape, not a rendering one: the feed-sync loop must not be able
+    to skip the openDossier call that follows it."""
+    body = _script_body()
+    start = body.index('el("wireCards").querySelectorAll(".bcard")')
+    handler = body[start:start + 1400]
+    sync = handler.index("WIRE.activeKey=sigKeyOf(WIRE.feed[i])")
+    opens = handler.index("openDossier(")
+    assert sync < opens, "the feed sync must come before the dossier open, not replace it"
+    between = handler[sync:opens]
+    assert "return" not in between, (
+        "the feed-sync branch returns before openDossier -- every signalled name "
+        "and every open position would click into nothing"
+    )
+
+
 def test_a_card_is_built_for_every_name_on_the_board_and_shared_anchors_are_counted():
     """The card grid replaced a force-directed canvas because the data is not a
     hairball: a name on this board carries a MEDIAN OF 2 disclosed counterparties.
