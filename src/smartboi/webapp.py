@@ -286,6 +286,17 @@ _INDEX_HTML = """<!doctype html>
   .st-open { background:color-mix(in srgb, var(--accent) 18%, transparent); color:var(--accent); }
   .st-sig { background:color-mix(in srgb, var(--muted) 18%, transparent); color:var(--muted); }
   .bscore { margin-left:auto; font-size:11.5px; color:var(--muted); }
+  /* The verdict line, between the header and the links. Muted rather than
+     alarming: a veto is a normal outcome of review, not an error state, and the
+     one thing it must not imply is that the position is in trouble. */
+  .vd { display:flex; align-items:center; gap:5px; margin:0 0 6px; font-size:10px; flex-wrap:wrap; }
+  .vtag { text-transform:uppercase; letter-spacing:.06em; font-weight:600; font-size:8.5px;
+          border-radius:3px; padding:1px 5px; }
+  .vd.veto .vtag { background:color-mix(in srgb, var(--warn) 20%, transparent); color:var(--warn); }
+  .vd.trim .vtag { background:color-mix(in srgb, var(--muted) 18%, transparent); color:var(--muted); }
+  .vd.stale .vtag { background:transparent; color:var(--faint); border:1px solid var(--line); }
+  .vtxt { color:var(--faint); }
+  .vtxt b { color:var(--muted); font-weight:600; }
   .feeds { display:flex; flex-direction:column; gap:1px; }
   .fd { display:flex; align-items:center; gap:6px; font-size:11.5px; }
   /* The line swatch is the only place colour carries the relationship type, and
@@ -1468,6 +1479,52 @@ function boardCards(g, dossiers){
 // channel's, so a new relationship type shows up as obviously unkeyed.
 var GC={customer:"--gc-cust",supplier:"--gc-supp",competitor:"--gc-comp",regulator:"--gc-reg"};
 
+// What the whole-body pass did to this score, said in words.
+//
+// A capped dossier used to render as a bare 0.00, which is the most misleading
+// number this dashboard can print. On a name with an OPEN POSITION it reads as
+// "this holding is worthless"; it actually means "the reviewer has judged the
+// accumulated evidence and vetoed it, while the trade stands on its own stop
+// and horizon". Measured on the live board the moment synthesis began judging
+// open positions: AOSL 0.266 -> 0.000 and SRI 0.213 -> 0.000, neither of them
+// priced-in -- the pass simply disagreed with the DIRECTION. Both were showing
+// a naked zero beside a "position" badge.
+//
+// It also threw away a real number. Synthesis rated AOSL 0.42 x 0.30 = 0.13 and
+// SRI 0.25 x 0.20 = 0.05; the card printed neither.
+//
+// The state is DERIVED rather than stored, because the verdict's direction is
+// not persisted -- only its effect is. _apply_synthesis zeroes the score on
+// exactly two conditions, so a zeroed score with no priced-in flag can only be
+// the direction disagreement, and that inference is sound as long as those
+// remain the only two zeroing paths.
+function verdictLine(r){
+  if(!r || !r.synthesis_at) return "";
+  var applied=(r.confidence||0)*(r.magnitude||0);
+  var rated=(r.synthesis_confidence||0)*(r.synthesis_magnitude||0);
+  var arith=r.pre_synthesis_score||0;
+  var kind, label;
+  // A LAPSED verdict is reported as history, not as the current state. Past the
+  // freshness window the cap stops applying and the score springs back to the
+  // arithmetic the verdict rejected -- so labelling that card "priced in" beside
+  // a live non-zero score describes something no longer in force. UFPT hit this
+  // on the live board: a five-day-old priced-in verdict, cap lapsed, score back
+  // at 0.15.
+  if(!r.synthesis_fresh){
+    if(!r.already_priced_in && applied>=arith-0.0005) return "";
+    return '<span class="vd stale"><span class="vtag">lapsed</span>'+
+      '<span class="vtxt">last review rated <b class="mono">'+fx(rated)+
+      "</b>, no longer capping</span></span>";
+  }
+  if(r.already_priced_in){ kind="veto"; label="priced in"; }
+  else if(applied===0 && arith>0){ kind="veto"; label="direction disputed"; }
+  else if(applied<arith-0.0005){ kind="trim"; label="trimmed"; }
+  else return "";   // the verdict agreed with the arithmetic; nothing to explain
+  return '<span class="vd '+kind+'"><span class="vtag">'+label+"</span>"+
+    '<span class="vtxt">reviewer rates <b class="mono">'+fx(rated)+"</b>"+
+    (arith?' &middot; arithmetic <b class="mono">'+fx(arith)+"</b>":"")+"</span></span>";
+}
+
 var ECO_SHORT={semi_equipment:"semis",defense_tier2:"defense",grid_datacenter:"grid",
   battery_storage:"battery",medtech_supply:"medtech",auto_supply:"auto",
   energy_services:"energy",industrial_machinery:"machinery",transport_logistics:"transport"};
@@ -1480,6 +1537,7 @@ function updateWire(d){
   var openSyms={}; (d.open_paper_trades||[]).forEach(function(t){ openSyms[t.symbol]=1; });
   var liveSyms={}; WIRE.feed.forEach(function(x){ liveSyms[x.symbol]=1; });
   var sel=(activeSig()||{}).symbol;
+  var dRow={}; (d.dossiers||[]).forEach(function(r){ dRow[r.symbol]=r; });
 
   var html=f.board.map(function(n){
     var fd=f.feeds[n.id]||{}, keys=Object.keys(fd);
@@ -1499,6 +1557,7 @@ function updateWire(d){
       '<span class="sym mono">'+esc(n.id)+"</span>"+
       (n.sector&&n.sector!=="custom"?'<span class="eco">'+esc(ECO_SHORT[n.sector]||n.sector)+"</span>":"")+badge+
       '<span class="bscore mono">'+(n.score==null?"&ndash;":fx(n.score))+"</span></span>"+
+      verdictLine(dRow[n.id])+
       '<span class="feeds">'+rows+"</span></button>";
   }).join("");
   el("wireCards").innerHTML=html||'<div class="ev-empty">No names on the board yet.</div>';

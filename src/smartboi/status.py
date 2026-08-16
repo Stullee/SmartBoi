@@ -11,7 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from smartboi.config import strategy_key
-from smartboi.dossier import SCORING_VERSION, Dossier, DossierStore, normalized_fact_key
+from smartboi.dossier import (
+    SCORING_VERSION,
+    Dossier,
+    DossierStore,
+    normalized_fact_key,
+    synthesis_verdict_fresh,
+)
 from smartboi.graph import RelationshipGraph
 
 
@@ -124,6 +130,31 @@ def _dossier_row(d: Dossier) -> dict:
         "signaled_price": d.signaled_price,
         "mass_agree": round(d.mass_agree, 3),
         "mass_opposing": round(d.mass_opposing, 3),
+        # What the whole-body pass did to this score, and what it rated the
+        # evidence on its own terms.
+        #
+        # Without these a capped dossier renders as a bare 0.00, which is the
+        # single most misleading number the dashboard can print: on a name with
+        # an OPEN POSITION it reads as "this holding is worthless" when it means
+        # "the reviewer has judged the accumulated evidence and vetoed it, while
+        # the trade stands on its own stop and horizon". It also throws away a
+        # real number -- synthesis rated AOSL 0.42 x 0.30 and the card showed
+        # zero. `pre_synthesis_score` is the arithmetic the verdict capped, so a
+        # reader can see the size of the disagreement rather than just its
+        # result.
+        "synthesis_at": d.synthesis_at,
+        # Whether the verdict is still GOVERNING. Past SYNTHESIS_CAP_MAX_AGE_HOURS
+        # the cap lapses and the score springs back to the arithmetic the verdict
+        # rejected, so a stale verdict describes what the reviewer thought, not
+        # what is currently in force. Computed here rather than from the
+        # timestamp in the browser, so the page cannot hold a second copy of the
+        # freshness window and drift from the one scoring actually uses.
+        "synthesis_fresh": synthesis_verdict_fresh(d, datetime.now(timezone.utc)),
+        "already_priced_in": d.already_priced_in,
+        "redundant_evidence": d.redundant_evidence,
+        "synthesis_confidence": d.synthesis_confidence,
+        "synthesis_magnitude": d.synthesis_magnitude,
+        "pre_synthesis_score": round(d.pre_synthesis_score, 3),
         # How many of this dossier's items carry a fact label, and how
         # many distinct labels that is. The whole per-fact
         # independence mechanism rests on the model reusing a label
