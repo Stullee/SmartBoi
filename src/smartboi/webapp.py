@@ -1504,11 +1504,24 @@ function updateWire(d){
   el("wireCards").innerHTML=html||'<div class="ev-empty">No names on the board yet.</div>';
   Array.prototype.forEach.call(el("wireCards").querySelectorAll(".bcard"),function(b){
     b.addEventListener("click",function(){
-      // Selecting a card selects that symbol's newest signal, so the card grid
-      // and the feed below it are always describing the same name.
-      for(var i=0;i<WIRE.feed.length;i++) if(WIRE.feed[i].symbol===b.getAttribute("data-sym")){
-        WIRE.activeKey=sigKeyOf(WIRE.feed[i]); renderFeed(true); updateWire(data); return; }
-      openDossier(b.getAttribute("data-sym"), null);
+      var sym=b.getAttribute("data-sym");
+      // A card ALWAYS opens the dossier. Syncing the feed selection is a side
+      // effect of clicking, never a substitute for it.
+      //
+      // This used to `return` after finding the symbol in the feed, so a name
+      // with a recent signal moved the feed highlight and opened nothing. That
+      // is not a minor subset: it was every open position and every signalled
+      // name -- 15 of 52 on the live board, and precisely the 15 an operator
+      // most wants to open. Every OTHER card opened its dossier, so the panel
+      // taught one rule and then broke it on the important names.
+      for(var i=0;i<WIRE.feed.length;i++) if(WIRE.feed[i].symbol===sym){
+        WIRE.activeKey=sigKeyOf(WIRE.feed[i]); renderFeed(true); break; }
+      // Highlight moved by hand rather than by re-running updateWire: a full
+      // rebuild replaces this very node in the middle of its own handler.
+      Array.prototype.forEach.call(el("wireCards").querySelectorAll(".bcard.on"),
+        function(x){ x.classList.remove("on"); });
+      b.classList.add("on");
+      openDossier(sym, null);
     });
   });
 
