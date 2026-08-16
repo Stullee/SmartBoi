@@ -1537,6 +1537,19 @@ function updateWire(d){
 
 
 
+// ===========================================================================
+// render everything
+// ===========================================================================
+function renderAll(d){
+  // Before anything that asks "does this fire?" -- the ladder, the dossiers
+  // table and (via BAR) any dossier sheet opened afterwards all read it.
+  setBar(d);
+  renderCaps(d); renderPnl(d); renderWinRate(d); renderExposure(d); renderExpectancy(d);
+  renderGenrec(d); renderFunnel(d); renderBudget(d); renderGraphHealth(d); renderLadder(d);
+  renderOpen(d); renderSignals(d); renderDetail(d);
+  updateWire(d);
+}
+
 // The ticker, and nothing else. The rAF repaint went with the canvas: cards are
 // DOM, so the browser paints them and a 60fps loop over a static grid would be
 // pure waste. setInterval is enough for a 4.8s advance.
