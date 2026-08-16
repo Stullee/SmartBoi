@@ -216,6 +216,71 @@ def test_a_card_click_always_opens_the_dossier():
     )
 
 
+def _verdict_source() -> str:
+    js = _script_body()
+    start = js.index("function verdictLine(")
+    depth, i, seen = 0, start, False
+    while i < len(js):
+        if js[i] == "{":
+            depth += 1; seen = True
+        elif js[i] == "}":
+            depth -= 1
+            if seen and depth == 0:
+                return js[start:i + 1]
+        i += 1
+    raise AssertionError("verdictLine never closes")
+
+
+def test_a_capped_score_says_why_instead_of_printing_a_bare_zero():
+    """A vetoed dossier rendered as `0.00` and nothing else. That is the most
+    misleading number this dashboard can print: on a name with an OPEN POSITION
+    it reads as "this holding is worthless", when it means "the reviewer has
+    judged the accumulated evidence and vetoed it, while the trade stands on its
+    own stop and horizon". It also discarded a real number -- synthesis rated
+    AOSL 0.42 x 0.30 and the card showed zero.
+
+    The four states, with the live values that produced them:
+      AOSL  applied 0.00, arithmetic 0.26, not priced-in -> direction disputed
+      UFPT  priced-in but the verdict has lapsed         -> reported as history
+      BKTI  applied 0.10 against arithmetic 0.49         -> trimmed
+      a verdict that agreed with the arithmetic          -> no line at all
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available to run verdictLine")
+
+    harness = "function fx(n,d){d=d===undefined?2:d;return (+n).toFixed(d);}\n" + _verdict_source() + """
+    const F=(o)=>Object.assign({synthesis_at:"2026-08-16T10:00:00Z", synthesis_fresh:true,
+      already_priced_in:false, synthesis_confidence:0, synthesis_magnitude:0,
+      confidence:0, magnitude:0, pre_synthesis_score:0}, o);
+    console.log(JSON.stringify({
+      unjudged: verdictLine(F({synthesis_at:""})),
+      disputed: verdictLine(F({confidence:0,magnitude:0,pre_synthesis_score:0.264,
+                               synthesis_confidence:0.42,synthesis_magnitude:0.30})),
+      pricedin: verdictLine(F({already_priced_in:true,confidence:0,magnitude:0})),
+      trimmed:  verdictLine(F({confidence:0.42,magnitude:0.25,pre_synthesis_score:0.49,
+                               synthesis_confidence:0.42,synthesis_magnitude:0.25})),
+      agreed:   verdictLine(F({confidence:0.5,magnitude:0.5,pre_synthesis_score:0.25,
+                               synthesis_confidence:0.5,synthesis_magnitude:0.5})),
+      lapsed:   verdictLine(F({synthesis_fresh:false,already_priced_in:true,
+                               confidence:0.3,magnitude:0.49,pre_synthesis_score:0}))}));
+    """
+    result = subprocess.run([node, "-e", harness], capture_output=True, text=True)
+    assert result.returncode == 0, f"verdictLine failed to run:\n{result.stderr}"
+    out = json.loads(result.stdout.strip().splitlines()[-1])
+
+    assert out["unjudged"] == "", "a dossier synthesis never judged claims no verdict"
+    assert out["agreed"] == "", "a verdict that changed nothing needs no line"
+    assert "direction disputed" in out["disputed"], out["disputed"]
+    assert "0.13" in out["disputed"], "the reviewer's own rating must survive the veto"
+    assert "0.26" in out["disputed"], "the arithmetic it capped must be shown"
+    assert "priced in" in out["pricedin"], out["pricedin"]
+    assert "trimmed" in out["trimmed"], out["trimmed"]
+    assert "lapsed" in out["lapsed"], "an expired verdict is history, not current state"
+    assert "priced in" not in out["lapsed"], \
+        "a lapsed verdict must not be presented as though it were still capping"
+
+
 def test_a_card_is_built_for_every_name_on_the_board_and_shared_anchors_are_counted():
     """The card grid replaced a force-directed canvas because the data is not a
     hairball: a name on this board carries a MEDIAN OF 2 disclosed counterparties.
