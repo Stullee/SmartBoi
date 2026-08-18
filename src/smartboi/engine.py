@@ -131,6 +131,16 @@ DAILY_SNAPSHOT_INTERVAL_SEC = 86400
 # (17:30 ET in summer, 16:30 ET in winter), so the mark is that session's
 # close and the snapshot is the evidence state that close judged.
 CAPTURE_ANCHOR_UTC = (21, 30)
+# A daily mark that moved more than this against the previous mark on file is
+# written with a suspect_jump_from field and EXCLUDED by the join-side reader
+# (forward_returns.price_marks_by_symbol) -- quote-rounding artifacts and
+# corporate actions both land here (±150% rounding artifacts observed live on
+# a sub-$1 name; an unadjusted reverse split is a fake 10-20x "move"), and
+# either one poisons every forward-return row it joins. The row is still
+# written, not dropped: a genuine 40%+ move stays on file for review, and a
+# persistent re-price (a real split) self-heals -- the NEXT day's mark is
+# compared against the flagged one, sits inside the band, and joins normally.
+SUSPECT_MARK_JUMP_PCT = 40.0
 # How often already-discovered, still-ticker-less universe candidates get
 # another resolution attempt (see _run_candidate_ticker_recheck) -- daily is
 # plenty for something that only changes when SEC's ticker map gains a new
@@ -3678,6 +3688,32 @@ class Engine:
             # _reset_to_active before re-firing; the merge path did not.
             dossier.entry_attempts = 0
             await self._snapshot_signal_price(dossier)
+            # The signal floor is checked at FIRE time, not just at entry:
+            # an episode is minted the moment the signal row is logged, and
+            # the per-fire event study counts every episode -- so a sub-floor
+            # name that fires and then gets refused at the gate still
+            # pollutes the forward record with a symbol whose quotes cannot
+            # support a return measurement. Below the floor nothing is
+            # logged and the dossier stays ACTIVE; the block is visible in
+            # the decisions ledger instead. A None price falls through to
+            # the entry gate's own floor check, which sees a real quote.
+            floor = self.settings.min_signal_price
+            if (dossier.signaled_price is not None
+                    and 0 < dossier.signaled_price < floor):
+                price = dossier.signaled_price
+                self._record_decision(
+                    "signal_floor_block", dossier.symbol, dossier.direction,
+                    dossier.signaled_at, price=price,
+                    reason=f"price {price:.2f} below the {floor:.2f} signal floor",
+                )
+                self._warn_once(
+                    f"signal-floor:{dossier.symbol}",
+                    f"{dossier.symbol}: thesis clears the bar but the price ({price:.2f}) is below "
+                    f"the {floor:.2f} signal floor -- not firing (delisting/quote-integrity territory).",
+                )
+                self._reset_to_active(dossier)
+                self.dossiers.save(dossier)
+                return
             self.dossiers.save(dossier)
             # Pull the next price poll forward to the entry cadence rather
             # than letting this wait up to price_poll_interval_sec (6h) for
@@ -3996,6 +4032,20 @@ class Engine:
                     "(IB unreachable/unsubscribed and no Finnhub quote). It will expire at the entry "
                     f"deadline ({self.settings.signal_entry_deadline_days}d) if nothing can price it.",
                 )
+            return
+
+        # The floor again, on the entry-time quote: this catches the episode
+        # that fired while no price source could answer (the fire-time check
+        # sees None and defers to here) and the price that collapsed under
+        # the floor after firing. Expired rather than left waiting -- a
+        # sub-floor price is not a transient the deadline should ride out,
+        # and a SIGNALED dossier holds the tightened entry-poll cadence open.
+        if 0 < price < self.settings.min_signal_price:
+            self._expire_signal(
+                dossier,
+                f"price {price:.2f} fell below the {self.settings.min_signal_price:.2f} signal floor",
+                price=price,
+            )
             return
 
         # Prefer the thesis-INCEPTION baseline over the signal-fire one. A
@@ -4756,6 +4806,27 @@ class Engine:
             )
         return written > 0
 
+    @staticmethod
+    def _last_marks_on_file(path: Path) -> dict[str, float]:
+        """The most recent price per symbol already in price_marks.jsonl --
+        the comparison base for the suspect-jump flag. Reads raw rows rather
+        than price_marks_by_symbol on purpose: the reader EXCLUDES suspect
+        rows, but the jump comparison must include them, or a genuine
+        persistent re-price (a real split) would be re-flagged against the
+        pre-split level every day forever instead of self-healing after one."""
+        marks: dict[str, float] = {}
+        if not path.exists():
+            return marks
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            symbol, price = row.get("symbol"), row.get("price")
+            if symbol and isinstance(price, (int, float)) and price > 0:
+                marks[symbol] = float(price)
+        return marks
+
     async def _run_daily_price_marks(self) -> bool:
         """Appends every universe symbol's last price to
         logs/price_marks.jsonl, once a day -- the raw material for joining
@@ -4802,9 +4873,22 @@ class Engine:
         marked_at = datetime.now(timezone.utc).isoformat()
         path = Path(self.settings.log_dir) / "price_marks.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
+        previous = self._last_marks_on_file(path)
+        flagged: list[str] = []
         with path.open("a") as f:
             for symbol, price in prices.items():
-                f.write(json.dumps({"marked_at": marked_at, "symbol": symbol, "price": price}) + "\n")
+                row: dict = {"marked_at": marked_at, "symbol": symbol, "price": price}
+                prev = previous.get(symbol)
+                if prev and abs(price / prev - 1.0) * 100.0 > SUSPECT_MARK_JUMP_PCT:
+                    row["suspect_jump_from"] = prev
+                    flagged.append(f"{symbol} {prev:.4g}->{price:.4g}")
+                f.write(json.dumps(row) + "\n")
+        if flagged:
+            log.warning(
+                "Daily price marks: %d mark(s) jumped >%.0f%% against the previous mark and were "
+                "flagged suspect (excluded from forward-return joins pending review): %s",
+                len(flagged), SUSPECT_MARK_JUMP_PCT, ", ".join(flagged),
+            )
         if len(prices) < len(symbols):
             log.warning("Daily price marks: %d of %d symbols priced (no source had the rest).",
                         len(prices), len(symbols))

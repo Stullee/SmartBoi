@@ -584,7 +584,7 @@ def run_exit_analysis(log_dir: str | Path) -> str:
 # email, as SEC requires), or a URL that can embed a token
 # (alert_webhook_url).
 _DIAGNOSTIC_SETTINGS = (
-    "signal_confidence_threshold", "min_independent_sources",
+    "signal_confidence_threshold", "min_signal_price", "min_independent_sources",
     "min_independent_sources_news_only", "max_horizon_days",
     "max_favorable_drift_pct", "signal_entry_deadline_days",
     "stop_loss_pct", "take_profit_pct", "strategy_label", "transaction_cost_bps_per_side",

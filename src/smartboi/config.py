@@ -30,6 +30,7 @@ _STRATEGY_PARAM_KEYS = (
     "stop_loss_pct",
     "take_profit_pct",
     "signal_confidence_threshold",
+    "min_signal_price",
     "transaction_cost_profile",
     "max_favorable_drift_pct",
     "max_horizon_days",
@@ -462,6 +463,14 @@ class Settings(BaseSettings):
     # filing types for EDGAR (an 8-K, a Form 4, and a 10-Q each count
     # separately -- independent disclosures, not restatements of each other).
     signal_confidence_threshold: float = 0.5
+    # No signal (and no entry) below this share price, default $1. Sub-dollar
+    # names are exchange delisting-notice territory, reverse-split candidates,
+    # and the price regime where quote rounding alone fabricates double-digit
+    # "moves" (a $0.94 stock carried live signals while ±150% quote-rounding
+    # artifacts sat in price_marks.jsonl). The forward record can't be
+    # validated on prices like that, and one reverse split writes a fake
+    # 10-20x move into it. 0 disables the floor.
+    min_signal_price: float = 1.0
     min_independent_sources: int = 2
     # Higher bar for dossiers whose agreeing evidence is ENTIRELY news:
     # dedup collapses exact and lightly-reworded republishes, but heavily

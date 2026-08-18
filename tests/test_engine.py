@@ -1510,6 +1510,115 @@ async def test_daily_price_marks_report_failure_when_no_source(engine):
     assert not (Path(engine.settings.log_dir) / "price_marks.jsonl").exists()
 
 
+# --- Invariant: a mark that jumps >SUSPECT_MARK_JUMP_PCT against the
+# previous mark on file is written flagged and excluded from every
+# forward-return join -- quote artifacts and unadjusted corporate actions
+# both fabricate exactly this shape (±150% rounding artifacts observed live
+# on a sub-$1 name), and one such row poisons each window it joins. ---
+
+async def test_a_suspect_mark_jump_is_flagged_and_excluded_from_joins(engine):
+    from smartboi.forward_returns import price_marks_by_symbol
+
+    path = Path(engine.settings.log_dir) / "price_marks.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"marked_at": _days_ago(1), "symbol": "FORM", "price": 10.0}) + "\n"
+        + json.dumps({"marked_at": _days_ago(1), "symbol": "INTC", "price": 10.0}) + "\n"
+    )
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol = {"FORM": 15.0, "INTC": 11.0}  # +50% / +10%
+
+    assert await engine._run_daily_price_marks() is True
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    by_symbol = {r["symbol"]: r for r in rows[2:]}  # today's batch
+    assert by_symbol["FORM"]["suspect_jump_from"] == 10.0
+    assert "suspect_jump_from" not in by_symbol["INTC"]
+    # The join-side reader drops the flagged row and keeps everything else.
+    marks = price_marks_by_symbol(rows)
+    assert list(marks["FORM"].values()) == [10.0]
+    assert sorted(marks["INTC"].values()) == [10.0, 11.0]
+
+
+async def test_a_persistent_reprice_is_flagged_only_once(engine):
+    # A real split re-prices permanently: day 1 is flagged against the old
+    # regime, but day 2 compares against the day-1 mark (flagged or not) and
+    # joins normally -- the flag must not re-fire forever.
+    path = Path(engine.settings.log_dir) / "price_marks.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"marked_at": _days_ago(2), "symbol": "FORM", "price": 1.0}) + "\n")
+    engine.price_feed = None
+    engine.finnhub.quotes_by_symbol = {"FORM": 10.0}  # 10x: reverse split
+    assert await engine._run_daily_price_marks() is True
+    engine.finnhub.quotes_by_symbol = {"FORM": 10.2}  # the new regime holds
+    assert await engine._run_daily_price_marks() is True
+
+    rows = [json.loads(line) for line in path.read_text().splitlines() if '"FORM"' in line]
+    assert rows[1]["suspect_jump_from"] == 1.0
+    assert "suspect_jump_from" not in rows[2]
+
+
+# --- Invariant: no signal, and no entry, below min_signal_price. Sub-floor
+# names are delisting/reverse-split territory whose quotes cannot support a
+# forward-return measurement; an episode minted there pollutes the per-fire
+# record even if no trade ever opens. ---
+
+def _qualifying_dossier(status="ACTIVE"):
+    from smartboi.dossier import Dossier, EvidenceRecord, merge_evidence
+
+    dossier = Dossier(symbol="FORM")
+    for i, src in enumerate(("reuters.com", "bloomberg.com")):
+        merge_evidence(dossier, EvidenceRecord(
+            evidence_id=f"e{i}", source_type="8-K", source_name=src, url="u", headline="h",
+            published_at=FRESH_TS, origin_symbol="FORM", is_propagated=False,
+            relationship_note="", direction="LONG", magnitude=0.9, confidence=0.9,
+            horizon_days=20, reasoning="r", skeptic_note="",
+        ))
+    dossier.status = status
+    return dossier
+
+
+async def test_a_sub_floor_price_blocks_the_signal_at_fire_time(engine):
+    engine.price_feed = FakePriceFeed(prices={"FORM": 0.80})
+    engine.dossiers.save(_qualifying_dossier())
+
+    await engine._run_decay_pass()
+
+    reloaded = engine.dossiers.load("FORM")
+    assert reloaded.status == "ACTIVE"          # not SIGNALED: no episode minted
+    assert not (Path(engine.settings.log_dir) / "signals.jsonl").exists()
+    decisions = (Path(engine.settings.log_dir) / "decisions.jsonl").read_text()
+    assert "signal_floor_block" in decisions    # ...but the block is on the ledger
+
+
+async def test_the_floor_disabled_lets_a_sub_dollar_signal_fire(engine):
+    engine.settings.min_signal_price = 0.0
+    engine.price_feed = FakePriceFeed(prices={"FORM": 0.80})
+    engine.dossiers.save(_qualifying_dossier())
+
+    await engine._run_decay_pass()
+
+    assert engine.dossiers.load("FORM").status == "SIGNALED"
+
+
+async def test_the_entry_gate_expires_a_price_that_fell_below_the_floor(engine):
+    # Fired at a valid price (or with no quote available -- the fire-time
+    # check sees None and defers here), now quoting under the floor: expired,
+    # not left holding the entry-poll cadence open on an untradeable quote.
+    engine.price_feed = FakePriceFeed(prices={"FORM": 0.80})
+    dossier = _qualifying_dossier(status="SIGNALED")
+    dossier.signaled_at = datetime.now(timezone.utc).isoformat()
+    dossier.signaled_direction = "LONG"
+    engine.dossiers.save(dossier)
+
+    await engine._try_open_from_signal("FORM", engine.dossiers.load("FORM"))
+
+    assert engine.dossiers.load("FORM").status == "ACTIVE"
+    assert not engine.journal.has_open("FORM")
+    decisions = (Path(engine.settings.log_dir) / "decisions.jsonl").read_text()
+    assert "signal floor" in decisions
+
+
 # --- Regression: an article with no timestamp must keep ONE stable
 # fingerprint across days -- substituting the sliding from_date used to
 # re-bill and re-merge the same story daily. ---

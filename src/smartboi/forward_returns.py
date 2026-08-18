@@ -71,6 +71,13 @@ def price_marks_by_symbol(rows: list[dict]) -> dict[str, dict[str, float]]:
         marked_at = row.get("marked_at") or ""
         if not symbol or price is None or not marked_at:
             continue
+        # A mark the writer flagged as a suspect jump (>SUSPECT_MARK_JUMP_PCT
+        # against the previous mark -- quote artifact or unadjusted corporate
+        # action, see engine._run_daily_price_marks) is excluded from every
+        # join: one such row poisons each forward-return window it lands in,
+        # and _price_on_or_after simply walks past it to the next clean mark.
+        if row.get("suspect_jump_from") is not None:
+            continue
         out.setdefault(symbol, {})[marked_at[:10]] = price
     return out
 

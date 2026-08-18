@@ -32,6 +32,17 @@ def test_price_marks_by_symbol_skips_malformed_rows():
     assert price_marks_by_symbol(rows) == {}
 
 
+def test_price_marks_by_symbol_excludes_suspect_jump_rows():
+    """A mark the writer flagged (>40% against the previous mark: quote
+    artifact or unadjusted corporate action) must never enter a join --
+    _price_on_or_after walks past it to the next clean mark instead."""
+    rows = _marks_rows("FORM", {"2026-07-01": 10.0, "2026-07-03": 10.5})
+    rows.append({"symbol": "FORM", "marked_at": "2026-07-02T21:30:00+00:00",
+                 "price": 25.0, "suspect_jump_from": 10.0})
+    marks = price_marks_by_symbol(rows)
+    assert marks == {"FORM": {"2026-07-01": 10.0, "2026-07-03": 10.5}}
+
+
 # --- dedup_snapshots ---
 
 def test_dedup_snapshots_collapses_same_symbol_same_day():
