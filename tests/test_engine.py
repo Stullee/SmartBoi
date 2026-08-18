@@ -209,6 +209,64 @@ def test_daily_pass_due_keys_are_independent(engine):
     assert engine._daily_pass_due("price_marks") is True
 
 
+# --- Invariant: the two halves of the forward-validation join (dossier
+# snapshots and price marks) schedule off ONE shared post-close anchor, so
+# they cannot drift apart the way two own-last-success 24h timers did
+# (measured live: ~12h of skew for ten straight trading days). ---
+
+_ANCHOR_DAY = datetime(2026, 9, 2, tzinfo=timezone.utc)  # any date; `now` is explicit
+
+
+def _at(day_offset: int, hour: int, minute: int = 0) -> datetime:
+    return (_ANCHOR_DAY + timedelta(days=day_offset)).replace(hour=hour, minute=minute)
+
+
+def test_capture_pass_due_on_first_ever_run(engine):
+    assert engine._capture_pass_due("dossier_snapshot", now=_at(0, 22)) is True
+
+
+def test_capture_pass_not_due_again_before_the_next_anchor(engine):
+    # Captured just after yesterday's 21:30 anchor; nothing is due until
+    # today's anchor comes around, no matter how many restarts happen.
+    engine.periodic_state.set("dossier_snapshot", _at(-1, 21, 35).isoformat())
+    assert engine._capture_pass_due("dossier_snapshot", now=_at(0, 10)) is False
+    assert engine._capture_pass_due("dossier_snapshot", now=_at(0, 21, 29)) is False
+
+
+def test_capture_pass_due_once_the_anchor_passes(engine):
+    engine.periodic_state.set("dossier_snapshot", _at(-1, 21, 35).isoformat())
+    assert engine._capture_pass_due("dossier_snapshot", now=_at(0, 21, 31)) is True
+
+
+def test_both_capture_passes_come_due_at_the_same_anchor(engine):
+    # The join property itself: one shared boundary, so the two passes are
+    # due in the same tick -- not whenever each one's own 24h happens to lapse.
+    engine.periodic_state.set("dossier_snapshot", _at(-1, 21, 35).isoformat())
+    engine.periodic_state.set("price_marks", _at(-1, 21, 36).isoformat())
+    for key in ("dossier_snapshot", "price_marks"):
+        assert engine._capture_pass_due(key, now=_at(0, 21, 30)) is True
+
+
+def test_weekend_does_not_reopen_a_captured_join(engine, monkeypatch):
+    # Saturday walks back to Friday's anchor, which is already captured; a
+    # non-session day must not make the pass due (a weekend mark carries a
+    # real-looking quote under a date forward_returns then mis-joins on).
+    monkeypatch.setattr(smartboi.engine, "is_trading_day",
+                        lambda now=None: now is None or now.weekday() < 5)
+    friday = datetime(2026, 9, 4, tzinfo=timezone.utc)
+    engine.periodic_state.set("price_marks",
+                              friday.replace(hour=21, minute=35).isoformat())
+    saturday_noon = (friday + timedelta(days=1)).replace(hour=12)
+    assert engine._capture_pass_due("price_marks", now=saturday_noon) is False
+    monday_post_close = (friday + timedelta(days=3)).replace(hour=21, minute=31)
+    assert engine._capture_pass_due("price_marks", now=monday_post_close) is True
+
+
+def test_capture_pass_with_corrupt_marker_is_due(engine):
+    engine.periodic_state.set("price_marks", "not-a-timestamp")
+    assert engine._capture_pass_due("price_marks", now=_at(0, 22)) is True
+
+
 # --- Invariant: SEED_RELATIONSHIPS only ever seeds edges between symbols
 # actually in the LIVE (possibly custom SYMBOLS/ANCHOR_SYMBOLS) universe --
 # a custom deployment must never get default-universe edges for companies
@@ -3667,7 +3725,10 @@ async def test_the_daily_snapshot_is_skipped_on_a_weekend(engine, monkeypatch):
 async def test_the_daily_snapshot_still_runs_on_a_trading_day(engine, monkeypatch):
     """The guard has to let the ordinary case through, or it would be a
     capture outage rather than a weekend skip."""
-    monkeypatch.setattr("smartboi.engine.is_trading_day", lambda: True)
+    monkeypatch.setattr("smartboi.engine.is_trading_day", lambda now=None: True)
+    # The subject here is the trading-day guard, not the capture anchor:
+    # force the pass due so the test does not depend on the hour it runs at.
+    monkeypatch.setattr(engine, "_capture_pass_due", lambda key, now=None: True)
     calls = []
     monkeypatch.setattr(engine, "_run_daily_snapshot", lambda: calls.append(1) or True)
 

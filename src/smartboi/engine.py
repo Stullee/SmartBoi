@@ -124,6 +124,13 @@ REGSHO_RETRY_GAP_SEC = 3600
 # backfilled, so this starts accruing from day one regardless of when the
 # analysis side of that question gets built.
 DAILY_SNAPSHOT_INTERVAL_SEC = 86400
+# The shared post-close instant both halves of the forward-validation join
+# (dossier snapshots and price marks) are anchored to -- see
+# _capture_pass_due for why they cannot be allowed to schedule
+# independently. 21:30 UTC is after the US close in both DST regimes
+# (17:30 ET in summer, 16:30 ET in winter), so the mark is that session's
+# close and the snapshot is the evidence state that close judged.
+CAPTURE_ANCHOR_UTC = (21, 30)
 # How often already-discovered, still-ticker-less universe candidates get
 # another resolution attempt (see _run_candidate_ticker_recheck) -- daily is
 # plenty for something that only changes when SEC's ticker map gains a new
@@ -1359,7 +1366,7 @@ class Engine:
         # Saturday. Measured live: 44-48 snapshot rows on each of 2026-08-01,
         # -02, -08 and -09 with no mark to join, i.e. roughly two sevenths of
         # the capture unjoinable by construction.
-        if is_trading_day() and self._daily_pass_due("dossier_snapshot"):
+        if is_trading_day() and self._capture_pass_due("dossier_snapshot"):
             # Gated on the return value, exactly like price marks below.
             # This used to call and mark unconditionally, so the comment
             # above described a property only ONE of the two passes had --
@@ -1391,7 +1398,7 @@ class Engine:
             (self.price_feed is not None or self.finnhub is not None)
             and now >= self._price_marks_retry_after
             and is_trading_day()
-            and self._daily_pass_due("price_marks")
+            and self._capture_pass_due("price_marks")
         ):
             if await self._run_daily_price_marks():
                 self._mark_daily_pass_done("price_marks")
@@ -1537,6 +1544,53 @@ class Engine:
 
     def _mark_daily_pass_done(self, state_key: str) -> None:
         self.periodic_state.set(state_key, datetime.now(timezone.utc).isoformat())
+
+    def _capture_anchor(self, now: datetime) -> datetime | None:
+        """The most recent trading-day capture instant at or before now.
+
+        Walks back day by day so that on a weekend or holiday the anchor is
+        the last session's close, not an instant no session produced -- a
+        Saturday must not make Friday's already-captured join due again."""
+        hour, minute = CAPTURE_ANCHOR_UTC
+        for days_back in range(10):
+            candidate = (now - timedelta(days=days_back)).replace(
+                hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate <= now and is_trading_day(candidate):
+                return candidate
+        return None
+
+    def _capture_pass_due(self, state_key: str, now: datetime | None = None) -> bool:
+        """_daily_pass_due, but for the two halves of the forward-validation
+        join (dossier_snapshot / price_marks), which must be captured at the
+        SAME point of the session to be joinable.
+
+        The generic version is anchored to each pass's OWN last success, so
+        two 24h timers drift apart -- each success re-anchors one timer and
+        never the other. Measured live: the snapshot pass settled at ~16:00
+        UTC and the mark pass at ~04:05 UTC for ten straight trading days
+        (2026-08-03..08-14), every joined row pricing a score captured half
+        a session away. Worse, a mark taken at 04:05 UTC carries THIS day's
+        date while quoting the PREVIOUS session's close, so the join was
+        shifted a day even when both passes ran.
+
+        Anchoring both passes to one shared post-close instant makes drift
+        unrepresentable: a pass is due exactly when its persisted marker
+        predates the latest anchor, so both come due at the same tick and,
+        once done, stay done until the next session's anchor. The retry
+        semantics are unchanged -- a failed pass is not marked done and
+        stays due (see the call sites' backoff)."""
+        now = now or datetime.now(timezone.utc)
+        anchor = self._capture_anchor(now)
+        if anchor is None:
+            return False
+        last = self.periodic_state.get(state_key)
+        if not last:
+            return True
+        try:
+            last_dt = datetime.fromisoformat(last)
+        except ValueError:
+            return True
+        return last_dt < anchor
 
     # --- EDGAR ingestion ---
 
