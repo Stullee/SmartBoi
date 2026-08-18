@@ -86,7 +86,10 @@ that specific inefficiency, not to race anyone on speed:
 
    - **DoD daily contract announcements** (`dod_contracts.py`, war.gov, free):
      every award at or above the DFARS 205.303 threshold, published ~5pm ET
-     each business day. Chosen over USASpending/FPDS for a hard reason: DoD
+     each business day. **Currently defaults OFF** (`ENABLE_DOD_CONTRACTS`):
+     war.gov's Akamai bot gate 403'd every request the feed made in its first
+     week live, so until the fetch path demonstrably returns announcements,
+     enabling it buys a request-and-warning loop and nothing else. Chosen over USASpending/FPDS for a hard reason: DoD
      awards are withheld from those for **90 days**, ~6x past the 14-day floor
      in `evidence_is_stale`, so that evidence would be *born aged out*.
      (FPDS-NG's ATOM feed no longer exists either — FPDS.gov was decommissioned

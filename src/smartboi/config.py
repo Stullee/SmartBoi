@@ -243,7 +243,15 @@ class Settings(BaseSettings):
     # day. Chosen over USASpending/FPDS because DoD awards are withheld from
     # those for 90 days -- ~6x past dossier.evidence_is_stale's 14-day floor,
     # so that evidence would be born aged out.
-    enable_dod_contracts: bool = True
+    #
+    # OFF until the fetch path works: war.gov sits behind an Akamai bot gate
+    # that 403'd every request the feed ever made -- 135 of 135 over its
+    # first week live, not one item delivered -- so "enabled" bought a
+    # request-and-warning loop while the defense cohort's intended primary
+    # source was silently absent either way. Flip back on only once a fetch
+    # demonstrably returns announcements (browser-grade headers or an
+    # official API/RSS route).
+    enable_dod_contracts: bool = False
     dod_lookback_days: int = 3
     dod_poll_interval_sec: int = 21600
     # Awards below this are not scored for an ANCHOR. LMT/RTX/NOC/GD/BA appear

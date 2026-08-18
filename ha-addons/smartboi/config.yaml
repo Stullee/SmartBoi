@@ -39,7 +39,9 @@ options:
   enable_federal_register: true
   federal_register_lookback_days: 3
   federal_register_poll_interval_sec: 21600
-  enable_dod_contracts: true
+  # Off until the war.gov fetch path works -- see config.py: the Akamai bot
+  # gate 403'd 135 of 135 requests in the feed's first week live.
+  enable_dod_contracts: false
   dod_lookback_days: 3
   dod_poll_interval_sec: 21600
   dod_anchor_value_floor_usd: 100000000.0
