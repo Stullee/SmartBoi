@@ -160,7 +160,7 @@ def test_every_non_secret_setting_is_either_reported_or_deliberately_omitted():
         "anthropic_api_key", "finnhub_api_key", "edgar_user_agent", "alert_webhook_url",
         "symbols", "anchor_symbols",          # shown in full by the Universe section
         "ib_client_id", "log_level", "log_dir",
-        "enable_dashboard", "dashboard_port",  # self-evident to anyone reading a dashboard
+        "enable_dashboard", "dashboard_host", "dashboard_port",  # self-evident to anyone reading a dashboard
     }
     reported = set(_DIAGNOSTIC_SETTINGS)
     fields = set(Settings.model_fields)

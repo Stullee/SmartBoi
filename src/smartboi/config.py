@@ -713,6 +713,15 @@ class Settings(BaseSettings):
     alert_webhook_url: str = ""
 
     enable_dashboard: bool = True
+    # Loopback by default: the dashboard has no auth of its own -- the CSRF
+    # header is the only guard on POSTs that can reset the universe or dump
+    # every dossier, and a custom header stops cross-site requests, not a
+    # neighbor on the LAN who can reach the port directly. Anything wider
+    # than 127.0.0.1 is an explicit choice. The HA add-on sets 0.0.0.0
+    # itself (see ha-addons/smartboi/_addon_options.py): supervisor ingress
+    # proxies from outside the host's loopback, so a loopback bind there
+    # would present a working config form and an unreachable panel.
+    dashboard_host: str = "127.0.0.1"
     dashboard_port: int = 8100
 
     @property

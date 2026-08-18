@@ -63,7 +63,8 @@ log = logging.getLogger(__name__)
 # Every state-changing request must carry this header, and the dashboard's
 # own JS sets it on every POST (see _INDEX_HTML). It is the standard custom-
 # header CSRF defense, and here it is the ONLY thing guarding the write
-# surface: the dashboard binds 0.0.0.0 with no auth, and reset-accepted /
+# surface: the dashboard has no auth (loopback-bound by default, but 0.0.0.0
+# under the HA add-on and whenever DASHBOARD_HOST widens it), and reset-accepted /
 # rebuild-graph don't even read their body -- so without it a plain
 # cross-origin <form> POST from any page the operator happened to open could
 # reset the universe on their host. A browser will not attach a non-safelisted
@@ -2037,8 +2038,9 @@ def create_app(engine) -> web.Application:
         rather than the side effect (there is none). The CSRF guard exempts
         GET on the stated grounds that "every GET here is a pure read with no
         side effect" -- true of this one too, but that rule was written when
-        the richest GET was a status payload, and the dashboard binds 0.0.0.0
-        with no auth of its own (see the module header). This endpoint hands
+        the richest GET was a status payload, and the dashboard has no auth
+        of its own (see the module header; the HA add-on binds it 0.0.0.0
+        for ingress). This endpoint hands
         back every dossier, the whole graph, the entire trade record and the
         logs, so it gets the same protection as the endpoints that change
         things, not the one the auto-refresh poll gets."""
@@ -2146,9 +2148,10 @@ async def run_dashboard(engine) -> None:
     app = create_app(engine)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", engine.settings.dashboard_port)
+    site = web.TCPSite(runner, engine.settings.dashboard_host, engine.settings.dashboard_port)
     await site.start()
-    log.info("Dashboard listening on 0.0.0.0:%d", engine.settings.dashboard_port)
+    log.info("Dashboard listening on %s:%d",
+             engine.settings.dashboard_host, engine.settings.dashboard_port)
     try:
         await asyncio.Event().wait()
     finally:
