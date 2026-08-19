@@ -13,6 +13,7 @@ from smartboi.dossier import Dossier, EvidenceRecord, merge_evidence
 from smartboi.engine import Engine
 from smartboi.tools import run_diagnostics
 
+from tests.conftest import fixture_date as _fx
 from tests.fakes import FakeEdgarClient, FakeFinnhub
 
 SECRETS = {
@@ -68,7 +69,7 @@ def test_reports_universe_and_integration_state(engine):
 def test_reports_dossier_scores(engine):
     dossier = Dossier(symbol="DCO")
     merge_evidence(dossier, EvidenceRecord(
-        "e1", "news", "Reuters", "u", "h", "2026-07-28", "DCO", False, "",
+        "e1", "news", "Reuters", "u", "h", _fx("2026-07-28"), "DCO", False, "",
         "LONG", 0.5, 0.6, 20, "reason", "skeptic",
     ))
     engine.dossiers.save(dossier)
@@ -593,7 +594,7 @@ def _labelled_dossier(engine, symbol, labels):
     d = Dossier(symbol=symbol)
     for n, label in enumerate(labels):
         merge_evidence(d, EvidenceRecord(
-            f"{symbol}-{n}", "news", f"outlet{n}.com", "u", "h", "2026-08-10", "MSFT", True, "note",
+            f"{symbol}-{n}", "news", f"outlet{n}.com", "u", "h", _fx("2026-08-10"), "MSFT", True, "note",
             "LONG", 0.5, 0.6, 20, "reason", "skeptic",
             relationship_confidence=0.95, fact_key=label,
         ))
@@ -634,7 +635,7 @@ def test_the_bundle_warns_when_most_evidence_predates_labelling(engine):
     d = Dossier(symbol="OLD")
     for n in range(4):
         merge_evidence(d, EvidenceRecord(
-            f"o{n}", "news", f"p{n}.com", "u", "h", "2026-08-10", "OLD", False, "",
+            f"o{n}", "news", f"p{n}.com", "u", "h", _fx("2026-08-10"), "OLD", False, "",
             "LONG", 0.5, 0.6, 20, "r", "s",
         ))
     engine.dossiers.save(d)
@@ -654,7 +655,7 @@ def test_an_edgeless_tradeable_reports_why_rather_than_promising_a_refresh(engin
 
     d = Dossier(symbol="PLPC")
     merge_evidence(d, EvidenceRecord(
-        "e1", "8-K", "SEC EDGAR (8-K)", "u", "h", "2026-08-10", "PLPC", False, "",
+        "e1", "8-K", "SEC EDGAR (8-K)", "u", "h", _fx("2026-08-10"), "PLPC", False, "",
         "LONG", 0.8, 0.8, 20, "r", "s",
     ))
     engine.dossiers.save(d)
@@ -681,7 +682,7 @@ def test_an_edgeless_tradeable_with_a_resolvable_counterparty_says_so_instead(en
 
     d = Dossier(symbol="CVLG")
     merge_evidence(d, EvidenceRecord(
-        "e1", "8-K", "SEC EDGAR (8-K)", "u", "h", "2026-08-10", "CVLG", False, "",
+        "e1", "8-K", "SEC EDGAR (8-K)", "u", "h", _fx("2026-08-10"), "CVLG", False, "",
         "LONG", 0.8, 0.8, 20, "r", "s",
     ))
     engine.dossiers.save(d)
@@ -694,3 +695,53 @@ def test_an_edgeless_tradeable_with_a_resolvable_counterparty_says_so_instead(en
 
     assert "waiting to be accepted" in report
     assert "SOME LISTED CUSTOMER" in report
+
+
+# --- Invariant: no test dates its own evidence to a literal calendar day.
+#
+# The failure this prevents has already happened. Evidence fixtures were pinned
+# to 2026-07-23; decay and the staleness rule read AGE, not the date on the
+# wire; and 27 real days later 30 tests in test_engine.py were red with nothing
+# in the code having changed. Three more in this file were queued behind them
+# for early October. A suite that rots on a calendar is worse than a missing
+# one, because it goes red for a reason no reviewer can connect to the commit
+# in front of them, and the honest-looking response is to shrug at
+# "pre-existing failures" -- which is what happened here for two weeks.
+#
+# Two shapes are safe, and only two. Either the DATE moves with the clock
+# (conftest.fixture_date, or now - timedelta(...)), or the CLOCK is pinned
+# beside it and passed in -- test_dossier.py does the second, with a module
+# NOW that every merge_evidence call is judged against, and is exempt here
+# because of it. What is unsafe is a literal date judged against the real
+# clock, because the gap between them grows on its own.
+#
+# Scoped to the two fields the pipeline reads as an age. A date that is only
+# ever an identifier or a URL fragment can say so on the line and opt out.
+
+def test_no_evidence_fixture_is_pinned_to_a_literal_calendar_date():
+    import re
+    from pathlib import Path
+
+    aged_field = re.compile(
+        r"""(published_at|filing_date)\s*=\s*"(\d{4}-\d{2}-\d{2}[^"]*)\"""")
+    pinned_clock = re.compile(r"^NOW\s*=\s*datetime\(", re.M)
+
+    offenders = []
+    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+        if path.name == Path(__file__).name:
+            continue                      # this file's own regexes are not fixtures
+        text = path.read_text()
+        if pinned_clock.search(text):
+            continue                      # judges its fixtures against its own clock
+        for n, line in enumerate(text.splitlines(), 1):
+            if "# not an age:" in line:
+                continue                  # opted out, with the reason on the line
+            for field, value in aged_field.findall(line):
+                offenders.append(f'{path.name}:{n}: {field}="{value}"')
+
+    assert not offenders, (
+        "a date judged against the real clock ages one day per real day and "
+        "eventually crosses every threshold the suite asserts is uncrossed. "
+        "Wrap it in conftest.fixture_date(), express it relative to now, or -- "
+        "if the value is never read as an age -- say so with a trailing "
+        "`# not an age: <why>`:\n  " + "\n  ".join(offenders))
