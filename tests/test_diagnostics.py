@@ -697,6 +697,107 @@ def test_an_edgeless_tradeable_with_a_resolvable_counterparty_says_so_instead(en
     assert "SOME LISTED CUSTOMER" in report
 
 
+# --- Invariant: a zeroed score says WHICH arm of the verdict zeroed it.
+#
+# _apply_synthesis zeroes on either of two conditions -- already_priced_in, or
+# a direction it resolved differently from the dossier -- and this report used
+# to test only the first, then file everything else under
+# "trimmed (redundant evidence)" because redundant_evidence is set on almost
+# every verdict and was the only flag that reached disk. The result: a channel
+# accounting for 78 of the 363 vetoes in the live record was reported as a
+# gentle trim for an entire measurement window, and the one question it raises
+# -- the whole-body pass and the arithmetic disagree about which WAY this goes
+# -- was never asked.
+#
+# The distinction inside that channel matters as much as the channel itself. A
+# resolved direction OPPOSITE the dossier's is a polarity dispute. "NONE" is an
+# ABSTENTION: the pass read the file and declined to call a direction at all,
+# which is most of them. Those are different findings and they were the same
+# zero.
+
+def _judged(symbol, *, arith, priced_in=False, called="", rated=(0.3, 0.2),
+            redundant=True, applied=None):
+    """One row shaped like status.gather_dossiers', judged by synthesis."""
+    sc, sm = rated
+    applied = (0.0 if (priced_in or (called and called != "LONG")) else arith
+               ) if applied is None else applied
+    return {
+        "symbol": symbol, "direction": "LONG", "status": "ACTIVE",
+        "confidence": applied, "magnitude": 1.0, "evidence_count": 4,
+        "independent_source_count": 4, "distinct_fact_count": 2,
+        "synthesis_at": "2026-08-19T10:00:00+00:00",
+        "synthesis_confidence": sc, "synthesis_magnitude": sm,
+        "already_priced_in": priced_in, "redundant_evidence": redundant,
+        "synthesis_direction": called, "pre_synthesis_score": arith,
+        "threshold_in_force": 0.25, "has_filing_evidence": False,
+        "has_disclosed_link_evidence": False, "thesis_summary": "",
+    }
+
+
+def _verdict_block(rows, monkeypatch, engine):
+    monkeypatch.setattr("smartboi.tools.gather_dossiers", lambda store: rows)
+    report = run_diagnostics(engine)
+    start = report.index("--- Synthesis verdicts")
+    return report[start:report.index("\n\n", start)]
+
+
+def test_a_direction_veto_is_not_reported_as_a_trim(engine, monkeypatch):
+    block = _verdict_block([
+        _judged("AAA", arith=0.9, priced_in=True),
+        _judged("BBB", arith=0.9, called="NONE"),
+        _judged("CCC", arith=0.9, called="SHORT"),
+    ], monkeypatch, engine)
+
+    assert "vetoed (already priced in)  : 1" in block
+    assert "vetoed (no direction called): 1" in block
+    assert "vetoed (direction disputed) : 1" in block
+    # The bug: all three carried redundant_evidence, so two of them were filed
+    # under a heading that says the thesis SURVIVED, smaller.
+    assert "trimmed to the rated score  : 0" in block
+    assert "no-direction" in block and "disputed" in block
+
+
+def test_a_verdict_zeroed_before_the_channel_was_recorded_says_so(engine, monkeypatch):
+    """Rows persisted before synthesis_direction existed carry "". A zero whose
+    cause is unknown is not a trim, and folding it into one silently is the
+    defect this whole split exists to remove -- so it gets its own bucket
+    rather than the nearest plausible one."""
+    block = _verdict_block(
+        [_judged("AAA", arith=0.9, called="", applied=0.0)], monkeypatch, engine)
+
+    assert "vetoed (channel unrecorded) : 1" in block
+    assert "zeroed(?)" in block
+    assert "trimmed to the rated score  : 0" in block
+
+
+def test_a_real_trim_is_still_a_trim(engine, monkeypatch):
+    """The split must not swallow the case it is splitting away from: a score
+    lowered but not zeroed is a surviving thesis, whatever the flags say."""
+    block = _verdict_block([
+        _judged("AAA", arith=0.9, rated=(0.5, 0.4), applied=0.2),
+        _judged("BBB", arith=0.9, rated=(0.9, 0.9), applied=0.9, redundant=False),
+    ], monkeypatch, engine)
+
+    assert "trimmed to the rated score  : 1" in block
+    assert "passed through              : 1" in block
+
+
+def test_the_board_warns_when_nothing_judged_can_fire(engine, monkeypatch):
+    """The condition that held live for six days. The old warning fired only
+    when every dossier was priced-in, so a board zeroed by three channels at
+    once -- which is what actually happened -- printed no warning at all."""
+    block = _verdict_block([
+        _judged("AAA", arith=0.9, priced_in=True),
+        _judged("BBB", arith=0.9, called="NONE"),
+        _judged("CCC", arith=0.9, rated=(0.3, 0.2), applied=0.06),
+    ], monkeypatch, engine)
+
+    assert "NOT ONE judged dossier can fire" in block
+    assert "3 of 3 zeroed" not in block          # one of them was trimmed, not zeroed
+    assert "2 of 3 zeroed outright, 1 trimmed under the bar" in block
+    assert "not on the same" in block            # the scale question, named
+
+
 # --- Invariant: no test dates its own evidence to a literal calendar day.
 #
 # The failure this prevents has already happened. Evidence fixtures were pinned

@@ -4420,6 +4420,9 @@ class Engine:
             dossier.distinct_fact_count = 0
         dossier.already_priced_in = bool(verdict.get("already_priced_in"))
         dossier.redundant_evidence = bool(verdict.get("redundant_evidence"))
+        # Recorded before it is used, so the veto below stops being the only
+        # evidence that it happened. See Dossier.synthesis_direction.
+        dossier.synthesis_direction = str(verdict.get("direction") or "")
         # What this verdict is a claim ABOUT, recorded so it can later be
         # falsified rather than merely re-asserted: the arithmetic it capped,
         # the evidence body it read, and the price it judged. All three are
@@ -5189,6 +5192,7 @@ class Engine:
             dossier.synthesis_magnitude = 0.0
             dossier.already_priced_in = False
             dossier.redundant_evidence = False
+            dossier.synthesis_direction = ""
             dossier.synthesis_note = ""
             dossier.synthesis_catalyst = ""
             dossier.distinct_fact_count = 0
