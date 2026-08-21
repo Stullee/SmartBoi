@@ -5,6 +5,9 @@ __pycache__/
 logs/
 data/*.json
 !data/.gitkeep
+# Fetched market history for scripts/backtest_trades.py -- a
+# reproducible cache of somebody else's data, not source.
+data/bars/
 *.egg-info/
 .pytest_cache/
 .DS_Store

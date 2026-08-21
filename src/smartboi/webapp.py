@@ -36,6 +36,7 @@ from smartboi.screen import (
 )
 from smartboi.tools import (
     collect_full_diagnostics,
+    run_backtest,
     run_diagnostics,
     run_event_study,
     run_exit_analysis,
@@ -614,6 +615,7 @@ _INDEX_HTML = """<!doctype html>
       <button class="tbtn" id="btn-analyze">Forward-return report</button>
       <button class="tbtn" id="btn-event-study">Signal event study</button>
       <button class="tbtn" id="btn-exit-analysis">Exit analysis</button>
+      <button class="tbtn" id="btn-backtest">Backtest vs real bars</button>
       <button class="tbtn" id="btn-graph-maint">Graph maintenance (dry run)</button>
       <button class="tbtn danger" id="btn-graph-maint-apply">Apply graph maintenance</button>
       <button class="tbtn" id="btn-research">Research anchor suppliers (web)</button>
@@ -626,8 +628,12 @@ _INDEX_HTML = """<!doctype html>
       <button class="tbtn danger" id="btn-reset">Reset added symbols</button>
       <button class="tbtn danger" id="btn-reset-runtime">Reset signals &amp; trades</button>
     </div>
-    <div class="thint">The first five are read-only &mdash; screening does market-cap/analyst lookups; the others read
-      already-persisted state (forward returns, the signal event study, the exit analysis of the closed ledger).
+    <div class="thint">The first six are read-only &mdash; screening does market-cap/analyst lookups and
+      <b>Backtest vs real bars</b> fetches daily price history (no API key needed) and caches it under
+      <code>data/bars/</code>; the others read already-persisted state (forward returns, the signal event study,
+      the exit analysis of the closed ledger). The backtest asks the one question the others cannot: of the move
+      around each signal, how much arrived <i>after</i> it fired &mdash; the lagged adjustment the strategy is
+      premised on. Its first run fetches the whole universe and can take a minute; later runs use the cache.
       <b>Research anchor suppliers</b> runs web searches to find small-cap counterparties of your anchors and writes
       universe candidates only. The diagnostics bundle is safe to paste &mdash; credentials and personal data are omitted
       and log lines scrubbed. <b>Download FULL diagnostics</b> is that same bundle plus the actual runtime files
@@ -690,7 +696,7 @@ function fallbackCopyToolOutput(text, flash){
 
 function runTool(path, body, button){
   var out = el("tool-output");
-  var buttons = [el("btn-screen"), el("btn-analyze"), el("btn-event-study"), el("btn-exit-analysis"), el("btn-diagnostics"), el("btn-research")];
+  var buttons = [el("btn-screen"), el("btn-analyze"), el("btn-event-study"), el("btn-exit-analysis"), el("btn-backtest"), el("btn-diagnostics"), el("btn-research")];
   buttons.forEach(function(b){ b.disabled = true; });
   showToolOutput(); out.textContent = "Running... (this can take a few minutes for a long ticker list)";
   var controller = new AbortController(), timedOut = false;
@@ -709,6 +715,7 @@ el("btn-screen").addEventListener("click", function(){
 el("btn-analyze").addEventListener("click", function(){ runTool("tools/forward-returns", {}, this); });
 el("btn-event-study").addEventListener("click", function(){ runTool("tools/event-study", {}, this); });
 el("btn-exit-analysis").addEventListener("click", function(){ runTool("tools/exit-analysis", {}, this); });
+el("btn-backtest").addEventListener("click", function(){ runTool("tools/backtest", {}, this); });
 el("btn-diagnostics").addEventListener("click", function(){ runTool("tools/diagnostics", {}, this); });
 // Not runTool (the response is a zip, not text for the output pane) and not a
 // plain navigation either: this is a POST so it carries the CSRF header, which
@@ -1993,6 +2000,23 @@ def create_app(engine) -> web.Application:
 
         return await _run_tool(run)
 
+    async def handle_tool_backtest(request: web.Request) -> web.Response:
+        """Runs the real-bar event study (smartboi.tools.run_backtest) over
+        every would-be trade in the logs: where in event time the move
+        happened, whether recorded entries match a price that actually
+        traded, and what the stop/target rules do against real intraday
+        ranges.
+
+        The only tool here that reaches the network -- it fetches daily
+        price history read-only and caches it under `data/bars/`. Nothing
+        is mutated and no LLM is called. Not offloaded to a thread: the
+        fetch is awaited I/O rather than blocking work, so the engine's
+        polling keeps running underneath it."""
+        async def run() -> str:
+            return await run_backtest(engine.settings.log_dir, engine.universe)
+
+        return await _run_tool(run)
+
     async def handle_tool_exit_analysis(request: web.Request) -> web.Response:
         """Runs the exit-quality analysis (smartboi.tools.run_exit_analysis)
         over paper_trades.jsonl + price_marks.jsonl -- holding period vs
@@ -2130,6 +2154,7 @@ def create_app(engine) -> web.Application:
     app.router.add_post("/api/tools/forward-returns", handle_tool_forward_returns)
     app.router.add_post("/api/tools/event-study", handle_tool_event_study)
     app.router.add_post("/api/tools/exit-analysis", handle_tool_exit_analysis)
+    app.router.add_post("/api/tools/backtest", handle_tool_backtest)
     app.router.add_post("/api/tools/diagnostics", handle_tool_diagnostics)
     app.router.add_post("/api/tools/full-diagnostics", handle_tool_full_diagnostics)
     app.router.add_post("/api/universe/reset-accepted", handle_reset_accepted)

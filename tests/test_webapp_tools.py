@@ -144,6 +144,16 @@ async def test_exit_analysis_endpoint_reports_no_data_gracefully(engine):
         assert "No paper trades" in (await response.json())["report"]
 
 
+async def test_backtest_endpoint_reports_no_data_gracefully(engine):
+    """A fresh deployment has signalled nothing yet. It must say so -- and
+    crucially it must say so WITHOUT reaching the network, since there is
+    nothing to fetch bars for."""
+    async with _client(engine) as client:
+        response = await client.post("/api/tools/backtest", json={})
+        assert response.status == 200
+        assert "No would-be trades logged yet" in (await response.json())["report"]
+
+
 async def test_concurrent_tool_runs_are_rejected(engine):
     """Two screening runs at once would interleave against the engine's
     single rate-limited Finnhub client and blow the free tier's 60/min."""
