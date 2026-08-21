@@ -1167,16 +1167,52 @@ def run_diagnostics(engine) -> str:
     judged = [d for d in dossiers if d.get("synthesis_at")]
     add(f"\n--- Synthesis verdicts ({len(judged)} of {len(dossiers)} dossier(s) judged) ---")
     if judged:
-        vetoed = [d for d in judged if d["already_priced_in"]]
-        redundant = [d for d in judged if d["redundant_evidence"] and not d["already_priced_in"]]
-        add(f"  vetoed (already priced in) : {len(vetoed)}")
-        add(f"  trimmed (redundant evidence): {len(redundant)}")
-        add(f"  passed through              : {len(judged) - len(vetoed) - len(redundant)}")
+        # Three channels, not two. _apply_synthesis zeroes a score on EITHER
+        # already_priced_in OR a direction the pass resolved differently from
+        # the dossier -- and this report used to file the second under the
+        # first's opposite, "trimmed (redundant evidence)", because
+        # redundant_evidence is set on almost every verdict and was the only
+        # flag left to test. So a channel that zeroed a fifth of the record
+        # was reported as a gentle trim, and the one question it raises --
+        # the pass and the aggregate disagree about which WAY this goes --
+        # was never asked in a whole measurement window.
+        #
+        # Split on synthesis_direction, which is now recorded. Older rows
+        # persisted before that field existed carry "", and are reported as
+        # unattributable rather than silently folded into a bucket: a zero
+        # whose cause is unknown is not the same as a zero that was a trim,
+        # and pretending otherwise is the bug being fixed.
+        def _channel(d):
+            """Which arm of the verdict actually moved this score.
+
+            Ordered by the order _apply_synthesis tests them, so the label
+            names the arm that fired first rather than a flag that merely
+            happened to be set."""
+            if d["already_priced_in"]:
+                return "priced-in"
+            if d["confidence"] * d["magnitude"] > 0.0 or d["pre_synthesis_score"] <= 0.0:
+                return ("trimmed"
+                        if d["confidence"] * d["magnitude"] < d["pre_synthesis_score"]
+                        else "-")
+            called = d.get("synthesis_direction") or ""
+            if called == "NONE":
+                return "no-direction"
+            return "disputed" if called else "zeroed(?)"
+
+        channels = [(_channel(d), d) for d in judged]
+        n = {k: sum(1 for c, _ in channels if c == k) for k in
+             ("priced-in", "no-direction", "disputed", "zeroed(?)", "trimmed", "-")}
+        add(f"  vetoed (already priced in)  : {n['priced-in']}")
+        add(f"  vetoed (no direction called): {n['no-direction']}")
+        add(f"  vetoed (direction disputed) : {n['disputed']}")
+        if n["zeroed(?)"]:
+            add(f"  vetoed (channel unrecorded) : {n['zeroed(?)']}"
+                "  <- judged before synthesis_direction was persisted")
+        add(f"  trimmed to the rated score  : {n['trimmed']}")
+        add(f"  passed through              : {n['-']}")
         add(f"  {'SYM':7}{'ARITH':>7}{'RATED':>7}{'APPLIED':>9}{'FACTS':>7}{'SRC':>5}  {'VERDICT':11} JUDGED")
-        for d in judged[:MAX_LISTED_ROWS]:
+        for verdict, d in channels[:MAX_LISTED_ROWS]:
             rated = d["synthesis_confidence"] * d["synthesis_magnitude"]
-            verdict = ("priced-in" if d["already_priced_in"]
-                       else "redundant" if d["redundant_evidence"] else "-")
             add(f"  {d['symbol']:7}{d['pre_synthesis_score']:7.3f}{rated:7.3f}"
                 f"{d['confidence'] * d['magnitude']:9.3f}{d['distinct_fact_count']:7}"
                 f"{d['independent_source_count']:5}  {verdict:11} {_ago(d['synthesis_at'], now)} ago")
@@ -1192,8 +1228,16 @@ def run_diagnostics(engine) -> str:
                 add("     evidence as a body. That is an aggregate problem, not a synthesis one --")
                 add("     check FACTS against SRC above: a large gap between them is one story")
                 add("     counted many times (see dossier.effective_corroboration_count).")
-        if len(judged) and len(vetoed) == len(judged):
-            add("  ^^ EVERY judged dossier was vetoed. No thesis can reach a trade while this holds.")
+        firing = [d for d in judged
+                  if d["confidence"] * d["magnitude"] >= d.get("threshold_in_force", 0.0)
+                  and d["confidence"] * d["magnitude"] > 0.0]
+        if judged and not firing:
+            zeroed = n["priced-in"] + n["no-direction"] + n["disputed"] + n["zeroed(?)"]
+            add(f"  ^^ NOT ONE judged dossier can fire: {zeroed} of {len(judged)} zeroed outright, "
+                f"{n['trimmed']} trimmed under the bar.")
+            add("     Check RATED against ARITH above before touching the signal bar. If no RATED")
+            add("     score in this table ever reaches the bar, the two columns are not on the same")
+            add("     scale and the bar is being applied to whichever one happened to be judged.")
     else:
         add("  none yet -- a dossier is only judged once it reaches "
             f"{s.signal_confidence_threshold * s.synthesis_score_floor_pct:.3f} "

@@ -23,7 +23,7 @@ from smartboi.dod_contracts import (
     split_announcements,
 )
 
-_UNIVERSE = {"LMT", "RTX", "NOC", "DCO", "V2X", "ATRO", "AIR", "TAYD", "KTOS"}
+_UNIVERSE = {"LMT", "RTX", "NOC", "DCO", "VVX", "ATRO", "AIR", "TAYD", "KTOS"}
 
 _DCO = (
     "Ducommun LaBarge Technologies Inc., Tulsa, Oklahoma, is awarded a "
@@ -55,7 +55,7 @@ def test_a_legal_entity_name_resolves_to_its_ticker():
 
 def test_vertex_pharmaceuticals_is_not_a_defense_contractor():
     """The collision the alias table exists for. 'Vertex' alone is banned;
-    only 'Vertex Aerospace' matches V2X."""
+    only 'Vertex Aerospace' matches VVX."""
     text = ("Vertex Pharmaceuticals Inc., Boston, Massachusetts, was mentioned "
             "in an unrelated context that should never reach a defense dossier "
             "under any circumstances whatsoever in this system.")
@@ -68,7 +68,7 @@ def test_vertex_aerospace_does_resolve_to_v2x():
             "$250,000,000 contract for aircraft maintenance services in support "
             "of training operations across several installations nationwide.")
 
-    assert match_symbols(text, _UNIVERSE) == [("V2X", "Vertex Aerospace")]
+    assert match_symbols(text, _UNIVERSE) == [("VVX", "Vertex Aerospace")]
 
 
 def test_matching_is_whole_word_so_air_does_not_match_aircraft():
@@ -256,3 +256,58 @@ def test_business_days_back_skips_weekends():
     days = business_days_back(3, today=date(2026, 8, 10))   # a Monday
 
     assert days == [date(2026, 8, 10), date(2026, 8, 7), date(2026, 8, 6)]
+
+
+# --- Invariant: every alias key is a ticker this system actually holds.
+#
+# match_symbols skips any key not in the universe, so a key that is not a real
+# ticker is not a harmless extra -- it is that company silently switched off.
+# COMPANY_ALIASES was keyed "V2X" because that is what the company calls
+# itself; the ticker stayed VVX through the rename. Every award to the largest
+# name in the defense cohort was dropped before anything looked at it, for as
+# long as the feed existed.
+#
+# The tests above could not catch it because they pass their own universe
+# literal, and that literal contained "V2X" -- it asserted the table against a
+# world invented to match the table. This one asks the universe.
+
+def test_no_alias_key_is_a_stale_ticker_for_a_company_we_hold():
+    """Keys for companies OUTSIDE the universe are deliberate and harmless --
+    match_symbols skips them, and the table is written as a superset because a
+    missed award costs nothing. What is not harmless is a key that is the
+    wrong ticker for a company the universe DOES hold: that name is then
+    switched off entirely, and it looks like a full entry while it happens.
+
+    V2X Inc renamed itself from Vectrus and kept the ticker VVX. The table was
+    keyed "V2X", so every award to the largest name in the defense cohort was
+    dropped before anything read it, for the whole life of the feed."""
+    from smartboi.dod_contracts import COMPANY_ALIASES
+    from smartboi.universe import spec_by_symbol
+
+    specs = spec_by_symbol()
+    by_name = {(c.name or "").lower(): sym for sym, c in specs.items() if c.name}
+
+    wrong = []
+    for symbol, aliases in COMPANY_ALIASES.items():
+        if symbol in specs:
+            continue
+        for alias in aliases:
+            held = next((sym for name, sym in by_name.items()
+                         if alias.lower() in name or name in alias.lower()), None)
+            if held:
+                wrong.append(f"{symbol!r} should be {held!r} (alias {alias!r} is {specs[held].name})")
+
+    assert not wrong, (
+        "these keys name a company the universe holds under a DIFFERENT ticker, "
+        "so match_symbols discards every award naming it:\n  " + "\n  ".join(wrong))
+
+
+def test_an_award_to_the_renamed_company_is_matched_on_its_ticker():
+    """The specific regression: V2X Inc trades as VVX."""
+    from smartboi.dod_contracts import match_symbols
+    from smartboi.universe import spec_by_symbol
+
+    text = ("V2X Inc., McLean, Virginia, is awarded a $500,000,000 "
+            "indefinite-delivery/indefinite-quantity contract for base operations.")
+
+    assert match_symbols(text, set(spec_by_symbol())) == [("VVX", "V2X Inc")]

@@ -242,7 +242,7 @@ def test_a_search_hit_is_frozen():
     import dataclasses
     import pytest
 
-    hit = SearchHit(adsh="x", cik="y", company="Z CORP (Z)", form="10-K", filing_date="2025-01-01")
+    hit = SearchHit(adsh="x", cik="y", company="Z CORP (Z)", form="10-K", filing_date="2025-01-01")  # not an age: the test asserts the dataclass is frozen
     with pytest.raises(dataclasses.FrozenInstanceError):
         hit.adsh = "other"  # type: ignore[misc]
 

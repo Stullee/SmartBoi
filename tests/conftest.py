@@ -11,10 +11,54 @@ was made.
 
 So RTH is pinned OPEN for the whole suite, and the gate's own behaviour is
 tested explicitly, with the clock passed in, in test_engine.py and
-test_signals.py."""
+test_signals.py.
+
+fixture_date below is the same argument applied to the calendar rather than
+the time of day."""
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta, timezone
+
 import pytest
+
+
+# --- The suite's calendar ----------------------------------------------------
+#
+# Evidence decays by age and goes STALE past max(horizon_days * 2, 14), so a
+# fixture pinned to a literal date ages one day per real day and eventually
+# crosses every threshold the tests assert is uncrossed. That is not
+# hypothetical: the 2026-07-23 news fixtures had drifted 27 days out and were
+# failing 30 tests in test_engine.py before this helper existed, with the rest
+# queued to fall as the gap widened. Nothing in the code had changed -- only
+# the date. It is the worst shape a failure can take, because the suite goes
+# red for a reason nobody can connect to the commit that turned it red.
+#
+# So the dates stay pinned in the tests, where a reader can see the spacing
+# between them, and are slid onto the running clock here at call time.
+#
+# Two eras, because the fixtures were written in two sittings: the news
+# fixtures cluster at or below 2026-07-29, the price and filing fixtures at or
+# below 2026-08-11. Each era slides as a block, so the spacing INSIDE it --
+# which is what the decay, dedup and ordering assertions actually read -- is
+# exactly what it was the day the test was written. Each era's newest day
+# lands on YESTERDAY rather than today, so a fixture carrying a wall-clock
+# time can never be dated into the future on a run before that hour.
+#
+# Tests that want stale evidence already ask for it in relative terms
+# (now - timedelta(...)). Those are deliberate and do not go through here.
+_FIXTURE_ERAS = (date(2026, 7, 29), date(2026, 8, 11))
+
+
+def fixture_date(stamp: str) -> str:
+    """Slide a pinned fixture timestamp onto the running clock.
+
+    Accepts a bare date ("2026-07-23") or a full timestamp
+    ("2026-07-23T13:00:00+00:00") and returns the same shape."""
+    day, sep, clock = stamp.partition("T")
+    day = date.fromisoformat(day)
+    era = next(e for e in _FIXTURE_ERAS if e >= day)
+    return ((datetime.now(timezone.utc).date() - timedelta(days=1))
+            - (era - day)).isoformat() + sep + clock
 
 
 @pytest.fixture(autouse=True)
