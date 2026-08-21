@@ -16,7 +16,7 @@ the one it fixes -- so nights and weekends are covered (where the observed
 damage was) and the residual is documented rather than half-solved."""
 from __future__ import annotations
 
-from datetime import datetime, time as dt_time, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -56,3 +56,55 @@ def is_regular_trading_hours(now: datetime | None = None) -> bool:
     if local.weekday() >= 5:  # Saturday/Sunday
         return False
     return MARKET_OPEN <= local.time() < MARKET_CLOSE
+
+def session_for_quote(captured_at: datetime, sessions: set[str] | None = None) -> str | None:
+    """The session whose price a quote captured at `captured_at` actually
+    holds -- which is NOT always the date it was captured on.
+
+    Neither IB nor Finnhub refuses to answer outside the session; both hand
+    back the last close (the same fact is_regular_trading_hours exists for,
+    on the entry path). So a quote taken before the open is the PREVIOUS
+    session's close, and stamping it with the capture date labels it one
+    session late.
+
+    That is not hypothetical. The daily price-marks pass is gated on
+    is_trading_day -- deliberately, because a mark taken after the close is
+    that session's real close -- but nothing holds it to after the close,
+    and on a live deployment the pass drifted to ~00:0x ET. From that point
+    every mark in the file was the previous session's close wearing the
+    current date: 3,992 of 5,025 rows, and every forward window measured
+    from them was aligned one session early.
+
+      captured >= 16:00 ET  -> that session (a real close)
+      09:30-16:00 ET        -> that session (mid-flight, not a close)
+      before 09:30 ET       -> the previous session's close
+      weekend               -> the previous session's close
+
+    `sessions` is an optional set of known trading dates (YYYY-MM-DD), used
+    to step back over holidays as well as weekends. Without it, only
+    weekends are skipped -- the same documented holiday gap the rest of this
+    module carries. Returns None if no prior session can be identified.
+    """
+    local = captured_at.astimezone(MARKET_TZ)
+    day = local.date()
+    if local.weekday() < 5 and local.time() >= MARKET_OPEN:
+        # Mid-session or after the close: either way it is today's session.
+        return day.isoformat()
+    for back in range(1, 8):
+        candidate = day - timedelta(days=back)
+        if candidate.weekday() >= 5:
+            continue
+        if sessions is None or candidate.isoformat() in sessions:
+            return candidate.isoformat()
+    return None
+
+
+def quote_is_a_close(captured_at: datetime) -> bool:
+    """Whether a quote taken at this moment is a settled session close --
+    true after the close on a weekday, and true before the open (it is the
+    PREVIOUS session's close). False mid-session, where the price is a
+    snapshot that has not finished happening yet."""
+    local = captured_at.astimezone(MARKET_TZ)
+    if local.weekday() >= 5:
+        return True
+    return not (MARKET_OPEN <= local.time() < MARKET_CLOSE)

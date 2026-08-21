@@ -774,3 +774,72 @@ def test_marks_as_series_sets_the_range_to_the_close():
     # No intraday range exists, so a replay can only ever see a close
     # THROUGH a level -- never one that traded and recovered.
     assert bar.high == bar.low == bar.close == 10.0
+
+
+# --- the session a quote actually belongs to --------------------------
+
+def test_a_pre_open_mark_is_filed_under_the_previous_session():
+    """The live failure: the daily marks pass drifted to ~00:0x ET, where
+    Finnhub hands back the previous session's close. Filed under the
+    capture date, 79% of a real deployment's marks sat one session late
+    and every forward window measured from them was aligned one session
+    early."""
+    from smartboi.backtest import marks_as_series
+    rows = [{"symbol": "A", "price": 9, "marked_at": "2026-08-20T04:15:00+00:00"},    # 00:15 ET -> 08-19 close
+            {"symbol": "A", "price": 10, "marked_at": "2026-08-21T04:22:00+00:00"},   # 00:22 ET -> 08-20 close
+            {"symbol": "A", "price": 11, "marked_at": "2026-08-24T04:10:00+00:00"}]   # Mon    -> 08-21 close
+    bars = {b.date: b.close for b in marks_as_series(rows)["A"].bars}
+    # Filed by capture date these would read 08-20/08-21/08-24 -- one session
+    # late throughout, and inventing a Monday session that holds Friday.
+    assert bars == {"2026-08-19": 9.0, "2026-08-20": 10.0, "2026-08-21": 11.0}
+
+
+def test_a_settled_close_beats_a_mid_session_snapshot_of_the_same_session():
+    from smartboi.backtest import marks_as_series
+    rows = [{"symbol": "A", "price": 10, "marked_at": "2026-08-20T15:55:00+00:00"},   # 11:55 ET, mid-flight
+            {"symbol": "A", "price": 11, "marked_at": "2026-08-21T04:22:00+00:00"},   # 00:22 ET -> 08-20 close
+            {"symbol": "A", "price": 12, "marked_at": "2026-08-24T04:10:00+00:00"}]   # Mon -> 08-21 close
+    bars = {b.date: b.close for b in marks_as_series(rows)["A"].bars}
+    assert bars == {"2026-08-20": 11.0, "2026-08-21": 12.0}
+
+
+def test_a_weekend_mark_is_fridays_close_not_a_discarded_row():
+    # It holds a real price -- Friday's close. Dropping it threw that away;
+    # stamping it Saturday invented a session.
+    from smartboi.backtest import marks_as_series
+    rows = [{"symbol": "A", "price": 9, "marked_at": "2026-08-20T20:30:00+00:00"},
+            {"symbol": "A", "price": 10, "marked_at": "2026-08-22T19:15:00+00:00"}]   # Sat 15:15 ET
+    bars = {b.date: b.close for b in marks_as_series(rows)["A"].bars}
+    assert bars == {"2026-08-20": 9.0, "2026-08-21": 10.0}
+
+
+def test_an_explicit_session_field_is_trusted_over_the_capture_time():
+    from smartboi.backtest import marks_as_series
+    rows = [{"symbol": "A", "price": 10, "session": "2026-08-19", "marked_at": "2026-08-21T04:22:00+00:00"},
+            {"symbol": "A", "price": 11, "session": "2026-08-20", "marked_at": "2026-08-24T04:10:00+00:00"}]
+    assert [b.date for b in marks_as_series(rows)["A"].bars] == ["2026-08-19", "2026-08-20"]
+
+
+def test_session_for_quote_maps_each_capture_hour_to_its_session():
+    from datetime import datetime
+    from smartboi.market_hours import quote_is_a_close, session_for_quote
+    cases = [
+        ("2026-08-21T04:22:00+00:00", "2026-08-20", True),    # 00:22 ET, before the open
+        ("2026-08-21T15:55:00+00:00", "2026-08-21", False),   # 11:55 ET, mid-session
+        ("2026-08-21T21:00:00+00:00", "2026-08-21", True),    # 17:00 ET, after the close
+        ("2026-08-22T19:15:00+00:00", "2026-08-21", True),    # Saturday
+        ("2026-08-24T04:10:00+00:00", "2026-08-21", True),    # Monday pre-open -> Friday
+    ]
+    for iso, expected, is_close in cases:
+        at = datetime.fromisoformat(iso)
+        assert session_for_quote(at) == expected, iso
+        assert quote_is_a_close(at) is is_close, iso
+
+
+def test_session_for_quote_steps_over_a_known_holiday():
+    from datetime import datetime
+    from smartboi.market_hours import session_for_quote
+    # Weekday, but not a session -- callers that know the calendar can say so.
+    sessions = {"2026-08-19", "2026-08-21"}   # 08-20 was a holiday
+    at = datetime.fromisoformat("2026-08-21T04:00:00+00:00")   # pre-open on the 21st
+    assert session_for_quote(at, sessions) == "2026-08-19"

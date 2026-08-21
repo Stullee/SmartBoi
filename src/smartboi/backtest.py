@@ -47,7 +47,7 @@ from pathlib import Path
 from smartboi.bars import DailyBar
 from smartboi.event_study import attach_outcomes, collapse_episodes
 from smartboi.forward_returns import cluster_bootstrap_ci, effective_sample_count
-from smartboi.market_hours import MARKET_CLOSE, MARKET_TZ
+from smartboi.market_hours import MARKET_CLOSE, MARKET_TZ, quote_is_a_close, session_for_quote
 from smartboi.paper_journal import PaperTrade
 
 # Event-time window. 5 days back is enough to see a run-up without
@@ -217,8 +217,8 @@ def marks_as_series(rows: list[dict], min_marks: int = 2) -> dict[str, "Series"]
     the zero-network fallback when no bar provider is reachable.
 
     These are real market prices (IB, else Finnhub /quote), captured live
-    once a day, so the event-time curve and the lag decomposition are
-    computable from them exactly as from fetched bars. Three things they
+    once a day, so the event-time curve, the lag decomposition and the
+    entry reconciliation are all computable from them. Three things they
     cannot do, and callers must not pretend otherwise:
 
     - **No intraday range.** high and low are set to the close, so
@@ -231,36 +231,44 @@ def marks_as_series(rows: list[dict], min_marks: int = 2) -> dict[str, "Series"]
       one are a selected subset.
     - **Holes** wherever no price source answered that day.
 
-    What they are good for, and what fetched bars are not available for
-    here at all: reconcile_entry. A recorded entry that disagrees with
-    the same session's captured price is a broken entry, and comparing
-    the two catches it whether or not an intraday range exists.
+    Every row is filed under the session its price actually belongs to,
+    not the date it was captured on -- see market_hours.session_for_quote.
+    A quote taken before the open is the PREVIOUS session's close, and a
+    weekend row holds Friday's. Filing by capture date instead puts 79% of
+    a live deployment's marks one session late and silently shifts every
+    event window measured through them; that deployment's whole
+    forward-validation series was affected, so this is applied to rows
+    that carry no explicit `session` field regardless of when they were
+    written. Rows written with one are trusted as-is.
 
-    Weekend marks are dropped. The daily pass is gated on is_trading_day,
-    but rows captured before that gate existed put a Saturday key in the
-    file, holding Friday's close. Left in, each becomes an extra
-    "session" and shifts every event-time offset measured through it by
-    one."""
-    by_symbol: dict[str, dict[str, float]] = {}
+    Where two marks land on the same session, a settled CLOSE beats a
+    mid-session snapshot, and among equals the later capture wins -- a
+    price that has finished happening is worth more than one that has not.
+    """
+    best: dict[str, dict[str, tuple[int, str, float]]] = {}
     for row in rows:
         symbol = row.get("symbol")
         price = row.get("price")
         marked_at = row.get("marked_at") or ""
         if not symbol or not price or not marked_at:
             continue
-        day = marked_at[:10]
         try:
-            if date.fromisoformat(day).weekday() >= 5:
-                continue
+            captured = datetime.fromisoformat(marked_at)
         except ValueError:
             continue
-        by_symbol.setdefault(symbol, {})[day] = float(price)
+        session = row.get("session") or session_for_quote(captured)
+        if not session:
+            continue
+        quality = 2 if quote_is_a_close(captured) else 1
+        current = best.setdefault(symbol, {}).get(session)
+        if current is None or (quality, marked_at) > (current[0], current[1]):
+            best[symbol][session] = (quality, marked_at, float(price))
     return {
         symbol: Series([
-            DailyBar(date=d, open=p, high=p, low=p, close=p)
-            for d, p in sorted(marks.items())
+            DailyBar(date=session, open=p, high=p, low=p, close=p)
+            for session, (_, _, p) in sorted(marks.items())
         ])
-        for symbol, marks in by_symbol.items()
+        for symbol, marks in best.items()
         if len(marks) >= min_marks
     }
 

@@ -73,6 +73,7 @@ from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal, cost_bps_per_side_for_cap
 from smartboi.prices import PriceBar, ReadOnlyPriceFeed
 from smartboi.ratelimit import SlidingWindowLimiter
+from smartboi.market_hours import session_for_quote
 from smartboi.regsho import RegShoClient
 from smartboi.signals import (
     evaluate,
@@ -4745,12 +4746,33 @@ class Engine:
             prices.update(await self.price_feed.last_prices(missing))
         if not prices:
             return False
-        marked_at = datetime.now(timezone.utc).isoformat()
+        captured = datetime.now(timezone.utc)
+        marked_at = captured.isoformat()
+        # The SESSION this price belongs to, which is not always the date it
+        # was captured on. This pass is gated on is_trading_day (a weekday
+        # check) and runs at whatever hour the daily tick lands on -- and
+        # neither IB nor Finnhub refuses to answer out of hours, they hand
+        # back the last close. So once the tick drifted to just after
+        # midnight ET on a live deployment, every row written here was the
+        # PREVIOUS session's close stamped with the current date: 3,992 of
+        # 5,025 marks, every forward window measured from them aligned one
+        # session early, and nothing in the row to tell a reader so.
+        #
+        # marked_at stays the capture time (readers of older files depend on
+        # it, and it is what makes the drift diagnosable at all); `session`
+        # is what analysis should key on. See market_hours.session_for_quote.
+        session = session_for_quote(captured)
         path = Path(self.settings.log_dir) / "price_marks.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a") as f:
             for symbol, price in prices.items():
-                f.write(json.dumps({"marked_at": marked_at, "symbol": symbol, "price": price}) + "\n")
+                f.write(json.dumps({"marked_at": marked_at, "session": session,
+                                    "symbol": symbol, "price": price}) + "\n")
+        if session != marked_at[:10]:
+            log.info(
+                "Daily price marks captured outside the session -- filed under %s (the session "
+                "these prices are the close of), not the capture date %s.", session, marked_at[:10],
+            )
         if len(prices) < len(symbols):
             log.warning("Daily price marks: %d of %d symbols priced (no source had the rest).",
                         len(prices), len(symbols))
