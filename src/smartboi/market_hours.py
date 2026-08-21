@@ -108,3 +108,27 @@ def quote_is_a_close(captured_at: datetime) -> bool:
     if local.weekday() >= 5:
         return True
     return not (MARKET_OPEN <= local.time() < MARKET_CLOSE)
+
+
+def minutes_into_session(now: datetime | None = None) -> float | None:
+    """How far into the regular session we are, in minutes. None outside it.
+
+    Exists because "the session is open" and "the data has caught up" are
+    not the same thing, and only the first is what is_regular_trading_hours
+    can tell you. In the first minutes after the bell a daily-bar request
+    still returns YESTERDAY's bar (there is no complete bar for today yet)
+    and a delayed /quote can still be reporting the prior close. Both
+    answer; neither refuses; and the price they hand back is one no order
+    placed now could have been filled at -- the same failure
+    is_regular_trading_hours exists to stop out of hours, arriving through
+    a door that check holds open.
+    """
+    now = now or datetime.now(timezone.utc)
+    local = now.astimezone(MARKET_TZ)
+    if local.weekday() >= 5:
+        return None
+    if not (MARKET_OPEN <= local.time() < MARKET_CLOSE):
+        return None
+    opened = local.replace(hour=MARKET_OPEN.hour, minute=MARKET_OPEN.minute,
+                           second=0, microsecond=0)
+    return (local - opened).total_seconds() / 60.0

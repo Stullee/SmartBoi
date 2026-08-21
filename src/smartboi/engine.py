@@ -73,7 +73,7 @@ from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal, cost_bps_per_side_for_cap
 from smartboi.prices import PriceBar, ReadOnlyPriceFeed
 from smartboi.ratelimit import SlidingWindowLimiter
-from smartboi.market_hours import session_for_quote
+from smartboi.market_hours import minutes_into_session, session_for_quote
 from smartboi.regsho import RegShoClient
 from smartboi.signals import (
     evaluate,
@@ -102,6 +102,11 @@ DATA_DIR = Path("data")
 # the Gateway restarting daily, or simply not being up yet, shouldn't cost
 # most of a day of price marks.
 IB_RETRY_GAP_SEC = 900
+# No entry is opened until this many minutes into the regular session.
+# Not a preference -- see the long note in _try_open_from_signal. Fifteen
+# minutes is chosen to clear the opening auction and the first daily-bar
+# refresh, and is immaterial against horizon_days of 18-21.
+ENTRY_OPENING_BLACKOUT_MIN = 15
 
 # How long the price-mark series backing the synthesis prompt is reused.
 # The file is appended to once a day, so minutes cannot serve a stale series;
@@ -3920,6 +3925,44 @@ class Engine:
             if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
                 self._expire_signal(dossier, "the entry deadline passed outside regular trading hours")
             return
+        # The opening minutes are as unsafe as being shut, and the check
+        # above cannot see it: is_regular_trading_hours asks whether the
+        # SESSION is open, not whether the DATA has caught up. Right after
+        # the bell neither source has a price for today yet -- IB's
+        # reqHistoricalData("2 D", "1 day") has no complete bar for the
+        # current session, so bars[-1] is yesterday's, and a delayed
+        # /quote is still reporting the prior close. Both answer happily.
+        #
+        # Measured on the live record, over the 49 trade_opened decisions:
+        # of the 23 booked within ten minutes of the open, 16 sit within
+        # 0.5% of the PREVIOUS session's close and the median deviation is
+        # 0.00% -- nine of the 2026-08-06 batch match it to the cent. Of
+        # the 21 booked ten minutes or more in, only 5 do. Those are not
+        # fills; they are yesterday's close with today's timestamp on it,
+        # and every stop, target and R multiple derived from one is
+        # fiction. PLPC on 2026-07-30 was booked at 283.51 -- the prior
+        # close to within 0.07% -- while the stock traded to 362.95 that
+        # session, so its 16% target was cleared by arithmetic alone.
+        #
+        # Deferring costs one entry-poll interval on a weeks-long horizon,
+        # which is nothing; the drift guard below already handles a move
+        # that happened while we waited. Refusing can only ever decline to
+        # open a trade, never open one it would otherwise have skipped --
+        # the recoverable direction of the two.
+        minutes_in = minutes_into_session()
+        if minutes_in is not None and minutes_in < ENTRY_OPENING_BLACKOUT_MIN:
+            # Deadline-checked like every other early return here: one that
+            # is not leaves a signal that never opens AND never expires.
+            if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
+                self._expire_signal(dossier, "the entry deadline passed during the opening blackout")
+            else:
+                log.info(
+                    "[ENTRY] %s: deferring, %.0f min into the session (blackout %d min) -- a price "
+                    "quoted this early is still the previous session's close.",
+                    symbol, minutes_in, ENTRY_OPENING_BLACKOUT_MIN,
+                )
+            return
+
         # IB first, Finnhub second (see _price_bar). Entry used to be the one
         # place in the system with NO fallback -- _snapshot_signal_price and
         # _run_daily_price_marks both already fell back to Finnhub, but the

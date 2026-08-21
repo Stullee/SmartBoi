@@ -2713,6 +2713,50 @@ def test_a_snapshot_that_wrote_rows_marks_the_day_done(engine):
     assert len(rows) == 1
 
 
+async def test_no_trade_opens_in_the_opening_minutes(engine, monkeypatch):
+    """The session being OPEN is not the same as the data having caught up.
+    Right after the bell IB's daily-bar request has no complete bar for
+    today (bars[-1] is yesterday's) and a delayed quote still reports the
+    prior close -- both answer, neither refuses. On the live record, 16 of
+    the 23 entries booked within ten minutes of the open sit within 0.5%
+    of the previous session's close."""
+    monkeypatch.setattr(smartboi.engine, "minutes_into_session", lambda now=None: 6.0)
+    # Dated off the wall clock, not hard-coded: evidence decays against
+    # datetime.now (dossier._age_days), so a fixed date silently ages out
+    # of the signal bar and the test then asserts nothing at all.
+    today = datetime.now(timezone.utc).date().isoformat()
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=today,
+        )
+    # The dossier must actually have signalled, or this asserts nothing.
+    assert engine.dossiers.load("FORM").status == "SIGNALED"
+    await engine._mark_and_execute()
+    assert not engine.journal.has_open("FORM")
+
+
+async def test_a_trade_opens_once_the_opening_window_has_passed(engine, monkeypatch):
+    """Pairs with the test above -- a blackout that never lifted would pass
+    that one and block the system entirely."""
+    monkeypatch.setattr(smartboi.engine, "minutes_into_session", lambda now=None: 45.0)
+    today = datetime.now(timezone.utc).date().isoformat()
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=today,
+        )
+    assert engine.dossiers.load("FORM").status == "SIGNALED"
+    await engine._mark_and_execute()
+    assert engine.journal.has_open("FORM")
+
+
 async def test_no_trade_opens_outside_regular_trading_hours(engine, monkeypatch):
     """Two live paper trades were booked at 09:18 ET. No price source
     refuses to answer out of hours -- they return the last close -- so the

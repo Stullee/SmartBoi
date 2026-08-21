@@ -884,3 +884,23 @@ def test_dedup_keeps_the_same_symbol_on_different_sessions():
     a = _trade(episode="a", event_at="2026-08-03T17:00:00+00:00")
     b = _trade(episode="b", event_at="2026-08-06T17:00:00+00:00")
     assert len(dedup_trades([a, b])) == 2
+
+
+# --- the opening-minutes staleness window -----------------------------
+
+def test_minutes_into_session_measures_from_the_bell():
+    from datetime import datetime
+    from smartboi.market_hours import minutes_into_session
+    # 13:36 UTC = 09:36 ET, six minutes after the open -- the exact window
+    # seven live entries were booked in on 2026-07-30.
+    assert minutes_into_session(datetime.fromisoformat("2026-07-30T13:36:00+00:00")) == 6.0
+    assert minutes_into_session(datetime.fromisoformat("2026-07-30T15:30:00+00:00")) == 120.0
+
+
+def test_minutes_into_session_is_none_when_the_session_is_shut():
+    from datetime import datetime
+    from smartboi.market_hours import minutes_into_session
+    for iso in ("2026-07-30T12:00:00+00:00",   # 08:00 ET, pre-open
+                "2026-07-30T21:00:00+00:00",   # 17:00 ET, after the close
+                "2026-08-22T15:00:00+00:00"):  # Saturday
+        assert minutes_into_session(datetime.fromisoformat(iso)) is None
