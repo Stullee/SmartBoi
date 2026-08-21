@@ -617,7 +617,7 @@ class Engine:
         # per business day once the value floor and the alias table have had
         # their say.
         self.dod: DodContractsClient | None = (
-            DodContractsClient(user_agent=settings.edgar_user_agent or "SmartBoi")
+            DodContractsClient()
             if settings.enable_dod_contracts else None
         )
 
