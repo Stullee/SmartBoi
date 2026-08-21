@@ -843,3 +843,44 @@ def test_session_for_quote_steps_over_a_known_holiday():
     sessions = {"2026-08-19", "2026-08-21"}   # 08-20 was a holiday
     at = datetime.fromisoformat("2026-08-21T04:00:00+00:00")   # pre-open on the 21st
     assert session_for_quote(at, sessions) == "2026-08-19"
+
+
+def test_dedup_collapses_repeat_episodes_landing_on_one_session():
+    """A dossier that keeps re-crossing the threshold fires a new episode
+    each time, and several land on one session. Seen live: PLPC produced
+    three episodes all resolving to day 0 = 2026-08-03, with identical
+    price paths -- three votes for one thesis in every mean."""
+    rows = [_trade(episode=f"ep{i}", event_at=f"2026-08-0{d}T{h}:00:00+00:00", kind="expired")
+            for i, (d, h) in enumerate([(1, "23"), (2, "05"), (2, "18")])]
+    # All three are actionable on 2026-08-03: the first two fire after the
+    # close on 08-01/08-02 (a weekend), the third after the close on 08-02.
+    assert len({actionable_session_date(t.event_at) for t in rows}) == 1
+    assert len(dedup_trades(rows)) == 1
+
+
+def test_dedup_collapses_an_expired_and_an_opened_row_for_one_thesis():
+    """They are different episodes and different kinds, so keying on those
+    let both through -- KLXE 2026-07-30 SHORT contributed its path twice."""
+    expired = _trade(symbol="KLXE", direction="SHORT", kind="expired", episode="ep1",
+                     event_at="2026-07-30T14:00:00+00:00")
+    opened = _trade(symbol="KLXE", direction="SHORT", kind="opened", episode="ep2",
+                    event_at="2026-07-30T15:00:00+00:00", entry_price=2.10,
+                    recorded_status="LOSS")
+    kept = dedup_trades([expired, opened])
+    assert len(kept) == 1
+    # The opened row knows the real entry price; the expiry knows nothing.
+    assert kept[0].kind == "opened" and kept[0].entry_price == 2.10
+
+
+def test_dedup_keeps_both_directions_on_one_symbol_and_session():
+    # A LONG and a SHORT on the same name the same day are two theses,
+    # contradictory ones -- collapsing them would hide the contradiction.
+    long_ = _trade(direction="LONG", episode="a")
+    short = _trade(direction="SHORT", episode="b")
+    assert len(dedup_trades([long_, short])) == 2
+
+
+def test_dedup_keeps_the_same_symbol_on_different_sessions():
+    a = _trade(episode="a", event_at="2026-08-03T17:00:00+00:00")
+    b = _trade(episode="b", event_at="2026-08-06T17:00:00+00:00")
+    assert len(dedup_trades([a, b])) == 2

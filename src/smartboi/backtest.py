@@ -172,21 +172,57 @@ def trades_from_signal_episodes(
     return out
 
 
+# Which kind of row to keep when several describe the same thesis on the
+# same session, best first. An opened trade knows its real entry price; a
+# drift-skip knows the guard fired; an expiry knows only that nothing
+# happened.
+_KIND_PRECEDENCE = {"opened": 0, "drift_skip": 1, "expired": 2}
+
+
 def dedup_trades(trades: list[WouldBeTrade]) -> list[WouldBeTrade]:
-    """One row per (symbol, episode, kind). The open-state snapshot and the
-    closed log overlap for the length of the close-crash window
-    (PaperTradeJournal._load_open_state self-heals the live path, but a
-    snapshot copied off the box mid-close can still contain both), and a
-    trade counted twice is two votes for one thesis in every mean below.
-    Keeps the row with the most information -- a closed record over an
-    open one."""
+    """One row per (symbol, actionable session, direction) -- one vote per
+    thesis per day.
+
+    Keying on the EPISODE instead was not enough, and the difference is
+    not cosmetic. Three ways one thesis produced several votes:
+
+    - The open-state snapshot and the closed log overlap for the length of
+      the close-crash window (PaperTradeJournal._load_open_state self-heals
+      the live path, but a snapshot copied off the box mid-close carries
+      both).
+    - A dossier that keeps re-crossing the threshold fires a new episode
+      every time, and several of those land on one session. Measured on a
+      live record: PLPC produced three separate episodes all resolving to
+      day 0 = 2026-08-03, with identical price paths and identical scores.
+    - An episode that expired and a later one that opened are different
+      episodes and different kinds, so both survived -- KLXE 2026-07-30
+      SHORT appeared once as `expired` and once as `opened`, contributing
+      the same path twice.
+
+    18 of 84 paths on that record (21%) were repeat observations of one
+    symbol on one session. Each was an independent vote in every mean, and
+    symbol-clustering does not catch it because they are the same symbol
+    AND the same day.
+
+    Keeps the most informative row: an opened trade over a drift-skip over
+    an expiry, and within a kind, a resolved record over an open one."""
     best: dict[tuple[str, str, str], WouldBeTrade] = {}
     for trade in trades:
-        key = (trade.symbol, trade.episode or trade.event_at, trade.kind)
+        try:
+            session = actionable_session_date(trade.event_at)
+        except ValueError:
+            session = trade.event_at[:10]
+        key = (trade.symbol, session, trade.direction)
         current = best.get(key)
-        if current is None or (not current.recorded_status or current.recorded_status == "OPEN"):
+        if current is None or _rank(trade) < _rank(current):
             best[key] = trade
     return sorted(best.values(), key=lambda t: (t.event_at, t.symbol))
+
+
+def _rank(trade: WouldBeTrade) -> tuple[int, int, str]:
+    """Sort key for "which row describes this thesis best" -- lower wins."""
+    resolved = 0 if trade.recorded_status not in ("", "OPEN") else 1
+    return (_KIND_PRECEDENCE.get(trade.kind, 9), resolved, trade.event_at)
 
 
 # --- loading the runtime logs -----------------------------------------
