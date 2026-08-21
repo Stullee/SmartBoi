@@ -1044,6 +1044,24 @@ no network at all. The default provider needs no API key and no account.
 Read-only: the script fetches price history and writes a cache, nothing
 else.
 
+**With no egress at all**, `--source marks` runs the whole report off
+`logs/price_marks.jsonl` instead of fetched bars. Those marks are real
+market prices (IB, else Finnhub) captured live once a day, so the event-time
+curve, the lag decomposition and -- the one that has already caught a real
+bug -- the entry-price reconciliation all work. Three things they cannot do:
+there is no intraday range, so a stop that traded and recovered is invisible
+and the replay's win rate reads high (the stop sits nearer than the target);
+there is no history before capture started, so the pre-signal window is
+short or missing for the earliest signals and the trades that have one are a
+selected subset; and there are holes wherever no price source answered.
+Weekend marks are dropped -- rows written before the `is_trading_day` gate
+existed hold Friday's close under a Saturday key, and left in, each becomes
+an extra "session" that shifts every offset measured through it.
+
+```bash
+python scripts/backtest_trades.py --source marks     # no network whatsoever
+```
+
 **On sample size.** Every point on the event curve carries its own `n`,
 because the tail of the curve rests on fewer trades than its head -- a
 signal fired three days ago has no day +10 yet. The report states how many

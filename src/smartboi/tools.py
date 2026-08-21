@@ -28,10 +28,12 @@ from pathlib import Path
 from smartboi.backtest import (
     DEFAULT_POST_DAYS,
     DEFAULT_PRE_DAYS,
+    ENTRY_TOLERANCE_PCT,
     NEAR_DRIFT_DAYS,
     Series,
     analyse,
     load_would_be_trades,
+    marks_as_series,
 )
 from smartboi.backtest import format_report as format_backtest_report
 from smartboi.bars import BarClient, window_bounds
@@ -546,6 +548,8 @@ async def run_backtest(
     pre_days: int = DEFAULT_PRE_DAYS,
     near_days: int = NEAR_DRIFT_DAYS,
     far_days: int = DEFAULT_POST_DAYS,
+    source: str = "bars",
+    entry_tolerance_pct: float | None = None,
 ) -> str:
     """The "was the adjustment lagged" event study over every would-be
     trade, against REAL historical bars rather than the engine's own
@@ -571,7 +575,36 @@ async def run_backtest(
                 "signals.jsonl + decisions.jsonl for episodes the entry guards blocked).")
 
     specs = spec_by_symbol(universe)
-    ecosystem_by_symbol = {symbol: spec.ecosystem for symbol, spec in specs.items()}
+    # Symbols with no ecosystem are LEFT OUT rather than mapped to a shared
+    # empty tag: benchmarking a name against "everything nobody classified"
+    # is not a sector control, it is noise wearing the label of one.
+    ecosystem_by_symbol = {
+        symbol: spec.ecosystem for symbol, spec in specs.items() if spec.ecosystem
+    }
+
+    if source == "marks":
+        # Zero-network path: the engine's own captured marks stand in for
+        # fetched bars. Close-only (see marks_as_series), so the entry
+        # check compares against that session's single captured price
+        # rather than a range -- which needs a wider tolerance to mean
+        # the same thing.
+        series_by_symbol = marks_as_series(read_jsonl(log_dir / "price_marks.jsonl"))
+        if not series_by_symbol:
+            return ("No price marks captured yet -- nothing to check against. These accrue once a "
+                    "day from IB when it's reachable, otherwise from Finnhub quotes.")
+        joined = analyse(
+            trades, series_by_symbol, ecosystem_by_symbol,
+            benchmark_mode=benchmark, market_symbol=market_symbol,
+            pre_days=pre_days, far_days=far_days,
+            entry_tolerance_pct=5.0 if entry_tolerance_pct is None else entry_tolerance_pct,
+        )
+        return format_backtest_report(
+            trades, joined["paths"], joined["replays"], joined["reconciliations"],
+            key=joined["key"], pre_days=pre_days, near_days=near_days, far_days=far_days,
+            benchmark_label=joined["benchmark_label"] + " (close-only price marks)",
+            unpriced=joined["unpriced"],
+            entry_tolerance_pct=joined["entry_tolerance_pct"],
+        )
     # Every universe symbol, not just the ones that signalled: a benchmark
     # built only from names that happened to signal is not a sector, it is
     # a selection of the sector on the thing being measured.
@@ -595,11 +628,14 @@ async def run_backtest(
         trades, series_by_symbol, ecosystem_by_symbol,
         benchmark_mode=benchmark, market_symbol=market_symbol,
         pre_days=pre_days, far_days=far_days,
+        entry_tolerance_pct=(ENTRY_TOLERANCE_PCT if entry_tolerance_pct is None
+                             else entry_tolerance_pct),
     )
     report = format_backtest_report(
         trades, joined["paths"], joined["replays"], joined["reconciliations"],
         key=joined["key"], pre_days=pre_days, near_days=near_days, far_days=far_days,
         benchmark_label=joined["benchmark_label"], unpriced=joined["unpriced"],
+        entry_tolerance_pct=joined["entry_tolerance_pct"],
     )
     if failures:
         shown = ", ".join(f"{s} ({why})" for s, why in sorted(failures.items())[:8])

@@ -212,6 +212,59 @@ def read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def marks_as_series(rows: list[dict], min_marks: int = 2) -> dict[str, "Series"]:
+    """The engine's own `price_marks.jsonl` as a close-only bar series --
+    the zero-network fallback when no bar provider is reachable.
+
+    These are real market prices (IB, else Finnhub /quote), captured live
+    once a day, so the event-time curve and the lag decomposition are
+    computable from them exactly as from fetched bars. Three things they
+    cannot do, and callers must not pretend otherwise:
+
+    - **No intraday range.** high and low are set to the close, so
+      replay_exit sees only a close THROUGH a level, never a level that
+      traded and recovered. Since the stop sits nearer than the target,
+      that under-counts losses specifically -- do not read a replay off
+      these as a win rate.
+    - **No history before capture started**, so the pre-signal window is
+      short or absent for the earliest signals, and the trades that HAVE
+      one are a selected subset.
+    - **Holes** wherever no price source answered that day.
+
+    What they are good for, and what fetched bars are not available for
+    here at all: reconcile_entry. A recorded entry that disagrees with
+    the same session's captured price is a broken entry, and comparing
+    the two catches it whether or not an intraday range exists.
+
+    Weekend marks are dropped. The daily pass is gated on is_trading_day,
+    but rows captured before that gate existed put a Saturday key in the
+    file, holding Friday's close. Left in, each becomes an extra
+    "session" and shifts every event-time offset measured through it by
+    one."""
+    by_symbol: dict[str, dict[str, float]] = {}
+    for row in rows:
+        symbol = row.get("symbol")
+        price = row.get("price")
+        marked_at = row.get("marked_at") or ""
+        if not symbol or not price or not marked_at:
+            continue
+        day = marked_at[:10]
+        try:
+            if date.fromisoformat(day).weekday() >= 5:
+                continue
+        except ValueError:
+            continue
+        by_symbol.setdefault(symbol, {})[day] = float(price)
+    return {
+        symbol: Series([
+            DailyBar(date=d, open=p, high=p, low=p, close=p)
+            for d, p in sorted(marks.items())
+        ])
+        for symbol, marks in by_symbol.items()
+        if len(marks) >= min_marks
+    }
+
+
 def load_would_be_trades(log_dir: Path, include_unopened: bool = True) -> list[WouldBeTrade]:
     """Every would-be trade the runtime logs know about, deduped.
 
@@ -714,9 +767,18 @@ def benchmark_series_for(
     if mode == "market":
         return ([market], market_symbol) if market else ([], f"{market_symbol} (unavailable)")
     ecosystem = ecosystem_by_symbol.get(symbol)
+    # No tag for the subject means no peer group. Grouping it with every
+    # OTHER untagged symbol would build a "sector" out of whatever the
+    # universe file happens not to classify -- a benchmark with a label
+    # and no meaning, which is worse than reporting the row as raw. Seen
+    # live: SCRNY and SCE-PN benchmarked against each other.
+    if not ecosystem:
+        return ([market], f"{market_symbol} (no ecosystem tag for {symbol})") if market else ([], "none available")
     peers = [
         series for peer, series in series_by_symbol.items()
-        if peer != symbol and peer != market_symbol and ecosystem_by_symbol.get(peer) == ecosystem
+        if peer != symbol and peer != market_symbol
+        and ecosystem_by_symbol.get(peer)
+        and ecosystem_by_symbol.get(peer) == ecosystem
     ]
     if peers:
         return peers, f"{ecosystem} peers"
@@ -768,6 +830,7 @@ def analyse(
         "unpriced": unpriced,
         "key": key,
         "benchmark_label": ", ".join(sorted(labels)) or "none",
+        "entry_tolerance_pct": entry_tolerance_pct,
     }
 
 
@@ -968,6 +1031,7 @@ def format_report(
     far_days: int = DEFAULT_POST_DAYS,
     benchmark_label: str = "ecosystem peers",
     unpriced: list[str] | None = None,
+    entry_tolerance_pct: float = ENTRY_TOLERANCE_PCT,
 ) -> str:
     """The whole report as plain text."""
     lines = ["=== Would-be trades vs real market data: was the adjustment lagged? ==="]
@@ -994,7 +1058,7 @@ def format_report(
         lines.append(f"  day +{horizon} has elapsed for {complete} of {len(paths)} trade(s).")
     lines.append("")
 
-    lines.extend(format_reconciliation(reconciliations))
+    lines.extend(format_reconciliation(reconciliations, entry_tolerance_pct))
     lines.append("")
 
     split = adjustment_split(paths, key=key, pre_days=pre_days, near_days=near_days, far_days=far_days)

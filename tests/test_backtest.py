@@ -681,3 +681,96 @@ def test_event_path_without_a_prior_close_yields_no_curve_rather_than_a_wrong_on
     assert path["raw"] == {}
     # ...but the P&L curve, which runs from the recorded entry, still works.
     assert path["as_traded"][1] == pytest.approx(10.0)
+
+
+# --- regressions found by running against a real deployment's logs -----
+
+def test_an_untagged_symbol_is_not_benchmarked_against_other_untagged_ones():
+    """Seen live: two symbols the universe file does not classify (SCRNY,
+    SCE-PN) were grouped into a shared "None" ecosystem and benchmarked
+    against each other -- a sector built from whatever happens to be
+    unclassified, carrying the authority of a sector control and none of
+    the meaning."""
+    from smartboi.backtest import benchmark_series_for
+    series = {"AAA": _series([1, 2]), "BBB": _series([1, 2]), "CCC": _series([1, 2])}
+    eco = {"CCC": "semi_equipment"}          # AAA and BBB are untagged
+    benchmarks, label = benchmark_series_for("AAA", "ecosystem", eco, series, market_symbol="IWM")
+    assert benchmarks == []
+    assert "no ecosystem tag" in label or label == "none available"
+
+
+def test_a_tagged_symbol_still_gets_its_peers():
+    from smartboi.backtest import benchmark_series_for
+    series = {"AAA": _series([1, 2]), "BBB": _series([1, 2]), "CCC": _series([1, 2])}
+    eco = {"AAA": "semi_equipment", "BBB": "semi_equipment", "CCC": "defense_tier2"}
+    benchmarks, label = benchmark_series_for("AAA", "ecosystem", eco, series)
+    assert len(benchmarks) == 1          # BBB only: subject excluded, CCC is another sector
+    assert label == "semi_equipment peers"
+
+
+def test_the_report_prints_the_tolerance_it_actually_applied():
+    """It printed the module default while applying whatever the caller
+    passed -- so a close-only run flagged at 5% and told the reader 2%."""
+    trade = _trade(event_at="2026-08-10T17:00:00+00:00", entry_price=100.0)
+    recon = [{"symbol": "AAA", "event_at": "2026-08-10T17:00:00+00:00", "session_date": "2026-08-10",
+              "recorded_entry": 100.0, "bar_low": 99.0, "bar_high": 101.0, "bar_close": 100.0,
+              "gap_pct": 0.0, "outside_range": False}]
+    report = format_report([trade], _paths_for_split(day0=1.0, near=9.0), [], recon,
+                           key="raw", entry_tolerance_pct=5.0)
+    assert "tolerance 5.0%" in report
+
+
+async def test_marks_source_needs_no_network_at_all(tmp_path):
+    """The zero-egress path: price_marks.jsonl stands in for fetched bars.
+    The handler must never construct a BarClient in this mode."""
+    from smartboi.tools import run_backtest
+    from smartboi.universe import CompanySpec
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    closes = [100.0] * 5 + [101.0, 102.0, 103.0, 104.0, 105.0, 106.0]
+    logs.joinpath("price_marks.jsonl").write_text("".join(
+        json.dumps({"symbol": "AAA", "price": c, "marked_at": f"{d}T20:00:00+00:00"}) + "\n"
+        for d, c in zip(SESSIONS + ["2026-08-17"], closes)))
+    logs.joinpath("paper_trades.jsonl").write_text(json.dumps({
+        "symbol": "AAA", "direction": "LONG", "entry_price": 101.0, "stop_price": 92.92,
+        "target_price": 117.16, "opened_at": "2026-08-10T17:00:00+00:00", "horizon_days": 20,
+        "confidence": 0.8, "magnitude": 0.7, "episode": "ep1", "status": "OPEN",
+    }) + "\n")
+
+    universe = [CompanySpec(symbol="AAA", name="A", ecosystem="semi_equipment")]
+    report = await run_backtest(logs, universe, source="marks", benchmark="none")
+    assert "1 would-be trade(s)" in report
+    assert "Consistent with the lagged-adjustment premise" in report
+
+
+async def test_marks_source_says_so_when_no_marks_captured(tmp_path):
+    from smartboi.tools import run_backtest
+    from smartboi.universe import CompanySpec
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    logs.joinpath("paper_trades.jsonl").write_text(json.dumps({
+        "symbol": "AAA", "direction": "LONG", "entry_price": 10.0, "stop_price": 9.0,
+        "target_price": 12.0, "opened_at": "2026-08-10T17:00:00+00:00", "horizon_days": 20,
+    }) + "\n")
+    report = await run_backtest(logs, [CompanySpec(symbol="AAA", name="A", ecosystem="x")],
+                                source="marks")
+    assert "No price marks captured yet" in report
+
+
+def test_marks_as_series_drops_weekend_marks():
+    from smartboi.backtest import marks_as_series
+    rows = [{"symbol": "A", "price": 10, "marked_at": "2026-08-07T20:00:00+00:00"},   # Fri
+            {"symbol": "A", "price": 10, "marked_at": "2026-08-08T20:00:00+00:00"},   # Sat
+            {"symbol": "A", "price": 11, "marked_at": "2026-08-10T20:00:00+00:00"}]   # Mon
+    assert [b.date for b in marks_as_series(rows)["A"].bars] == ["2026-08-07", "2026-08-10"]
+
+
+def test_marks_as_series_sets_the_range_to_the_close():
+    from smartboi.backtest import marks_as_series
+    rows = [{"symbol": "A", "price": 10, "marked_at": "2026-08-07T20:00:00+00:00"},
+            {"symbol": "A", "price": 11, "marked_at": "2026-08-10T20:00:00+00:00"}]
+    bar = marks_as_series(rows)["A"].bars[0]
+    # No intraday range exists, so a replay can only ever see a close
+    # THROUGH a level -- never one that traded and recovered.
+    assert bar.high == bar.low == bar.close == 10.0

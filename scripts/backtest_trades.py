@@ -44,6 +44,7 @@ from smartboi.backtest import (  # noqa: E402
 )
 from smartboi.bars import PROVIDERS, BarClient, window_bounds  # noqa: E402
 from smartboi.config import load_settings  # noqa: E402
+from smartboi.tools import run_backtest  # noqa: E402
 from smartboi.universe import spec_by_symbol  # noqa: E402
 
 
@@ -55,6 +56,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tiingo-token", default="", help="Token for --provider tiingo")
     parser.add_argument("--offline", action="store_true",
                         help="Never hit the network -- run from cached bars only")
+    parser.add_argument("--source", default="bars", choices=("bars", "marks"),
+                        help="'marks' runs off logs/price_marks.jsonl instead of fetched bars: "
+                             "real captured prices, but close-only and only back to when capture "
+                             "started. Needs no network at all.")
     parser.add_argument("--pre", type=int, default=DEFAULT_PRE_DAYS,
                         help="Sessions of pre-signal history to include")
     parser.add_argument("--near", type=int, default=NEAR_DRIFT_DAYS,
@@ -68,8 +73,10 @@ def _parse_args() -> argparse.Namespace:
                              "ecosystem has no other priced member")
     parser.add_argument("--kinds", default=",".join(KINDS),
                         help=f"Which would-be trades to include ({', '.join(KINDS)})")
-    parser.add_argument("--entry-tolerance", type=float, default=ENTRY_TOLERANCE_PCT,
-                        help="%% outside the real session range before a recorded entry is flagged")
+    parser.add_argument("--entry-tolerance", type=float, default=None,
+                        help=f"%% outside the real session range before a recorded entry is flagged "
+                             f"(default {ENTRY_TOLERANCE_PCT:.0f}%% against a real intraday range, 5%% "
+                             f"against --source marks, which has only a single close to compare to)")
     parser.add_argument("--json", dest="as_json", action="store_true",
                         help="Emit the joined rows as JSON instead of the text report")
     return parser.parse_args()
@@ -83,6 +90,18 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"No would-be trades in {log_dir}/ -- nothing to check. "
               f"(Looked for paper_trades.jsonl, open_paper_trades.json, signals.jsonl, decisions.jsonl.)")
         return 1
+
+    if args.source == "marks":
+        # Zero-egress path -- see backtest.marks_as_series for what these
+        # can and cannot answer. Delegated to the same entry point the
+        # dashboard button uses so the two cannot drift apart.
+        settings = load_settings()
+        print(await run_backtest(
+            log_dir, settings.universe, source="marks", benchmark=args.benchmark,
+            market_symbol=args.market_symbol, pre_days=args.pre, near_days=args.near,
+            far_days=args.far, entry_tolerance_pct=args.entry_tolerance,
+        ))
+        return 0
 
     settings = load_settings()
     specs = spec_by_symbol(settings.universe)
@@ -119,7 +138,9 @@ async def _run(args: argparse.Namespace) -> int:
     joined = analyse(
         trades, series_by_symbol, ecosystem_by_symbol,
         benchmark_mode=args.benchmark, market_symbol=args.market_symbol,
-        pre_days=args.pre, far_days=args.far, entry_tolerance_pct=args.entry_tolerance,
+        pre_days=args.pre, far_days=args.far,
+        entry_tolerance_pct=(ENTRY_TOLERANCE_PCT if args.entry_tolerance is None
+                             else args.entry_tolerance),
     )
     if args.as_json:
         # Event-time offsets are ints; JSON object keys must be strings.
@@ -139,6 +160,7 @@ async def _run(args: argparse.Namespace) -> int:
         trades, joined["paths"], joined["replays"], joined["reconciliations"],
         key=joined["key"], pre_days=args.pre, near_days=args.near, far_days=args.far,
         benchmark_label=joined["benchmark_label"], unpriced=joined["unpriced"],
+        entry_tolerance_pct=joined["entry_tolerance_pct"],
     ))
     return 0
 
