@@ -2715,6 +2715,109 @@ def test_a_snapshot_that_wrote_rows_marks_the_day_done(engine):
     assert len(rows) == 1
 
 
+async def test_an_open_trade_is_closed_when_its_thesis_flips(engine, monkeypatch):
+    """The live PUMP case: opened SHORT 2026-07-29, the dossier turned LONG
+    the next day and stayed LONG for eleven days with conviction RISING
+    (score 0.43 -> 0.74, 4 -> 14 sources) while the price ran 10.20 ->
+    12.79. Nothing noticed -- the flip check runs only before an entry, and
+    entry evaluation skips symbols that already have a position."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=today,
+        )
+    await engine._mark_and_execute()
+    assert engine.journal.has_open("FORM")
+    assert engine.journal.open_trades["FORM"].direction == "LONG"
+
+    # The evidence now says the opposite, at full signal strength.
+    flipped = engine.dossiers.load("FORM")
+    flipped.direction = "SHORT"
+    engine.dossiers.save(flipped)
+
+    await engine._mark_and_execute()
+    assert not engine.journal.has_open("FORM")
+    closed = [json.loads(l) for l in engine.journal.log_path.read_text().splitlines() if l.strip()]
+    assert closed[-1]["status"] == "THESIS_FLIPPED"
+    # Neither a win nor a loss: it never reached a level.
+    assert closed[-1]["status"] not in ("WIN", "LOSS", "TIMEOUT")
+
+
+async def test_a_weakened_thesis_does_not_close_an_open_trade(engine, monkeypatch):
+    """Only a flip that clears the SIGNAL bar closes a position. A thesis
+    that merely weakens, goes NONE, or turns without conviction is a reason
+    to stop adding to it, not to abandon it mid-horizon."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=today,
+        )
+    await engine._mark_and_execute()
+    assert engine.journal.has_open("FORM")
+
+    # Opposite direction, but far too weak to have opened anything.
+    weak = engine.dossiers.load("FORM")
+    weak.direction = "SHORT"
+    weak.confidence = 0.05
+    weak.magnitude = 0.05
+    engine.dossiers.save(weak)
+
+    await engine._mark_and_execute()
+    assert engine.journal.has_open("FORM")
+
+
+async def test_no_trade_opens_in_the_opening_minutes(engine, monkeypatch):
+    """The session being OPEN is not the same as the data having caught up.
+    Right after the bell IB's daily-bar request has no complete bar for
+    today (bars[-1] is yesterday's) and a delayed quote still reports the
+    prior close -- both answer, neither refuses. On the live record, 16 of
+    the 23 entries booked within ten minutes of the open sit within 0.5%
+    of the previous session's close."""
+    monkeypatch.setattr(smartboi.engine, "minutes_into_session", lambda now=None: 6.0)
+    # Dated off the wall clock, not hard-coded: evidence decays against
+    # datetime.now (dossier._age_days), so a fixed date silently ages out
+    # of the signal bar and the test then asserts nothing at all.
+    today = datetime.now(timezone.utc).date().isoformat()
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=today,
+        )
+    # The dossier must actually have signalled, or this asserts nothing.
+    assert engine.dossiers.load("FORM").status == "SIGNALED"
+    await engine._mark_and_execute()
+    assert not engine.journal.has_open("FORM")
+
+
+async def test_a_trade_opens_once_the_opening_window_has_passed(engine, monkeypatch):
+    """Pairs with the test above -- a blackout that never lifted would pass
+    that one and block the system entirely."""
+    monkeypatch.setattr(smartboi.engine, "minutes_into_session", lambda now=None: 45.0)
+    today = datetime.now(timezone.utc).date().isoformat()
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=today,
+        )
+    assert engine.dossiers.load("FORM").status == "SIGNALED"
+    await engine._mark_and_execute()
+    assert engine.journal.has_open("FORM")
+
+
 async def test_no_trade_opens_outside_regular_trading_hours(engine, monkeypatch):
     """Two live paper trades were booked at 09:18 ET. No price source
     refuses to answer out of hours -- they return the last close -- so the
@@ -3792,7 +3895,11 @@ async def test_synthesis_is_shown_the_price_around_its_earliest_evidence(engine)
     path.mkdir(parents=True, exist_ok=True)
     path = path / "price_marks.jsonl"
     path.write_text("".join(
-        __import__("json").dumps({"symbol": "BWEN", "marked_at": d + "T04:00:00+00:00",
+        # 16:30 ET -- an actual close for the date it is labelled with.
+        # T04:00Z was 00:00 ET, before that session had opened, which is
+        # the PREVIOUS session's close (market_hours.session_for_quote) and
+        # shifted this whole fixture back a day.
+        __import__("json").dumps({"symbol": "BWEN", "marked_at": d + "T20:30:00+00:00",
                                   "price": p}) + "\n"
         for d, p in marks
     ))
@@ -3843,7 +3950,11 @@ async def test_the_price_block_actually_reaches_the_synthesizer(engine):
     path.mkdir(parents=True, exist_ok=True)
     path = path / "price_marks.jsonl"
     path.write_text("".join(
-        __import__("json").dumps({"symbol": "BWEN", "marked_at": d + "T04:00:00+00:00",
+        # 16:30 ET -- an actual close for the date it is labelled with.
+        # T04:00Z was 00:00 ET, before that session had opened, which is
+        # the PREVIOUS session's close (market_hours.session_for_quote) and
+        # shifted this whole fixture back a day.
+        __import__("json").dumps({"symbol": "BWEN", "marked_at": d + "T20:30:00+00:00",
                                   "price": p}) + "\n"
         for d, p in [(_fx("2026-08-04"), 30.0), (_fx("2026-08-07"), 33.0), (_fx("2026-08-11"), 36.0)]
     ))

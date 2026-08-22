@@ -59,6 +59,21 @@ _UNKNOWN_CAP_BUCKET_INDEX = 1
 # separable in every statistic instead of silently commingled.
 _BORROW_RISK_CAP_MUSD = 500.0
 
+# The statuses that mean "this trade reached an outcome the strategy is
+# accountable for". Every win-rate, average-R and P&L figure counts these
+# and ONLY these.
+#
+# THESIS_FLIPPED and ARCHIVED are deliberately outside it. Neither reached
+# a level: one was abandoned because the evidence turned against it, the
+# other because a runtime reset retired it. Counting them would answer
+# "what happened to positions we opened" with a number that is supposed to
+# answer "does the strategy pick well" -- and counting an ARCHIVED row as
+# a loss because its mark happened to be red would be inventing an outcome
+# outright. They are recorded so the exclusion is visible; they are not
+# scored.
+RESOLVED_STATUSES = ("WIN", "LOSS", "TIMEOUT")
+UNSCORED_STATUSES = ("THESIS_FLIPPED", "ARCHIVED")
+
 
 def cost_buckets(profile: str = "institutional") -> tuple[tuple[float, float], ...]:
     """The cap->bps/side table for a cost profile. An unrecognised name gets
@@ -216,7 +231,7 @@ class PaperTrade:
     # recoverable from the trade record -- only from signals.jsonl, which
     # needed the join key above to reach.
     magnitude: float = 0.0
-    status: str = "OPEN"  # OPEN | WIN | LOSS | TIMEOUT
+    status: str = "OPEN"  # OPEN | WIN | LOSS | TIMEOUT | THESIS_FLIPPED | ARCHIVED
     closed_at: str | None = None
     exit_price: float | None = None
     r_multiple: float | None = None            # NET of transaction costs
@@ -386,13 +401,43 @@ class PaperTradeJournal:
         tmp.replace(self.open_state_path)
 
     def archive_open_trades(self) -> list[str]:
-        """Discards every currently-open paper trade WITHOUT recording an
-        outcome -- they never reached a WIN/LOSS/TIMEOUT, so they must never
-        enter the closed win-rate record. The open-state file is renamed aside
-        (recoverable), not deleted. Used by the runtime reset to start a clean
-        measurement window after a scoring-rules change (see
-        engine.reset_runtime_state)."""
+        """Retires every currently-open paper trade, recording each one as
+        ARCHIVED rather than discarding it. Used by the runtime reset to
+        start a clean measurement window after a scoring-rules change (see
+        engine.reset_runtime_state).
+
+        They never reached a WIN/LOSS/TIMEOUT and must never enter the
+        win-rate record -- but "must not be counted as an outcome" and
+        "must not be written down" are different requirements, and only
+        the first one is real. Writing an ARCHIVED row makes the exclusion
+        VISIBLE; leaving the row out makes it ABSENT, and absent is the
+        one that silently biases everything downstream.
+
+        Measured on a live deployment: a single reset on 2026-08-09
+        archived 30 of the 49 positions the engine had opened. It archives
+        whatever is still RUNNING, which is not a random third of the book
+        -- everything that had already hit a level stayed in the log,
+        everything still open was dropped. The 19 survivors had a median
+        hold of one session; the 30 archived took a median of nine to ten
+        sessions and seventeen never resolved at all. For a strategy whose
+        premise is that repricing takes days to weeks, that removed
+        precisely the observations the premise is about, and nothing in
+        the ledger recorded that it had happened.
+
+        Each row carries its mark-to-market at archive time (r_multiple,
+        currency_pnl), so an analysis can include them as unrealised or
+        exclude them explicitly -- both of which beat not knowing they
+        existed. The open-state file is still renamed aside as a second
+        copy."""
         symbols = sorted(self.open_trades)
+        now = datetime.now(timezone.utc)
+        for symbol in symbols:
+            trade = self.open_trades[symbol]
+            # Marked at the last price the engine saw. A trade the feed
+            # never priced has no mark to close against, so it is recorded
+            # at its entry -- a 0.00R placeholder that is visibly a
+            # placeholder, not a fabricated outcome.
+            self._close(trade, "ARCHIVED", trade.last_price or trade.entry_price, now)
         self.open_trades = {}
         if self.open_state_path.exists():
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -610,6 +655,29 @@ class PaperTradeJournal:
         self._append_to_log(trade)
         del self.open_trades[trade.symbol]
         self._write_open_state()
+
+    def close_on_thesis_flip(
+        self, symbol: str, price: float, now: datetime | None = None
+    ) -> PaperTrade | None:
+        """Closes an open trade because the evidence now supports the
+        OPPOSITE direction -- not because a level was hit.
+
+        Its own status rather than a WIN or a LOSS, because it is neither:
+        the trade did not reach a level, it was abandoned because the
+        thesis behind it stopped being the thesis. Folding these into
+        WIN/LOSS would corrupt the only two numbers the journal exists to
+        produce. Callers decide WHEN a flip is confirmed (see engine.py,
+        which reuses signals.evaluate so "strong enough to abandon a
+        position" is literally the same bar as "strong enough to open
+        one"); this method only books it.
+
+        Returns the closed trade, or None if the symbol had no open
+        position."""
+        trade = self.open_trades.get(symbol)
+        if trade is None:
+            return None
+        self._close(trade, "THESIS_FLIPPED", price, now or datetime.now(timezone.utc))
+        return trade
 
     def _append_to_log(self, trade: PaperTrade) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)

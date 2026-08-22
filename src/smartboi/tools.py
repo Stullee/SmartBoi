@@ -25,6 +25,18 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from smartboi.backtest import (
+    DEFAULT_POST_DAYS,
+    DEFAULT_PRE_DAYS,
+    ENTRY_TOLERANCE_PCT,
+    NEAR_DRIFT_DAYS,
+    Series,
+    analyse,
+    load_would_be_trades,
+    marks_as_series,
+)
+from smartboi.backtest import format_report as format_backtest_report
+from smartboi.bars import BarClient, window_bounds
 from smartboi.news import redact_token, redact_url
 from smartboi.paper_journal import cost_buckets, trade_economics
 from smartboi.usage import CAT_RESEARCH, CATEGORIES
@@ -522,6 +534,120 @@ def run_forward_returns(
                                    attempted=len(directional)))
         lines.append("")
     return "\n".join(lines)
+
+
+async def run_backtest(
+    log_dir: str | Path,
+    universe: list[CompanySpec],
+    cache_dir: str | Path | None = None,
+    provider: str = "stooq",
+    tiingo_token: str = "",
+    offline: bool = False,
+    benchmark: str = "ecosystem",
+    market_symbol: str = "IWM",
+    pre_days: int = DEFAULT_PRE_DAYS,
+    near_days: int = NEAR_DRIFT_DAYS,
+    far_days: int = DEFAULT_POST_DAYS,
+    source: str = "bars",
+    entry_tolerance_pct: float | None = None,
+) -> str:
+    """The "was the adjustment lagged" event study over every would-be
+    trade, against REAL historical bars rather than the engine's own
+    captured marks -- see backtest.py for why that distinction decides
+    whether the question is answerable at all on a young record.
+
+    The one tool here that reaches the network: it fetches daily bars for
+    the universe from a market-data provider (read-only; the default needs
+    no API key) and caches them under `data/bars/`, so a re-run costs no
+    requests. Nothing about the engine's state is touched.
+
+    Everything else it needs is already on disk in the four runtime logs.
+    """
+    log_dir = Path(log_dir)
+    # Next to the other persisted state rather than a new configurable
+    # path: one fewer setting to keep in sync with the add-on schema, and
+    # the cache belongs with the data it is derived from.
+    cache_dir = Path(cache_dir) if cache_dir else log_dir.parent / "data" / "bars"
+    trades = load_would_be_trades(log_dir)
+    if not trades:
+        return ("No would-be trades logged yet -- nothing to check. These accrue as signals fire "
+                "(paper_trades.jsonl / open_paper_trades.json for opened positions, "
+                "signals.jsonl + decisions.jsonl for episodes the entry guards blocked).")
+
+    specs = spec_by_symbol(universe)
+    # Symbols with no ecosystem are LEFT OUT rather than mapped to a shared
+    # empty tag: benchmarking a name against "everything nobody classified"
+    # is not a sector control, it is noise wearing the label of one.
+    ecosystem_by_symbol = {
+        symbol: spec.ecosystem for symbol, spec in specs.items() if spec.ecosystem
+    }
+    # Anchors are in the universe to be news sources, not comparables --
+    # see backtest.benchmark_series_for for why they are the second choice
+    # for a sector control rather than the first.
+    anchors = {symbol for symbol, spec in specs.items() if spec.signal_source_only}
+
+    if source == "marks":
+        # Zero-network path: the engine's own captured marks stand in for
+        # fetched bars. Close-only (see marks_as_series), so the entry
+        # check compares against that session's single captured price
+        # rather than a range -- which needs a wider tolerance to mean
+        # the same thing.
+        series_by_symbol = marks_as_series(read_jsonl(log_dir / "price_marks.jsonl"))
+        if not series_by_symbol:
+            return ("No price marks captured yet -- nothing to check against. These accrue once a "
+                    "day from IB when it's reachable, otherwise from Finnhub quotes.")
+        joined = analyse(
+            trades, series_by_symbol, ecosystem_by_symbol,
+            benchmark_mode=benchmark, market_symbol=market_symbol,
+            pre_days=pre_days, far_days=far_days,
+            entry_tolerance_pct=5.0 if entry_tolerance_pct is None else entry_tolerance_pct,
+            anchors=anchors,
+        )
+        return format_backtest_report(
+            trades, joined["paths"], joined["replays"], joined["reconciliations"],
+            key=joined["key"], pre_days=pre_days, near_days=near_days, far_days=far_days,
+            benchmark_label=joined["benchmark_label"] + " (close-only price marks)",
+            unpriced=joined["unpriced"],
+            entry_tolerance_pct=joined["entry_tolerance_pct"],
+        )
+    # Every universe symbol, not just the ones that signalled: a benchmark
+    # built only from names that happened to signal is not a sector, it is
+    # a selection of the sector on the thing being measured.
+    needed = {t.symbol for t in trades} | set(specs)
+    if benchmark != "none":
+        needed.add(market_symbol.upper())
+    start_date, end_date = window_bounds([t.event_at[:10] for t in trades], pre_days, far_days)
+
+    async with BarClient(cache_dir=cache_dir, provider=provider,
+                         tiingo_token=tiingo_token, offline=offline) as client:
+        bars_by_symbol = await client.bars_for_all(sorted(needed), start_date, end_date)
+        failures = dict(client.failures)
+
+    series_by_symbol = {symbol: Series(bars) for symbol, bars in bars_by_symbol.items() if bars}
+    if not series_by_symbol:
+        return (f"No bars could be fetched from '{provider}' for {start_date}..{end_date} -- "
+                f"nothing to check against. First failure: "
+                f"{next(iter(failures.items()), ('n/a', 'no symbols requested'))}")
+
+    joined = analyse(
+        trades, series_by_symbol, ecosystem_by_symbol,
+        benchmark_mode=benchmark, market_symbol=market_symbol,
+        pre_days=pre_days, far_days=far_days,
+        entry_tolerance_pct=(ENTRY_TOLERANCE_PCT if entry_tolerance_pct is None
+                             else entry_tolerance_pct),
+        anchors=anchors,
+    )
+    report = format_backtest_report(
+        trades, joined["paths"], joined["replays"], joined["reconciliations"],
+        key=joined["key"], pre_days=pre_days, near_days=near_days, far_days=far_days,
+        benchmark_label=joined["benchmark_label"], unpriced=joined["unpriced"],
+        entry_tolerance_pct=joined["entry_tolerance_pct"],
+    )
+    if failures:
+        shown = ", ".join(f"{s} ({why})" for s, why in sorted(failures.items())[:8])
+        report += (f"\n\n{len(failures)} symbol(s) returned no bars and were left out of the "
+                   f"subjects and the benchmarks: {shown}" + (" ..." if len(failures) > 8 else ""))
+    return report
 
 
 def run_skeptic_report(log_dir: str | Path, dossier_store) -> str:

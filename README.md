@@ -956,6 +956,181 @@ See `forward_returns.py` for the join/aggregation math (network-free and
 unit tested on synthetic rows) and a counterfactual ledger for signals the
 confidence threshold skipped is still a possible future addition.
 
+## What closes a paper trade
+
+Four outcomes, and two of them are deliberately not scored.
+
+**`WIN` / `LOSS` / `TIMEOUT`** are the record. A trade reached its target,
+its stop, or its horizon. These are the only statuses that enter a win
+rate, an average R, or a P&L figure (`paper_journal.RESOLVED_STATUSES`).
+
+**`THESIS_FLIPPED`** closes a position whose own dossier now qualifies for a
+signal in the OPPOSITE direction. Nothing used to notice: the flip check in
+`_try_open_from_signal` runs only *before* an entry, and entry evaluation
+skips any symbol that already holds a position -- so a flipped thesis could
+not even fire, and the position and the evidence simply diverged for as long
+as the trade stayed open. Confirmed live on PUMP: opened SHORT on
+2026-07-29, its dossier turned LONG the next day and stayed LONG for eleven
+days with conviction *rising* (score 0.43 -> 0.74, 4 -> 14 independent
+sources) while the price ran 10.20 -> 12.79. The evidence was right, the
+position was wrong, and the system held it. The bar for closing is
+`signals.evaluate` itself, not a second definition of "strong enough" --
+abandoning a position needs exactly the conviction opening one needs, and a
+thesis that merely weakens, goes NONE, or turns without clearing the bar is
+a reason to stop adding conviction, not to abandon a position mid-horizon.
+
+**`ARCHIVED`** is a position retired by the runtime reset
+(`archive_open_trades`). It never reached a level, so it is never scored --
+but "must not be counted as an outcome" and "must not be written down" are
+different requirements, and only the first is real. A single reset on
+2026-08-09 retired 30 of the 49 positions a live deployment had opened, and
+left no trace in the ledger. It archives whatever is still *running*, which
+is not a random third of the book: everything that had already hit a level
+stayed, everything still open was dropped. The 19 survivors had a median
+hold of one session; the 30 archived took a median of nine to ten sessions
+and seventeen never resolved at all. For a strategy whose premise is that
+repricing takes days to weeks, that removed precisely the observations the
+premise is about -- and nothing recorded that it had happened. Each archived
+row now carries its mark-to-market, so an analysis can include it as
+unrealised or exclude it explicitly. Both beat not knowing it existed.
+
+The dashboard shows the unscored counts next to the scored ones: a large
+archived count beside a small closed one is the signature of a record that
+has been reset out from under itself.
+
+## Backtesting the would-be trades against real market data
+
+Everything above scores the record against `logs/price_marks.jsonl` -- the
+engine's own daily marks. That log answers "does the score predict
+returns" and is the wrong instrument for a different question: **did the
+lagged course adjustment this strategy is premised on actually happen to
+the names it signalled?**
+
+Three reasons the marks log cannot answer it. It **cannot be backfilled**,
+so the pre-signal window does not exist and, on a young deployment,
+neither does most of the post-signal one. It **has holes** wherever a
+price source was down that day, and the join then reaches up to five
+calendar days forward for a substitute, quietly stretching the very window
+it is measuring. And it is **close-only**, so a stop that traded intraday
+and recovered is not in it at all.
+
+Real historical bars have none of those problems, and the one property
+that matters most here: they can be fetched *today* for a window that has
+already happened. So the question can be asked of the record that already
+exists, rather than needing another month of capture first.
+
+```bash
+python scripts/backtest_trades.py                      # default: Stooq, no API key needed
+python scripts/backtest_trades.py --near 5 --far 20
+python scripts/backtest_trades.py --provider tiingo --tiingo-token $TIINGO_API_KEY
+python scripts/backtest_trades.py --offline            # re-run from the bar cache, no network
+```
+
+It reads all four runtime logs, not just the paper-trade one. A signal the
+entry-timing guards blocked is still a would-be trade, and those guards are
+themselves premised on the lag being real -- answering the lag question
+only on the episodes they let through would be circular. Opened trades,
+drift-blocked episodes and expired ones are each reported, and the report
+repeats the headline restricted to the trades the engine actually opened,
+so a disagreement between the two is visible rather than assumed away.
+
+Each would-be trade is aligned in **event time** around its signal, and the
+move is split into the four segments that decide the question:
+
+```
+before   close(-5) -> close(-1)    the run-up we followed
+day 0    close(-1) -> close(0)     repriced the same session
+near     close(0)  -> close(+5)    the drift an entry captures
+far      close(+5) -> close(+20)   the drift a horizon captures
+```
+
+plus a **capture ratio** -- `near / (day0 + near)`, the share of everything
+that moved from the moment the evidence was in hand that was still
+available after the signal session closed. That number is the
+lagged-adjustment premise expressed as a fraction. Near 1.0 the market had
+not reacted yet and the entry was early enough to matter; near 0 the
+repricing happened the same session and the entry is late by construction
+-- which implies a faster entry, not a better score. A pre-signal run-up is
+called out separately: on names that were already moving in the thesis
+direction before the evidence crossed threshold, some of what looks like
+prediction is the pipeline confirming price.
+
+Returns are signed in the thesis direction (LONG: up is a win) and measured
+**abnormal** -- net of the ecosystem's own move over the same dates, with
+the subject excluded from its own benchmark and a market proxy (`--market-symbol`,
+default IWM) standing in where an ecosystem has no other priced member.
+These are all small caps; an unadjusted number here is mostly Russell beta.
+
+The peer group is the ecosystem's **tradeables**, not all its members. An
+anchor is in the universe to be a news source, not a comparable -- the
+ecosystems are deliberately seeded with the large, efficiently-priced names
+whose news is expected to move the small ones, so an all-member benchmark
+asks what a $150M supplier did relative to a basket that is mostly
+megacaps. Measured on a live record, tradeable-only peers track the traded
+names distinctly better (mean daily-return correlation 0.470 against 0.426)
+despite being far fewer: six comparables beat twenty-six
+non-comparables. Where fewer than four tradeable peers are priced the
+benchmark widens back to the full ecosystem and says so in its label, so a
+row resting on the weaker control is visible rather than silently pooled.
+Peer returns are aggregated by **median**: one ecosystem on that record
+spanned $1.85 to $1,244 a share, and a mean lets the largest name stand in
+for what the sector did.
+Offsets are positions in the symbol's own bar series, so weekends, holidays
+and halts are handled by construction rather than by calendar arithmetic.
+
+Two things it checks that nothing else in the system does:
+
+- **Recorded entry prices against the real session range.** An entry
+  outside the day's actual `[low, high]` means a stale quote, a symbol
+  mismatch, or a split between then and now -- and every R multiple derived
+  from that entry is fiction. Reported first, because a failure here
+  invalidates the numbers below it, and those trades are excluded from the
+  replay aggregates rather than pooled into them.
+- **Stop/target replay against real intraday ranges**, using
+  `paper_journal.update`'s exact conventions (the entry session never
+  resolves; the stop wins when both levels traded in one bar; a stop fills
+  at the stop or the close, whichever is worse). The live journal can only
+  apply those rules on days a price source answered -- a symbol the feed
+  dropped for four sessions had four bars' worth of touches that were never
+  evaluated. Disagreements between the live outcome and the real-bar one
+  are listed individually.
+
+Bars are cached under `data/bars/` (gitignored), so the first run costs one
+request per symbol and every re-run costs none; `--offline` then works with
+no network at all. The default provider needs no API key and no account.
+Read-only: the script fetches price history and writes a cache, nothing
+else.
+
+**With no egress at all**, `--source marks` runs the whole report off
+`logs/price_marks.jsonl` instead of fetched bars. Those marks are real
+market prices (IB, else Finnhub) captured live once a day, so the event-time
+curve, the lag decomposition and -- the one that has already caught a real
+bug -- the entry-price reconciliation all work. Three things they cannot do:
+there is no intraday range, so a stop that traded and recovered is invisible
+and the replay's win rate reads high (the stop sits nearer than the target);
+there is no history before capture started, so the pre-signal window is
+short or missing for the earliest signals and the trades that have one are a
+selected subset; and there are holes wherever no price source answered.
+Weekend marks are dropped -- rows written before the `is_trading_day` gate
+existed hold Friday's close under a Saturday key, and left in, each becomes
+an extra "session" that shifts every offset measured through it.
+
+```bash
+python scripts/backtest_trades.py --source marks     # no network whatsoever
+```
+
+**On sample size.** Every point on the event curve carries its own `n`,
+because the tail of the curve rests on fewer trades than its head -- a
+signal fired three days ago has no day +10 yet. The report states how many
+trades have reached each horizon, bootstraps its confidence intervals over
+SYMBOLS rather than rows, counts non-overlapping thesis-windows as the
+effective sample, and says outright when the sample is too small to accept
+or reject the premise. On a few weeks of runtime it will be: the honest use
+at that stage is to read the SHAPE of the reaction and to catch broken
+plumbing, not to draw a conclusion. See `backtest.py` for the math
+(network-free, unit tested on synthetic bars) and `bars.py` for the fetch
+and cache.
+
 ## Setup
 
 ```bash

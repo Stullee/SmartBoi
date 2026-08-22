@@ -630,3 +630,44 @@ def test_the_snapshot_carries_per_mechanism_attribution():
     assert row["veto_falsified_by_price"] is True
     assert row["ecosystem_slot_counted"] is True
     assert row["synthesis_stale_evidence"] is False
+
+
+def test_archived_and_flipped_rows_do_not_enter_the_win_rate(tmp_path):
+    """They are in the ledger so the exclusion is visible, not so they can
+    be scored. Counting an ARCHIVED row as a loss because its mark happened
+    to be red would invent an outcome the trade never reached."""
+    log = tmp_path / "paper_trades.jsonl"
+    rows = [
+        {"symbol": "AAA", "direction": "LONG", "status": "WIN", "r_multiple": 1.9,
+         "opened_at": "2026-08-03T14:00:00+00:00", "closed_at": "2026-08-05T14:00:00+00:00"},
+        {"symbol": "BBB", "direction": "LONG", "status": "LOSS", "r_multiple": -1.0,
+         "opened_at": "2026-08-03T14:00:00+00:00", "closed_at": "2026-08-04T14:00:00+00:00"},
+        {"symbol": "CCC", "direction": "LONG", "status": "ARCHIVED", "r_multiple": -0.4,
+         "opened_at": "2026-08-03T14:00:00+00:00", "closed_at": "2026-08-09T08:00:00+00:00"},
+        {"symbol": "DDD", "direction": "SHORT", "status": "THESIS_FLIPPED", "r_multiple": -0.2,
+         "opened_at": "2026-08-03T14:00:00+00:00", "closed_at": "2026-08-06T14:00:00+00:00"},
+    ]
+    log.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    stats, _ = gather_paper_trade_stats(log)
+
+    assert stats.closed == 2                     # not 4
+    assert (stats.wins, stats.losses) == (1, 1)
+    assert stats.win_rate == 0.5                 # 25% if the unscored rows leaked in
+    assert stats.archived == 1
+    assert stats.thesis_flipped == 1
+
+
+def test_a_ledger_of_only_archived_rows_reports_no_record_rather_than_zero_percent(tmp_path):
+    """The state right after a reset. A 0% win rate over 0 trades reads as
+    "the strategy lost"; it means "nothing has resolved yet"."""
+    log = tmp_path / "paper_trades.jsonl"
+    log.write_text(json.dumps({
+        "symbol": "AAA", "direction": "LONG", "status": "ARCHIVED", "r_multiple": -0.4,
+        "opened_at": "2026-08-03T14:00:00+00:00", "closed_at": "2026-08-09T08:00:00+00:00"}) + "\n")
+
+    stats, _ = gather_paper_trade_stats(log)
+
+    assert stats.closed == 0
+    assert stats.win_rate == 0.0
+    assert stats.archived == 1
