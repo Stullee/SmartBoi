@@ -16,6 +16,7 @@ from smartboi.config import Settings
 from smartboi.engine import Engine
 from smartboi.webapp import _CSRF_HEADER, _parse_tickers, create_app
 
+from tests.conftest import fixture_date as _fx
 from tests.fakes import FakeFinnhub
 
 
@@ -347,7 +348,7 @@ async def test_dossier_endpoint_returns_the_evidence_behind_a_score(engine):
         thesis_summary="Backlog build",
         evidence=[EvidenceRecord(
             evidence_id="e1", source_type="8-K", source_name="SEC EDGAR (8-K)",
-            url="https://sec.gov/x", headline="Award announced", published_at="2026-08-01T00:00:00+00:00",
+            url="https://sec.gov/x", headline="Award announced", published_at=_fx("2026-08-01T00:00:00+00:00"),
             origin_symbol="RTX", is_propagated=True, relationship_note="RTX is a customer of DCO",
             direction="LONG", magnitude=0.6, confidence=0.7, horizon_days=30,
             reasoning="Sole-source award", skeptic_note="Size undisclosed",

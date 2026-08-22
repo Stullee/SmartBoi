@@ -159,6 +159,7 @@ def _dossier_row(d: Dossier) -> dict:
         "synthesis_fresh": synthesis_verdict_fresh(d, datetime.now(timezone.utc)),
         "already_priced_in": d.already_priced_in,
         "redundant_evidence": d.redundant_evidence,
+        "synthesis_direction": d.synthesis_direction,
         "synthesis_confidence": d.synthesis_confidence,
         "synthesis_magnitude": d.synthesis_magnitude,
         "pre_synthesis_score": round(d.pre_synthesis_score, 3),
@@ -186,6 +187,7 @@ def _dossier_row(d: Dossier) -> dict:
         "distinct_fact_count": d.distinct_fact_count,
         "already_priced_in": d.already_priced_in,
         "redundant_evidence": d.redundant_evidence,
+        "synthesis_direction": d.synthesis_direction,
     }
 
 
@@ -860,6 +862,14 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str, min_sources_required: int 
         # to stop: shipping a scoring change whose effect cannot afterwards be
         # attributed to it.
         "redundant_evidence": d.redundant_evidence,
+        # WHICH veto channel touched this row. A zeroed score carries no
+        # record of why it was zeroed, and the two channels are different
+        # claims: "already priced in" says the move is gone, "direction"
+        # says the pass read the same file and reached a different thesis --
+        # or, far more often, declined to reach one at all. Bucketing forward
+        # returns on the wrong channel is how a veto accounting for a fifth
+        # of the record stayed invisible for a whole measurement window.
+        "synthesis_direction": d.synthesis_direction,
         # The arithmetic score BEFORE synthesis capped or vetoed it. Without
         # this a vetoed row records 0.000 for both numbers, so "0.9 confidence
         # but priced in" and "0.05 and priced in" are the same row forever --

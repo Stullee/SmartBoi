@@ -638,13 +638,25 @@ def test_a_friday_entry_is_not_resolved_across_the_whole_weekend(tmp_path, real_
     journal = _journal(tmp_path)
     journal.open("UCTT", "LONG", 100.0, 8.0, 16.0, 30, "t", 0.7, 2, [])
     opened = datetime.fromisoformat(journal.open_trades["UCTT"].opened_at)
-    # Walk to the next Saturday, mid-day UTC.
-    saturday = opened + timedelta(days=1)
+    # Walk to the next Saturday -- with the hour pinned FIRST, exactly as
+    # _session_stamp does, and for the same reason.
+    #
+    # Walking first and replacing the hour afterwards reads as equivalent and
+    # is not. `opened` is a UTC instant, and between 00:00 and 04:00 UTC its
+    # MARKET date is the day before, so the walk lands on a stamp whose UTC
+    # date is already one ahead; replacing the UTC hour with 15:00 then drags
+    # it forward a market day. The two assertions become Sunday and MONDAY,
+    # 11:00 ET -- mid-session, where resolving is correct -- and this test
+    # failed for four hours out of every twenty-four. It was failing at HEAD
+    # when this was written.
+    saturday = (opened + timedelta(days=1)).replace(
+        hour=15, minute=0, second=0, microsecond=0
+    )
     while saturday.astimezone(MARKET_TZ).weekday() != 5:
         saturday += timedelta(days=1)
     for day in (saturday, saturday + timedelta(days=1)):
-        journal.update("UCTT", 99.0, high=101.0, low=90.0,
-                       now=day.replace(hour=15, minute=0, second=0, microsecond=0))
+        assert day.astimezone(MARKET_TZ).weekday() >= 5, day  # the premise of the test
+        journal.update("UCTT", 99.0, high=101.0, low=90.0, now=day)
         assert journal.has_open("UCTT"), day
 
 

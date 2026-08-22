@@ -196,6 +196,32 @@ class Dossier:
     # which is why, against those 77 vetoes, the re-judge path fired exactly
     # once in three days.
     redundant_evidence: bool = False
+    # The direction the whole-body pass itself resolved, which is NOT the same
+    # question as the dossier's direction and, until now, was the one part of
+    # a verdict that reached disk only as an EFFECT.
+    #
+    # _apply_synthesis zeroes a score when this disagrees with the dossier, so
+    # a zeroed score with no priced-in flag was the only trace the disagreement
+    # left, and the reporting layer had to infer the channel from an absence.
+    # It inferred wrong: tools.py filed every one of them under "trimmed
+    # (redundant evidence)", so a channel accounting for 78 of the 363 vetoes
+    # in the record had no bucket it could appear in, and went unexamined for
+    # the whole measurement window.
+    #
+    # The distinction the inference could never recover is the one that
+    # matters. "NONE" is an ABSTENTION -- the pass read the file and declined
+    # to call a direction -- and it is the overwhelming majority of this
+    # channel. A resolved direction OPPOSITE the dossier's is a genuine
+    # polarity dispute and is rare. Those are different findings about the
+    # evidence and they deserve different responses; collapsing them into one
+    # zero, and then labelling that zero "redundant", loses both.
+    #
+    # Recorded, never acted on: the veto below already reads verdict direction
+    # directly, so persisting it changes no score. What it changes is that
+    # _cap_with_synthesis, which today re-applies only the priced-in half of
+    # the verdict on the merge path, CAN be made whole later without a second
+    # LLM call -- it cannot check a direction the dossier does not carry.
+    synthesis_direction: str = ""
     synthesis_note: str = ""
     synthesis_catalyst: str = ""
     # --- What the verdict above was judged AGAINST, so it can be falsified

@@ -76,7 +76,7 @@ def test_summarize_form4_no_transactions_still_summarizes():
 
 def test_raw_document_url_strips_xsl_rendering_prefix():
     filing = FilingEvent(
-        symbol="UCTT", cik10="0001275014", form="4", filing_date="2026-07-20",
+        symbol="UCTT", cik10="0001275014", form="4", filing_date="2026-07-20",  # not an age: only the accession builds the URL under test
         accession_number="0001275014-26-000001", primary_document="xslF345X05/form4.xml",
     )
     assert filing.raw_document_url.endswith("000127501426000001/form4.xml")

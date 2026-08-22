@@ -28,6 +28,8 @@ from smartboi.universe import CompanySpec
 from smartboi.ratelimit import SlidingWindowLimiter
 from smartboi.status import snapshot_dossier
 from smartboi.graph import Relationship
+from tests.conftest import fixture_date as _fx
+
 from smartboi.news import NewsArticle
 
 from tests.fakes import (
@@ -105,9 +107,9 @@ def engine(tmp_path, monkeypatch):
 async def test_distinct_publishers_count_as_independent_sources(engine):
     engine.finnhub.articles_by_symbol["FORM"] = [
         NewsArticle(symbol="FORM", headline="Headline A", summary="s", source="Reuters",
-                    url="https://finnhub.io/api/news/1", published_at="2026-07-23T00:00:00+00:00"),
+                    url="https://finnhub.io/api/news/1", published_at=_fx("2026-07-23T00:00:00+00:00")),
         NewsArticle(symbol="FORM", headline="Headline B", summary="s", source="Bloomberg",
-                    url="https://finnhub.io/api/news/2", published_at="2026-07-23T00:00:00+00:00"),
+                    url="https://finnhub.io/api/news/2", published_at=_fx("2026-07-23T00:00:00+00:00")),
     ]
     engine.updater.default = proposal(direction="LONG")
     engine.skeptic.default = verdict(refuted=False)
@@ -122,12 +124,12 @@ async def test_distinct_publishers_count_as_independent_sources(engine):
 async def test_same_headline_syndication_still_collapses_to_one_source(engine):
     engine.finnhub.articles_by_symbol["FORM"] = [
         NewsArticle(symbol="FORM", headline="Same Headline", summary="s", source="Reuters",
-                    url="https://finnhub.io/api/news/1", published_at="2026-07-23T00:00:00+00:00"),
+                    url="https://finnhub.io/api/news/1", published_at=_fx("2026-07-23T00:00:00+00:00")),
         # A different publisher syndicating the exact same story, same day --
         # the dedup FINGERPRINT (symbol:normalized_headline:date) is what
         # collapses this, deliberately independent of source identity.
         NewsArticle(symbol="FORM", headline="Same Headline", summary="s", source="Yahoo",
-                    url="https://finnhub.io/api/news/2", published_at="2026-07-23T00:00:00+00:00"),
+                    url="https://finnhub.io/api/news/2", published_at=_fx("2026-07-23T00:00:00+00:00")),
     ]
     engine.updater.default = proposal(direction="LONG")
     engine.skeptic.default = verdict(refuted=False)
@@ -206,7 +208,7 @@ async def test_seed_graph_seeds_relationships_fully_inside_the_universe(tmp_path
 
 async def test_relationship_extraction_falls_back_to_finnhub_search(engine):
     filing = FilingEvent(
-        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date=_fx("2026-07-01"),
         accession_number="0001234567-26-000001", primary_document="form.htm",
     )
     engine.extractor.default = [{
@@ -231,7 +233,7 @@ async def test_relationship_extraction_falls_back_to_finnhub_search(engine):
 
 async def test_extract_relationships_drops_invalid_rel_type(engine):
     filing = FilingEvent(
-        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date=_fx("2026-07-01"),
         accession_number="0001234567-26-000001", primary_document="form.htm",
     )
     engine.extractor.default = [{
@@ -249,7 +251,7 @@ async def test_extract_relationships_drops_invalid_rel_type(engine):
 async def test_second_discovery_with_a_resolved_ticker_merges_the_orphan(engine):
     # First mention: no ticker resolves -- stored under the name key.
     filing = FilingEvent(
-        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date=_fx("2026-07-01"),
         accession_number="0001234567-26-000001", primary_document="form.htm",
     )
     engine.extractor.default = [{
@@ -269,7 +271,7 @@ async def test_second_discovery_with_a_resolved_ticker_merges_the_orphan(engine)
     # now counted per filing, so it would (correctly) refuse to count the
     # same document twice.
     other_filing = FilingEvent(
-        symbol="UCTT", cik10="0000000002", form="10-K", filing_date="2026-07-02",
+        symbol="UCTT", cik10="0000000002", form="10-K", filing_date=_fx("2026-07-02"),
         accession_number="0001234567-26-000002", primary_document="uctt.htm",
     )
     engine.extractor.default = [{
@@ -294,7 +296,7 @@ def _seed_candidate(engine, key, **overrides):
     entry = {
         "name": "Some Uncommon Co", "ticker": "", "related_to": ["FORM"],
         "rel_types": ["customer"], "description": "d", "sources": [],
-        "seen_count": 3, "first_seen_at": "2026-07-01T00:00:00+00:00",
+        "seen_count": 3, "first_seen_at": _fx("2026-07-01T00:00:00+00:00"),
     }
     entry.update(overrides)
     engine.candidates.set(key, entry)
@@ -711,7 +713,7 @@ async def test_deferred_updater_is_not_definitive(engine):
     engine.updater.default = None  # simulates budget exhaustion / a transient failure
     handled = await engine._process_evidence(
         origin_symbol="FORM", evidence_text="some news", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
     )
     assert handled is False
 
@@ -721,7 +723,7 @@ async def test_refuted_evidence_is_definitive_but_does_not_merge(engine):
     engine.skeptic.default = verdict(refuted=True)
     handled = await engine._process_evidence(
         origin_symbol="FORM", evidence_text="some news", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
     )
     assert handled is True
     dossier = engine.dossiers.load("FORM")
@@ -733,7 +735,7 @@ async def test_accepted_evidence_is_definitive_and_merges(engine):
     engine.skeptic.default = verdict(refuted=False)
     handled = await engine._process_evidence(
         origin_symbol="FORM", evidence_text="some news", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
     )
     assert handled is True
     dossier = engine.dossiers.load("FORM")
@@ -749,7 +751,7 @@ async def test_retry_after_deferred_skeptic_does_not_repropose(engine):
 
     first = await engine._update_dossier(
         "FORM", "evidence text", "FORM", "", None, "news", "reuters.com",
-        "https://x/1", "h1", "2026-07-23",
+        "https://x/1", "h1", _fx("2026-07-23"),
     )
     assert first == "deferred"
     assert len(engine.updater.calls) == 1
@@ -757,7 +759,7 @@ async def test_retry_after_deferred_skeptic_does_not_repropose(engine):
     engine.skeptic.queue(verdict(refuted=False))  # retry: skeptic now answers
     second = await engine._update_dossier(
         "FORM", "evidence text", "FORM", "", None, "news", "reuters.com",
-        "https://x/1", "h1", "2026-07-23",
+        "https://x/1", "h1", _fx("2026-07-23"),
     )
     assert second == "handled"
     # The cached proposal from the first attempt was reused -- propose_update
@@ -769,26 +771,26 @@ async def test_retry_after_deferred_skeptic_does_not_repropose(engine):
 # target's evidence is DEFINITIVELY handled, never on a deferred attempt ---
 
 async def test_propagation_slot_not_consumed_on_deferred_attempt(engine):
-    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "test", 0.9, "2026-07-23"))
+    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "test", 0.9, _fx("2026-07-23")))
     engine.updater.default = proposal()
     engine.skeptic.default = None  # every attempt against FORM is deferred
 
     await engine._process_evidence(
         origin_symbol="INTC", evidence_text="Intel news", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
     )
     now = time.monotonic()
     assert engine._propagation_limiter.would_allow("INTC->FORM", now)
 
 
 async def test_propagation_slot_consumed_once_definitively_handled(engine):
-    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "test", 0.9, "2026-07-23"))
+    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "test", 0.9, _fx("2026-07-23")))
     engine.updater.default = proposal()
     engine.skeptic.default = verdict(refuted=True)  # definitively refused -- still "handled"
 
     await engine._process_evidence(
         origin_symbol="INTC", evidence_text="Intel news", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
     )
     # max_propagated_evidence_per_link=1 in the fixture -- one definitive
     # propagation to FORM should have fully consumed the cooldown slot.
@@ -805,14 +807,14 @@ async def test_full_lifecycle_signal_open_close_reset(engine):
 
     await engine._process_evidence(
         origin_symbol="FORM", evidence_text="evidence 1", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
     )
     dossier = engine.dossiers.load("FORM")
     assert dossier.status == "ACTIVE"  # only 1 independent source so far -- not enough to signal
 
     await engine._process_evidence(
         origin_symbol="FORM", evidence_text="evidence 2", source_type="news",
-        source_name="bloomberg.com", url="https://x/2", headline="h2", published_at="2026-07-23",
+        source_name="bloomberg.com", url="https://x/2", headline="h2", published_at=_fx("2026-07-23"),
     )
     dossier = engine.dossiers.load("FORM")
     assert dossier.status == "SIGNALED"
@@ -856,7 +858,7 @@ async def test_decisions_ledger_records_open_with_episode_key(engine):
     for i, source in enumerate(("reuters.com", "bloomberg.com")):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
     episode = engine.dossiers.load("FORM").signaled_at
     assert episode
@@ -880,7 +882,7 @@ async def test_decisions_ledger_records_drift_skip_once_per_episode(engine):
     for i, source in enumerate(("reuters.com", "bloomberg.com")):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
     # Price ran 10% favorably before entry -- drift guard skips, twice polled.
     engine.price_feed.prices["FORM"] = 11.0
@@ -903,7 +905,7 @@ async def test_decisions_ledger_records_expiry_with_reason(engine):
     for i, source in enumerate(("reuters.com", "bloomberg.com")):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
     dossier = engine.dossiers.load("FORM")
     episode = dossier.signaled_at
@@ -928,7 +930,7 @@ async def test_decisions_ledger_records_expiry_with_reason(engine):
 
 async def test_placeholder_tickers_are_treated_as_no_ticker(engine):
     filing = FilingEvent(
-        symbol="AMPX", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        symbol="AMPX", cik10="0000000001", form="10-K", filing_date=_fx("2026-07-01"),
         accession_number="0001234567-26-000001", primary_document="f.htm",
     )
     engine.extractor.default = [{
@@ -949,7 +951,7 @@ async def test_placeholder_tickers_are_treated_as_no_ticker(engine):
 
 async def test_lender_supplier_relationships_are_dropped(engine):
     filing = FilingEvent(
-        symbol="UFPT", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        symbol="UFPT", cik10="0000000001", form="10-K", filing_date=_fx("2026-07-01"),
         accession_number="0001234567-26-000002", primary_document="f.htm",
     )
     engine.extractor.default = [{
@@ -970,7 +972,7 @@ async def test_a_demand_line_of_credit_is_recognised_as_lending(engine):
     list only covered some of them: confirmed live, M&T Bank reached the
     graph as a "supplier" to Taylor Devices off a demand line of credit."""
     filing = FilingEvent(
-        symbol="TAYD", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        symbol="TAYD", cik10="0000000001", form="10-K", filing_date=_fx("2026-07-01"),
         accession_number="0001234567-26-000012", primary_document="f.htm",
     )
     engine.extractor.default = [{
@@ -992,7 +994,7 @@ async def test_a_demand_line_of_credit_is_recognised_as_lending(engine):
 
 async def test_executive_biography_relationships_are_dropped(engine):
     filing = FilingEvent(
-        symbol="EPAC", cik10="0000000001", form="8-K", filing_date="2026-07-01",
+        symbol="EPAC", cik10="0000000001", form="8-K", filing_date=_fx("2026-07-01"),
         accession_number="0001234567-26-000013", primary_document="f.htm",
     )
     engine.extractor.default = [{
@@ -1022,7 +1024,7 @@ async def test_a_bank_as_a_genuine_customer_is_kept(engine):
     """Only the "our lender" direction is a dead end -- a company SELLING to
     a bank is a real propagation path."""
     filing = FilingEvent(
-        symbol="UFPT", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        symbol="UFPT", cik10="0000000001", form="10-K", filing_date=_fx("2026-07-01"),
         accession_number="0001234567-26-000003", primary_document="f.htm",
     )
     engine.extractor.default = [{
@@ -1044,7 +1046,7 @@ async def test_a_bank_as_a_genuine_customer_is_kept(engine):
 async def test_extract_relationships_survives_missing_finnhub(engine):
     engine.finnhub = None
     filing = FilingEvent(
-        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date=_fx("2026-07-01"),
         accession_number="0001234567-26-000001", primary_document="form.htm",
     )
     engine.extractor.default = [{
@@ -1061,7 +1063,7 @@ async def test_extract_relationships_survives_missing_finnhub(engine):
 
 async def test_extract_relationships_reports_deferred_when_budget_exhausted(engine):
     filing = FilingEvent(
-        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date=_fx("2026-07-01"),
         accession_number="0001234567-26-000001", primary_document="form.htm",
     )
     engine.extractor.default = None  # budget exhausted / transient API failure
@@ -1072,7 +1074,7 @@ async def test_extract_relationships_reports_deferred_when_budget_exhausted(engi
 async def test_backfill_not_marked_done_when_extraction_deferred(engine):
     engine.settings.enable_relationship_backfill = True
     filing = FilingEvent(
-        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2025-09-01",
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2025-09-01",  # not an age: keyed by accession
         accession_number="0001234567-25-000001", primary_document="form.htm",
     )
     engine.edgar_client.latest_filings[("FORM", "10-K")] = filing
@@ -1102,7 +1104,7 @@ async def test_signal_expired_when_new_evidence_drops_below_threshold(engine):
     for i, source in enumerate(("reuters.com", "bloomberg.com")):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
     assert engine.dossiers.load("FORM").status == "SIGNALED"
 
@@ -1113,7 +1115,7 @@ async def test_signal_expired_when_new_evidence_drops_below_threshold(engine):
     for i in range(3):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"bad news {i}", source_type="news",
-            source_name=f"src{i}.com", url=f"https://y/{i}", headline=f"bad{i}", published_at="2026-07-23",
+            source_name=f"src{i}.com", url=f"https://y/{i}", headline=f"bad{i}", published_at=_fx("2026-07-23"),
         )
 
     dossier = engine.dossiers.load("FORM")
@@ -1131,7 +1133,7 @@ async def test_no_trade_opens_when_thesis_no_longer_qualifies_at_entry(engine):
     for i, source in enumerate(("reuters.com", "bloomberg.com")):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
     dossier = engine.dossiers.load("FORM")
     assert dossier.status == "SIGNALED"
@@ -1200,7 +1202,7 @@ async def test_a_fresh_signal_marks_an_entry_as_pending(engine):
     for i, source in enumerate(("reuters.com", "bloomberg.com")):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
 
     assert engine.dossiers.load("FORM").status == "SIGNALED"
@@ -1245,14 +1247,14 @@ async def test_news_only_dossier_held_to_higher_source_bar(engine):
     for i, source in enumerate(("reuters.com", "bloomberg.com")):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
     assert engine.dossiers.load("FORM").status == "ACTIVE"
 
     # A third, genuinely distinct publisher clears the news-only bar.
     await engine._process_evidence(
         origin_symbol="FORM", evidence_text="evidence 2", source_type="news",
-        source_name="wsj.com", url="https://x/2", headline="h2", published_at="2026-07-23",
+        source_name="wsj.com", url="https://x/2", headline="h2", published_at=_fx("2026-07-23"),
     )
     assert engine.dossiers.load("FORM").status == "SIGNALED"
 
@@ -1264,11 +1266,11 @@ async def test_filing_evidence_restores_the_normal_bar(engine):
 
     await engine._process_evidence(
         origin_symbol="UCTT", evidence_text="news evidence", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="n1", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="n1", published_at=_fx("2026-07-23"),
     )
     await engine._process_evidence(
         origin_symbol="UCTT", evidence_text="8-K material event", source_type="8-K",
-        source_name="SEC EDGAR (8-K)", url="https://sec.gov/1", headline="8-K", published_at="2026-07-23",
+        source_name="SEC EDGAR (8-K)", url="https://sec.gov/1", headline="8-K", published_at=_fx("2026-07-23"),
     )
     # Two sources, one of them a filing: normal bar (2) applies -> signals.
     assert engine.dossiers.load("UCTT").status == "SIGNALED"
@@ -1279,8 +1281,8 @@ async def test_filing_evidence_restores_the_normal_bar(engine):
 # and must not burn extra propagation-cooldown slots. ---
 
 async def test_retry_does_not_repay_for_already_refuted_target(engine):
-    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "test", 0.9, "2026-07-23"))
-    engine.graph.add(Relationship("INTC", "UCTT", "customer", "Intel is a customer of UCTT", "test", 0.9, "2026-07-23"))
+    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "test", 0.9, _fx("2026-07-23")))
+    engine.graph.add(Relationship("INTC", "UCTT", "customer", "Intel is a customer of UCTT", "test", 0.9, _fx("2026-07-23")))
 
     # Pass 1: FORM's evidence is refuted (propose + skeptic paid), UCTT's
     # skeptic call is deferred -- the item as a whole stays unregistered.
@@ -1289,7 +1291,7 @@ async def test_retry_does_not_repay_for_already_refuted_target(engine):
     engine.skeptic.queue(None)                    # UCTT: deferred
     scored = await engine._process_evidence(
         origin_symbol="INTC", evidence_text="intel news", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
     )
     assert scored is False
     updater_calls_after_first = len(engine.updater.calls)
@@ -1301,7 +1303,7 @@ async def test_retry_does_not_repay_for_already_refuted_target(engine):
     engine.skeptic.default = verdict(refuted=False)
     scored = await engine._process_evidence(
         origin_symbol="INTC", evidence_text="intel news", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
     )
     assert scored is True
     assert len(engine.updater.calls) == updater_calls_after_first  # UCTT's proposal was cached; FORM not re-proposed
@@ -1314,15 +1316,15 @@ async def test_propagation_slot_not_double_counted_on_retry_of_merged_target(eng
     # an anchor, so origin isn't a target here) -- use two linked targets:
     # FORM merges, UCTT defers. The retry's has_evidence fast path for FORM
     # must NOT record a second slot for the same underlying evidence.
-    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "test", 0.9, "2026-07-23"))
-    engine.graph.add(Relationship("INTC", "UCTT", "customer", "Intel is a customer of UCTT", "test", 0.9, "2026-07-23"))
+    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "test", 0.9, _fx("2026-07-23")))
+    engine.graph.add(Relationship("INTC", "UCTT", "customer", "Intel is a customer of UCTT", "test", 0.9, _fx("2026-07-23")))
     engine.updater.default = proposal()
     engine.skeptic.queue(verdict(refuted=False))  # FORM: merged
     engine.skeptic.queue(None)                    # UCTT: deferred
 
     await engine._process_evidence(
         origin_symbol="INTC", evidence_text="intel news", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
     )
     # FORM consumed its 1 slot; window for INTC->FORM is now full.
     now = time.monotonic()
@@ -1332,7 +1334,7 @@ async def test_propagation_slot_not_double_counted_on_retry_of_merged_target(eng
     engine.skeptic.default = verdict(refuted=False)
     await engine._process_evidence(
         origin_symbol="INTC", evidence_text="intel news", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h1", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
     )
     # The retry re-handles FORM via has_evidence (already merged) -- it must
     # not append a second phantom event for the same evidence.
@@ -1346,7 +1348,7 @@ async def test_malformed_proposal_is_dropped_not_crashing(engine):
     engine.updater.default = {"direction": "LONG"}  # missing magnitude/confidence/horizon
     outcome = await engine._update_dossier(
         "FORM", "evidence text", "FORM", "", None, "news", "reuters.com",
-        "https://x/1", "h1", "2026-07-23",
+        "https://x/1", "h1", _fx("2026-07-23"),
     )
     assert outcome == "handled"
     assert engine.dossiers.load("FORM").evidence == []
@@ -1365,7 +1367,7 @@ async def _merge_one(engine, prop):
     engine.skeptic = FakeSkeptic(default=verdict(refuted=False))
     await engine._update_dossier(
         "FORM", "evidence text", "FORM", "", None, "news", "reuters.com",
-        "https://x/1", "h1", "2026-07-23",
+        "https://x/1", "h1", _fx("2026-07-23"),
     )
     return engine.dossiers.load("FORM").evidence
 
@@ -1457,7 +1459,7 @@ async def test_decay_pass_fires_a_signal_for_a_newly_qualifying_dossier(engine):
     for i, src in enumerate(("reuters.com", "bloomberg.com")):
         merge_evidence(dossier, EvidenceRecord(
             evidence_id=f"e{i}", source_type="8-K", source_name=src, url="u", headline="h",
-            published_at="2026-07-28T00:00:00+00:00", origin_symbol="FORM", is_propagated=False,
+            published_at=_fx("2026-07-28T00:00:00+00:00"), origin_symbol="FORM", is_propagated=False,
             relationship_note="", direction="LONG", magnitude=0.9, confidence=0.9,
             horizon_days=20, reasoning="r", skeptic_note="",
         ))
@@ -1484,7 +1486,7 @@ async def test_decay_pass_does_not_signal_a_dossier_with_an_open_trade(engine):
     for i, src in enumerate(("reuters.com", "bloomberg.com")):
         merge_evidence(dossier, EvidenceRecord(
             evidence_id=f"e{i}", source_type="8-K", source_name=src, url="u", headline="h",
-            published_at="2026-07-28T00:00:00+00:00", origin_symbol="FORM", is_propagated=False,
+            published_at=_fx("2026-07-28T00:00:00+00:00"), origin_symbol="FORM", is_propagated=False,
             relationship_note="", direction="LONG", magnitude=0.9, confidence=0.9,
             horizon_days=20, reasoning="r", skeptic_note="",
         ))
@@ -1502,7 +1504,7 @@ async def test_decay_pass_does_not_signal_a_dossier_with_an_open_trade(engine):
 # rather than retrying it once the window rolled off. ---
 
 async def test_evidence_throttled_to_zero_targets_is_retried_not_discarded(engine):
-    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "t", 0.9, "2026-07-23"))
+    engine.graph.add(Relationship("INTC", "FORM", "customer", "Intel is a customer of FORM", "t", 0.9, _fx("2026-07-23")))
     engine.updater.default = proposal()
     engine.skeptic.default = verdict(refuted=False)
 
@@ -1510,13 +1512,13 @@ async def test_evidence_throttled_to_zero_targets_is_retried_not_discarded(engin
     # consumes INTC->FORM's only slot.
     assert await engine._process_evidence(
         origin_symbol="INTC", evidence_text="first", source_type="news", source_name="reuters.com",
-        url="https://x/1", headline="h1", published_at="2026-07-23") is True
+        url="https://x/1", headline="h1", published_at=_fx("2026-07-23")) is True
 
     # The second finds every link throttled -> zero targets. It must report
     # NOT-definitive so its fingerprint stays unregistered and it is retried.
     assert await engine._process_evidence(
         origin_symbol="INTC", evidence_text="second", source_type="news", source_name="reuters.com",
-        url="https://x/2", headline="h2", published_at="2026-07-23") is False
+        url="https://x/2", headline="h2", published_at=_fx("2026-07-23")) is False
 
 
 async def test_evidence_for_an_unconnected_anchor_is_definitively_done(engine):
@@ -1527,7 +1529,7 @@ async def test_evidence_for_an_unconnected_anchor_is_definitively_done(engine):
     engine.settings.enable_ecosystem_propagation = False
     assert await engine._process_evidence(
         origin_symbol="INTC", evidence_text="x", source_type="news", source_name="reuters.com",
-        url="https://x/3", headline="h3", published_at="2026-07-23") is True
+        url="https://x/3", headline="h3", published_at=_fx("2026-07-23")) is True
 
 
 async def test_decay_pass_signals_a_dossier_whose_score_has_not_moved(engine):
@@ -1542,7 +1544,7 @@ async def test_decay_pass_signals_a_dossier_whose_score_has_not_moved(engine):
     for i, src in enumerate(("reuters.com", "bloomberg.com")):
         merge_evidence(dossier, EvidenceRecord(
             evidence_id=f"e{i}", source_type="8-K", source_name=src, url="u", headline="h",
-            published_at="2026-07-28T00:00:00+00:00", origin_symbol="FORM", is_propagated=False,
+            published_at=_fx("2026-07-28T00:00:00+00:00"), origin_symbol="FORM", is_propagated=False,
             relationship_note="", direction="LONG", magnitude=0.9, confidence=0.9,
             horizon_days=20, reasoning="r", skeptic_note="",
         ))
@@ -1610,7 +1612,7 @@ async def test_an_inert_anchor_reaches_same_ecosystem_tradeables(engine):
     assert engine.graph.relationships == []
     await engine._process_evidence(
         origin_symbol="INTC", evidence_text="Intel guides capex up", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h", published_at="2026-07-29")
+        source_name="reuters.com", url="https://x/1", headline="h", published_at=_fx("2026-07-29"))
 
     # FORM and UCTT share INTC's ecosystem and are tradeable.
     assert engine.dossiers.load("FORM").evidence
@@ -1625,7 +1627,7 @@ async def test_ecosystem_evidence_is_marked_as_not_a_disclosed_link(engine):
 
     await engine._process_evidence(
         origin_symbol="INTC", evidence_text="x", source_type="news", source_name="reuters.com",
-        url="https://x/1", headline="h", published_at="2026-07-29")
+        url="https://x/1", headline="h", published_at=_fx("2026-07-29"))
 
     call = engine.updater.calls[0]
     assert call["relationship_confidence"] == ECOSYSTEM_LINK_CONFIDENCE
@@ -1644,7 +1646,7 @@ async def test_ecosystem_evidence_cannot_relax_the_corroboration_bar(engine):
     engine.skeptic.default = verdict(refuted=False)
     await engine._process_evidence(
         origin_symbol="INTC", evidence_text="x", source_type="news", source_name="reuters.com",
-        url="https://x/1", headline="h", published_at="2026-07-29")
+        url="https://x/1", headline="h", published_at=_fx("2026-07-29"))
 
     assert engine.dossiers.load("FORM").has_disclosed_link_evidence is False
 
@@ -1652,13 +1654,13 @@ async def test_ecosystem_evidence_cannot_relax_the_corroboration_bar(engine):
 async def test_a_disclosed_edge_suppresses_the_ecosystem_fallback(engine):
     """A disclosed contract is strictly better evidence -- the fallback must
     not run alongside it or double up on the same target."""
-    engine.graph.add(Relationship("FORM", "INTC", "customer", "Intel is a customer of FORM", "t", 0.95, "2026-07-29"))
+    engine.graph.add(Relationship("FORM", "INTC", "customer", "Intel is a customer of FORM", "t", 0.95, _fx("2026-07-29")))
     engine.updater.default = proposal(direction="LONG")
     engine.skeptic.default = verdict(refuted=False)
 
     await engine._process_evidence(
         origin_symbol="INTC", evidence_text="x", source_type="news", source_name="reuters.com",
-        url="https://x/1", headline="h", published_at="2026-07-29")
+        url="https://x/1", headline="h", published_at=_fx("2026-07-29"))
 
     notes = [c["relationship_note"] for c in engine.updater.calls]
     assert all("ecosystem" not in n for n in notes)
@@ -1670,19 +1672,19 @@ async def test_a_disclosed_edge_suppresses_the_ecosystem_fallback(engine):
 async def test_a_throttled_disclosed_link_does_not_fall_back(engine):
     """Otherwise the fallback routes around the very cooldown it just hit,
     reaching the same target by a weaker route."""
-    engine.graph.add(Relationship("FORM", "INTC", "customer", "Intel is a customer of FORM", "t", 0.95, "2026-07-29"))
+    engine.graph.add(Relationship("FORM", "INTC", "customer", "Intel is a customer of FORM", "t", 0.95, _fx("2026-07-29")))
     engine.updater.default = proposal(direction="LONG")
     engine.skeptic.default = verdict(refuted=False)
 
     # max_propagated_evidence_per_link=1 in the fixture: this consumes it.
     await engine._process_evidence(
         origin_symbol="INTC", evidence_text="first", source_type="news", source_name="reuters.com",
-        url="https://x/1", headline="h1", published_at="2026-07-29")
+        url="https://x/1", headline="h1", published_at=_fx("2026-07-29"))
     before = len(engine.updater.calls)
 
     await engine._process_evidence(
         origin_symbol="INTC", evidence_text="second", source_type="news", source_name="bloomberg.com",
-        url="https://x/2", headline="h2", published_at="2026-07-29")
+        url="https://x/2", headline="h2", published_at=_fx("2026-07-29"))
 
     assert len(engine.updater.calls) == before  # throttled, and no weaker route taken
 
@@ -1697,7 +1699,7 @@ async def test_ecosystem_fanout_is_rate_limited_on_its_own_budget(engine):
         await engine._process_evidence(
             origin_symbol="INTC", evidence_text=f"item {i}", source_type="news",
             source_name=f"src{i}.com", url=f"https://x/{i}", headline=f"h{i}",
-            published_at="2026-07-29")
+            published_at=_fx("2026-07-29"))
 
     # One item per (origin -> target) pair inside the window, for each of the
     # two same-ecosystem tradeables.
@@ -1791,7 +1793,7 @@ async def _signal_form(engine, sources=("reuters.com", "bloomberg.com")):
     for i, source in enumerate(sources):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"evidence {i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
     return engine.dossiers.load("FORM")
 
@@ -1983,7 +1985,7 @@ async def test_a_flip_refire_resets_the_grace_period(engine):
     dossier = Dossier(
         symbol="FORM", direction="SHORT", confidence=0.9, magnitude=0.9,
         independent_source_count=3, has_filing_evidence=True, status="SIGNALED",
-        signaled_at="2026-08-01T00:00:00+00:00", signaled_direction="LONG", entry_attempts=2,
+        signaled_at=_fx("2026-08-01T00:00:00+00:00"), signaled_direction="LONG", entry_attempts=2,
     )
     signal = evaluate(dossier, engine.settings.signal_confidence_threshold,
                       engine.settings.min_independent_sources,
@@ -2022,7 +2024,7 @@ async def test_a_runaway_horizon_is_clamped_to_the_max_hold(engine):
 
     await engine._process_evidence(
         origin_symbol="FORM", evidence_text="e", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h", published_at=_fx("2026-07-23"),
     )
 
     rec = engine.dossiers.load("FORM").evidence[-1]
@@ -2038,7 +2040,7 @@ async def test_the_skeptic_adjustment_replaces_the_proposed_values(engine):
 
     await engine._process_evidence(
         origin_symbol="FORM", evidence_text="e", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h", published_at=_fx("2026-07-23"),
     )
 
     rec = engine.dossiers.load("FORM").evidence[-1]
@@ -2056,7 +2058,7 @@ async def test_inception_price_is_captured_when_the_thesis_first_turns_direction
 
     await engine._process_evidence(
         origin_symbol="FORM", evidence_text="e", source_type="news",
-        source_name="reuters.com", url="https://x/1", headline="h", published_at="2026-07-23",
+        source_name="reuters.com", url="https://x/1", headline="h", published_at=_fx("2026-07-23"),
     )
 
     d = engine.dossiers.load("FORM")
@@ -2158,7 +2160,7 @@ async def _build_thesis(engine, symbol="FORM", confidence=0.8, magnitude=0.8):
     for i, source in enumerate(("reuters.com", "bloomberg.com")):
         await engine._process_evidence(
             origin_symbol=symbol, evidence_text=f"e{i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
     return engine.dossiers.load(symbol)
 
@@ -2314,7 +2316,7 @@ async def test_a_synthesis_veto_survives_a_later_evidence_merge(engine):
     # A brand-new evidence item merges (distinct id -> not deduped as handled).
     await engine._process_evidence(
         origin_symbol="FORM", evidence_text="e2", source_type="news",
-        source_name="ft.com", url="https://x/2", headline="h2", published_at="2026-07-24",
+        source_name="ft.com", url="https://x/2", headline="h2", published_at=_fx("2026-07-24"),
     )
 
     after = engine.dossiers.load("FORM")
@@ -2331,9 +2333,9 @@ async def test_a_refuted_outcome_survives_a_restart_and_is_not_re_judged(engine)
     args = dict(target_symbol="FORM", evidence_text="e", origin_symbol="FORM",
                 relationship_note="", relationship_confidence=None, source_type="news",
                 source_name="reuters.com", url="https://x/9", headline="h9",
-                published_at="2026-07-23")
+                published_at=_fx("2026-07-23"))
     assert await engine._update_dossier(**args) == "handled"
-    key = "FORM:news:https://x/9:2026-07-23"
+    key = f"FORM:news:https://x/9:{_fx('2026-07-23')}"
     assert key in engine._handled_outcomes
 
     # "Restart": a fresh Engine in the same working dir loads the persisted
@@ -2353,11 +2355,11 @@ async def test_reset_runtime_state_clears_signals_and_trades_but_keeps_evidence(
     """The clean-measurement-window reset: open (previous-regime) paper trades
     are archived, dossiers reset to ACTIVE with their synthesis episode cleared,
     but the accumulated evidence is kept (it re-aggregates under the new rules)."""
-    d = Dossier(symbol="FORM", status="SIGNALED", signaled_at="2026-08-01T00:00:00+00:00",
-                signaled_price=10.0, already_priced_in=True, synthesis_at="2026-08-01T00:00:00+00:00")
+    d = Dossier(symbol="FORM", status="SIGNALED", signaled_at=_fx("2026-08-01T00:00:00+00:00"),
+                signaled_price=10.0, already_priced_in=True, synthesis_at=_fx("2026-08-01T00:00:00+00:00"))
     merge_evidence(d, EvidenceRecord(
         evidence_id="e1", source_type="news", source_name="reuters.com", url="u", headline="h",
-        published_at="2026-07-23", origin_symbol="FORM", is_propagated=False, relationship_note="",
+        published_at=_fx("2026-07-23"), origin_symbol="FORM", is_propagated=False, relationship_note="",
         direction="LONG", magnitude=0.5, confidence=0.5, horizon_days=20, reasoning="r", skeptic_note=""))
     d.status = "SIGNALED"  # merge_evidence doesn't touch status; keep it signaled for the test
     engine.dossiers.save(d)
@@ -2383,7 +2385,7 @@ async def test_a_refutation_is_logged_for_the_skeptic_readout(engine):
     await engine._update_dossier(
         target_symbol="FORM", evidence_text="e", origin_symbol="INTC",  # propagated: origin != target
         relationship_note="INTC is a customer", relationship_confidence=0.9, source_type="news",
-        source_name="reuters.com", url="https://x/ref", headline="h", published_at="2026-07-23")
+        source_name="reuters.com", url="https://x/ref", headline="h", published_at=_fx("2026-07-23"))
 
     rows = [json.loads(line) for line in
             (Path(engine.settings.log_dir) / "skeptic_refutations.jsonl").read_text().splitlines()]
@@ -2399,7 +2401,7 @@ async def test_extraction_is_not_re_billed_when_scoring_defers(engine):
     completes. When scoring defers on an exhausted budget the filing stays
     unregistered, so the next poll must RETRY SCORING but must NOT re-run the
     already-completed extraction."""
-    filing = FilingEvent("FORM", "0000000001", "10-K", "2026-07-28", "acc-1", "d10k.htm")
+    filing = FilingEvent("FORM", "0000000001", "10-K", _fx("2026-07-28"), "acc-1", "d10k.htm")
     engine.edgar_client.text_by_accession["acc-1"] = "some 10-K text with a customer"
     engine.extractor.default = []      # extraction runs and returns no edges (not None -> True)
     engine.updater.default = None      # dossier scoring defers (budget-exhausted shape)
@@ -2563,10 +2565,10 @@ async def test_a_cold_start_reaches_an_open_paper_trade(engine):
     engine.finnhub.articles_by_symbol["FORM"] = [
         NewsArticle(symbol="FORM", headline="FORM wins $40M photomask supply award",
                     summary="multi-year", source="Reuters", url="https://finnhub.io/1",
-                    published_at="2026-07-29T12:00:00+00:00"),
+                    published_at=_fx("2026-07-29T12:00:00+00:00")),
         NewsArticle(symbol="FORM", headline="Intel raises capex guidance for 2027",
                     summary="fab expansion", source="Bloomberg", url="https://finnhub.io/2",
-                    published_at="2026-07-29T13:00:00+00:00"),
+                    published_at=_fx("2026-07-29T13:00:00+00:00")),
     ]
     engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
     engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
@@ -2659,7 +2661,7 @@ async def test_every_signal_row_records_the_bar_it_actually_cleared(engine):
     for i, source in enumerate(("reuters.com", "bloomberg.com")):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
 
     rows = [json.loads(line) for line in
@@ -2683,7 +2685,7 @@ async def test_the_news_only_elevation_is_what_gets_stamped_not_the_base_setting
     for i, source in enumerate(("reuters.com", "bloomberg.com", "wsj.com")):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
 
     rows = [json.loads(line) for line in
@@ -2827,7 +2829,7 @@ async def test_no_trade_opens_outside_regular_trading_hours(engine, monkeypatch)
     for i, source in enumerate(("reuters.com", "bloomberg.com")):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
-            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at="2026-07-23",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=_fx("2026-07-23"),
         )
     assert engine.dossiers.load("FORM").status == "SIGNALED"
 
@@ -2876,7 +2878,7 @@ async def test_a_non_object_relationship_does_not_kill_the_paid_for_extraction(e
 
     ran = await engine._extract_relationships(
         "FORM", FilingEvent(symbol="FORM", cik10="0000000001", form="10-K",
-                            filing_date="2026-07-20", accession_number="a-1",
+                            filing_date=_fx("2026-07-20"), accession_number="a-1",
                             primary_document="d.htm"),
         "filing text",
     )
@@ -2928,7 +2930,7 @@ def test_graph_refresh_requeues_the_least_recently_extracted_symbols(engine):
     engine.settings.graph_refresh_symbols_per_day = 2
     _mark_backfilled(engine, "FORM", "2026-01-01T00:00:00+00:00")   # oldest
     _mark_backfilled(engine, "UCTT", "2026-06-01T00:00:00+00:00")
-    _mark_backfilled(engine, "INTC", "2026-07-01T00:00:00+00:00")   # newest (an anchor)
+    _mark_backfilled(engine, "INTC", _fx("2026-07-01T00:00:00+00:00"))   # newest (an anchor)
 
     assert engine._run_graph_refresh() == 2
 
@@ -2944,7 +2946,7 @@ def test_graph_refresh_includes_anchors(engine):
     unread -- so it is exactly what most needs re-reading."""
     engine.settings.graph_refresh_symbols_per_day = 1
     _mark_backfilled(engine, "INTC", "2020-01-01T00:00:00+00:00")   # anchor, stalest
-    _mark_backfilled(engine, "FORM", "2026-07-01T00:00:00+00:00")
+    _mark_backfilled(engine, "FORM", _fx("2026-07-01T00:00:00+00:00"))
 
     engine._run_graph_refresh()
 
@@ -3067,7 +3069,7 @@ async def test_re_extracting_the_same_filing_does_not_inflate_seen_count(engine)
     auto_accept_min_seen_count (default 2) with no new filing in
     existence."""
     filing = FilingEvent(
-        symbol="FORM", cik10="0000000001", form="10-K", filing_date="2026-07-01",
+        symbol="FORM", cik10="0000000001", form="10-K", filing_date=_fx("2026-07-01"),
         accession_number="0001234567-26-000001", primary_document="form.htm",
     )
     engine.extractor.default = [{
@@ -3177,7 +3179,7 @@ async def test_the_daily_snapshot_records_the_synthesis_verdict(engine):
     await _build_thesis(engine, confidence=0.5, magnitude=0.5)
     await engine._decay_one("FORM", datetime.now(timezone.utc))
 
-    row = snapshot_dossier(engine.dossiers.load("FORM"), "2026-08-07T00:00:00+00:00")
+    row = snapshot_dossier(engine.dossiers.load("FORM"), _fx("2026-08-07T00:00:00+00:00"))
     assert row["already_priced_in"] is True
     assert row["synthesis_at"] != ""
     assert row["score"] == 0.0
@@ -3314,7 +3316,7 @@ async def test_two_new_independent_sources_invalidate_a_verdict(engine):
         await engine._process_evidence(
             origin_symbol="FORM", evidence_text=f"n{i}", source_type="news",
             source_name=source, url=f"https://y/{i}", headline=f"n{i}",
-            published_at="2026-07-23",
+            published_at=_fx("2026-07-23"),
         )
 
     assert len(engine.synthesizer.calls) > calls_before
@@ -3330,7 +3332,7 @@ async def test_one_new_source_is_ordinary_accumulation_not_invalidation(engine):
 
     await engine._process_evidence(
         origin_symbol="FORM", evidence_text="n", source_type="news",
-        source_name="ft.com", url="https://y/1", headline="n", published_at="2026-07-23",
+        source_name="ft.com", url="https://y/1", headline="n", published_at=_fx("2026-07-23"),
     )
 
     assert len(engine.synthesizer.calls) == calls_before
@@ -3358,7 +3360,7 @@ async def test_off_schedule_re_synthesis_is_capped_per_day(engine):
 # form AND filing day, so a cross-filer pushing routine announcements would
 # mint a fresh independent-source slot with each one. ---
 
-def _filing(form, accession, filing_date="2026-08-07"):
+def _filing(form, accession, filing_date=_fx("2026-08-07")):
     from smartboi.edgar import FilingEvent
 
     return FilingEvent(symbol="FORM", cik10="0000000001", form=form,
@@ -3385,8 +3387,8 @@ async def test_a_6k_on_a_new_filing_date_gets_a_fresh_allowance(engine):
     for n in ("b1", "b2"):
         engine.edgar_client.text_by_accession[n] = "material news"
 
-    await engine._process_filing("FORM", _filing("6-K", "b1", "2026-08-07"))
-    await engine._process_filing("FORM", _filing("6-K", "b2", "2026-08-10"))
+    await engine._process_filing("FORM", _filing("6-K", "b1", _fx("2026-08-07")))
+    await engine._process_filing("FORM", _filing("6-K", "b2", _fx("2026-08-10")))
 
     assert len(engine.dossiers.load("FORM").evidence) == 2
 
@@ -3447,7 +3449,7 @@ def _hit(adsh="0001050915-25-000012", company="ICHOR HOLDINGS, LTD. (ICHR)"):
     from smartboi.edgar_search import SearchHit
 
     return SearchHit(adsh=adsh, cik="0001050915", company=company, form="10-K",
-                     filing_date="2025-02-14", document="ichr-20250101.htm")
+                     filing_date="2025-02-14", document="ichr-20250101.htm")  # not an age: a search hit, routed to candidates not evidence
 
 
 def _anchor_spec(engine):
@@ -3634,7 +3636,7 @@ async def test_a_regulatory_document_reaches_the_company_not_the_regulator(tmp_p
     await engine._process_evidence(
         origin_symbol="ITC", evidence_text="AD/CVD final results on wind towers.",
         source_type="regulatory", source_name="Federal Register (ITC/wind-towers-adcvd)",
-        url="https://x/1", headline="Wind towers AD/CVD", published_at="2026-08-07",
+        url="https://x/1", headline="Wind towers AD/CVD", published_at=_fx("2026-08-07"),
     )
 
     assert engine.dossiers.load("BWEN").evidence, "the rule must reach the company"
@@ -3662,7 +3664,7 @@ async def test_two_proceedings_by_one_agency_are_two_sources(tmp_path, monkeypat
         await engine._process_evidence(
             origin_symbol="BIS", evidence_text=f"rule {key}", source_type="regulatory",
             source_name=f"Federal Register (BIS/{key})", url=f"https://x/{key}",
-            headline=key, published_at="2026-08-07",
+            headline=key, published_at=_fx("2026-08-07"),
         )
 
     records = engine.dossiers.load("AOSL").evidence
@@ -3886,8 +3888,8 @@ async def test_synthesis_is_shown_the_price_around_its_earliest_evidence(engine)
 
     now = datetime.now(timezone.utc)
     marks = [
-        ("2026-08-04", 32.10), ("2026-08-05", 32.44), ("2026-08-06", 32.29),
-        ("2026-08-07", 33.33), ("2026-08-10", 34.90), ("2026-08-11", 36.28),
+        (_fx("2026-08-04"), 32.10), (_fx("2026-08-05"), 32.44), (_fx("2026-08-06"), 32.29),
+        (_fx("2026-08-07"), 33.33), (_fx("2026-08-10"), 34.90), (_fx("2026-08-11"), 36.28),
     ]
     path = Path(engine.settings.log_dir)
     path.mkdir(parents=True, exist_ok=True)
@@ -3905,7 +3907,7 @@ async def test_synthesis_is_shown_the_price_around_its_earliest_evidence(engine)
     dossier = Dossier(symbol="BWEN")
     for n in range(8):
         merge_evidence(dossier, EvidenceRecord(
-            f"e{n}", "news", f"outlet{n}.com", "u", "h", "2026-08-07T13:00:00+00:00",
+            f"e{n}", "news", f"outlet{n}.com", "u", "h", _fx("2026-08-07T13:00:00+00:00"),
             "BWEN", False, "", "LONG", 0.45, 0.60, 20, "reason", "skeptic",
         ), now=now)
     recompute_decay(dossier, now)
@@ -3913,7 +3915,7 @@ async def test_synthesis_is_shown_the_price_around_its_earliest_evidence(engine)
     context = engine._price_context_for(dossier, now)
     assert "PRICE" in context, "the synthesis prompt carries no price block"
     # Starts BEFORE the news, or the reaction it exists to reveal is invisible.
-    assert "2026-08-04" in context
+    assert _fx("2026-08-04") in context
     assert "first evidence in this dossier is dated here" in context
     # ...and states the move, which is the number the judgement turns on.
     assert "+8.9% since the first evidence is dated" in context
@@ -3954,12 +3956,12 @@ async def test_the_price_block_actually_reaches_the_synthesizer(engine):
         # shifted this whole fixture back a day.
         __import__("json").dumps({"symbol": "BWEN", "marked_at": d + "T20:30:00+00:00",
                                   "price": p}) + "\n"
-        for d, p in [("2026-08-04", 30.0), ("2026-08-07", 33.0), ("2026-08-11", 36.0)]
+        for d, p in [(_fx("2026-08-04"), 30.0), (_fx("2026-08-07"), 33.0), (_fx("2026-08-11"), 36.0)]
     ))
     dossier = Dossier(symbol="BWEN")
     for n in range(8):
         merge_evidence(dossier, EvidenceRecord(
-            f"e{n}", "news", f"outlet{n}.com", "u", "h", "2026-08-07T13:00:00+00:00",
+            f"e{n}", "news", f"outlet{n}.com", "u", "h", _fx("2026-08-07T13:00:00+00:00"),
             "BWEN", False, "", "LONG", 0.9, 0.9, 20, "reason", "skeptic",
         ), now=now)
     recompute_decay(dossier, now)

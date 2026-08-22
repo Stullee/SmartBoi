@@ -1,6 +1,7 @@
 import json
 
 from smartboi.skeptic_report import analyze_skeptic_effect, format_skeptic_report
+from tests.conftest import fixture_date as _fx
 
 
 def _acc(is_propagated=False, model="haiku", pc=0.6, pm=0.5, c=0.6, m=0.5):
@@ -66,7 +67,7 @@ def test_run_skeptic_report_reads_dossiers_and_refutations(tmp_path):
     d = Dossier(symbol="FORM")
     merge_evidence(d, EvidenceRecord(
         evidence_id="e1", source_type="news", source_name="reuters.com", url="u", headline="h",
-        published_at="2026-07-23", origin_symbol="FORM", is_propagated=False, relationship_note="",
+        published_at=_fx("2026-07-23"), origin_symbol="FORM", is_propagated=False, relationship_note="",
         direction="LONG", magnitude=0.5, confidence=0.5, horizon_days=20, reasoning="r",
         skeptic_note="", reviewed_by_model="haiku", proposed_confidence=0.8, proposed_magnitude=0.8))
     store.save(d)

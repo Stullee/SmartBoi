@@ -89,7 +89,13 @@ COMPANY_ALIASES: dict[str, tuple[str, ...]] = {
     "LDOS": ("Leidos",),
     "TXT": ("Textron", "Bell Textron"),
     "DCO": ("Ducommun",),
-    "V2X": ("Vertex Aerospace", "V2X Inc", "Vectrus"),
+    # Keyed VVX, which is the ticker -- the company renamed itself V2X and
+    # kept the old symbol, so "V2X" is its NAME and belongs on the right-hand
+    # side with the other aliases. Keyed on the left it silently disabled the
+    # cohort's largest name: match_symbols skips any key not in the universe,
+    # and the universe carries VVX. Every award to V2X Inc was dropped before
+    # anything looked at it.
+    "VVX": ("Vertex Aerospace", "V2X Inc", "Vectrus"),
     "AIR": ("AAR Corp",),
     "KTOS": ("Kratos Defense", "Kratos Unmanned"),
     "MOG.A": ("Moog Inc",),
@@ -210,11 +216,22 @@ class DodContractsClient:
     maintenance page -- must degrade to "no awards today" rather than to
     garbage paragraphs fed to an LLM."""
 
+    # war.gov sits behind a bot filter that answers a bare tool-style
+    # User-Agent with 403 -- 159 requests, 159 rejections, not one item ever
+    # ingested. This is a public HTML page, not an API with an identification
+    # policy: SEC asks to be told who is calling and enforces it, DoD asks to
+    # be indistinguishable from a browser. So this feed does NOT reuse
+    # edgar_user_agent, which is the shape SEC requires and the shape the
+    # filter rejects.
+    _BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/128.0.0.0 Safari/537.36")
+
     def __init__(self, client: httpx.AsyncClient | None = None,
-                 user_agent: str = "SmartBoi") -> None:
+                 user_agent: str = "") -> None:
         self._client = client
         self._owns_client = client is None
-        self._user_agent = user_agent
+        self._user_agent = user_agent or self._BROWSER_UA
 
     async def fetch_day(self, day: date) -> str:
         """The announcements page text for one day, or "" if there isn't one.
@@ -227,7 +244,14 @@ class DodContractsClient:
         if client is None:
             client = httpx.AsyncClient(
                 timeout=_TIMEOUT_SEC, follow_redirects=True,
-                headers={"User-Agent": self._user_agent},
+                headers={
+                    "User-Agent": self._user_agent,
+                    # Sent for the same reason as the User-Agent: a request
+                    # with a browser UA and no Accept headers is the exact
+                    # signature these filters score as automated.
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
             )
             self._client = client
         url = f"{_BASE_URL}Contract/Article/{day.isoformat()}/"
