@@ -701,11 +701,55 @@ def test_an_untagged_symbol_is_not_benchmarked_against_other_untagged_ones():
 
 def test_a_tagged_symbol_still_gets_its_peers():
     from smartboi.backtest import benchmark_series_for
-    series = {"AAA": _series([1, 2]), "BBB": _series([1, 2]), "CCC": _series([1, 2])}
-    eco = {"AAA": "semi_equipment", "BBB": "semi_equipment", "CCC": "defense_tier2"}
+    series = {f"P{i}": _series([1, 2]) for i in range(5)}
+    series["AAA"] = _series([1, 2])
+    series["CCC"] = _series([1, 2])
+    eco = {"AAA": "semi_equipment", "CCC": "defense_tier2"}
+    eco.update({f"P{i}": "semi_equipment" for i in range(5)})
     benchmarks, label = benchmark_series_for("AAA", "ecosystem", eco, series)
-    assert len(benchmarks) == 1          # BBB only: subject excluded, CCC is another sector
-    assert label == "semi_equipment peers"
+    assert len(benchmarks) == 5          # the five peers: subject excluded, CCC is another sector
+    assert label == "semi_equipment tradeable peers"
+
+
+def test_anchors_are_left_out_of_the_benchmark_when_enough_tradeables_remain():
+    """An anchor is in the universe to be a news source, not a comparable.
+    Measured on a live record, tradeable-only peers track the traded names
+    better (mean daily-return correlation 0.470 vs 0.426) despite being
+    fewer."""
+    from smartboi.backtest import benchmark_series_for
+    series = {f"T{i}": _series([1, 2]) for i in range(4)}
+    series.update({f"A{i}": _series([1, 2]) for i in range(9)})
+    series["AAA"] = _series([1, 2])
+    eco = {"AAA": "semi_equipment"}
+    eco.update({s: "semi_equipment" for s in list(series) if s != "AAA"})
+    anchors = {f"A{i}" for i in range(9)}
+    benchmarks, label = benchmark_series_for("AAA", "ecosystem", eco, series, anchors=anchors)
+    assert len(benchmarks) == 4
+    assert label == "semi_equipment tradeable peers"
+
+
+def test_the_benchmark_widens_to_anchors_when_tradeables_are_too_thin():
+    """A median over three names is not a sector. Widening is preferred to
+    a degenerate control -- but it is labelled, so a row built on the
+    weaker benchmark is visible rather than silently pooled."""
+    from smartboi.backtest import benchmark_series_for
+    series = {"T0": _series([1, 2]), "T1": _series([1, 2]), "AAA": _series([1, 2])}
+    series.update({f"A{i}": _series([1, 2]) for i in range(6)})
+    eco = {s: "semi_equipment" for s in series}
+    anchors = {f"A{i}" for i in range(6)}
+    benchmarks, label = benchmark_series_for("AAA", "ecosystem", eco, series, anchors=anchors)
+    assert len(benchmarks) == 8          # widened: 2 tradeables + 6 anchors
+    assert "widened" in label
+
+
+def test_the_benchmark_move_is_a_median_not_a_mean():
+    """One megacap in a peer group spanning four orders of magnitude of
+    market cap should not stand in for what the sector did."""
+    from smartboi.backtest import benchmark_move
+    flat = [_series([100.0, 100.0]) for _ in range(4)]
+    outlier = _series([100.0, 200.0])          # +100%
+    move = benchmark_move(flat + [outlier], "2026-08-03", "2026-08-04")
+    assert move == pytest.approx(0.0)          # a mean would say +20%
 
 
 def test_the_report_prints_the_tolerance_it_actually_applied():

@@ -26,6 +26,7 @@ from datetime import date, datetime, timedelta
 # would be a second place for the date->price mapping to drift. price marks
 # are close-only and at most one per symbol per day (see engine.py's
 # _run_daily_price_marks), which is all the counterfactual needs.
+from smartboi.paper_journal import RESOLVED_STATUSES
 from smartboi.forward_returns import _price_on_or_after, price_marks_by_symbol  # noqa: F401 (re-exported for the tool wrapper)
 
 # A loss whose GROSS r-multiple is at or below this gapped through the stop:
@@ -42,7 +43,7 @@ def _closed(trades: list[dict]) -> list[dict]:
     whole report."""
     return [
         t for t in trades
-        if t.get("status") in ("WIN", "LOSS", "TIMEOUT")
+        if t.get("status") in RESOLVED_STATUSES
         and t.get("entry_price") and t.get("exit_price") is not None
     ]
 
@@ -163,7 +164,7 @@ def hold_to_horizon(
     horizon would have beaten the grid exit for that trade."""
     out = []
     for t in trades:
-        if t.get("status") not in ("WIN", "LOSS", "TIMEOUT"):
+        if t.get("status") not in RESOLVED_STATUSES:
             continue
         entry, exit_price = t.get("entry_price"), t.get("exit_price")
         direction, opened = t.get("direction"), t.get("opened_at")

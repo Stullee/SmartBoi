@@ -6,7 +6,7 @@ import pytest
 import smartboi.market_hours
 import smartboi.paper_journal
 from smartboi.market_hours import MARKET_TZ
-from smartboi.paper_journal import PaperTrade, PaperTradeJournal
+from smartboi.paper_journal import RESOLVED_STATUSES, PaperTrade, PaperTradeJournal
 
 
 def _next_session(days: int = 1) -> datetime:
@@ -49,10 +49,13 @@ def _journal(tmp_path):
     return PaperTradeJournal(tmp_path / "logs" / "paper_trades.jsonl")
 
 
-def test_archive_open_trades_clears_without_recording_outcomes(tmp_path):
-    """The runtime reset discards open trades that never reached an outcome --
-    they must not enter the closed win-rate record, and the open-state file is
-    renamed aside (recoverable), not deleted."""
+def test_archive_open_trades_records_them_as_archived(tmp_path):
+    """The runtime reset retires open trades that never reached an outcome.
+    They must not enter the win-rate record -- but "not counted as an
+    outcome" and "not written down" are different requirements, and only
+    the first is real. A live reset archived 30 of 49 positions and left no
+    trace in the ledger, which is what made the surviving 15 read as the
+    record when they were the residue of it."""
     journal = _journal(tmp_path)
     journal.open("AAA", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.9, 3, [])
     journal.open("BBB", "SHORT", 50.0, 8.0, 16.0, 21, "t", 0.8, 2, [])
@@ -61,12 +64,41 @@ def test_archive_open_trades_clears_without_recording_outcomes(tmp_path):
 
     assert sorted(archived) == ["AAA", "BBB"]
     assert journal.open_trades == {}
-    # No closed-log rows written (they never reached WIN/LOSS/TIMEOUT).
-    assert not journal.log_path.exists()
+    rows = [json.loads(l) for l in journal.log_path.read_text().splitlines() if l.strip()]
+    assert sorted(r["symbol"] for r in rows) == ["AAA", "BBB"]
+    assert {r["status"] for r in rows} == {"ARCHIVED"}
+    # Recorded, but never scorable as an outcome.
+    assert all(r["status"] not in RESOLVED_STATUSES for r in rows)
     # Open-state renamed aside, not deleted; a fresh journal starts clean.
     assert not journal.open_state_path.exists()
     assert list(journal.open_state_path.parent.glob("open_paper_trades.reset-*.json"))
     assert PaperTradeJournal(journal.log_path).open_trades == {}
+
+
+def test_archived_trades_are_marked_at_the_last_price_seen(tmp_path):
+    journal = _journal(tmp_path)
+    journal.open("AAA", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.9, 3, [])
+    journal.open_trades["AAA"].last_price = 110.0
+
+    journal.archive_open_trades()
+
+    row = [json.loads(l) for l in journal.log_path.read_text().splitlines() if l.strip()][0]
+    assert row["exit_price"] == 110.0
+
+
+def test_an_unpriced_archived_trade_falls_back_to_its_entry(tmp_path):
+    # No mark ever arrived, so there is no price to close against. Booking
+    # it at entry is a visible 0.00R placeholder rather than a fabricated
+    # outcome in either direction.
+    journal = _journal(tmp_path)
+    journal.open("AAA", "LONG", 100.0, 8.0, 16.0, 21, "t", 0.9, 3, [])
+    assert journal.open_trades["AAA"].last_price is None
+
+    journal.archive_open_trades()
+
+    row = [json.loads(l) for l in journal.log_path.read_text().splitlines() if l.strip()][0]
+    assert row["exit_price"] == 100.0
+    assert row["r_multiple_gross"] == 0.0
 
 
 def test_open_long_computes_stop_and_target(tmp_path):

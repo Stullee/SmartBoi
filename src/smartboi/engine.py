@@ -3860,6 +3860,33 @@ class Engine:
         self._reset_to_active(dossier)
         self.dossiers.save(dossier)
 
+    def _close_if_thesis_flipped(self, symbol: str, trade, price: float) -> None:
+        """Closes `trade` when its dossier now qualifies for a signal in the
+        OPPOSITE direction. No-op otherwise -- including when the dossier has
+        merely weakened, gone NONE, or flipped without clearing the bar,
+        which are all reasons to stop adding conviction, not to abandon a
+        position mid-horizon."""
+        dossier = self.dossiers.load(symbol)
+        signal = evaluate(dossier, self.settings.signal_confidence_threshold,
+                          self.settings.min_independent_sources,
+                          self.settings.min_independent_sources_news_only)
+        if signal is None or signal.direction == trade.direction:
+            return
+        log.warning(
+            "[PAPER] %s: thesis flipped %s -> %s at signal strength "
+            "(confidence=%.2f magnitude=%.2f sources=%d) while a %s position was open -- closing it.",
+            symbol, trade.direction, signal.direction, dossier.confidence,
+            dossier.magnitude, dossier.independent_source_count, trade.direction,
+        )
+        closed = self.journal.close_on_thesis_flip(symbol, price)
+        if closed is not None:
+            self._record_decision(
+                "thesis_flipped", symbol, signal.direction, dossier.signaled_at,
+                price=price,
+                reason=(f"closed an open {trade.direction} because the dossier now qualifies "
+                        f"{signal.direction} (score {dossier.confidence * dossier.magnitude:.3f})"),
+            )
+
     async def _try_open_from_signal(self, symbol: str, dossier: Dossier) -> None:
         """Whether/how a SIGNALED-but-not-yet-open dossier becomes a paper
         trade this poll -- the "are we too late" gate. Two guards, both a
@@ -4173,6 +4200,29 @@ class Engine:
             # for any live position -- evaluating on close alone erased
             # exactly those losses and flattered the paper record.
             self.journal.update(symbol, bar.close, high=bar.high, low=bar.low)
+            # A position whose own dossier now points the other way, hard
+            # enough that it would open the opposite trade, is a position
+            # held against the evidence that justifies it. Nothing used to
+            # notice: the flip check in _try_open_from_signal runs only
+            # BEFORE an entry, and _run_entry_evaluations skips any symbol
+            # with an open trade, so a flipped thesis could not even fire.
+            # The two simply diverged, silently, for as long as the trade
+            # stayed open.
+            #
+            # Confirmed live on PUMP: opened SHORT 2026-07-29, its dossier
+            # turned LONG the next day and stayed LONG for eleven days with
+            # conviction RISING (score 0.43 -> 0.74, 4 -> 14 independent
+            # sources) while the price went 10.20 -> 12.79. The evidence was
+            # right, the position was wrong, and the system held it until an
+            # unrelated reset discarded it.
+            #
+            # The bar is signals.evaluate itself, not a second definition of
+            # "strong enough" -- abandoning a position needs exactly the
+            # conviction that opening one needs. Checked only while the trade
+            # is still OPEN, so a level that resolved on this same bar wins:
+            # the stop or target actually traded, the flip is an opinion.
+            if trade.status == "OPEN":
+                self._close_if_thesis_flipped(symbol, trade, bar.close)
             if trade.status != "OPEN":
                 # The paper trade just closed (WIN/LOSS/TIMEOUT) -- notify,
                 # then reset the dossier so future evidence can trigger a

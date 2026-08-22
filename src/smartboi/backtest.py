@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import statistics
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -59,6 +60,9 @@ DEFAULT_POST_DAYS = 20
 # calendar week -- long enough that a lagged reaction has had room to
 # start, short enough that an entry is still holding.
 NEAR_DRIFT_DAYS = 5
+# Below this many priced tradeable peers, the benchmark widens to include
+# the ecosystem's anchors. A median over three names is not a sector.
+MIN_TRADEABLE_PEERS = 4
 
 # How far a recorded entry price may sit outside the real session's
 # [low, high] range before the row is flagged. Not zero: the engine's
@@ -426,10 +430,17 @@ def _pct(from_price: float, to_price: float) -> float | None:
 def benchmark_move(
     benchmarks: list[Series], from_date: str, to_date: str
 ) -> float | None:
-    """Mean RAW (unsigned) return of the benchmark members between two
+    """MEDIAN raw (unsigned) return of the benchmark members between two
     session dates. None when no member can price both ends -- reported as
     unbenchmarkable rather than given a fabricated 0.00, which would read
-    as "no sector move" instead of "no data"."""
+    as "no sector move" instead of "no data".
+
+    Median, not mean. A peer group here spans four orders of magnitude of
+    market cap -- a live deployment had $1.85 and $1,244 stocks in one
+    ecosystem -- and an equal-weighted mean lets one megacap's move stand
+    in for what a $150M supplier's sector did. It also holds up on the
+    thin peer groups that tradeable-only benchmarking produces, where one
+    outlier is a quarter of the sample."""
     moves = []
     for series in benchmarks:
         start = series.close_on_or_before(from_date)
@@ -441,7 +452,7 @@ def benchmark_move(
             moves.append(move)
     if not moves:
         return None
-    return sum(moves) / len(moves)
+    return statistics.median(moves)
 
 
 def event_path(
@@ -793,6 +804,7 @@ def benchmark_series_for(
     ecosystem_by_symbol: dict[str, str],
     series_by_symbol: dict[str, Series],
     market_symbol: str = "IWM",
+    anchors: frozenset[str] | set[str] = frozenset(),
 ) -> tuple[list[Series], str]:
     """The benchmark for one symbol, and a label for it.
 
@@ -818,14 +830,37 @@ def benchmark_series_for(
     # live: SCRNY and SCE-PN benchmarked against each other.
     if not ecosystem:
         return ([market], f"{market_symbol} (no ecosystem tag for {symbol})") if market else ([], "none available")
-    peers = [
-        series for peer, series in series_by_symbol.items()
-        if peer != symbol and peer != market_symbol
-        and ecosystem_by_symbol.get(peer)
-        and ecosystem_by_symbol.get(peer) == ecosystem
-    ]
-    if peers:
-        return peers, f"{ecosystem} peers"
+
+    def members(tradeable_only: bool) -> list[Series]:
+        return [
+            series for peer, series in series_by_symbol.items()
+            if peer != symbol and peer != market_symbol
+            and ecosystem_by_symbol.get(peer) == ecosystem
+            and not (tradeable_only and peer in anchors)
+        ]
+
+    # TRADEABLE peers first. An anchor is in the universe to be a news
+    # source, not a comparable: the ecosystems are seeded with the large,
+    # efficiently-priced names whose news is expected to move the small
+    # ones, so an all-member benchmark asks "what did this small cap do
+    # relative to a basket that is mostly megacaps". Measured on a live
+    # record, tradeable-only peers track the traded names distinctly
+    # better -- mean correlation of daily returns 0.470 against 0.426 for
+    # all members -- despite being far fewer. Six comparables beat
+    # twenty-six non-comparables.
+    #
+    # But only where there are enough of them. Excluding anchors takes the
+    # median peer count from 24 to 4 on that same record, and 19 of 67
+    # events drop below four priced peers, where a median stops meaning
+    # anything. Those widen back to the full ecosystem and SAY SO in the
+    # label, so a row built on the weaker control is visible as such
+    # rather than silently mixed in with the rest.
+    peers = members(tradeable_only=True)
+    if len(peers) >= MIN_TRADEABLE_PEERS:
+        return peers, f"{ecosystem} tradeable peers"
+    widened = members(tradeable_only=False)
+    if widened:
+        return widened, f"{ecosystem} peers (widened, <{MIN_TRADEABLE_PEERS} tradeable priced)"
     return ([market], f"{market_symbol} (no ecosystem peer priced)") if market else ([], "none available")
 
 
@@ -838,6 +873,7 @@ def analyse(
     pre_days: int = DEFAULT_PRE_DAYS,
     far_days: int = DEFAULT_POST_DAYS,
     entry_tolerance_pct: float = ENTRY_TOLERANCE_PCT,
+    anchors: frozenset[str] | set[str] = frozenset(),
 ) -> dict:
     """Joins would-be trades to bars: event paths, exit replays, entry
     reconciliations. Pure -- the caller does the fetching and hands in the
@@ -851,7 +887,8 @@ def analyse(
             unpriced.append(trade.symbol)
             continue
         benchmarks, label = benchmark_series_for(
-            trade.symbol, benchmark_mode, ecosystem_by_symbol, series_by_symbol, market_symbol
+            trade.symbol, benchmark_mode, ecosystem_by_symbol, series_by_symbol,
+            market_symbol, anchors,
         )
         labels.add(label)
         path = event_path(trade, series, benchmarks, pre_days=pre_days, post_days=far_days)

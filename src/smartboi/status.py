@@ -19,6 +19,7 @@ from smartboi.dossier import (
     synthesis_verdict_fresh,
 )
 from smartboi.graph import RelationshipGraph
+from smartboi.paper_journal import RESOLVED_STATUSES
 
 
 @dataclass
@@ -53,6 +54,12 @@ class PaperTradeStats:
     # implicit -- the gap between these two is the whole question of whether
     # a thin-edge strategy survives contact with real spreads.
     avg_r_gross: float = 0.0
+    # Recorded but NOT scored (see paper_journal.UNSCORED_STATUSES). Shown
+    # so a reader can see how much of the book left without an outcome --
+    # a large archived count next to a small closed one is the signature of
+    # a record that has been reset out from under itself.
+    thesis_flipped: int = 0
+    archived: int = 0
     # Closed SHORTs whose borrow was never verifiable (small/unknown-cap
     # names are routinely hard-to-borrow -- see paper_journal.assumes_borrow)
     # and the avg R of everything else. borrow-assumed trades commingled
@@ -632,10 +639,18 @@ def gather_paper_trade_stats(
     log_path: Path, initial_capital: float = 0.0, currency: str = "",
     max_concurrent_positions: int = 0,
 ) -> tuple[PaperTradeStats, list[dict]]:
-    rows = _read_jsonl(log_path)
+    all_rows = _read_jsonl(log_path)
+    # Only rows that reached an outcome are scored. A THESIS_FLIPPED or
+    # ARCHIVED row is in the log so the exclusion is VISIBLE, but it never
+    # hit a level -- folding it into wins/losses would answer "what became
+    # of the positions we opened" with a number presented as "does the
+    # strategy pick well". Counted separately below so they cannot vanish.
+    rows = [r for r in all_rows if r.get("status") in RESOLVED_STATUSES]
     stats = PaperTradeStats(closed=len(rows), currency=currency, initial_capital=initial_capital,
                             max_concurrent_positions=max_concurrent_positions,
-                            peak_concurrent=_peak_concurrent(rows))
+                            peak_concurrent=_peak_concurrent(all_rows),
+                            thesis_flipped=sum(1 for r in all_rows if r.get("status") == "THESIS_FLIPPED"),
+                            archived=sum(1 for r in all_rows if r.get("status") == "ARCHIVED"))
     if rows:
         # A win is net-of-cost profit (realized R > 0), not a target hit -- so
         # a profitable SHORT that can only ever TIMEOUT (its 100%-take-profit
@@ -667,7 +682,7 @@ def gather_paper_trade_stats(
         pnls = [r.get("currency_pnl") for r in rows if r.get("currency_pnl") is not None]
         stats.realized_pnl = round(sum(pnls), 2) if pnls else 0.0
     stats.equity = round(initial_capital + stats.realized_pnl, 2)
-    return stats, rows[-20:]
+    return stats, all_rows[-20:]
 
 
 def _generation_stats(
@@ -675,6 +690,8 @@ def _generation_stats(
 ) -> StrategyGeneration:
     legacy = key == ""
     is_current = bool(current_key) and key == current_key and not legacy
+    # Same rule as gather_paper_trade_stats: score only resolved outcomes.
+    rows = [r for r in rows if r.get("status") in RESOLVED_STATUSES]
     closed = len(rows)
     # Net-of-cost basis, matching gather_paper_trade_stats: a win is realized
     # R > 0, losses the complement, timeouts the exit-reason overlay.

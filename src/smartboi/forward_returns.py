@@ -8,7 +8,9 @@ append-only daily logs captured for exactly this purpose -- see README's
 from __future__ import annotations
 
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+
+from smartboi.market_hours import quote_is_a_close, session_for_quote
 
 # Score buckets: is the forward-return relationship monotonic across them?
 # A real edge should show higher buckets outperforming lower ones; if it
@@ -60,19 +62,48 @@ def dedup_snapshots(rows: list[dict]) -> list[dict]:
 
 
 def price_marks_by_symbol(rows: list[dict]) -> dict[str, dict[str, float]]:
-    """symbol -> {date (YYYY-MM-DD): price}. Last mark wins for a given
-    day if there were somehow more than one (shouldn't happen -- price
-    marks are written at most once a day per symbol -- but this must never
-    crash on real log data)."""
-    out: dict[str, dict[str, float]] = {}
+    """symbol -> {session (YYYY-MM-DD): price}.
+
+    Keyed on the SESSION the price belongs to, not the date it was
+    captured on. The daily marks pass is gated on is_trading_day (a
+    weekday check) and stamps marked_at with the capture moment, so once
+    the tick drifts outside the session the two stop agreeing: a quote
+    taken before the open is the PREVIOUS session's close, because neither
+    IB nor Finnhub refuses out of hours -- they hand back the last close.
+    On a live deployment that drift put 3,992 of 5,025 marks one session
+    late, and a weekend capture holds Friday's close under a Saturday key.
+
+    A same-length window shifted by one session is misaligned rather than
+    mis-measured, so this matters less here than in an event study -- but
+    two modules disagreeing about what a mark's date MEANS is worse than
+    either convention on its own, and backtest.marks_as_series already
+    files by session. Rows written with an explicit `session` field are
+    trusted; older rows have it derived from marked_at.
+
+    Where two marks land on one session, a settled close beats a
+    mid-session snapshot, and among equals the later capture wins."""
+    best: dict[str, dict[str, tuple[int, str, float]]] = {}
     for row in rows:
         symbol = row.get("symbol")
         price = row.get("price")
         marked_at = row.get("marked_at") or ""
         if not symbol or price is None or not marked_at:
             continue
-        out.setdefault(symbol, {})[marked_at[:10]] = price
-    return out
+        try:
+            captured = datetime.fromisoformat(marked_at)
+        except ValueError:
+            continue
+        session = row.get("session") or session_for_quote(captured)
+        if not session:
+            continue
+        quality = 2 if quote_is_a_close(captured) else 1
+        current = best.setdefault(symbol, {}).get(session)
+        if current is None or (quality, marked_at) > (current[0], current[1]):
+            best[symbol][session] = (quality, marked_at, price)
+    return {
+        symbol: {session: price for session, (_, _, price) in marks.items()}
+        for symbol, marks in best.items()
+    }
 
 
 def _price_on_or_after(marks: dict[str, float], target_date: str, max_lookahead_days: int = 5) -> tuple[str, float] | None:

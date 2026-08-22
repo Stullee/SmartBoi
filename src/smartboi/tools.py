@@ -581,6 +581,10 @@ async def run_backtest(
     ecosystem_by_symbol = {
         symbol: spec.ecosystem for symbol, spec in specs.items() if spec.ecosystem
     }
+    # Anchors are in the universe to be news sources, not comparables --
+    # see backtest.benchmark_series_for for why they are the second choice
+    # for a sector control rather than the first.
+    anchors = {symbol for symbol, spec in specs.items() if spec.signal_source_only}
 
     if source == "marks":
         # Zero-network path: the engine's own captured marks stand in for
@@ -597,6 +601,7 @@ async def run_backtest(
             benchmark_mode=benchmark, market_symbol=market_symbol,
             pre_days=pre_days, far_days=far_days,
             entry_tolerance_pct=5.0 if entry_tolerance_pct is None else entry_tolerance_pct,
+            anchors=anchors,
         )
         return format_backtest_report(
             trades, joined["paths"], joined["replays"], joined["reconciliations"],
@@ -630,6 +635,7 @@ async def run_backtest(
         pre_days=pre_days, far_days=far_days,
         entry_tolerance_pct=(ENTRY_TOLERANCE_PCT if entry_tolerance_pct is None
                              else entry_tolerance_pct),
+        anchors=anchors,
     )
     report = format_backtest_report(
         trades, joined["paths"], joined["replays"], joined["reconciliations"],

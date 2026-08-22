@@ -432,3 +432,44 @@ def test_format_report_shows_join_accounting():
     assert "1 of 4" in report
     assert "3 unjoinable" in report
     assert "N_eff" in report
+
+
+# --- marks are keyed on the session, not the capture date -------------
+
+def test_price_marks_are_keyed_on_the_session_the_price_belongs_to():
+    """A quote captured before the open is the PREVIOUS session's close --
+    neither IB nor Finnhub refuses out of hours, they hand back the last
+    close. On a live deployment the daily pass drifted to ~00:0x ET and
+    3,992 of 5,025 marks landed one session late."""
+    rows = [{"symbol": "FORM", "price": 10.0, "marked_at": "2026-08-20T04:15:00+00:00"},   # 00:15 ET -> 08-19
+            {"symbol": "FORM", "price": 11.0, "marked_at": "2026-08-21T04:22:00+00:00"}]   # 00:22 ET -> 08-20
+    assert price_marks_by_symbol(rows) == {"FORM": {"2026-08-19": 10.0, "2026-08-20": 11.0}}
+
+
+def test_a_weekend_mark_is_filed_under_friday():
+    rows = [{"symbol": "FORM", "price": 9.0, "marked_at": "2026-08-20T20:30:00+00:00"},    # Thu 16:30 ET
+            {"symbol": "FORM", "price": 10.0, "marked_at": "2026-08-22T19:15:00+00:00"}]   # Sat 15:15 ET -> Fri
+    assert price_marks_by_symbol(rows) == {"FORM": {"2026-08-20": 9.0, "2026-08-21": 10.0}}
+
+
+def test_a_settled_close_beats_a_mid_session_snapshot_of_the_same_session():
+    rows = [{"symbol": "FORM", "price": 10.0, "marked_at": "2026-08-20T15:55:00+00:00"},   # 11:55 ET, mid-flight
+            {"symbol": "FORM", "price": 11.0, "marked_at": "2026-08-21T04:22:00+00:00"}]   # 00:22 ET -> 08-20 close
+    assert price_marks_by_symbol(rows) == {"FORM": {"2026-08-20": 11.0}}
+
+
+def test_an_explicit_session_field_is_trusted_over_the_capture_time():
+    rows = [{"symbol": "FORM", "price": 10.0, "session": "2026-08-18",
+             "marked_at": "2026-08-21T04:22:00+00:00"}]
+    assert price_marks_by_symbol(rows) == {"FORM": {"2026-08-18": 10.0}}
+
+
+def test_backtest_and_forward_returns_agree_on_what_a_mark_means():
+    """The point of the change: two modules disagreeing about what a mark's
+    date MEANS is worse than either convention on its own."""
+    from smartboi.backtest import marks_as_series
+    rows = [{"symbol": "FORM", "price": 10.0, "marked_at": "2026-08-20T04:15:00+00:00"},
+            {"symbol": "FORM", "price": 11.0, "marked_at": "2026-08-21T04:22:00+00:00"}]
+    from_forward = price_marks_by_symbol(rows)["FORM"]
+    from_backtest = {b.date: b.close for b in marks_as_series(rows)["FORM"].bars}
+    assert from_forward == from_backtest
