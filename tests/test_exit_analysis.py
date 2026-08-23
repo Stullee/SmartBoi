@@ -11,6 +11,7 @@ from smartboi.exit_analysis import (
     format_report,
     hold_to_horizon,
     net_pct,
+    nominal_grid,
     reward_risk,
     stop_integrity,
 )
@@ -129,3 +130,65 @@ def test_format_report_renders_the_key_sections():
     # No price marks were supplied, so the counterfactual reports itself as
     # not-yet-joinable rather than crashing or fabricating numbers.
     assert "0 of 6 trades joinable yet" in report
+
+
+# --- The report must not quote a grid its trades were never held to --------
+#
+# format_report used to print a hardcoded "the 16/8 grid implies 2:1". Commit
+# 5a6b64d moved the defaults to 50/100 and the line kept printing, so every
+# reader of a losing record was told the wrong benchmark. The ratio is now
+# read off the strategy signature stamped on each closed row.
+
+def _closed_trade(stop: float, target: float, **over) -> dict:
+    trade = {
+        "status": "LOSS", "r_multiple": -1.4, "r_multiple_gross": -1.2,
+        # _closed() requires a real exit: a truncated final write must not
+        # reach the aggregates, so a row without both prices is not "closed".
+        "entry_price": 10.0, "exit_price": 8.0, "direction": "LONG",
+        "cost_bps_round_trip": 300.0,
+        "opened_at": "2026-08-03T14:00:00+00:00",
+        "closed_at": "2026-08-05T14:00:00+00:00",
+        "strategy": {"stop_loss_pct": stop, "take_profit_pct": target},
+    }
+    trade.update(over)
+    return trade
+
+
+def test_nominal_grid_reads_the_grid_the_trades_were_opened_under():
+    trades = [_closed_trade(50.0, 100.0), _closed_trade(50.0, 100.0)]
+    assert nominal_grid(trades) == (50.0, 100.0)
+
+
+def test_nominal_grid_is_unknown_when_generations_are_mixed():
+    """Two grids in one record describe no single ratio, so the report must
+    not pick one of them and present it as the benchmark."""
+    assert nominal_grid([_closed_trade(8.0, 16.0), _closed_trade(50.0, 100.0)]) is None
+
+
+def test_nominal_grid_is_unknown_for_unstamped_legacy_rows():
+    assert nominal_grid([_closed_trade(50.0, 100.0), _closed_trade(50.0, 100.0, strategy=None)]) is None
+
+
+def test_open_trades_do_not_decide_the_grid():
+    """Only closed trades are in the report, so only closed trades may set the
+    ratio it quotes -- an open position under a new grid must not relabel a
+    record made entirely under the old one."""
+    trades = [_closed_trade(8.0, 16.0),
+              {"status": "OPEN", "strategy": {"stop_loss_pct": 50.0, "take_profit_pct": 100.0}}]
+    assert nominal_grid(trades) == (8.0, 16.0)
+
+
+def test_the_inverted_payoff_warning_quotes_the_real_grid():
+    trades = [_closed_trade(50.0, 100.0, status="WIN", r_multiple=0.4, r_multiple_gross=0.5),
+              _closed_trade(50.0, 100.0, status="LOSS", r_multiple=-1.6, r_multiple_gross=-1.5)]
+    report = format_report(trades, {})
+    assert "each loss is BIGGER than each win" in report
+    assert "50%/100% grid implies 2:1" in report
+    assert "16/8" not in report
+
+
+def test_the_warning_stays_honest_when_the_grid_is_unknown():
+    trades = [_closed_trade(50.0, 100.0, status="WIN", r_multiple=0.4, r_multiple_gross=0.5, strategy=None),
+              _closed_trade(50.0, 100.0, status="LOSS", r_multiple=-1.6, r_multiple_gross=-1.5, strategy=None)]
+    report = format_report(trades, {})
+    assert "the configured grid implies more" in report

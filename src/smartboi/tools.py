@@ -1635,11 +1635,14 @@ def run_diagnostics(engine) -> str:
         add(f"    {symbol:6} {trade.direction:5} {cap:>12}  {trade.cost_bps_round_trip:.0f}bp round trip"
             f"  -> win {econ.r_win:+.2f}R / loss {econ.r_loss:+.2f}R")
 
-    # The 8%/16% grid LOOKS like 2:1 and is not: cost is charged on notional
-    # while R is measured against the stop distance, so it lands on both
-    # legs and eats a large share of a tight stop. Printed per bucket
-    # because it is the difference between a strategy that needs a 42% hit
-    # rate and one that needs 59%, and nothing else in this output shows it.
+    # A nominal 2:1 grid is not 2:1 once costs land: cost is charged on
+    # notional while R is measured against the stop distance, so it hits both
+    # legs and eats a large share of a TIGHT stop. Printed per bucket, off
+    # the live grid rather than a remembered one, because on the 8%/16% grid
+    # that used to ship this was the difference between needing a 40% hit
+    # rate and needing 59% -- and on today's 50%/100% grid it reads small for
+    # a reason that is not reassuring (see transaction_cost_profile in
+    # config.py: one R is a move the horizon usually closes before).
     add(f"\n--- Cost drag on the {s.stop_loss_pct:.0f}%/{s.take_profit_pct:.0f}% grid "
         f"(profile: {s.transaction_cost_profile}) ---")
     buckets = cost_buckets(s.transaction_cost_profile)

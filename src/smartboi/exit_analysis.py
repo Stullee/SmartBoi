@@ -6,8 +6,8 @@ the STOP/TARGET GRID was the right exit. This answers the questions it can't:
 
   - did trades close far before their horizon (is the grid, not the thesis
     window, deciding outcomes)?
-  - is the realized reward:risk the 2:1 the 16/8 grid implies, or has it
-    inverted after costs and gaps?
+  - is the realized reward:risk the ratio the configured grid implies, or
+    has it inverted after costs and gaps?
   - does the stop actually cap a loss at 1R, or do illiquid names gap
     straight through it?
   - how much do transaction costs eat, gross vs net?
@@ -104,10 +104,10 @@ def exit_reasons(trades: list[dict]) -> dict:
 
 def reward_risk(trades: list[dict]) -> dict:
     """Realized reward:risk and the expectancy decomposition. The single most
-    important comparison here is avg-win vs avg-loss: the 16/8 grid LOOKS 2:1,
-    and costs+gaps can invert it to below 1:1 while the nominal grid is
-    unchanged. Net vs gross expectancy isolates how much of the result is the
-    strategy and how much is the transaction-cost tax."""
+    important comparison here is avg-win vs avg-loss: a nominal 2:1 grid only
+    LOOKS 2:1, and costs+gaps can invert it to below 1:1 while the configured
+    grid is unchanged. Net vs gross expectancy isolates how much of the result
+    is the strategy and how much is the transaction-cost tax."""
     closed = _closed(trades)
     wins = [t["r_multiple"] for t in closed if t.get("status") == "WIN" and t.get("r_multiple") is not None]
     losses = [t["r_multiple"] for t in closed if t.get("status") == "LOSS" and t.get("r_multiple") is not None]
@@ -194,6 +194,33 @@ def hold_to_horizon(
     return out
 
 
+def nominal_grid(trades: list[dict]) -> tuple[float, float] | None:
+    """The stop/target grid the CLOSED trades were actually opened under, read
+    off the strategy signature stamped on each row (config.strategy_signature).
+
+    Read from the rows and not from Settings on purpose. This report covers
+    history, and the live config is whatever it happens to be today: quoting
+    it at a record opened under a different grid is how a report ends up
+    asserting a ratio none of its trades were ever held to. That is not
+    hypothetical -- this function replaced a hardcoded "16/8", which went
+    stale the moment 5a6b64d moved the defaults to 50/100 and then kept
+    printing for every reader of the report.
+
+    None when the record is silent (pre-stamping trades) or mixed (more than
+    one generation closed), because a single ratio describes neither."""
+    grids = set()
+    for trade in _closed(trades):
+        strategy = trade.get("strategy") or {}
+        stop, target = strategy.get("stop_loss_pct"), strategy.get("take_profit_pct")
+        if stop is None or target is None:
+            return None
+        grids.add((float(stop), float(target)))
+    if len(grids) != 1:
+        return None
+    stop, target = grids.pop()
+    return (stop, target) if stop > 0 else None
+
+
 def _fmt(value: float | None, suffix: str = "", places: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{places}f}{suffix}"
 
@@ -232,7 +259,10 @@ def format_report(trades: list[dict], price_marks: dict[str, dict[str, float]]) 
     lines.append(f"  avg win  {_fmt(rr['avg_win_r'], 'R')}   avg loss  {_fmt(rr['avg_loss_r'], 'R')}   "
                  f"ratio {_fmt(ratio, ' : 1') if ratio is not None else 'n/a'}")
     if ratio is not None and ratio < 1.0:
-        lines.append("  ^^ each loss is BIGGER than each win -- the 16/8 grid implies 2:1, this is under 1:1.")
+        grid = nominal_grid(trades)
+        implied = (f"the {grid[0]:.0f}%/{grid[1]:.0f}% grid implies {grid[1] / grid[0]:.2g}:1"
+                   if grid else "the configured grid implies more")
+        lines.append(f"  ^^ each loss is BIGGER than each win -- {implied}, this is under 1:1.")
     lines.append(f"  net expectancy   : {_fmt(rr['net_expectancy_r'], 'R')} / trade")
     lines.append(f"  gross expectancy : {_fmt(rr['gross_expectancy_r'], 'R')} / trade   (before costs)")
     lines.append(f"  cost drag        : {_fmt(rr['cost_drag_r'], 'R')} / trade   (net = gross minus this)")

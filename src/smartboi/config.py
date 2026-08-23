@@ -500,11 +500,28 @@ class Settings(BaseSettings):
     # the cost is the half-spread plus commission -- 15/35/75 bps per side.
     #
     # This is the single most consequential number in the paper record and
-    # it is NOT a modelling detail: on the 8%/16% grid, the sub-$300M
-    # institutional bucket (600bp round trip) turns a nominal 2:1 into
-    # +1.19R/-1.72R, needing a 59% hit rate to break even; the same trade on
-    # the retail table (150bp) is +1.71R/-1.26R, needing 42%. Both are
-    # printed per bucket in diagnostics so the assumption is never invisible.
+    # it is NOT a modelling detail. How large it LOOKS depends on the
+    # stop/target grid in force, because R is measured against the stop
+    # distance while cost is charged on notional:
+    #
+    #   - On the 8%/16% grid this system shipped until 5a6b64d, a 600bp
+    #     round trip (the sub-$300M institutional bucket) turned a nominal
+    #     2:1 into +1.19R/-1.72R -- a 59% hit rate merely to break even,
+    #     against 40% on the retail table (150bp). Cost was 72% of one R.
+    #   - On the 50%/100% hold-to-horizon grid shipped today, the same 600bp
+    #     is 9% of one R (+1.82R/-1.09R, breakeven 37%), because one R is now
+    #     a 50% move.
+    #
+    # Do NOT read the second bullet as "cost stopped mattering" -- that
+    # reading is the trap this comment exists to close. The R denominator
+    # grew; the tax did not shrink. At this width the stop almost never
+    # fires, so trades close at the HORIZON on moves of a few percent, and
+    # 600bp charged against that is what actually decides the record.
+    # R-denominated cost flatters a wide grid precisely because it divides by
+    # a distance the strategy no longer travels.
+    #
+    # Both are printed per bucket in diagnostics so the assumption is never
+    # invisible.
     #
     # Defaults to institutional deliberately. An over-stated cost makes a
     # real edge look smaller -- annoying but recoverable, since the journal

@@ -105,15 +105,20 @@ class TradeEconomics:
     """What the configured stop/target grid is actually worth once the
     round-trip cost is charged, for one cost bucket.
 
-    This exists because the 8%/16% grid LOOKS like 2:1 reward:risk and is
-    not. Cost is charged against notional while R is measured against the
-    stop distance, so the same bps figure is a far larger share of a risk
-    unit on a tight stop -- and it lands on BOTH sides, shrinking the win
-    and deepening the loss. At 600bp round-trip (the sub-$300M
-    institutional bucket) the real payoff of a nominal 2:1 grid is
-    +1.19R/-1.72R, which needs a 59% hit rate merely to break even. Nothing
-    in the pipeline surfaced that, so it is computed here and printed in
-    diagnostics rather than left to be discovered from a losing record."""
+    This exists because a nominal 2:1 grid is not 2:1 once costs land.
+    Cost is charged against notional while R is measured against the stop
+    distance, so the same bps figure is a far larger share of a risk unit on
+    a TIGHT stop -- and it lands on BOTH legs, shrinking the win and
+    deepening the loss. On the 8%/16% grid this system shipped until
+    5a6b64d, 600bp round-trip (the sub-$300M institutional bucket) took a
+    nominal 2:1 to +1.19R/-1.72R, needing a 59% hit rate to break even. On
+    the 50%/100% grid shipped today the same 600bp is +1.82R/-1.09R
+    (breakeven 37%) -- not because the tax shrank, but because one R is now
+    a 50% move the strategy rarely travels before the horizon closes it.
+
+    Both readings matter, which is why this is computed from the grid passed
+    in rather than assumed: it is the caller's configured stop/target that
+    decides whether the cost is 72% of a risk unit or 9% of one."""
 
     r_win: float
     r_loss: float
