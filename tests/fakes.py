@@ -257,3 +257,41 @@ def verdict(refuted=False, reasoning="looks solid", adjusted_confidence=0.7, adj
         "refuted": refuted, "reasoning": reasoning,
         "adjusted_confidence": adjusted_confidence, "adjusted_magnitude": adjusted_magnitude,
     }
+
+
+class FakeBarClient:
+    """Stands in for bars.BarClient in the daily volatility pass.
+
+    `bars_by_symbol` is what the provider "has"; anything requested and not
+    present lands in `failures`, which is how the real client reports an
+    unknown, delisted or unfetchable symbol. `requested` records the symbol
+    list each call asked for, so a test can assert the pass does not fetch
+    anchors it will never resolve a threshold for.
+
+    `hang` makes bars_for_all wait forever, for the pass-budget test -- the
+    single-task engine's worst case is a provider that accepts a connection
+    and then never answers, which no per-request timeout in this fake would
+    otherwise reproduce."""
+
+    def __init__(self, bars_by_symbol: dict | None = None, hang: bool = False):
+        self.bars_by_symbol = bars_by_symbol or {}
+        self.hang = hang
+        self.failures: dict[str, str] = {}
+        self.requested: list[list[str]] = []
+        self.closed = False
+
+    async def bars_for_all(self, symbols, start_date, end_date):
+        import asyncio
+        self.requested.append(list(symbols))
+        if self.hang:
+            await asyncio.Event().wait()
+        out = {}
+        for symbol in symbols:
+            if symbol in self.bars_by_symbol:
+                out[symbol] = self.bars_by_symbol[symbol]
+            else:
+                self.failures[symbol] = "no bars"
+        return out
+
+    async def aclose(self) -> None:
+        self.closed = True

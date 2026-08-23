@@ -1,6 +1,6 @@
 ---
 name: SmartBoi (Evidence Synthesis, Paper-Only)
-version: "0.76.0"
+version: "0.77.0"
 slug: smartboi
 description: >-
   LLM-driven cross-company evidence synthesis for equity research: ingests
@@ -73,6 +73,7 @@ options:
   transaction_cost_profile: "retail"
   max_favorable_drift_pct: 12.0
   signal_entry_deadline_days: 5
+  enable_volatility_scaling: true
   stop_loss_pct: 50.0
   take_profit_pct: 100.0
   strategy_label: "hold-to-horizon"
@@ -150,6 +151,7 @@ schema:
   transaction_cost_profile: "list(institutional|retail)"
   max_favorable_drift_pct: float(0,100)
   signal_entry_deadline_days: int(1,60)
+  enable_volatility_scaling: bool
   stop_loss_pct: float(0.1,50)
   take_profit_pct: float(0.1,100)
   strategy_label: str

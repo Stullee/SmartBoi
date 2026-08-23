@@ -712,7 +712,7 @@ def run_exit_analysis(log_dir: str | Path) -> str:
 _DIAGNOSTIC_SETTINGS = (
     "signal_confidence_threshold", "min_independent_sources",
     "min_independent_sources_news_only", "max_horizon_days",
-    "max_favorable_drift_pct", "signal_entry_deadline_days",
+    "max_favorable_drift_pct", "signal_entry_deadline_days", "enable_volatility_scaling",
     "stop_loss_pct", "take_profit_pct", "strategy_label", "transaction_cost_bps_per_side",
     "transaction_cost_profile",
     "initial_trading_capital", "trading_currency", "max_concurrent_positions",
@@ -1486,7 +1486,10 @@ def run_diagnostics(engine) -> str:
     add(f"  waiting for an entry    : {' '.join(waiting) or 'nothing'}")
     add(f"  price poll (idle)       : {s.price_poll_interval_sec}s")
     add(f"  price poll (entry due)  : {s.signal_entry_poll_interval_sec}s")
-    add(f"  entry deadline          : {s.signal_entry_deadline_days}d, max favorable drift {s.max_favorable_drift_pct}%")
+    drift_basis = ("per-symbol, scaled by ATR" if s.enable_volatility_scaling
+                   else "flat across the universe")
+    add(f"  entry deadline          : {s.signal_entry_deadline_days}d, max favorable drift "
+        f"{s.max_favorable_drift_pct}% ({drift_basis})")
 
     stats, closed = gather_paper_trade_stats(
         log_dir / "paper_trades.jsonl", s.initial_trading_capital, s.trading_currency,

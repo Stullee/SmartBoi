@@ -39,6 +39,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from smartboi.alerts import AlertSender
+from smartboi.bars import BarClient
 from smartboi.config import Settings
 from smartboi.dedup import DedupIndex, fingerprint, source_domain
 from smartboi.edgar import _truncate_head_tail, describe_8k_items
@@ -91,6 +92,7 @@ from smartboi.status import _STALE_EDGE_DAYS, snapshot_dossier
 from smartboi.universe import SEED_RELATIONSHIPS, CompanySpec, spec_by_symbol
 from smartboi.universe_screen import guess_ecosystem, recommend_candidate_type, screen_universe
 from smartboi.usage import CAT_DOSSIER, CAT_EXTRACTION, CAT_RESEARCH, CAT_SYNTHESIS, UsageTracker
+from smartboi.volatility import atr_pct, scaled_threshold
 from smartboi.webapp import run_dashboard
 
 log = logging.getLogger(__name__)
@@ -102,6 +104,13 @@ DATA_DIR = Path("data")
 # the Gateway restarting daily, or simply not being up yet, shouldn't cost
 # most of a day of price marks.
 IB_RETRY_GAP_SEC = 900
+# Wall-clock ceiling on the daily volatility pass. bars.py already bounds a
+# single request (30s x 3 attempts), but the product across a whole tradeable
+# universe is what reaches the tick, and the tick is a single task. Generous
+# enough for a cold start that fetches every symbol's history for the first
+# time (~0.4s apart, so a few dozen symbols is well under a minute), tight
+# enough that a hung provider costs one pass rather than a cycle.
+_VOLATILITY_PASS_BUDGET_SEC = 180
 # No entry is opened until this many minutes into the regular session.
 # Not a preference -- see the long note in _try_open_from_signal. Fifteen
 # minutes is chosen to clear the opening auction and the first daily-bar
@@ -306,6 +315,12 @@ _RESYNTHESIS_MIN_NEW_KEYS = 2
 # refutes describes a move a re-judged thesis could still plausibly enter.
 # Above 12% the entry gate would refuse the trade anyway and re-judging buys
 # nothing but an Opus call.
+#
+# With enable_volatility_scaling on this is the bar for a REFERENCE-volatility
+# name rather than for every name -- see _resolved_veto_pct and volatility.py.
+# The bracketing argument survives that unchanged, because the entry gate it
+# is bracketed against is scaled by the same factor: 8/12 of the drift limit
+# on every symbol, exactly as it is here.
 _VETO_FALSIFICATION_DRIFT_PCT = 8.0
 
 # Ceiling on off-schedule re-synthesis calls per UTC day. At synthesis
@@ -594,6 +609,13 @@ class Engine:
         # Backoff after a failed Reg SHO refresh -- see the retry_after gate
         # in _tick for why a bare "not done yet" retries every 30 seconds.
         self._regsho_retry_after: float = 0.0
+        # {symbol: {"atr_pct": float, "as_of": "YYYY-MM-DD", "bars": int}} --
+        # the per-symbol volatility the two drift thresholds are scaled by.
+        # Persisted so a restart does not re-fetch the whole universe's bar
+        # history, and stamped with its own date so a stale entry is
+        # recognisable as stale rather than silently trusted forever.
+        self.volatility_state = JsonState(DATA_DIR / "volatility.json")
+        self._volatility_retry_after: float = 0.0
         self._retry_state = JsonState(DATA_DIR / "retry_state.json")
         self._load_retry_state()
 
@@ -611,6 +633,15 @@ class Engine:
         self.regsho: RegShoClient | None = (
             RegShoClient(state=JsonState(DATA_DIR / "regsho.json"))
             if settings.enable_regsho else None
+        )
+        # Daily OHLC bars, for the per-symbol volatility the drift thresholds
+        # are scaled by. Free and keyless on the default provider (stooq), and
+        # cache-first, so the steady state is one request per tradeable symbol
+        # per day. None when scaling is off, which is also what makes the pass
+        # inert in tests -- the same shape as every other optional client here.
+        self.bars: BarClient | None = (
+            BarClient(cache_dir=DATA_DIR / "bars")
+            if settings.enable_volatility_scaling else None
         )
         # Also free and unauthenticated. Scoped to a handful of hand-written
         # searches -- the Federal Register publishes ~200 documents a business
@@ -1194,6 +1225,8 @@ class Engine:
                 await self.fedreg.aclose()
             if self.dod is not None:
                 await self.dod.aclose()
+            if self.bars is not None:
+                await self.bars.aclose()
             if self.price_feed is not None:
                 self.price_feed.disconnect()
             await self.alerts.aclose()
@@ -1403,6 +1436,25 @@ class Engine:
                 self._mark_daily_pass_done("price_marks")
             else:
                 self._price_marks_retry_after = time.monotonic() + IB_RETRY_GAP_SEC
+        # Per-symbol volatility, from daily OHLC bars. Same retry_after shape
+        # as the pass above and for the same reason: a failure leaves the pass
+        # due, and without a backoff that means a whole-universe bar fetch on
+        # every 30-second tick.
+        #
+        # Trading days only. Bars for a session that has not happened cannot
+        # exist, so a weekend pass would refetch the universe to be told the
+        # same thing -- and bars.py's own cache-staleness window (3 days)
+        # already covers the gap.
+        if (
+            self.bars is not None
+            and now >= self._volatility_retry_after
+            and is_trading_day()
+            and self._daily_pass_due("volatility")
+        ):
+            if await self._run_daily_volatility_refresh():
+                self._mark_daily_pass_done("volatility")
+            else:
+                self._volatility_retry_after = time.monotonic() + IB_RETRY_GAP_SEC
         # One plain-text file a day, free and unauthenticated, refreshed on
         # trading days only (the list is published per SETTLEMENT day).
         #
@@ -3893,11 +3945,14 @@ class Engine:
         no-op without enable_ib_price_feed (no baseline price to compare
         against, see _snapshot_signal_price):
 
-        1. Favorable drift: if the price already moved
-           max_favorable_drift_pct in the signal's favorable direction
-           since it fired, the correction likely already happened between
-           signal and entry -- skip rather than chase a move that's largely
-           over. Alerted once per signal (drift_alert_sent), not every poll.
+        1. Favorable drift: if the price already moved past this symbol's
+           drift limit in the signal's favorable direction since it fired,
+           the correction likely already happened between signal and entry --
+           skip rather than chase a move that's largely over. Alerted once per
+           signal (drift_alert_sent), not every poll. The limit is
+           max_favorable_drift_pct resized for how volatile this particular
+           name is (_resolved_drift_pct); with scaling off, or with no ATR
+           reading for the symbol, it is that setting unchanged.
         2. Entry deadline: a signal stuck unopened (drift-blocked every
            poll, or IB unreachable) for signal_entry_deadline_days is
            expired back to ACTIVE rather than left waiting forever on an
@@ -4029,14 +4084,18 @@ class Engine:
             baseline, since = dossier.inception_price, "the thesis began forming"
         if baseline is not None:
             drift = favorable_drift_pct(dossier.direction, baseline, price)
-            if drift >= self.settings.max_favorable_drift_pct:
+            drift_limit = self._resolved_drift_pct(symbol)
+            if drift >= drift_limit:
                 if not dossier.drift_alert_sent:
                     dossier.drift_alert_sent = True
                     self.dossiers.save(dossier)
+                    atr = self._atr_pct_for(symbol)
                     log.info(
                         "[SIGNAL] %s: price already moved %.1f%% favorably since %s "
-                        "at $%.2f (now $%.2f) -- likely already priced in, skipping entry.",
-                        symbol, drift, since, baseline, price,
+                        "at $%.2f (now $%.2f), limit %.1f%% (%s) -- likely already priced in, "
+                        "skipping entry.",
+                        symbol, drift, since, baseline, price, drift_limit,
+                        f"ATR {atr:.1f}%" if atr is not None else "unscaled, no ATR",
                     )
                     # Once per episode (same gate as the alert): the price
                     # at skip time is what lets the event study ask whether
@@ -4044,7 +4103,13 @@ class Engine:
                     self._record_decision(
                         "drift_skip", symbol, dossier.direction, dossier.signaled_at,
                         price=price,
-                        reason=f"drifted {drift:.1f}% favorably from {baseline:.2f} (since {since})",
+                        # The resolved limit is ON the row, for the same reason
+                        # SignalEvent.threshold_in_force is: a forward record
+                        # whose admission criterion is unknown per row cannot be
+                        # partitioned later, and drift-skips are exactly what
+                        # event_study.py exists to re-examine.
+                        reason=(f"drifted {drift:.1f}% favorably from {baseline:.2f} "
+                                f"(since {since}; limit {drift_limit:.1f}%)"),
                     )
                     await self.alerts.send(
                         "signal_stale",
@@ -4055,7 +4120,9 @@ class Engine:
                         {"symbol": symbol, "drift_pct": drift, "baseline_price": baseline, "current_price": price},
                     )
                 if signal_expired(dossier.signaled_at, self.settings.signal_entry_deadline_days):
-                    self._expire_signal(dossier, f"price drifted {drift:.1f}% before an entry could be confirmed",
+                    self._expire_signal(dossier,
+                                        f"price drifted {drift:.1f}% (limit {drift_limit:.1f}%) before "
+                                        "an entry could be confirmed",
                                         price=price)
                 return
 
@@ -4624,7 +4691,7 @@ class Engine:
         if bar is None or dossier.synthesis_price <= 0:
             return False
         drift = favorable_drift_pct(dossier.direction, dossier.synthesis_price, bar.close)
-        return drift >= _VETO_FALSIFICATION_DRIFT_PCT
+        return drift >= self._resolved_veto_pct(dossier.symbol)
 
     def _resynthesis_budget_remaining(self, now: datetime) -> bool:
         today = now.date().isoformat()
@@ -4678,9 +4745,13 @@ class Engine:
             reasons.append("new independent source(s) since the verdict")
         refuted_by_price = await self._veto_refuted_by_price(dossier)
         if refuted_by_price:
+            # The RESOLVED bar, not the constant: on a volatility-scaled
+            # deployment the two differ per symbol, and a reason string
+            # quoting the unscaled figure would misdescribe exactly the
+            # verdicts where the distinction mattered.
             reasons.append(
-                f"price moved >={_VETO_FALSIFICATION_DRIFT_PCT:.0f}% toward the thesis since the "
-                "already-priced-in verdict"
+                f"price moved >={self._resolved_veto_pct(dossier.symbol):.1f}% toward the thesis "
+                "since the already-priced-in verdict"
             )
         if not reasons:
             return
@@ -4790,6 +4861,7 @@ class Engine:
                 dossier = self.dossiers.load(symbol)
                 f.write(json.dumps(snapshot_dossier(
                     dossier, snapshotted_at, self._required_sources(dossier),
+                    atr_pct=self._atr_pct_for(symbol),
                 )) + "\n")
                 written += 1
         if not written:
@@ -4798,6 +4870,138 @@ class Engine:
                 "due so the next tick retries; a day marked done with no rows is unbackfillable."
             )
         return written > 0
+
+    # --- Per-symbol volatility -------------------------------------------
+    #
+    # How stale a stored ATR may be before it stops being used. Volatility is
+    # persistent -- that is the property that makes it forecastable at all --
+    # so a reading from a few sessions ago is still informative, and refusing
+    # to use one would drop straight back to the flat constant on the first
+    # day a provider is unreachable. Two weeks is where an estimate stops
+    # describing the regime a 21-day thesis is entering.
+    _VOLATILITY_MAX_AGE_DAYS = 14
+
+    async def _run_daily_volatility_refresh(self) -> bool:
+        """Recomputes each TRADEABLE symbol's ATR from daily OHLC bars.
+
+        Tradeables only. An anchor is never a trade target, so no threshold is
+        ever resolved for it -- fetching its bars would be a request per
+        anchor per day for a number nothing reads, and this universe is mostly
+        anchors (209 symbols, a couple of dozen tradeable).
+
+        Cache-first and cheap on repeat: bars.py keeps a per-symbol CSV under
+        data/bars/ and only refetches when its newest bar is older than the
+        requested end date by more than a few days, so the steady state is one
+        request per symbol per day and the first run is the only expensive
+        one. The provider default (stooq) needs no API key and no account,
+        which is what lets this ship without a new setting.
+
+        Returns False when NOTHING could be computed, so the caller leaves the
+        pass due and retries after a backoff rather than marking a lost day
+        done. A PARTIAL result is a success: one delisted or unfetchable
+        symbol must not cost the other thirty their refresh.
+
+        Never raises into the tick. This is the only pass whose failure mode
+        is "thresholds stay flat", which is precisely the behaviour the system
+        had before it existed -- so an exception here must degrade, not
+        propagate."""
+        symbols = [c.symbol for c in self.universe if not c.signal_source_only]
+        if not symbols:
+            return True
+        # Enough history to seed the estimate and survive a gap, not so much
+        # that a first run pulls years per symbol.
+        end = date.today()
+        start = end - timedelta(days=180)
+        computed = 0
+        # BarClient accumulates `failures` across calls and never clears them
+        # -- fine for the one-shot use in scripts/backtest_trades.py, wrong for
+        # a client this engine owns for the process lifetime, where a symbol
+        # that failed once would be reported as failing every day after it
+        # recovered.
+        self.bars.failures.clear()
+        try:
+            bars_by_symbol = await asyncio.wait_for(
+                self.bars.bars_for_all(sorted(symbols), start.isoformat(), end.isoformat()),
+                timeout=_VOLATILITY_PASS_BUDGET_SEC,
+            )
+            failures = dict(self.bars.failures)
+        except asyncio.TimeoutError:
+            # The engine is a SINGLE task: ingestion, scoring, signalling and
+            # entry evaluation all wait behind whatever this pass is doing. A
+            # provider that hangs rather than refuses costs _TIMEOUT_SEC x
+            # _MAX_ATTEMPTS per symbol inside bars.py, which across a
+            # tradeable universe is tens of minutes of a 15-minute cycle --
+            # the same stall prices.py grew a circuit breaker for. Bound the
+            # whole pass instead, and let the retry backoff handle the rest.
+            log.warning("[VOL] bar fetch exceeded %ds -- abandoning this pass; thresholds stay "
+                        "flat until it succeeds.", _VOLATILITY_PASS_BUDGET_SEC)
+            return False
+        except Exception:  # noqa: BLE001 - a dead provider must not stop the tick
+            log.exception("[VOL] bar fetch failed outright -- thresholds stay flat this pass.")
+            return False
+
+        fresh: dict[str, dict] = {}
+        for symbol, bars in bars_by_symbol.items():
+            value = atr_pct(bars) if bars else None
+            if value is None:
+                # Left in place rather than deleted: a symbol that briefly
+                # cannot be priced should keep using its last good reading
+                # until _VOLATILITY_MAX_AGE_DAYS ages it out, not snap back to
+                # the flat threshold for one bad fetch.
+                continue
+            fresh[symbol] = {
+                "atr_pct": round(value, 4),
+                "as_of": end.isoformat(),
+                "bars": len(bars),
+            }
+            computed += 1
+        # One durable write for the whole pass. set() fsyncs per key, which on
+        # an SD-card Home Assistant host is thirty fsyncs a day for one
+        # logical update.
+        if fresh:
+            self.volatility_state.update(fresh)
+
+        if failures:
+            log.info("[VOL] %d symbol(s) had no usable bars: %s",
+                     len(failures), ", ".join(sorted(failures)[:8]))
+        log.info("[VOL] refreshed ATR for %d/%d tradeable symbol(s).", computed, len(symbols))
+        return computed > 0
+
+    def _atr_pct_for(self, symbol: str) -> float | None:
+        """This symbol's stored ATR, or None if there is none, it is too old,
+        or scaling is switched off.
+
+        None is the signal to use the configured threshold unchanged, so every
+        failure path here lands on the system's pre-existing behaviour."""
+        if not self.settings.enable_volatility_scaling:
+            return None
+        entry = self.volatility_state.get(symbol)
+        if not isinstance(entry, dict):
+            return None
+        value, as_of = entry.get("atr_pct"), entry.get("as_of")
+        if value is None or not as_of:
+            return None
+        try:
+            age = (date.today() - date.fromisoformat(as_of)).days
+        except ValueError:
+            return None
+        if age > self._VOLATILITY_MAX_AGE_DAYS:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            # State files are hand-editable and outlive versions. A malformed
+            # reading must fall back to the flat threshold, not raise inside
+            # an entry decision.
+            return None
+
+    def _resolved_drift_pct(self, symbol: str) -> float:
+        """The entry drift gate this symbol is actually held to."""
+        return scaled_threshold(self.settings.max_favorable_drift_pct, self._atr_pct_for(symbol))
+
+    def _resolved_veto_pct(self, symbol: str) -> float:
+        """The move that refutes an already-priced-in verdict on this symbol."""
+        return scaled_threshold(_VETO_FALSIFICATION_DRIFT_PCT, self._atr_pct_for(symbol))
 
     async def _run_daily_price_marks(self) -> bool:
         """Appends every universe symbol's last price to

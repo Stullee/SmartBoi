@@ -33,6 +33,14 @@ _STRATEGY_PARAM_KEYS = (
     "transaction_cost_profile",
     "max_favorable_drift_pct",
     "max_horizon_days",
+    # Not a percentage like the rest, and it belongs here for exactly the
+    # reason the others do: with it on, max_favorable_drift_pct stops being
+    # the threshold every name is held to and becomes the threshold a
+    # REFERENCE-volatility name is held to. The stamped number is unchanged
+    # either way, so without this key the two regimes would pool into one
+    # generation while measuring different rules -- the precise contamination
+    # this tuple exists to prevent.
+    "enable_volatility_scaling",
 )
 
 
@@ -547,6 +555,23 @@ class Settings(BaseSettings):
     # stuck forever waiting to chase an increasingly stale opportunity --
     # fresh evidence can re-signal it later with a clean baseline.
     signal_entry_deadline_days: int = 5
+    # Resize the two "has the move already happened" thresholds -- the drift
+    # gate above and engine._VETO_FALSIFICATION_DRIFT_PCT -- by how volatile
+    # each symbol actually is (see volatility.py).
+    #
+    # Both were single percentages applied identically to a $164M forging shop
+    # and a $2.6B structures supplier, which cannot mean the same thing on
+    # both. With this on, the configured percentages keep their meaning for a
+    # REFERENCE-volatility name (volatility.REFERENCE_ATR_PCT, calibrated to
+    # the middle of this universe) and are scaled within [0.5x, 2x] for
+    # everything else. A symbol with too little bar history to estimate falls
+    # back to the flat configured value, so the fallback path is exactly the
+    # behaviour this system had before the setting existed.
+    #
+    # A kill switch rather than a permanent decision: this is in
+    # _STRATEGY_PARAM_KEYS, so flipping it starts a new strategy generation
+    # and the two regimes are measured separately rather than pooled.
+    enable_volatility_scaling: bool = True
 
     # --- Paper trade journal (percentage-based stop/target -- this system
     # has no intraday bar/ATR data at a weeks-long holding horizon) ---

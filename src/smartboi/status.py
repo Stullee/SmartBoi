@@ -801,7 +801,8 @@ def gather_universe_candidates(candidates: dict, accepted: dict) -> list[dict]:
     return rows
 
 
-def snapshot_dossier(d: Dossier, snapshotted_at: str, min_sources_required: int = 0) -> dict:
+def snapshot_dossier(d: Dossier, snapshotted_at: str, min_sources_required: int = 0,
+                     atr_pct: float | None = None) -> dict:
     """One row for the daily dossier-snapshot log (logs/dossier_snapshots.jsonl,
     see engine.py's _run_daily_snapshot) -- the raw material for eventually
     validating whether confidence*magnitude predicts forward returns,
@@ -814,7 +815,15 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str, min_sources_required: int 
     `min_sources_required` is passed in rather than re-derived here: the bar
     depends on runtime settings this module has no access to, and computing it
     from a second copy of the rule is how a row comes to report a bar the gate
-    never applied (see signals.required_sources). 0 means "not supplied"."""
+    never applied (see signals.required_sources). 0 means "not supplied".
+
+    `atr_pct` is passed in for the same reason and recorded for a stronger
+    one: with volatility scaling on, two rows carrying the same score were
+    held to DIFFERENT drift and veto thresholds, and nothing else on the row
+    says by how much. Forward data cannot be backfilled, so a row written
+    without it can never be re-stamped -- nothing remembers what this symbol's
+    volatility was on the day. None means no reading was in force, which is
+    also exactly what a scaling-disabled deployment records."""
     return {
         "snapshotted_at": snapshotted_at,
         # Which scoring logic produced these numbers (see
@@ -831,6 +840,11 @@ def snapshot_dossier(d: Dossier, snapshotted_at: str, min_sources_required: int 
         "score": round(d.confidence * d.magnitude, 4),
         "independent_source_count": d.independent_source_count,
         "status": d.status,
+        # The volatility in force for this symbol on this day, and therefore
+        # the multiple its drift/veto thresholds were scaled by. None on a
+        # symbol with no reading and on a scaling-disabled deployment -- both
+        # of which mean "held to the flat configured threshold".
+        "atr_pct": None if atr_pct is None else round(atr_pct, 4),
         # The thesis-inception price baseline (see engine._capture_inception):
         # snapped when the thesis first turned directional, so joined against
         # price_marks it shows how much of the favourable move happened BEFORE

@@ -561,13 +561,40 @@ Gateway silently blocked the system's only output.
 
 Two guards then decide whether the entry happens:
 
-- **Favorable drift** (`MAX_FAVORABLE_DRIFT_PCT`, default 5%): the price
+- **Favorable drift** (`MAX_FAVORABLE_DRIFT_PCT`): the price
   the moment a dossier flips to SIGNALED is snapshotted
   (`Dossier.signaled_price`). At entry time, if the price has already
   moved this many percent in the signal's favorable direction (up for
   LONG, down for SHORT) since that snapshot, the correction likely already
   happened -- the trade is skipped rather than chasing a move that's
   largely over. Alerted once per signal, not every poll.
+
+  The bar is **per symbol, not universal** (`ENABLE_VOLATILITY_SCALING`,
+  on by default). This universe runs from SIF at a $164M cap with no
+  analyst coverage to names near the $5B ceiling, and a move that is three
+  ordinary sessions for one is a week and a half for the other -- so one
+  percentage was simultaneously too tight on the noisy name (refusing
+  entries that never had any information content) and too loose on the
+  quiet one. Each symbol's Wilder ATR is computed daily from free keyless
+  daily OHLC bars (`volatility.py`, `bars.py`), and the configured
+  percentage is resized by `ATR / REFERENCE_ATR_PCT`, clamped to
+  [0.5x, 2x].
+
+  Calibrated to **redistribute** the threshold, not loosen it:
+  `REFERENCE_ATR_PCT` is 4.0, the midpoint of the "3-5% daily vol is
+  ordinary in this universe" range the old constants were justified
+  against, so a typical name is held to exactly the number it was before.
+  True range rather than close-to-close, because the risk in a thin name
+  is mostly overnight -- a 424B5 prices after the bell and the stock opens
+  20% lower having "moved" nothing intraday.
+
+  A symbol with too little bar history, or a deployment with the setting
+  off, falls back to the flat configured percentage, so the fallback path
+  is exactly the behaviour that shipped before this existed. The switch is
+  in the strategy signature, so flipping it starts a new strategy
+  generation rather than pooling two regimes into one record. The same
+  scaling applies to the 8% that refutes an `already_priced_in` verdict
+  (`SCORING_VERSION` 11).
 - **Entry deadline** (`SIGNAL_ENTRY_DEADLINE_DAYS`, default 5): a signal
   stuck unopened this long (drift-blocked every poll, or IB briefly
   unreachable) is expired back to `ACTIVE` instead of waiting forever on an
@@ -1332,9 +1359,16 @@ and every pull request.
   -- this is the ingestion + dossier + paper-journal layer; portfolio
   construction is a natural next step once dossiers/signals prove out on
   real forward data.
-- Percentage-based stop/target for paper trades, not ATR-based -- there's
-  no intraday bar data at a weeks-long holding horizon the way TradingBot's
-  intraday strategies have.
+- The stop/target grid is still a flat percentage pair (50%/100%), not
+  ATR-based. The data limitation that used to justify this is gone --
+  `bars.py` fetches free daily OHLC with intraday extremes, and
+  `volatility.py` already turns it into a per-symbol ATR that the entry
+  drift gate and the verdict-falsification bar both use. Scaling the grid
+  too was deliberately deferred rather than forgotten: at 50%/100% under
+  `hold-to-horizon` the stop almost never binds (the horizon closes the
+  trade), so it would fork the strategy record -- both parameters are in
+  the signature -- for a rule that rarely fires. Worth revisiting if the
+  grid ever tightens.
 
 Transaction costs are market-cap-bucketed per trade (50bp/side above $1B,
 150bp $300M-$1B, 300bp below, middle bucket when no cap source is

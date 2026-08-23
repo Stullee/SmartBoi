@@ -790,7 +790,17 @@ COMPETITOR_SATISFIES_DISCLOSED_LINK = False
 # same evidence. Routing those to the trim alone would have changed nothing --
 # none of the 23 clears the bar on its trimmed score either -- which is what
 # says the gap, not the routing, was the defect.
-SCORING_VERSION = 10
+#
+# 11: the already-priced-in veto's falsification threshold is scaled by each
+# symbol's own volatility (engine._resolved_veto_pct, volatility.py) instead
+# of the flat 8% every name was held to. The bar that refutes a verdict is
+# therefore a different number per symbol -- looser on a name that routinely
+# moves 8% in a session, tighter on one that does not -- so which verdicts got
+# re-judged, and which stood, is decided by a rule v10 rows were never scored
+# under. A v10 row and a v11 row can carry the same capped score and mean
+# different things about how hard the cap was to overturn, which is what makes
+# this a boundary rather than a refinement.
+SCORING_VERSION = 11
 
 # How long a persisted synthesis verdict is honoured -- as a cap on the merge
 # path (engine._cap_with_synthesis) and as the corroboration ceiling in

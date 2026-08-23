@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -31,8 +31,10 @@ from smartboi.graph import Relationship
 from tests.conftest import fixture_date as _fx
 
 from smartboi.news import NewsArticle
+from smartboi.volatility import REFERENCE_ATR_PCT
 
 from tests.fakes import (
+    FakeBarClient,
     FakeEdgarClient,
     FakeExtractor,
     FakeFinnhub,
@@ -95,6 +97,11 @@ def engine(tmp_path, monkeypatch):
     e.updater = FakeUpdater()
     e.skeptic = FakeSkeptic()
     e.price_feed = FakePriceFeed()
+    # No bar provider: the volatility pass is inert, exactly as it is on a
+    # deployment with scaling switched off. Tests that want a resolved
+    # threshold seed engine.volatility_state directly (see the volatility
+    # section below) rather than reaching for a network.
+    e.bars = None
     return e
 
 
@@ -4038,3 +4045,250 @@ async def test_a_web_sighting_never_helps_clear_the_auto_accept_bar(engine):
                                   "ticker": "SVT", "researched_only": True})
 
     assert engine._filing_seen_count(engine.candidates.get("SVT")) == 1
+
+
+# --- Volatility-scaled drift thresholds ------------------------------------
+#
+# The entry gate and the veto-falsification check were single percentages
+# applied identically across a universe spanning a $164M forging shop and a
+# $2.6B structures supplier. Both are now resized per symbol (volatility.py);
+# these cover the wiring, not the math, which test_volatility.py owns.
+#
+# The engine fixture ships e.bars = None, so the pass is inert and the ATR
+# cache is seeded directly -- no test here reaches for a network.
+
+def _seed_atr(engine, symbol: str, atr: float, as_of: date | None = None) -> None:
+    engine.volatility_state.set(symbol, {
+        "atr_pct": atr,
+        "as_of": (as_of or date.today()).isoformat(),
+        "bars": 60,
+    })
+
+
+async def test_a_volatile_name_is_given_more_room_before_the_drift_gate_fires(engine):
+    """The whole point: the fixture pins max_favorable_drift_pct at 5%, and a
+    name whose ordinary session is twice the reference must not have a 6% move
+    read as "the correction already happened"."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    _seed_atr(engine, "FORM", REFERENCE_ATR_PCT * 2)      # scale 2.0 -> 10% gate
+
+    dossier = await _signal_form(engine)
+    assert dossier.status == "SIGNALED"
+    engine.price_feed.prices["FORM"] = 10.6               # +6%: over 5%, under 10%
+    await engine._mark_and_execute()
+
+    assert engine.journal.has_open("FORM"), "a 6% move on a 2x-ATR name should still open"
+
+
+async def test_a_quiet_name_is_held_to_a_tighter_gate(engine):
+    """The other direction, which is the half that actually refuses trades:
+    the same 4% move that would pass unscaled is a skip on a calm name."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    _seed_atr(engine, "FORM", REFERENCE_ATR_PCT * 0.5)    # scale 0.5 -> 2.5% gate
+
+    await _signal_form(engine)
+    engine.price_feed.prices["FORM"] = 10.4               # +4%: under 5%, over 2.5%
+    await engine._mark_and_execute()
+
+    assert not engine.journal.has_open("FORM")
+
+
+async def test_an_unscaled_symbol_is_held_to_exactly_the_configured_gate(engine):
+    """The fallback path is the system's pre-existing behaviour, so a symbol
+    with no ATR reading behaves precisely as it did before this existed."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    assert engine._atr_pct_for("FORM") is None
+    assert engine._resolved_drift_pct("FORM") == pytest.approx(engine.settings.max_favorable_drift_pct)
+
+    await _signal_form(engine)
+    engine.price_feed.prices["FORM"] = 10.6               # +6%, over the flat 5%
+    await engine._mark_and_execute()
+
+    assert not engine.journal.has_open("FORM")
+
+
+async def test_the_drift_skip_row_records_the_limit_it_was_measured_against(engine):
+    """Same argument as SignalEvent.threshold_in_force: a forward record whose
+    admission criterion is unknown per row cannot be partitioned later, and
+    drift-skips are exactly what event_study.py re-examines."""
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    _seed_atr(engine, "FORM", REFERENCE_ATR_PCT * 0.5)    # 2.5% gate
+
+    await _signal_form(engine)
+    engine.price_feed.prices["FORM"] = 10.4
+    await engine._mark_and_execute()
+
+    rows = [json.loads(line) for line in
+            (Path(engine.settings.log_dir) / "decisions.jsonl").read_text().splitlines()]
+    skip = next(r for r in rows if r["event"] == "drift_skip")
+    assert "limit 2.5%" in skip["reason"]
+
+
+def test_scaling_off_ignores_a_stored_reading_entirely(tmp_path, monkeypatch):
+    """The kill switch has to actually kill it -- including for a deployment
+    that accumulated readings before the operator turned it off."""
+    monkeypatch.chdir(tmp_path)
+    e = Engine(Settings(_env_file=None, symbols="FORM", enable_dashboard=False,
+                        enable_universe_autoscreen=False, enable_volatility_scaling=False))
+    _seed_atr(e, "FORM", REFERENCE_ATR_PCT * 2)
+
+    assert e.bars is None, "no client is constructed, so the pass cannot run"
+    assert e._atr_pct_for("FORM") is None
+    assert e._resolved_drift_pct("FORM") == pytest.approx(e.settings.max_favorable_drift_pct)
+
+
+async def test_a_stale_reading_falls_back_rather_than_being_trusted(engine):
+    """Volatility is persistent, so a reading from a few sessions ago is still
+    informative -- but one from a quarter ago describes a regime the thesis
+    will never see. Past the cutoff it must stop counting."""
+    _seed_atr(engine, "FORM", REFERENCE_ATR_PCT * 2,
+              as_of=date.today() - timedelta(days=engine._VOLATILITY_MAX_AGE_DAYS + 1))
+    assert engine._atr_pct_for("FORM") is None
+
+    _seed_atr(engine, "FORM", REFERENCE_ATR_PCT * 2,
+              as_of=date.today() - timedelta(days=engine._VOLATILITY_MAX_AGE_DAYS - 1))
+    assert engine._atr_pct_for("FORM") == pytest.approx(REFERENCE_ATR_PCT * 2)
+
+
+async def test_a_corrupt_reading_falls_back_instead_of_raising(engine):
+    """State files are hand-editable and survive across versions. A malformed
+    entry must degrade to the flat threshold, not take down an entry decision."""
+    for junk in ({"atr_pct": None, "as_of": "2026-08-01"},
+                 {"atr_pct": 5.0, "as_of": "not-a-date"},
+                 {"atr_pct": "not-a-number", "as_of": date.today().isoformat()},
+                 {"atr_pct": 5.0},
+                 "not-a-dict"):
+        engine.volatility_state.set("FORM", junk)
+        assert engine._atr_pct_for("FORM") is None
+        assert engine._resolved_drift_pct("FORM") == pytest.approx(
+            engine.settings.max_favorable_drift_pct)
+
+
+async def test_the_veto_falsification_bar_is_scaled_too(engine):
+    """A1: the 8% that refutes an already-priced-in verdict is a volatility
+    estimate in disguise (engine's own comment says so), so it scales with the
+    same reading the entry gate uses."""
+    _seed_atr(engine, "FORM", REFERENCE_ATR_PCT * 2)
+    assert engine._resolved_veto_pct("FORM") == pytest.approx(16.0)
+    assert engine._resolved_veto_pct("UCTT") == pytest.approx(8.0)   # no reading -> flat
+
+
+# --- The daily volatility refresh pass --------------------------------------
+
+def _flat_bars(n: int, price: float = 100.0, range_pct: float = 4.0):
+    from smartboi.bars import DailyBar
+    half = price * range_pct / 200.0
+    return [DailyBar(date=f"2026-06-{i % 28 + 1:02d}", open=price,
+                     high=price + half, low=price - half, close=price)
+            for i in range(n)]
+
+
+async def test_the_refresh_pass_stores_an_atr_per_tradeable(engine):
+    engine.bars = FakeBarClient({"FORM": _flat_bars(60), "UCTT": _flat_bars(60, range_pct=8.0)})
+
+    assert await engine._run_daily_volatility_refresh() is True
+    assert engine._atr_pct_for("FORM") == pytest.approx(4.0, abs=0.01)
+    assert engine._atr_pct_for("UCTT") == pytest.approx(8.0, abs=0.01)
+
+
+async def test_the_refresh_pass_does_not_fetch_anchors(engine):
+    """An anchor is never a trade target, so no threshold is ever resolved for
+    it. This universe is mostly anchors -- fetching them would be a request a
+    day each for a number nothing reads."""
+    engine.bars = FakeBarClient({"FORM": _flat_bars(60)})
+    await engine._run_daily_volatility_refresh()
+
+    assert engine.bars.requested == [["FORM", "UCTT"]]     # INTC is the anchor
+    assert "INTC" not in engine.bars.requested[0]
+
+
+async def test_one_unfetchable_symbol_does_not_cost_the_others_their_refresh(engine):
+    engine.bars = FakeBarClient({"FORM": _flat_bars(60)})   # UCTT missing
+
+    assert await engine._run_daily_volatility_refresh() is True
+    assert engine._atr_pct_for("FORM") is not None
+    assert engine._atr_pct_for("UCTT") is None
+
+
+async def test_a_symbol_that_briefly_cannot_be_priced_keeps_its_last_reading(engine):
+    """A single bad fetch must not snap a name back to the flat threshold --
+    that is what the staleness cutoff is for, and it is measured in days."""
+    engine.bars = FakeBarClient({"FORM": _flat_bars(60, range_pct=8.0)})
+    await engine._run_daily_volatility_refresh()
+    assert engine._atr_pct_for("FORM") == pytest.approx(8.0, abs=0.01)
+
+    engine.bars = FakeBarClient({})                          # provider drops FORM
+    await engine._run_daily_volatility_refresh()
+    assert engine._atr_pct_for("FORM") == pytest.approx(8.0, abs=0.01)
+
+
+async def test_a_pass_that_computes_nothing_is_a_failure_so_it_retries(engine):
+    """Returning False leaves the pass due; the caller then applies the retry
+    backoff rather than marking a lost day done."""
+    engine.bars = FakeBarClient({})
+    assert await engine._run_daily_volatility_refresh() is False
+
+
+async def test_too_little_history_yields_no_reading_rather_than_a_guess(engine):
+    engine.bars = FakeBarClient({"FORM": _flat_bars(5)})
+    assert await engine._run_daily_volatility_refresh() is False
+    assert engine._atr_pct_for("FORM") is None
+
+
+async def test_a_hung_provider_costs_one_pass_not_the_tick(engine, monkeypatch):
+    """The engine is a SINGLE task: ingestion, scoring, signalling and entry
+    evaluation all wait behind this pass. A provider that accepts a connection
+    and never answers must be abandoned, not waited on."""
+    monkeypatch.setattr(smartboi.engine, "_VOLATILITY_PASS_BUDGET_SEC", 0.05)
+    engine.bars = FakeBarClient(hang=True)
+
+    assert await engine._run_daily_volatility_refresh() is False
+
+
+async def test_a_provider_that_raises_degrades_to_flat_thresholds(engine):
+    """The failure mode of this pass is "thresholds stay flat", which is the
+    behaviour the system had before it existed -- so it must degrade, never
+    propagate into the tick."""
+    class Exploding(FakeBarClient):
+        async def bars_for_all(self, symbols, start_date, end_date):
+            raise RuntimeError("provider on fire")
+
+    engine.bars = Exploding()
+    assert await engine._run_daily_volatility_refresh() is False
+    assert engine._resolved_drift_pct("FORM") == pytest.approx(engine.settings.max_favorable_drift_pct)
+
+
+async def test_the_daily_snapshot_records_the_volatility_in_force(engine):
+    """Two rows carrying the same score were held to different drift and veto
+    thresholds, and nothing else on the row says by how much. Forward data
+    cannot be backfilled, so a row written without it can never be
+    re-stamped -- nothing remembers what this symbol's volatility was that
+    day."""
+    engine.bars = FakeBarClient({"FORM": _flat_bars(60, range_pct=7.0)})
+    await engine._run_daily_volatility_refresh()
+    await _signal_form(engine)
+
+    engine._run_daily_snapshot()
+
+    rows = [json.loads(line) for line in
+            (Path(engine.settings.log_dir) / "dossier_snapshots.jsonl").read_text().splitlines()]
+    form = next(r for r in rows if r["symbol"] == "FORM")
+    assert form["atr_pct"] == pytest.approx(7.0, abs=0.01)
+    # UCTT had no bars, so it was held to the flat threshold -- recorded as
+    # None rather than as a number nothing measured.
+    uctt = next((r for r in rows if r["symbol"] == "UCTT"), None)
+    if uctt is not None:
+        assert uctt["atr_pct"] is None
+
+
+async def test_a_recovered_symbol_stops_being_reported_as_failing(engine):
+    """BarClient accumulates `failures` across calls and never clears them --
+    correct for the one-shot use in scripts/backtest_trades.py, wrong for a
+    client the engine owns for the process lifetime."""
+    engine.bars = FakeBarClient({"FORM": _flat_bars(60)})       # UCTT fails
+    await engine._run_daily_volatility_refresh()
+    assert "UCTT" in engine.bars.failures
+
+    engine.bars.bars_by_symbol["UCTT"] = _flat_bars(60)         # UCTT recovers
+    await engine._run_daily_volatility_refresh()
+    assert engine.bars.failures == {}
