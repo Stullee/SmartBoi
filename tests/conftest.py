@@ -41,8 +41,25 @@ import pytest
 # below 2026-08-11. Each era slides as a block, so the spacing INSIDE it --
 # which is what the decay, dedup and ordering assertions actually read -- is
 # exactly what it was the day the test was written. Each era's newest day
-# lands on YESTERDAY rather than today, so a fixture carrying a wall-clock
+# lands in the PAST rather than today, so a fixture carrying a wall-clock
 # time can never be dated into the future on a run before that hour.
+#
+# The slide is WEEK-ALIGNED (a whole number of weeks, so every fixture keeps
+# its weekday). Sliding by raw calendar days did not, and that silently broke
+# the price fixtures: the era-2 dates were written as trading sessions
+# (2026-08-04..08-11, Tue..Tue), and on a run where the raw slide happened to
+# land them on a Saturday, market_hours.session_for_quote folded each weekend
+# mark back onto the preceding Friday. Two marks then collapsed onto one
+# session, the series the assertions read lost days, and the suite went red on
+# a Sunday having been green on the Friday -- the exact wall-clock-dependent
+# failure this helper exists to prevent, one layer down. Preserving the
+# weekday preserves trading-day-ness, which is what every price, session and
+# forward-return fixture is actually pinned to.
+#
+# The cost is that an era's newest day now lands 1-7 days back instead of
+# always exactly 1. That is well inside the 14-day floor in
+# dossier.evidence_is_stale (_MIN_STALE_DAYS), so nothing that asserts an item
+# is still fresh comes near the boundary.
 #
 # Tests that want stale evidence already ask for it in relative terms
 # (now - timedelta(...)). Those are deliberate and do not go through here.
@@ -57,8 +74,11 @@ def fixture_date(stamp: str) -> str:
     day, sep, clock = stamp.partition("T")
     day = date.fromisoformat(day)
     era = next(e for e in _FIXTURE_ERAS if e >= day)
-    return ((datetime.now(timezone.utc).date() - timedelta(days=1))
-            - (era - day)).isoformat() + sep + clock
+    # The latest day on or before yesterday sharing the era's weekday: a whole
+    # number of weeks back, so `day` keeps its own weekday too.
+    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+    anchor = yesterday - timedelta(days=(yesterday - era).days % 7)
+    return (anchor - (era - day)).isoformat() + sep + clock
 
 
 @pytest.fixture(autouse=True)
