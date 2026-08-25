@@ -2934,10 +2934,14 @@ def test_graph_refresh_requeues_the_least_recently_extracted_symbols(engine):
 
     assert engine._run_graph_refresh() == 2
 
-    # The two stalest markers are cleared -- backfill re-reads them next tick.
-    assert engine.backfill_state.get("FORM") is None
-    assert engine.backfill_state.get("UCTT") is None
-    assert engine.backfill_state.get("INTC") is not None
+    # The two stalest are queued -- backfill re-reads them next tick -- but
+    # they REMEMBER when they were last read. Deleting the marker also made
+    # them due, and also erased that, so a re-queued symbol was reported as
+    # never-extracted for as long as extraction stayed broken.
+    assert engine._backfill_due("FORM") and engine._backfill_due("UCTT")
+    assert not engine._backfill_due("INTC")
+    assert engine.backfill_state.get("FORM")["backfilled_at"] == "2026-01-01T00:00:00+00:00"
+    assert engine.backfill_state.get("UCTT")["backfilled_at"] == "2026-06-01T00:00:00+00:00"
 
 
 def test_graph_refresh_includes_anchors(engine):
@@ -2950,7 +2954,7 @@ def test_graph_refresh_includes_anchors(engine):
 
     engine._run_graph_refresh()
 
-    assert engine.backfill_state.get("INTC") is None
+    assert engine._backfill_due("INTC")
 
 
 def test_graph_refresh_skips_symbols_already_pending(engine):
@@ -2982,12 +2986,12 @@ async def test_graph_refresh_runs_once_a_day_from_the_tick(engine):
     _mark_backfilled(engine, "UCTT", "2026-06-01T00:00:00+00:00")
 
     await engine._tick()
-    assert engine.backfill_state.get("FORM") is None      # stalest was re-queued
+    assert engine._backfill_due("FORM")                   # stalest was re-queued
     assert not engine._daily_pass_due("graph_refresh")
 
     # A second tick the same day must not queue another batch.
     await engine._tick()
-    assert engine.backfill_state.get("UCTT") is not None
+    assert not engine._backfill_due("UCTT")
 
 
 async def test_auto_supplier_research_failure_never_kills_the_tick(engine, monkeypatch):
@@ -4038,3 +4042,110 @@ async def test_a_web_sighting_never_helps_clear_the_auto_accept_bar(engine):
                                   "ticker": "SVT", "researched_only": True})
 
     assert engine._filing_seen_count(engine.candidates.get("SVT")) == 1
+
+
+# --- The oriented channel reaches the grader ----------------------------
+#
+# linked_symbols walks edges in BOTH directions, so the same (origin, target)
+# pair has opposite roles depending on which way the stored edge points. These
+# two differ ONLY in the edge orientation and must produce opposite roles.
+
+async def test_the_grader_is_told_the_origin_is_a_customer(engine):
+    """Edge FORM->INTC customer == 'INTC is a customer of FORM'. News about
+    INTC reaching FORM's dossier is a CUSTOMER's news."""
+    engine.graph.add(Relationship("FORM", "INTC", "customer",
+                                  "Intel is a major customer", "test", 0.9, _fx("2026-07-23")))
+    engine.updater.default = proposal()
+    engine.skeptic.default = verdict(refuted=False)
+
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="Intel news", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
+    )
+    call = next(c for c in engine.updater.calls if c["symbol"] == "FORM")
+    assert call["relationship_role"] == "a CUSTOMER of"
+
+
+async def test_the_grader_is_told_the_origin_is_a_supplier_when_the_edge_points_the_other_way(engine):
+    """Edge INTC->FORM customer == 'FORM is a customer of INTC', so INTC is
+    the SUPPLIER. Same origin, same target, mirrored edge, mirrored role --
+    this is the case a raw rel_type passthrough would get backwards."""
+    engine.graph.add(Relationship("INTC", "FORM", "customer",
+                                  "FORM is a major customer", "test", 0.9, _fx("2026-07-23")))
+    engine.updater.default = proposal()
+    engine.skeptic.default = verdict(refuted=False)
+
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="Intel news", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
+    )
+    call = next(c for c in engine.updater.calls if c["symbol"] == "FORM")
+    assert call["relationship_role"] == "a SUPPLIER to"
+
+
+async def test_the_stored_relationship_type_is_not_re_oriented(engine):
+    """relationship_role is for the prompt only. The record keeps the RAW
+    edge type, because _link_type_corroborates and every stored dossier read
+    it that way -- re-orienting it would change the meaning of history."""
+    engine.graph.add(Relationship("INTC", "FORM", "competitor",
+                                  "named competitor", "test", 0.9, _fx("2026-07-23")))
+    engine.updater.default = proposal()
+    engine.skeptic.default = verdict(refuted=False)
+
+    await engine._process_evidence(
+        origin_symbol="INTC", evidence_text="Intel news", source_type="news",
+        source_name="reuters.com", url="https://x/1", headline="h1", published_at=_fx("2026-07-23"),
+    )
+    record = engine.dossiers.load("FORM").evidence[-1]
+    assert record.relationship_type == "competitor"
+
+
+async def test_direct_evidence_carries_no_role(engine):
+    engine.updater.default = proposal()
+    engine.skeptic.default = verdict(refuted=False)
+
+    await engine._process_evidence(
+        origin_symbol="FORM", evidence_text="FORM news", source_type="news",
+        source_name="reuters.com", url="https://x/2", headline="h2", published_at=_fx("2026-07-23"),
+    )
+    call = next(c for c in engine.updater.calls if c["symbol"] == "FORM")
+    assert call["relationship_role"] == ""
+
+
+def test_a_requeued_symbol_keeps_its_extraction_history(engine):
+    _mark_backfilled(engine, "FORM", "2026-01-01T00:00:00+00:00")
+
+    engine._request_reextraction("FORM")
+
+    marker = engine.backfill_state.get("FORM")
+    assert engine._backfill_due("FORM")                              # queued
+    assert marker["backfilled_at"] == "2026-01-01T00:00:00+00:00"    # and remembered
+    assert marker["refresh_requested"] is True
+
+
+def test_a_second_refresh_does_not_re_queue_what_is_already_queued(engine):
+    """The marker keeps its old stamp, so it still sorts as the stalest thing
+    on the board. Without an explicit skip it would win a slot every single
+    day and the rest of the universe would never rotate."""
+    engine.settings.graph_refresh_symbols_per_day = 1
+    _mark_backfilled(engine, "FORM", "2026-01-01T00:00:00+00:00")   # stalest
+    _mark_backfilled(engine, "UCTT", "2026-06-01T00:00:00+00:00")
+
+    assert engine._run_graph_refresh() == 1
+    assert engine.backfill_state.get("FORM")["refresh_requested"] is True
+
+    # Second day, FORM still un-read: the slot must go to UCTT instead.
+    assert engine._run_graph_refresh() == 1
+    assert engine.backfill_state.get("UCTT")["refresh_requested"] is True
+
+
+def test_a_successful_re_extraction_clears_the_queue_flag(engine):
+    _mark_backfilled(engine, "FORM", "2026-01-01T00:00:00+00:00")
+    engine._request_reextraction("FORM")
+
+    # What the backfill writes on success -- a whole-marker replace.
+    engine.backfill_state.set("FORM", {"backfilled_at": "2026-08-25T00:00:00+00:00",
+                                       "accession": "0001", "filing_date": "2026-08-24"})
+
+    assert not engine._backfill_due("FORM")
+    assert "refresh_requested" not in engine.backfill_state.get("FORM")

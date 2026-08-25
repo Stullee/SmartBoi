@@ -671,3 +671,28 @@ def test_a_ledger_of_only_archived_rows_reports_no_record_rather_than_zero_perce
     assert stats.closed == 0
     assert stats.win_rate == 0.0
     assert stats.archived == 1
+
+
+def test_a_requeued_symbol_still_reports_its_real_extraction_age(tmp_path):
+    """The rolling refresh used to DELETE the marker to re-queue a symbol,
+    which also erased the record that its filing had ever been read. While
+    extraction was broken the marker never came back, so 36 recently-read
+    symbols reported as "never extracted" and the graph looked far emptier
+    than it was. The queue flag now rides alongside the stamp."""
+    from smartboi.dossier import DossierStore
+    from smartboi.status import gather_graph_health
+    from smartboi.universe import CompanySpec
+
+    graph = RelationshipGraph(tmp_path / "g.json")
+    universe = [CompanySpec("A", "A", "x"), CompanySpec("B", "B", "x")]
+    recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    state = {
+        "A": {"backfilled_at": recent, "refresh_requested": True},  # queued, but read 2d ago
+        "B": {},                                                    # genuinely never read
+    }
+
+    h = gather_graph_health(graph, universe, DossierStore(tmp_path / "d"),
+                            backfill_state=state, refresh_per_day=10)
+
+    assert h["never_extracted"] == 1               # B only
+    assert 1 < h["stalest_days"] < 3               # A's real age, not "unknown"

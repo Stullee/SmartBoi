@@ -68,7 +68,7 @@ from smartboi.federal_register import (
     FederalRegisterClient,
 )
 from smartboi.llm import LLMTrace
-from smartboi.graph import REL_TYPES, RelationshipExtractor, RelationshipGraph, Relationship
+from smartboi.graph import REL_TYPES, RelationshipExtractor, RelationshipGraph, Relationship, link_role
 from smartboi.news import FinnhubClient
 from smartboi.paper_journal import PaperTradeJournal, cost_bps_per_side_for_cap
 from smartboi.prices import PriceBar, ReadOnlyPriceFeed
@@ -2707,6 +2707,21 @@ class Engine:
 
     # --- One-time relationship backfill ---
 
+    def _request_reextraction(self, symbol: str) -> None:
+        """Queue `symbol`'s filing to be read again, WITHOUT forgetting that it
+        was ever read.
+
+        The marker doubles as the queue (absent == pending), so deleting it was
+        the obvious way to re-queue. It also erased `backfilled_at`, and when
+        extraction is failing the marker never comes back -- which is how a
+        healthy, recently-extracted universe came to report 37 symbols as
+        "never extracted" while the real figure was one."""
+        marker = self.backfill_state.get(symbol)
+        marker = dict(marker) if isinstance(marker, dict) else {}
+        marker["refresh_requested"] = True
+        marker["refresh_requested_at"] = datetime.now(timezone.utc).isoformat()
+        self.backfill_state.set(symbol, marker)
+
     def _backfill_due(self, symbol: str) -> bool:
         """Whether this symbol's 10-K still needs reading.
 
@@ -2717,7 +2732,17 @@ class Engine:
         marker = self.backfill_state.get(symbol)
         if not marker:
             return True
-        if not isinstance(marker, dict) or not marker.get("error"):
+        if not isinstance(marker, dict):
+            return False
+        # An explicit re-extraction request, which the rolling refresh writes
+        # INSTEAD of deleting the marker. Deleting it made the symbol due by
+        # erasing it, which worked, but it also destroyed the record that the
+        # filing had ever been read -- so a re-queued symbol became
+        # indistinguishable from one that was never extracted at all, and the
+        # graph-health readout reported both as "never extracted".
+        if marker.get("refresh_requested"):
+            return True
+        if not marker.get("error"):
             return False
         try:
             last = datetime.fromisoformat(str(marker.get("last_attempt_at") or ""))
@@ -2873,6 +2898,12 @@ class Engine:
                 # will read it regardless, so spending a refresh slot on it
                 # would just displace a symbol that has actually gone stale.
                 continue
+            if isinstance(marker, dict) and marker.get("refresh_requested"):
+                # Already queued by an earlier refresh and not yet re-read.
+                # It keeps its old stamp so the readout stays honest, which
+                # means it would otherwise still sort as stale and be
+                # re-selected every day, burning the slot on a no-op.
+                continue
             stamp = marker.get("backfilled_at", "") if isinstance(marker, dict) else ""
             dated.append((stamp, spec.symbol))
         if not dated:
@@ -2883,7 +2914,7 @@ class Engine:
         dated.sort()
         selected = [symbol for _, symbol in dated[:limit]]
         for symbol in selected:
-            self.backfill_state.delete(symbol)
+            self._request_reextraction(symbol)
         # A previous budget-exhausted backfill may have backed off; this is a
         # fresh day's work, so let the next tick try immediately.
         self._backfill_retry_after = 0.0
@@ -3129,7 +3160,7 @@ class Engine:
         # check below cannot be what protects it. This is.
         is_regulator = origin_symbol in REGULATOR_SYMBOLS
         if not is_regulator and (origin_spec is None or not origin_spec.signal_source_only):
-            targets.append((origin_symbol, "", None, ""))
+            targets.append((origin_symbol, "", None, "", ""))
 
         now = time.monotonic()
         throttled = 0
@@ -3154,7 +3185,13 @@ class Engine:
                 throttled += 1
                 continue
             propagation_keys[linked_symbol] = key
-            targets.append((linked_symbol, rel.description, rel.confidence, rel.rel_type))
+            # link_role is oriented: what the ORIGIN is to the TARGET, which is
+            # the mirror of rel_type whenever the edge was traversed backwards.
+            # rel.rel_type itself is passed through UNCHANGED -- it is what gets
+            # stored on the record and read by _link_type_corroborates, and
+            # re-orienting that would change the meaning of stored history.
+            targets.append((linked_symbol, rel.description, rel.confidence, rel.rel_type,
+                            link_role(rel, origin_symbol)))
         # Ecosystem fallback: only for an origin with NO disclosed link to
         # any tradeable at all. A disclosed contractual relationship is
         # strictly better evidence, so this never runs alongside one and
@@ -3182,7 +3219,9 @@ class Engine:
                     ECOSYSTEM_LINK_CONFIDENCE,
                     # Not a REL_TYPES kind at all -- sector co-membership, no
                     # graph edge behind it. Left empty rather than borrowing a
-                    # real type it does not have.
+                    # real type it does not have, and with no oriented role for
+                    # the same reason.
+                    "",
                     "",
                 ))
 
@@ -3219,11 +3258,13 @@ class Engine:
             return True
 
         all_definitive = True
-        for target_symbol, relationship_note, relationship_confidence, relationship_type in targets:
+        for (target_symbol, relationship_note, relationship_confidence,
+             relationship_type, relationship_role) in targets:
             outcome = await self._update_dossier(
                 target_symbol, evidence_text, origin_symbol, relationship_note, relationship_confidence,
                 source_type, source_name, url, headline, published_at,
                 relationship_type=relationship_type,
+                relationship_role=relationship_role,
             )
             # Only a target handled fresh THIS pass consumes a cooldown
             # slot -- "already" means an earlier, partially-deferred pass
@@ -3379,6 +3420,7 @@ class Engine:
         headline: str,
         published_at: str,
         relationship_type: str = "",
+        relationship_role: str = "",
     ) -> str:
         """Outcome of folding one evidence item into one dossier:
         "handled"  -- definitively handled fresh this pass (merged, judged
@@ -3407,6 +3449,7 @@ class Engine:
             raw = await self.updater.propose_update(
                 dossier, evidence_text, origin_symbol, relationship_note, relationship_confidence,
                 ecosystem=target_spec.ecosystem if target_spec is not None else "",
+                relationship_role=relationship_role,
             )
             if raw is None:
                 return "deferred"  # transient LLM failure or budget exhausted -- retry later
@@ -4942,7 +4985,7 @@ class Engine:
         touched."""
         pending = [s.symbol for s in self.universe if not s.signal_source_only]
         for symbol in pending:
-            self.backfill_state.delete(symbol)
+            self._request_reextraction(symbol)
         self._backfill_retry_after = 0.0
         log.warning("[GRAPH] Queued %d tradeable symbol(s) for relationship re-extraction against the "
                     "current %d-symbol universe. Edges are only ever added, never removed.",

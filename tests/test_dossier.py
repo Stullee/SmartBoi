@@ -1099,3 +1099,86 @@ def test_stale_evidence_does_not_keep_offering_its_label():
                             "published_at": (NOW - timedelta(days=400)).isoformat()})
     d = _scored([old])
     assert fact_keys_on(d, NOW) == []
+
+
+# --- The propagation line the grader actually reads ----------------------
+#
+# Nothing exercised the real DossierUpdater prompt before this. The system
+# prompt promises "its customer, supplier, competitor, or regulator; you'll be
+# told which" and the Tier 2 rubric prices a competitor's capacity loss as good
+# news HERE -- but only the free-text description was ever sent, so neither
+# could fire on anything the prose did not happen to state.
+
+class _CapturingMessages:
+    def __init__(self, outer):
+        self._outer = outer
+
+    async def create(self, **kwargs):
+        self._outer.kwargs = kwargs
+        raise RuntimeError("prompt captured -- no response needed")
+
+
+class _CapturingClient:
+    def __init__(self):
+        self.kwargs = None
+        self.messages = _CapturingMessages(self)
+
+    async def close(self):
+        pass
+
+
+async def _capture_prompt(**call_kwargs) -> str:
+    """Run propose_update far enough to build the prompt, and return it."""
+    from smartboi.dossier import Dossier, DossierUpdater
+    from smartboi.usage import UsageTracker
+    import tempfile
+    import pathlib
+
+    with tempfile.TemporaryDirectory() as tmp:
+        usage = UsageTracker(pathlib.Path(tmp) / "u.json", daily_call_budget=100)
+        updater = DossierUpdater.__new__(DossierUpdater)
+        client = _CapturingClient()
+        updater._client = client
+        updater._model = "claude-haiku-4-5"
+        updater._usage = usage
+        updater._trace = None
+        await updater.propose_update(Dossier(symbol="FORM"), "evidence body", **call_kwargs)
+    assert client.kwargs is not None, "the call never reached messages.create"
+    return client.kwargs["messages"][0]["content"]
+
+
+async def test_the_channel_is_named_to_the_grader_for_a_linked_company():
+    prompt = await _capture_prompt(
+        origin_symbol="INTC", relationship_note="Intel is a major customer",
+        relationship_confidence=0.95, relationship_role="a CUSTOMER of",
+    )
+    assert "INTC is a CUSTOMER of FORM." in prompt
+    assert "Intel is a major customer" in prompt
+
+
+async def test_the_named_channel_follows_the_edge_orientation():
+    """Same origin and target, mirrored role: the prompt must say what
+    link_role computed, not the raw stored rel_type."""
+    prompt = await _capture_prompt(
+        origin_symbol="INTC", relationship_note="FORM is a customer of Intel",
+        relationship_confidence=0.95, relationship_role="a SUPPLIER to",
+    )
+    assert "INTC is a SUPPLIER to FORM." in prompt
+    assert "CUSTOMER" not in prompt.split("New evidence:")[0].replace("customer", "")
+
+
+async def test_direct_evidence_names_no_channel():
+    prompt = await _capture_prompt(origin_symbol="FORM", relationship_note="")
+    assert "This evidence is about FORM directly." in prompt
+    assert " is a " not in prompt.split("Sector context")[0].split("New evidence:")[0]
+
+
+async def test_an_unroled_link_still_renders_the_description():
+    """Ecosystem association carries no role; the line must not read
+    'INTC is  FORM.'"""
+    prompt = await _capture_prompt(
+        origin_symbol="INTC", relationship_note="both in the semi_equipment ecosystem",
+        relationship_confidence=0.3, relationship_role="",
+    )
+    assert "both in the semi_equipment ecosystem" in prompt
+    assert "INTC is  FORM" not in prompt

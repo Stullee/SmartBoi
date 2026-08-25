@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from smartboi.graph import Relationship, RelationshipGraph
+from smartboi.graph import Relationship, RelationshipGraph, link_role
 
 
 def _rel(from_sym="UCTT", to_sym="AMAT", rel_type="customer"):
@@ -265,3 +265,59 @@ def test_every_llm_call_site_reports_its_failures_to_the_breaker():
     assert {p.name for p in callers} == {"dossier.py", "graph.py", "skeptic.py", "research.py"}
     missing = [p.name for p in callers if "note_failure(" not in p.read_text()]
     assert not missing, f"LLM call sites that never trip the breaker: {missing}"
+
+
+# --- link_role: the oriented channel name -------------------------------
+#
+# rel_type states what to_symbol IS to from_symbol, but linked_symbols walks
+# every edge in BOTH directions. These pin the mirror, because getting it
+# backwards feeds the grader a supplier's news labelled as a customer's.
+
+def test_link_role_reads_the_edge_forwards_for_the_to_symbol():
+    """Edge UCTT->AMAT customer means 'AMAT is a customer of UCTT'."""
+    rel = _rel("UCTT", "AMAT", "customer")
+    assert link_role(rel, "AMAT") == "a CUSTOMER of"
+
+
+def test_link_role_mirrors_the_edge_for_the_from_symbol():
+    """Same edge, other end: if AMAT is UCTT's customer, UCTT is AMAT's
+    supplier. This is the case that inverts, and the one that matters."""
+    rel = _rel("UCTT", "AMAT", "customer")
+    assert link_role(rel, "UCTT") == "a SUPPLIER to"
+
+
+def test_link_role_covers_both_orientations_of_every_type():
+    expected = {
+        # rel_type:     (what to_symbol is,    what from_symbol is)
+        "customer":     ("a CUSTOMER of",      "a SUPPLIER to"),
+        "supplier":     ("a SUPPLIER to",      "a CUSTOMER of"),
+        "competitor":   ("a COMPETITOR of",    "a COMPETITOR of"),
+        "regulator":    ("a REGULATOR of",     "REGULATED BY"),
+    }
+    for rel_type, (to_role, from_role) in expected.items():
+        rel = _rel("AAA", "BBB", rel_type)
+        assert link_role(rel, "BBB") == to_role, rel_type
+        assert link_role(rel, "AAA") == from_role, rel_type
+
+
+def test_link_role_is_symmetric_only_for_competitor():
+    """A competitor edge reads the same from either end; nothing else does.
+    If this ever fails, some type's mirror has been made an identity."""
+    for rel_type in ("customer", "supplier", "regulator"):
+        rel = _rel("AAA", "BBB", rel_type)
+        assert link_role(rel, "AAA") != link_role(rel, "BBB"), rel_type
+    comp = _rel("AAA", "BBB", "competitor")
+    assert link_role(comp, "AAA") == link_role(comp, "BBB")
+
+
+def test_link_role_is_empty_for_a_stranger_or_an_unknown_type():
+    assert link_role(_rel("UCTT", "AMAT", "customer"), "NVDA") == ""
+    assert link_role(_rel("UCTT", "AMAT", "ecosystem"), "AMAT") == ""
+
+
+def test_link_role_composes_into_a_true_sentence_both_ways():
+    """The phrase completes '<subject> is ___ <other>'. Both readings of one
+    edge have to be true statements about the same world."""
+    rel = _rel("UCTT", "AMAT", "customer")  # AMAT is a customer of UCTT
+    assert f"AMAT is {link_role(rel, 'AMAT')} UCTT" == "AMAT is a CUSTOMER of UCTT"
+    assert f"UCTT is {link_role(rel, 'UCTT')} AMAT" == "UCTT is a SUPPLIER to AMAT"

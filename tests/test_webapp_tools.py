@@ -239,9 +239,9 @@ async def test_rebuild_graph_queues_every_tradeable(engine):
 
     assert body["ok"] is True
     assert "DCO" in body["symbols"]
-    # The once-ever marker is cleared, so _run_relationship_backfill picks it
-    # up on the next tick.
-    assert engine.backfill_state.get("DCO") is None
+    # The symbol is queued, so _run_relationship_backfill picks it up on the
+    # next tick -- without forgetting when it was last read.
+    assert engine._backfill_due("DCO")
 
 
 async def test_rebuild_graph_never_removes_an_edge(engine):

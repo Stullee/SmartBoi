@@ -36,6 +36,43 @@ class Relationship:
     extracted_at: str = ""
 
 
+# What `subject` IS to the OTHER endpoint of an edge, as a phrase completing
+# "<subject> is ___ <the other company>".
+#
+# `rel_type` describes what to_symbol IS to from_symbol, but `linked_symbols`
+# below walks every edge in BOTH directions -- so one stored edge describes
+# opposite roles depending on which end the evidence arrived from. Naming the
+# role without honouring that gets it backwards half the time, and a
+# customer's guidance raise presented to the grader as a supplier's is a sign
+# error, not a wording one.
+#
+# Regulator is the one type whose mirror is not itself a REL_TYPE ("regulated
+# by" is not a kind of edge), so it is spelled out rather than forced into the
+# enum.
+_ROLE_WHEN_SUBJECT_IS_TO = {
+    "customer": "a CUSTOMER of",
+    "supplier": "a SUPPLIER to",
+    "competitor": "a COMPETITOR of",
+    "regulator": "a REGULATOR of",
+}
+_ROLE_WHEN_SUBJECT_IS_FROM = {
+    "customer": "a SUPPLIER to",
+    "supplier": "a CUSTOMER of",
+    "competitor": "a COMPETITOR of",
+    "regulator": "REGULATED BY",
+}
+
+
+def link_role(rel: "Relationship", subject: str) -> str:
+    """The phrase completing "<subject> is ___ <the other endpoint>", or ""
+    when `subject` is not an endpoint of `rel` or the type is unknown."""
+    if subject == rel.to_symbol:
+        return _ROLE_WHEN_SUBJECT_IS_TO.get(rel.rel_type, "")
+    if subject == rel.from_symbol:
+        return _ROLE_WHEN_SUBJECT_IS_FROM.get(rel.rel_type, "")
+    return ""
+
+
 @dataclass
 class RelationshipGraph:
     path: Path
