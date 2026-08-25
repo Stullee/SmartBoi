@@ -463,3 +463,21 @@ def test_a_successful_probe_closes_the_breaker(tmp_path):
 
     assert u.breaker_reason() == ""
     assert all(u.budget_remaining(CAT_DOSSIER) for _ in range(5))
+
+
+def test_an_sdk_signature_mismatch_halts_the_day(tmp_path):
+    """The 2026-08-21 outage. A rebuild resolved `anthropic>=0.40` to 1.0.0,
+    which had removed `temperature` from AsyncMessages.create(). Every haiku
+    call raised TypeError in the client, every call site read it as transient,
+    and the engine retried 109,092 times over four days with the breaker still
+    reading closed and llm_usage.json's breaker_reason still "".
+
+    A TypeError never reached the network, so no retry could ever clear it.
+    It has to halt the day the way an exhausted balance does."""
+    u = UsageTracker(tmp_path / "u.json", daily_call_budget=5000, daily_usd_budget=10.0)
+    exc = TypeError("AsyncMessages.create() got an unexpected keyword argument 'temperature'")
+
+    assert u.note_failure(exc, today="2026-08-21") is True
+    for category in (CAT_DOSSIER, CAT_SYNTHESIS, CAT_EXTRACTION, CAT_RESEARCH):
+        assert not u.budget_remaining(category, today="2026-08-21")
+    assert "anthropic SDK" in u.snapshot(today="2026-08-21").breaker_reason

@@ -120,11 +120,21 @@ def request_kwargs(model: str, max_tokens: int, effort: str = "high") -> dict:
     if supports_effort:
         kwargs["output_config"] = {"effort": effort}
     if supports_temperature:
-        # Only where the parameter still exists. Pinned to 0 there for the
-        # original reason: these scores gate trades at a hard threshold,
-        # and the API default of 1.0 made some threshold crossings sampling
-        # noise rather than evidence.
-        kwargs["temperature"] = 0
+        # Only where the parameter still exists, and only ever through
+        # `extra_body`. The API still accepts temperature on these models;
+        # the SDK does not still NAME it. anthropic 1.0.0 removed
+        # `temperature` (and top_p/top_k) from AsyncMessages.create()
+        # altogether, so passing it as a named kwarg raises TypeError in the
+        # client before a request is ever sent -- which is how this system
+        # spent four days retrying 109,092 calls that could never succeed.
+        # `extra_body` is merged into the request body verbatim and has
+        # existed across both SDK generations, so it is the one spelling that
+        # survives the next signature change too.
+        #
+        # Pinned to 0 for the original reason: these scores gate trades at a
+        # hard threshold, and the API default of 1.0 made some threshold
+        # crossings sampling noise rather than evidence.
+        kwargs["extra_body"] = {"temperature": 0}
     return kwargs
 
 
@@ -183,10 +193,28 @@ _PERMANENT_API_FAILURES: tuple[tuple[str, str], ...] = (
 
 
 def permanent_failure_reason(exc: object) -> str:
-    """A human-readable reason when `exc` is an account-level failure that
-    retrying cannot fix, or "" when it is an ordinary transient error.
+    """A human-readable reason when `exc` is a failure that retrying cannot
+    fix, or "" when it is an ordinary transient error.
 
-    See _PERMANENT_API_FAILURES for why this is matched on text."""
+    See _PERMANENT_API_FAILURES for why the account-level cases are matched
+    on text."""
+    # A TypeError never reaches the network. It means the kwargs this module
+    # built are not the signature of the SDK that is installed -- a mismatch
+    # no retry can clear, and one that a dependency bump can introduce
+    # without a line of this repository changing. Classified by TYPE rather
+    # than by message because the wording is the SDK's to change: what makes
+    # it permanent is that the call failed in the client.
+    #
+    # This is the exact gap that let anthropic 1.0.0's removal of
+    # `temperature` from AsyncMessages.create() run for four days as 109,092
+    # "transient" retries with the breaker still reading closed.
+    if isinstance(exc, TypeError):
+        return (
+            f"the installed anthropic SDK rejected a request parameter ({exc}) -- "
+            "llm.request_kwargs is building a request shape this SDK version does "
+            "not accept, so no retry can succeed. Check the pinned anthropic version "
+            "against _CAPABILITIES"
+        )
     text = str(exc).lower()
     for needle, reason in _PERMANENT_API_FAILURES:
         if needle in text:

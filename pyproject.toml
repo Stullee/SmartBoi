@@ -8,7 +8,13 @@ dependencies = [
     "pydantic-settings>=2.3",
     "httpx>=0.27",
     "aiohttp>=3.9",
-    "anthropic>=0.40",
+    # Upper-bounded on purpose. anthropic 1.0.0 removed `temperature` from
+    # AsyncMessages.create(); the old floor-only pin let a rebuild resolve
+    # across that major and the engine stopped scoring evidence for four
+    # days without a crash or a failed test. A new major has to be an
+    # explicit edit here, checked by
+    # tests/test_llm.py::test_every_emitted_kwarg_is_accepted_by_the_INSTALLED_sdk.
+    "anthropic>=1.0,<2",
     "beautifulsoup4>=4.12",
     "python-dotenv>=1.0",
     "ib_async>=1.0.3",
