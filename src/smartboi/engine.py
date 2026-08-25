@@ -443,7 +443,8 @@ class Engine:
 
         self.dedup = DedupIndex(DATA_DIR / "dedup_index.json")
         self.graph = RelationshipGraph(DATA_DIR / "graph.json")
-        self.dossiers = DossierStore(DATA_DIR / "dossiers")
+        self.dossiers = DossierStore(DATA_DIR / "dossiers",
+                                     max_horizon_days=self.settings.max_horizon_days)
         self.journal = PaperTradeJournal(log_dir / "paper_trades.jsonl")
         self.universe_screen_state = JsonState(DATA_DIR / "universe_screen_state.json")
         self.periodic_state = JsonState(DATA_DIR / "periodic_pass_state.json")

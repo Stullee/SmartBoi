@@ -1182,3 +1182,65 @@ async def test_an_unroled_link_still_renders_the_description():
     )
     assert "both in the semi_equipment ecosystem" in prompt
     assert "INTC is  FORM" not in prompt
+
+
+# --- Read-time horizon clamp --------------------------------------------
+
+def _write_dossier(tmp_path, horizon_days):
+    from smartboi.dossier import DossierStore
+
+    store = DossierStore(tmp_path / "d")
+    d = Dossier(symbol="SIF", direction="LONG")
+    d.evidence.append(EvidenceRecord(
+        evidence_id="e1", source_type="news", source_name="reuters.com", url="u",
+        headline="h", published_at="2026-08-01T00:00:00+00:00",
+        origin_symbol="SIF", is_propagated=False, relationship_note="",
+        direction="LONG", magnitude=0.5, confidence=0.5,
+        horizon_days=horizon_days, reasoning="r", skeptic_note="",
+        merged_at="2026-08-01T00:00:00+00:00",
+    ))
+    store.save(d)
+    return store
+
+
+def test_a_legacy_horizon_is_clamped_on_load(tmp_path):
+    """engine._validated_proposal clamps at MERGE time; nothing clamped what
+    was already on disk. 232 of 1143 live items sat above the ceiling."""
+    from smartboi.dossier import DossierStore
+
+    _write_dossier(tmp_path, horizon_days=180)
+
+    clamped = DossierStore(tmp_path / "d", max_horizon_days=21).load("SIF")
+    assert clamped.evidence[0].horizon_days == 21
+
+
+def test_the_clamp_is_off_by_default_for_read_only_callers(tmp_path):
+    from smartboi.dossier import DossierStore
+
+    _write_dossier(tmp_path, horizon_days=180)
+
+    assert DossierStore(tmp_path / "d").load("SIF").evidence[0].horizon_days == 180
+
+
+def test_a_horizon_inside_the_ceiling_is_untouched(tmp_path):
+    from smartboi.dossier import DossierStore
+
+    _write_dossier(tmp_path, horizon_days=14)
+
+    assert DossierStore(tmp_path / "d", max_horizon_days=21).load("SIF").evidence[0].horizon_days == 14
+
+
+def test_the_clamp_is_what_lets_a_legacy_item_go_stale(tmp_path):
+    """The horizon is not inert data -- _stale_cutoff_days DOUBLES it. A
+    180-day record stays live for 360 days against a 21-day strategy; clamped,
+    it goes stale at 42."""
+    from smartboi.dossier import DossierStore, evidence_is_stale
+
+    _write_dossier(tmp_path, horizon_days=180)
+    at_100_days = datetime(2026, 11, 9, tzinfo=timezone.utc)   # 100 days after merge
+
+    unclamped = DossierStore(tmp_path / "d").load("SIF").evidence[0]
+    clamped = DossierStore(tmp_path / "d", max_horizon_days=21).load("SIF").evidence[0]
+
+    assert not evidence_is_stale(unclamped, at_100_days)   # still propping up the thesis
+    assert evidence_is_stale(clamped, at_100_days)

@@ -281,9 +281,22 @@ class Dossier:
 
 
 class DossierStore:
-    def __init__(self, dir_path: Path):
+    def __init__(self, dir_path: Path, max_horizon_days: int = 0):
         self.dir_path = dir_path
         self.dir_path.mkdir(parents=True, exist_ok=True)
+        # Read-time ceiling on a record's horizon. 0 disables it, which is the
+        # right default for the read-only callers (status, tools, tests) that
+        # have no Settings to consult.
+        #
+        # engine._validated_proposal clamps horizon_days at MERGE time, but
+        # nothing clamped what was already on disk, and a horizon is not inert
+        # data: _stale_cutoff_days DOUBLES it, so a record the model gave 180
+        # days stays live -- at full weight for the first 180 -- for 360 days,
+        # against a strategy whose longest hold is 21. Measured on the live
+        # deployment: 232 of 1143 items above the clamp (139 at 30d, 82 at
+        # 45d, 10 at 180d), every one merged on or before 2026-08-10, i.e. the
+        # backlog from before the merge-time clamp existed.
+        self.max_horizon_days = max_horizon_days
 
     def _path(self, symbol: str) -> Path:
         return self.dir_path / f"{symbol}.json"
@@ -295,6 +308,10 @@ class DossierStore:
         try:
             raw = json.loads(path.read_text())
             raw["evidence"] = [EvidenceRecord(**e) for e in raw.get("evidence", [])]
+            if self.max_horizon_days:
+                for record in raw["evidence"]:
+                    if record.horizon_days > self.max_horizon_days:
+                        record.horizon_days = self.max_horizon_days
             return Dossier(**raw)
         except (json.JSONDecodeError, OSError, TypeError) as exc:
             # A dossier is the permanent record of accumulated evidence, so a
