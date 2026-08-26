@@ -57,26 +57,48 @@ the system trade — and the names it would trade are the losing ones.
 
 Joining `dossier_snapshots.jsonl` to `price_marks.jsonl`, forward return over
 10 sessions, signed by the thesis direction, **symbol-equal-weighted** (one
-vote per symbol, so one long-lived thesis cannot carry a bucket):
+vote per symbol, so one long-lived thesis cannot carry a bucket).
 
-| score bucket | rows | symbols | mean 10d | hit rate |
+**Corrected 2026-08-26, after building the measurement properly.** The first
+pass at this used an ad-hoc join and overstated both the effect size and its
+monotonicity. Run through the real pipeline — `dedup_snapshots`,
+session-correct price marks, synthesis-vetoed rows excluded — the effects are
+smaller and the shape is not a clean staircase. What survives is the
+conclusion, not the drama:
+
+| variable | high-minus-low spread | verdict |
+|---|---|---|
+| score (confidence × magnitude) | −1.49 pts | anti-predictive |
+| confidence alone | −1.34 pts | anti-predictive |
+| magnitude alone | −2.72 pts | anti-predictive |
+| **independent source count** | **−3.87 pts** | **anti-predictive** |
+
+Baseline across every joined row: **+2.68%** over 10 sessions, 58% hit, 65
+symbols. Read every band as excess over that.
+
+Not one of the four variables a threshold could be set on earns it. The
+corroboration count is the worst of them, and it is the one the strategy is
+built on.
+
+| source count | rows | symbols | mean 10d | hit rate |
 |---|---|---|---|---|
-| 0.00 – 0.10 | 123 | 31 | **+7.63%** | 71% |
-| 0.10 – 0.20 | 65 | 22 | +6.44% | 59% |
-| 0.20 – 0.40 | 147 | 36 | +2.61% | 56% |
-| **0.40 – 1.00** | 114 | 28 | **−1.47%** | **43%** |
+| **1** | 213 | 51 | **+4.40%** | 63% |
+| 2 | 72 | 21 | −1.59% | 38% |
+| 3–4 | 109 | 34 | −1.96% | 43% |
+| 5+ | 245 | 37 | +0.53% | 51% |
 
-Monotone decreasing across every bucket. The universe baseline over the same
-window is **+3.23%**, so the highest-conviction names underperform the
-universe by about five points and are the only bucket that loses money — and
-the only bucket that could ever clear the signal bar.
+The single-source band is the only one that beats the baseline. It is not a
+monotone decline — 5+ recovers to roughly flat — so the honest statement is
+narrower than "more evidence is worse": **the one band that beats the universe
+is the one `min_independent_sources = 2` structurally refuses to trade.**
 
 Two confounds checked and ruled out:
 
-- **The outage.** All 449 rows predate 2026-08-21; the frozen-score window
-  contributes zero joinable rows, so none of this is dead-score-vs-live-price.
-- **Direction mix.** SHORT share by bucket is 17% / 11% / 15% / 14% — flat.
-  This is not "the high bucket is short in an up-market".
+- **The outage.** Every joined row predates 2026-08-21; the frozen-score window
+  contributes zero joinable rows at a 10-session horizon, so none of this is
+  dead-score-vs-live-price.
+- **Direction mix.** SHORT share by band runs 11–17% throughout — flat. This is
+  not "the high band is short in an up-market".
 
 ### The mechanism
 
@@ -104,30 +126,38 @@ arithmetic aggregate that keeps handing it chased moves.
 
 ## What follows
 
-Do not lower the signal bar. That converts "never trades" into "trades the
-−1.47% bucket", which is worse than doing nothing.
+Do not lower the signal bar. Every variable it could be set on is
+anti-predictive, so lowering it converts "never trades" into "trades the bands
+that lose money" — worse than doing nothing.
 
-The three things worth doing, in order:
+Three things, in order:
 
-1. **Close the calibration loop before writing any more strategy code.** The
-   system already captures the right raw material — daily score snapshots and
-   daily price marks. Nothing reads them back to ask whether a score predicts
-   anything. Until a bucket demonstrates positive out-of-sample expectancy,
-   every threshold in the system is a guess.
-2. **Test the inverted thesis.** The 0.00–0.10 bucket returned +7.63% at a 71%
-   hit rate on 31 symbols. That is what the original premise actually predicts
-   — get in while diffusion is incomplete, not after corroboration arrives. The
-   current implementation rewards the opposite of its own thesis.
-3. **Stop thresholding `confidence × magnitude`.** It is two unanchored
+1. **DONE — the calibration loop is closed.** `forward_returns.calibrate` now
+   buckets by every captured decision variable and reports the high-minus-low
+   spread, and the diagnostics dump prints it without being asked. The next
+   threshold argument is settled by a table rather than an opinion. That is the
+   fix that had to come first, because everything below is a hypothesis until
+   something can measure it.
+2. **Test the inverted thesis, on more data.** The single-source band is the
+   only one beating the universe (+4.40% vs +2.68%, 51 symbols). That is what
+   the original premise actually predicts — enter while diffusion is
+   incomplete, not after corroboration has arrived. But one month in one
+   regime is not enough to invert a strategy on, and flipping
+   `min_independent_sources` on this evidence would repeat the original mistake
+   in the opposite direction. Let the capture run and watch the spread.
+3. **Stop thresholding `confidence × magnitude`.** Two unanchored
    LLM-elicited numbers multiplied together, produced by two passes that
    disagree with each other by 5x on the same evidence, compared against a
    hand-set constant. Nothing anywhere ties "confidence 0.6" to a 60% realized
-   hit rate.
+   hit rate — and the calibration table now says so out loud.
 
 ## Limits of this analysis
 
-About one month of snapshots, 57 symbols, a single market regime (small caps
-drifting up — the +3.23% baseline). The join is daily, so intraday timing is
-invisible. The mechanism table is n=25. This is enough to say the current
-decision variable does not work; it is not enough to say the inverted one does.
-That is what step 1 is for.
+About one month of snapshots, 65 symbols, a single market regime (small caps
+drifting up — the +2.68% baseline). The join is daily, so intraday timing is
+invisible. The mechanism table is n=25 and is suggestive only. Bands are 21–51
+symbols, and the source-count relationship is not monotone.
+
+This is enough to say no current decision variable earns its threshold. It is
+**not** enough to say the inverted one does. Step 1 exists so that question
+gets answered by accumulation rather than by argument.

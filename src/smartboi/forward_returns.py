@@ -161,6 +161,16 @@ def compute_forward_return(
         "symbol": symbol,
         "direction": direction,
         "score": snapshot.get("score", 0.0),
+        # The score's INPUTS, carried separately so the report can ask which
+        # of them (if any) actually predicts. Bucketing only by the product
+        # cannot distinguish "the score is uninformative" from "one of its two
+        # factors is informative and the other is cancelling it out" -- and on
+        # the live capture it was neither: the corroboration COUNT, which the
+        # score does not contain at all, was the strongest signal in the file
+        # and it pointed the wrong way. See DECISION_VARIABLES.
+        "confidence": snapshot.get("confidence", 0.0),
+        "magnitude": snapshot.get("magnitude", 0.0),
+        "independent_source_count": snapshot.get("independent_source_count", 0),
         # Carried through so the report can separate snapshots the daily
         # synthesis flagged as already-priced-in (a veto) from clean ones. It
         # matters most for pre-SCORING_VERSION-5 rows, where the merge path did
@@ -249,35 +259,95 @@ def bucket_returns(rows: list[dict], horizon_days: int | None = None) -> list[di
         bucket_rows = grouped.get(label)
         if not bucket_rows:
             continue
-        vals = [r["signed_return_pct"] for r in bucket_rows]
-        # SYMBOL-equal-weighted stats alongside the row-weighted ones. A single
-        # thesis that persists is snapshotted once per DAY with almost-fully-
-        # overlapping forward windows, so the row-weighted mean/hit-rate can be
-        # driven almost entirely by whichever name stayed in the bucket
-        # longest -- a "97% hit rate" that is one winning thesis counted 40
-        # times. Averaging per-symbol means (one vote per symbol) is the
-        # headline the report should show, and it matches the CI, which is
-        # already bootstrapped over symbols. Row-weighted figures are kept for
-        # any programmatic consumer.
-        by_symbol: dict[str, list[float]] = {}
-        for r in bucket_rows:
-            by_symbol.setdefault(r.get("symbol", ""), []).append(r["signed_return_pct"])
-        sym_means = [sum(v) / len(v) for v in by_symbol.values()]
-        sym_hits = [sum(1 for x in v if x > 0) / len(v) for v in by_symbol.values()]
-        entry = {
-            "bucket": label,
-            "count": len(vals),
-            "n_symbols": len(by_symbol),
-            "mean_return_pct": sum(vals) / len(vals),
-            "hit_rate": sum(1 for v in vals if v > 0) / len(vals),
-            "mean_return_pct_symbol_weighted": sum(sym_means) / len(sym_means),
-            "hit_rate_symbol_weighted": sum(sym_hits) / len(sym_hits),
-        }
-        if horizon_days is not None:
-            entry["n_effective"] = effective_sample_count(bucket_rows, horizon_days)
-            entry["ci_90"] = cluster_bootstrap_ci(by_symbol)
+        entry = _bucket_stats(label, bucket_rows, horizon_days)
         out.append(entry)
     return out
+
+
+def _bucket_stats(label: str, bucket_rows: list[dict], horizon_days: int | None) -> dict:
+    """The per-bucket figures, shared by every bucketing in this module.
+
+    SYMBOL-equal-weighted stats alongside the row-weighted ones. A single
+    thesis that persists is snapshotted once per DAY with almost-fully-
+    overlapping forward windows, so the row-weighted mean/hit-rate can be
+    driven almost entirely by whichever name stayed in the bucket longest --
+    a "97% hit rate" that is one winning thesis counted 40 times. Averaging
+    per-symbol means (one vote per symbol) is the headline, and it matches the
+    CI, which is already bootstrapped over symbols. Row-weighted figures are
+    kept for any programmatic consumer."""
+    vals = [r["signed_return_pct"] for r in bucket_rows]
+    by_symbol: dict[str, list[float]] = {}
+    for r in bucket_rows:
+        by_symbol.setdefault(r.get("symbol", ""), []).append(r["signed_return_pct"])
+    sym_means = [sum(v) / len(v) for v in by_symbol.values()]
+    sym_hits = [sum(1 for x in v if x > 0) / len(v) for v in by_symbol.values()]
+    entry = {
+        "bucket": label,
+        "count": len(vals),
+        "n_symbols": len(by_symbol),
+        "mean_return_pct": sum(vals) / len(vals),
+        "hit_rate": sum(1 for v in vals if v > 0) / len(vals),
+        "mean_return_pct_symbol_weighted": sum(sym_means) / len(sym_means),
+        "hit_rate_symbol_weighted": sum(sym_hits) / len(sym_hits),
+    }
+    if horizon_days is not None:
+        entry["n_effective"] = effective_sample_count(bucket_rows, horizon_days)
+        entry["ci_90"] = cluster_bootstrap_ci(by_symbol)
+    return entry
+
+
+# Every variable the capture can be asked about, with explicit bands rather
+# than data-derived tertiles so a run is comparable to the one before it.
+#
+# independent_source_count is here because it is the one the strategy is built
+# on -- "the signal is accumulated, corroborated evidence crossing a threshold"
+# -- and the one that had never been tested. It is not a factor of `score`, so
+# no amount of bucketing by score could have found it.
+DECISION_VARIABLES: tuple[tuple[str, str, tuple[tuple[float, float, str], ...]], ...] = (
+    ("score", "score (confidence x magnitude)",
+     ((0.0, 0.10, "0.00-0.10"), (0.10, 0.20, "0.10-0.20"),
+      (0.20, 0.40, "0.20-0.40"), (0.40, 1.01, "0.40+"))),
+    ("confidence", "confidence alone",
+     ((0.0, 0.30, "0.00-0.30"), (0.30, 0.50, "0.30-0.50"),
+      (0.50, 0.70, "0.50-0.70"), (0.70, 1.01, "0.70+"))),
+    ("magnitude", "magnitude alone",
+     ((0.0, 0.20, "0.00-0.20"), (0.20, 0.40, "0.20-0.40"),
+      (0.40, 0.60, "0.40-0.60"), (0.60, 1.01, "0.60+"))),
+    ("independent_source_count", "independent source count",
+     ((0, 2, "1"), (2, 3, "2"), (3, 5, "3-4"), (5, 1e9, "5+"))),
+)
+
+
+def calibrate(rows: list[dict], horizon_days: int | None = None) -> list[dict]:
+    """For each decision variable, the forward return per band and the
+    high-minus-low SPREAD between its top and bottom band.
+
+    The spread is the number that matters. A variable a threshold is set on
+    must earn it: if the top band does not out-return the bottom one, raising
+    that threshold selects for worse outcomes, and no amount of tuning the
+    number fixes the direction."""
+    out = []
+    for key, label, bands in DECISION_VARIABLES:
+        buckets = []
+        for lo, hi, band_label in bands:
+            in_band = [r for r in rows if lo <= float(r.get(key) or 0) < hi]
+            if in_band:
+                buckets.append(_bucket_stats(band_label, in_band, horizon_days))
+        spread = None
+        if len(buckets) >= 2:
+            spread = (buckets[-1]["mean_return_pct_symbol_weighted"]
+                      - buckets[0]["mean_return_pct_symbol_weighted"])
+        out.append({"variable": key, "label": label, "buckets": buckets, "spread_pct": spread})
+    return out
+
+
+def baseline_return(rows: list[dict]) -> dict | None:
+    """Every joined row, symbol-equal-weighted. Bucket means are only
+    meaningful as EXCESS over this -- in a drifting market a bucket can look
+    strong while trailing the universe it was picked from."""
+    if not rows:
+        return None
+    return _bucket_stats("ALL", rows, None)
 
 
 def pearson_correlation(xs: list[float], ys: list[float]) -> float | None:
@@ -507,12 +577,57 @@ def format_report(
         lines.extend(_bucket_table(bench_for_bucket, horizon_days, "Mean Alpha %"))
 
     lines.append("")
+    lines.extend(format_calibration(clean_rows, horizon_days))
+
+    lines.append("")
     lines.append("-- Per-symbol breakdown (worst first) --")
     lines.append(f"{'Symbol':<8}{'Count':<8}{'Mean Return %':<16}")
     for s in per_symbol_breakdown(clean_rows):
         lines.append(f"{s['symbol']:<8}{s['count']:<8}{s['mean_return_pct']:<16.2f}")
 
     return "\n".join(lines)
+
+
+def format_calibration(rows: list[dict], horizon_days: int) -> list[str]:
+    """Every variable a threshold could be set on, and whether it earns one.
+
+    This exists because the report only ever asked about `score`, and the
+    strongest relationship in the captured data was in a variable the score
+    does not contain: the corroboration COUNT. Measured on the 2026-08-26
+    capture, one source returned +7.5% over ten sessions and five-or-more
+    returned -1.8%, against a +3.0% universe baseline -- so the accumulation
+    the whole strategy is built on was selecting against itself, and no
+    bucketing of `score` could have shown it."""
+    base = baseline_return(rows)
+    lines = ["-- Decision-variable calibration (symbol-weighted, signed by thesis direction) --"]
+    if base is None:
+        lines.append("No rows to calibrate.")
+        return lines
+    lines.append(
+        f"   BASELINE, every joined row: {base['mean_return_pct_symbol_weighted']:+.2f}% "
+        f"over {horizon_days}d, hit {base['hit_rate_symbol_weighted'] * 100:.0f}% "
+        f"({base['n_symbols']} symbols). Read every band below as EXCESS over this."
+    )
+    for entry in calibrate(rows, horizon_days):
+        spread = entry["spread_pct"]
+        if spread is None:
+            lines.append(f"\n   {entry['label']}: too few bands populated to judge.")
+            continue
+        verdict = ("PREDICTIVE" if spread > 1.0
+                   else "ANTI-PREDICTIVE" if spread < -1.0 else "no relationship")
+        lines.append(f"\n   {entry['label']}  --  high-minus-low spread {spread:+.2f} pts  [{verdict}]")
+        lines.append(f"      {'band':<12}{'rows':<7}{'syms':<6}{'mean %':<10}{'hit %':<8}")
+        for b in entry["buckets"]:
+            lines.append(
+                f"      {b['bucket']:<12}{b['count']:<7}{b['n_symbols']:<6}"
+                f"{b['mean_return_pct_symbol_weighted']:<10.2f}"
+                f"{b['hit_rate_symbol_weighted'] * 100:<8.0f}"
+            )
+    lines.append("")
+    lines.append("   ^^ a variable a threshold is set on must earn it. Where the spread is")
+    lines.append("      NEGATIVE, raising that threshold selects for WORSE outcomes -- the fix")
+    lines.append("      is the variable or its sign, never a different number for the bar.")
+    return lines
 
 
 # How many marked sessions BEFORE the earliest evidence to show. The

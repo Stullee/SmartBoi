@@ -1,5 +1,8 @@
 from smartboi.forward_returns import (
+    baseline_return,
     bucket_returns,
+    calibrate,
+    format_calibration,
     benchmark_relative_returns,
     compute_forward_return,
     dedup_snapshots,
@@ -473,3 +476,102 @@ def test_backtest_and_forward_returns_agree_on_what_a_mark_means():
     from_forward = price_marks_by_symbol(rows)["FORM"]
     from_backtest = {b.date: b.close for b in marks_as_series(rows)["FORM"].bars}
     assert from_forward == from_backtest
+
+
+# --- Decision-variable calibration ---------------------------------------
+#
+# The report only ever bucketed by `score`, and the strongest relationship in
+# the live capture was in a variable `score` does not contain: the
+# corroboration COUNT. One source returned +4.4% over ten sessions against a
+# +2.7% universe baseline; two, three and four all returned less than zero --
+# and min_independent_sources=2 excludes the only band that beat the baseline.
+
+def _row(symbol, ret, score=0.5, conf=0.7, mag=0.7, src=3):
+    return {"symbol": symbol, "direction": "LONG", "score": score, "confidence": conf,
+            "magnitude": mag, "independent_source_count": src,
+            "already_priced_in": False, "signed_return_pct": ret,
+            "entry_date": "2026-08-01", "exit_date": "2026-08-11", "horizon_days": 10}
+
+
+def test_calibrate_reports_a_negative_spread_when_the_variable_is_backwards():
+    """High band worse than low band -- raising this threshold selects for
+    worse outcomes, and the report has to say so in the sign."""
+    rows = ([_row(f"LO{i}", 8.0, src=1) for i in range(6)]
+            + [_row(f"HI{i}", -4.0, src=7) for i in range(6)])
+
+    entry = next(e for e in calibrate(rows, 10) if e["variable"] == "independent_source_count")
+
+    assert entry["spread_pct"] < 0
+    assert [b["bucket"] for b in entry["buckets"]] == ["1", "5+"]
+    assert entry["buckets"][0]["mean_return_pct_symbol_weighted"] == 8.0
+    assert entry["buckets"][-1]["mean_return_pct_symbol_weighted"] == -4.0
+
+
+def test_calibrate_reports_a_positive_spread_when_the_variable_earns_it():
+    rows = ([_row(f"LO{i}", -3.0, src=1) for i in range(6)]
+            + [_row(f"HI{i}", 9.0, src=7) for i in range(6)])
+
+    entry = next(e for e in calibrate(rows, 10) if e["variable"] == "independent_source_count")
+
+    assert entry["spread_pct"] > 0
+
+
+def test_calibration_is_symbol_equal_weighted():
+    """One thesis snapshotted daily must not outvote five distinct symbols --
+    the same clustering the CI already uses."""
+    rows = [_row("LOUD", 20.0, src=7) for _ in range(20)] + [_row(f"Q{i}", -2.0, src=7)
+                                                             for i in range(5)]
+
+    entry = next(e for e in calibrate(rows, 10) if e["variable"] == "independent_source_count")
+    band = entry["buckets"][-1]
+
+    assert band["n_symbols"] == 6
+    # Row-weighted would be about +15.6; symbol-weighted is (20 + 5*-2)/6.
+    assert abs(band["mean_return_pct_symbol_weighted"] - (20.0 - 10.0) / 6) < 1e-9
+
+
+def test_the_SPREAD_is_symbol_equal_weighted_too():
+    """Not just the bands. A spread computed off row-weighted means would let
+    one loud thesis decide whether a variable reads as predictive -- which is
+    the single number this whole table exists to produce."""
+    # Low band: one symbol snapshotted 20 times at +20, five symbols at -2.
+    #   symbol-weighted low = (20 + 5*-2)/6 = +1.667
+    #   row-weighted    low = (20*20 + 5*-2)/25 = +15.6
+    rows = [_row("LOUD", 20.0, src=1) for _ in range(20)]
+    rows += [_row(f"Q{i}", -2.0, src=1) for i in range(5)]
+    # High band: six symbols, one row each, all +3.
+    rows += [_row(f"H{i}", 3.0, src=7) for i in range(6)]
+
+    entry = next(e for e in calibrate(rows, 10) if e["variable"] == "independent_source_count")
+
+    # Symbol-weighted: 3.0 - 1.667 = +1.33 (the high band EARNS its threshold).
+    # Row-weighted:    3.0 - 15.6  = -12.6 (it would read as anti-predictive).
+    assert entry["spread_pct"] > 0
+    assert abs(entry["spread_pct"] - (3.0 - (20.0 - 10.0) / 6)) < 1e-9
+
+
+def test_the_baseline_is_reported_so_bands_read_as_excess():
+    """In a drifting market a band can look strong while trailing the universe
+    it was picked from."""
+    rows = [_row(f"S{i}", 5.0) for i in range(4)]
+
+    base = baseline_return(rows)
+
+    assert base["n_symbols"] == 4
+    assert base["mean_return_pct_symbol_weighted"] == 5.0
+    assert baseline_return([]) is None
+
+
+def test_format_calibration_names_an_anti_predictive_variable():
+    rows = ([_row(f"LO{i}", 8.0, src=1) for i in range(6)]
+            + [_row(f"HI{i}", -4.0, src=7) for i in range(6)])
+
+    text = "\n".join(format_calibration(rows, 10))
+
+    assert "ANTI-PREDICTIVE" in text
+    assert "BASELINE" in text
+    assert "independent source count" in text
+
+
+def test_format_calibration_survives_an_empty_join():
+    assert "No rows to calibrate." in "\n".join(format_calibration([], 10))
