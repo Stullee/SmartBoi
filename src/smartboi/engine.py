@@ -315,6 +315,22 @@ _VETO_FALSIFICATION_DRIFT_PCT = 8.0
 # standing veto suppresses a thesis and never opens a trade.
 _MAX_RESYNTHESIS_PER_DAY = 5
 
+# How many CONSECUTIVE synthesis passes must return already_priced_in before
+# an OPEN position is abandoned for it.
+#
+# Entry requires surviving synthesis; staying in did not. A position could sit
+# at -19.8% while the pass that gates every entry said, that same morning, that
+# the move was already priced -- because _close_if_thesis_flipped only fires on
+# a direction FLIP that clears the bar, and a veto to zero is not a flip.
+#
+# Three, not one, because the verdict is a per-pass LLM draw and one draw is
+# not a decision. Measured over 434 adjacent-day verdict pairs in
+# llm_trace.jsonl: acting on the first veto would have been withdrawn by the
+# next pass 14% of the time; two in a row 9%; three 7%; four also 7%. Three is
+# where the curve flattens, and on a 21-day horizon three daily passes is a
+# cheap wait against a 600bp round trip spent abandoning a live thesis.
+_VETO_EXIT_CONFIRMATIONS = 3
+
 
 # Ticker shapes that are NOT the operating-company common stock this system
 # builds a thesis about, and must never become trade targets:
@@ -3931,6 +3947,36 @@ class Engine:
                         f"{signal.direction} (score {dossier.confidence * dossier.magnitude:.3f})"),
             )
 
+    def _close_if_thesis_vetoed(self, symbol: str, trade, price: float) -> None:
+        """Closes `trade` once the whole-body pass has ruled the move already
+        priced on _VETO_EXIT_CONFIRMATIONS consecutive passes.
+
+        The asymmetry this removes: a thesis had to survive synthesis to open a
+        position, but nothing re-applied that test to a position already open,
+        so the only exits were a level, the horizon, or a full direction flip.
+
+        Deliberately NOT triggered by a weakened score, a NONE direction, or a
+        single veto. The first two are reasons to stop adding conviction rather
+        than to abandon a position mid-horizon (see _close_if_thesis_flipped),
+        and the third is one sampling draw of a pass that changes its mind 14%
+        of the time."""
+        dossier = self.dossiers.load(symbol)
+        if dossier.consecutive_priced_in < _VETO_EXIT_CONFIRMATIONS:
+            return
+        log.warning(
+            "[PAPER] %s: synthesis has ruled this move already priced on %d consecutive passes "
+            "(latest %s) while a %s position was open -- closing it.",
+            symbol, dossier.consecutive_priced_in, dossier.synthesis_at or "?", trade.direction,
+        )
+        closed = self.journal.close_on_thesis_vetoed(symbol, price)
+        if closed is not None:
+            self._record_decision(
+                "thesis_vetoed", symbol, trade.direction, dossier.signaled_at,
+                price=price,
+                reason=(f"closed an open {trade.direction} because synthesis called the move "
+                        f"already priced on {dossier.consecutive_priced_in} consecutive passes"),
+            )
+
     async def _try_open_from_signal(self, symbol: str, dossier: Dossier) -> None:
         """Whether/how a SIGNALED-but-not-yet-open dossier becomes a paper
         trade this poll -- the "are we too late" gate. Two guards, both a
@@ -4267,6 +4313,10 @@ class Engine:
             # the stop or target actually traded, the flip is an opinion.
             if trade.status == "OPEN":
                 self._close_if_thesis_flipped(symbol, trade, bar.close)
+            # Flip first: it is the stronger statement, and a position can only
+            # be abandoned once.
+            if trade.status == "OPEN":
+                self._close_if_thesis_vetoed(symbol, trade, bar.close)
             if trade.status != "OPEN":
                 # The paper trade just closed (WIN/LOSS/TIMEOUT) -- notify,
                 # then reset the dossier so future evidence can trigger a
@@ -4557,6 +4607,12 @@ class Engine:
             )
             dossier.distinct_fact_count = 0
         dossier.already_priced_in = bool(verdict.get("already_priced_in"))
+        # The RUN, not the flag: one veto is a draw, a run is a judgement.
+        # Reset the moment a pass declines to veto, so the count always means
+        # "this many passes in a row, ending now".
+        dossier.consecutive_priced_in = (
+            dossier.consecutive_priced_in + 1 if dossier.already_priced_in else 0
+        )
         dossier.redundant_evidence = bool(verdict.get("redundant_evidence"))
         # Recorded before it is used, so the veto below stops being the only
         # evidence that it happened. See Dossier.synthesis_direction.
@@ -5350,6 +5406,7 @@ class Engine:
             dossier.synthesis_confidence = 0.0
             dossier.synthesis_magnitude = 0.0
             dossier.already_priced_in = False
+            dossier.consecutive_priced_in = 0
             dossier.redundant_evidence = False
             dossier.synthesis_direction = ""
             dossier.synthesis_note = ""

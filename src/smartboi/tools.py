@@ -1604,6 +1604,15 @@ def run_diagnostics(engine) -> str:
         f"{stats.timeouts} held to horizon), win rate {stats.win_rate * 100:.0f}% "
         f"(95% CI {stats.win_rate_ci_low * 100:.0f}-{stats.win_rate_ci_high * 100:.0f}%), "
         f"avg R {stats.avg_r:.2f}")
+    # Positions that left the book WITHOUT reaching an outcome. Printed next
+    # to the closed count because the two are easy to confuse and the
+    # difference is the honest denominator: a large unscored count beside a
+    # small closed one means most of what was opened never got measured.
+    unscored = stats.thesis_flipped + stats.thesis_vetoed + stats.archived
+    if unscored:
+        add(f"    unscored (opened, never reached an outcome): {unscored} "
+            f"({stats.thesis_flipped} thesis flipped, {stats.thesis_vetoed} thesis vetoed, "
+            f"{stats.archived} archived) -- excluded from every figure above")
     # By direction: a win is net-of-cost R>0, so a SHORT is no longer penalised
     # by a 100%-take-profit target it could only reach at price 0.
     if stats.closed_long or stats.closed_short:

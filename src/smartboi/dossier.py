@@ -177,6 +177,13 @@ class Dossier:
     # Whether the market has plainly already made this connection. The whole
     # strategy is trading the lag BEFORE it does, so this is a veto.
     already_priced_in: bool = False
+    # How many CONSECUTIVE synthesis passes have returned already_priced_in.
+    # One veto is not a decision: measured over 434 adjacent-day verdict pairs
+    # on the live deployment, a True reverts to False the next pass 14% of the
+    # time. Two in a row cuts that to 9%, three to 7%, and four buys nothing
+    # further -- so an open position is abandoned only on a veto that has
+    # STOOD (see engine._VETO_EXIT_CONFIRMATIONS), never on a single draw.
+    consecutive_priced_in: int = 0
     # Whether the evidence body collapses to far fewer facts than items --
     # the overlap finding, held SEPARATELY from already_priced_in.
     #

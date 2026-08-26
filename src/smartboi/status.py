@@ -59,6 +59,7 @@ class PaperTradeStats:
     # a large archived count next to a small closed one is the signature of
     # a record that has been reset out from under itself.
     thesis_flipped: int = 0
+    thesis_vetoed: int = 0
     archived: int = 0
     # Closed SHORTs whose borrow was never verifiable (small/unknown-cap
     # names are routinely hard-to-borrow -- see paper_journal.assumes_borrow)
@@ -652,6 +653,7 @@ def gather_paper_trade_stats(
                             max_concurrent_positions=max_concurrent_positions,
                             peak_concurrent=_peak_concurrent(all_rows),
                             thesis_flipped=sum(1 for r in all_rows if r.get("status") == "THESIS_FLIPPED"),
+                            thesis_vetoed=sum(1 for r in all_rows if r.get("status") == "THESIS_VETOED"),
                             archived=sum(1 for r in all_rows if r.get("status") == "ARCHIVED"))
     if rows:
         # A win is net-of-cost profit (realized R > 0), not a target hit -- so

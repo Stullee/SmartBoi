@@ -23,7 +23,12 @@ from smartboi.dossier import (
     merge_evidence,
     recompute_decay,
 )
-from smartboi.engine import ECOSYSTEM_LINK_CONFIDENCE, Engine, is_common_equity
+from smartboi.engine import (
+    ECOSYSTEM_LINK_CONFIDENCE,
+    _VETO_EXIT_CONFIRMATIONS,
+    Engine,
+    is_common_equity,
+)
 from smartboi.universe import CompanySpec
 from smartboi.ratelimit import SlidingWindowLimiter
 from smartboi.status import snapshot_dossier
@@ -4149,3 +4154,109 @@ def test_a_successful_re_extraction_clears_the_queue_flag(engine):
 
     assert not engine._backfill_due("FORM")
     assert "refresh_requested" not in engine.backfill_state.get("FORM")
+
+
+# --- Abandoning a position on a veto that has STOOD --------------------
+#
+# Entry requires surviving synthesis; staying in did not. The live AOSL case:
+# open at -19.8% while that same morning's synthesis pass said the move was
+# already priced. _close_if_thesis_flipped could not see it -- a veto to zero
+# is not a direction flip.
+
+async def _open_a_long(engine):
+    today = datetime.now(timezone.utc).date().isoformat()
+    engine.price_feed = FakePriceFeed(prices={"FORM": 10.0})
+    engine.updater.default = proposal(direction="LONG", magnitude=0.8, confidence=0.8, horizon_days=20)
+    engine.skeptic.default = verdict(refuted=False, adjusted_confidence=0.8, adjusted_magnitude=0.8)
+    for i, source in enumerate(("reuters.com", "bloomberg.com")):
+        await engine._process_evidence(
+            origin_symbol="FORM", evidence_text=f"e{i}", source_type="news",
+            source_name=source, url=f"https://x/{i}", headline=f"h{i}", published_at=today,
+        )
+    await engine._mark_and_execute()
+    assert engine.journal.has_open("FORM")
+
+
+def _set_veto_run(engine, n):
+    d = engine.dossiers.load("FORM")
+    d.consecutive_priced_in = n
+    engine.dossiers.save(d)
+
+
+async def test_a_standing_veto_closes_an_open_trade(engine):
+    await _open_a_long(engine)
+    _set_veto_run(engine, 3)
+
+    await engine._mark_and_execute()
+
+    assert not engine.journal.has_open("FORM")
+    closed = [json.loads(l) for l in engine.journal.log_path.read_text().splitlines() if l.strip()]
+    assert closed[-1]["status"] == "THESIS_VETOED"
+    # Neither a win nor a loss: it never reached a level.
+    assert closed[-1]["status"] not in ("WIN", "LOSS", "TIMEOUT")
+
+
+async def test_a_single_veto_does_not_close_an_open_trade(engine):
+    """One veto is a draw, not a decision -- it is withdrawn by the next pass
+    14% of the time. Acting on it would abandon live theses on sampling noise
+    and pay a round trip to do it."""
+    await _open_a_long(engine)
+    _set_veto_run(engine, 1)
+
+    await engine._mark_and_execute()
+
+    assert engine.journal.has_open("FORM")
+
+
+async def test_a_veto_run_one_short_of_the_bar_does_not_close(engine):
+    await _open_a_long(engine)
+    _set_veto_run(engine, _VETO_EXIT_CONFIRMATIONS - 1)
+
+    await engine._mark_and_execute()
+
+    assert engine.journal.has_open("FORM")
+
+
+async def test_the_veto_run_counts_up_across_passes(engine):
+    """A vetoed dossier keeps being re-judged -- the synthesis floor reads the
+    UNCAPPED arithmetic, which survives the veto that zeroes the score. Live
+    confirmation: CDRE was vetoed on 12 consecutive passes and re-judged every
+    one of them. Without that, the run could never reach the bar and this whole
+    exit arm would be inert."""
+    await _open_a_long(engine)
+    engine.synthesizer = FakeSynthesizer(
+        default=synthesis(direction="LONG", already_priced_in=True))
+
+    subject = engine.dossiers.load("FORM")
+    for expected in (1, 2, 3):
+        applied = await engine._apply_synthesis(subject, datetime.now(timezone.utc))
+        assert applied, "a vetoed dossier must still be re-judged on the next pass"
+        assert subject.consecutive_priced_in == expected
+
+
+async def test_the_veto_run_resets_when_a_pass_declines_to_veto(engine):
+    """The counter means 'this many passes in a row, ending now'. A single
+    non-veto has to clear it, or a position would be closed by vetoes that
+    were never consecutive."""
+    await _open_a_long(engine)
+    engine.synthesizer = FakeSynthesizer(
+        default=synthesis(direction="LONG", already_priced_in=True))
+    subject = engine.dossiers.load("FORM")
+    for _ in range(2):
+        await engine._apply_synthesis(subject, datetime.now(timezone.utc))
+    assert subject.consecutive_priced_in == 2
+
+    engine.synthesizer = FakeSynthesizer(
+        default=synthesis(direction="LONG", already_priced_in=False))
+    await engine._apply_synthesis(subject, datetime.now(timezone.utc))
+
+    assert subject.consecutive_priced_in == 0
+
+
+async def test_a_vetoed_close_is_unscored_not_a_loss(engine):
+    """It never reached a level. Folding it into wins/losses would answer
+    'does the strategy pick well' with a number about abandonment."""
+    from smartboi.paper_journal import RESOLVED_STATUSES, UNSCORED_STATUSES
+
+    assert "THESIS_VETOED" in UNSCORED_STATUSES
+    assert "THESIS_VETOED" not in RESOLVED_STATUSES
