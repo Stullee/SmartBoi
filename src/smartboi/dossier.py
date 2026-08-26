@@ -281,9 +281,22 @@ class Dossier:
 
 
 class DossierStore:
-    def __init__(self, dir_path: Path):
+    def __init__(self, dir_path: Path, max_horizon_days: int = 0):
         self.dir_path = dir_path
         self.dir_path.mkdir(parents=True, exist_ok=True)
+        # Read-time ceiling on a record's horizon. 0 disables it, which is the
+        # right default for the read-only callers (status, tools, tests) that
+        # have no Settings to consult.
+        #
+        # engine._validated_proposal clamps horizon_days at MERGE time, but
+        # nothing clamped what was already on disk, and a horizon is not inert
+        # data: _stale_cutoff_days DOUBLES it, so a record the model gave 180
+        # days stays live -- at full weight for the first 180 -- for 360 days,
+        # against a strategy whose longest hold is 21. Measured on the live
+        # deployment: 232 of 1143 items above the clamp (139 at 30d, 82 at
+        # 45d, 10 at 180d), every one merged on or before 2026-08-10, i.e. the
+        # backlog from before the merge-time clamp existed.
+        self.max_horizon_days = max_horizon_days
 
     def _path(self, symbol: str) -> Path:
         return self.dir_path / f"{symbol}.json"
@@ -295,6 +308,10 @@ class DossierStore:
         try:
             raw = json.loads(path.read_text())
             raw["evidence"] = [EvidenceRecord(**e) for e in raw.get("evidence", [])]
+            if self.max_horizon_days:
+                for record in raw["evidence"]:
+                    if record.horizon_days > self.max_horizon_days:
+                        record.horizon_days = self.max_horizon_days
             return Dossier(**raw)
         except (json.JSONDecodeError, OSError, TypeError) as exc:
             # A dossier is the permanent record of accumulated evidence, so a
@@ -1334,7 +1351,7 @@ class DossierUpdater:
     async def propose_update(
         self, dossier: Dossier, evidence_text: str, origin_symbol: str, relationship_note: str,
         relationship_confidence: float | None = None, ecosystem: str = "",
-        now: datetime | None = None,
+        now: datetime | None = None, relationship_role: str = "",
     ) -> dict | None:
         if not self._usage.budget_remaining(CAT_DOSSIER):
             log.info("%s: %s -- deferring dossier update.",
@@ -1353,9 +1370,22 @@ class DossierUpdater:
             if relationship_confidence is not None
             else ""
         )
+        # The system prompt tells the model it will be told which KIND of link
+        # this is ("its customer, supplier, competitor, or regulator; you'll be
+        # told which"), and the Tier 2 rubric prices a competitor's bad news as
+        # good news here. Neither could fire: only the free-text description was
+        # ever sent, so the channel had to be inferred from prose that often
+        # does not state it. `relationship_role` is oriented by graph.link_role
+        # -- what the ORIGIN is to THIS company, mirrored when the edge was
+        # traversed backwards -- so a supplier's news is never presented as a
+        # customer's.
+        role_note = (
+            f" {origin_symbol} is {relationship_role} {dossier.symbol}."
+            if relationship_role else ""
+        )
         propagation = (
             f"This evidence is about a LINKED company ({origin_symbol}), not {dossier.symbol} "
-            f"directly. Relationship: {relationship_note}{relationship_confidence_note}"
+            f"directly.{role_note} Relationship: {relationship_note}{relationship_confidence_note}"
             if relationship_note
             else f"This evidence is about {dossier.symbol} directly."
         )

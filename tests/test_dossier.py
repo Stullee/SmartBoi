@@ -1099,3 +1099,148 @@ def test_stale_evidence_does_not_keep_offering_its_label():
                             "published_at": (NOW - timedelta(days=400)).isoformat()})
     d = _scored([old])
     assert fact_keys_on(d, NOW) == []
+
+
+# --- The propagation line the grader actually reads ----------------------
+#
+# Nothing exercised the real DossierUpdater prompt before this. The system
+# prompt promises "its customer, supplier, competitor, or regulator; you'll be
+# told which" and the Tier 2 rubric prices a competitor's capacity loss as good
+# news HERE -- but only the free-text description was ever sent, so neither
+# could fire on anything the prose did not happen to state.
+
+class _CapturingMessages:
+    def __init__(self, outer):
+        self._outer = outer
+
+    async def create(self, **kwargs):
+        self._outer.kwargs = kwargs
+        raise RuntimeError("prompt captured -- no response needed")
+
+
+class _CapturingClient:
+    def __init__(self):
+        self.kwargs = None
+        self.messages = _CapturingMessages(self)
+
+    async def close(self):
+        pass
+
+
+async def _capture_prompt(**call_kwargs) -> str:
+    """Run propose_update far enough to build the prompt, and return it."""
+    from smartboi.dossier import Dossier, DossierUpdater
+    from smartboi.usage import UsageTracker
+    import tempfile
+    import pathlib
+
+    with tempfile.TemporaryDirectory() as tmp:
+        usage = UsageTracker(pathlib.Path(tmp) / "u.json", daily_call_budget=100)
+        updater = DossierUpdater.__new__(DossierUpdater)
+        client = _CapturingClient()
+        updater._client = client
+        updater._model = "claude-haiku-4-5"
+        updater._usage = usage
+        updater._trace = None
+        await updater.propose_update(Dossier(symbol="FORM"), "evidence body", **call_kwargs)
+    assert client.kwargs is not None, "the call never reached messages.create"
+    return client.kwargs["messages"][0]["content"]
+
+
+async def test_the_channel_is_named_to_the_grader_for_a_linked_company():
+    prompt = await _capture_prompt(
+        origin_symbol="INTC", relationship_note="Intel is a major customer",
+        relationship_confidence=0.95, relationship_role="a CUSTOMER of",
+    )
+    assert "INTC is a CUSTOMER of FORM." in prompt
+    assert "Intel is a major customer" in prompt
+
+
+async def test_the_named_channel_follows_the_edge_orientation():
+    """Same origin and target, mirrored role: the prompt must say what
+    link_role computed, not the raw stored rel_type."""
+    prompt = await _capture_prompt(
+        origin_symbol="INTC", relationship_note="FORM is a customer of Intel",
+        relationship_confidence=0.95, relationship_role="a SUPPLIER to",
+    )
+    assert "INTC is a SUPPLIER to FORM." in prompt
+    assert "CUSTOMER" not in prompt.split("New evidence:")[0].replace("customer", "")
+
+
+async def test_direct_evidence_names_no_channel():
+    prompt = await _capture_prompt(origin_symbol="FORM", relationship_note="")
+    assert "This evidence is about FORM directly." in prompt
+    assert " is a " not in prompt.split("Sector context")[0].split("New evidence:")[0]
+
+
+async def test_an_unroled_link_still_renders_the_description():
+    """Ecosystem association carries no role; the line must not read
+    'INTC is  FORM.'"""
+    prompt = await _capture_prompt(
+        origin_symbol="INTC", relationship_note="both in the semi_equipment ecosystem",
+        relationship_confidence=0.3, relationship_role="",
+    )
+    assert "both in the semi_equipment ecosystem" in prompt
+    assert "INTC is  FORM" not in prompt
+
+
+# --- Read-time horizon clamp --------------------------------------------
+
+def _write_dossier(tmp_path, horizon_days):
+    from smartboi.dossier import DossierStore
+
+    store = DossierStore(tmp_path / "d")
+    d = Dossier(symbol="SIF", direction="LONG")
+    d.evidence.append(EvidenceRecord(
+        evidence_id="e1", source_type="news", source_name="reuters.com", url="u",
+        headline="h", published_at="2026-08-01T00:00:00+00:00",
+        origin_symbol="SIF", is_propagated=False, relationship_note="",
+        direction="LONG", magnitude=0.5, confidence=0.5,
+        horizon_days=horizon_days, reasoning="r", skeptic_note="",
+        merged_at="2026-08-01T00:00:00+00:00",
+    ))
+    store.save(d)
+    return store
+
+
+def test_a_legacy_horizon_is_clamped_on_load(tmp_path):
+    """engine._validated_proposal clamps at MERGE time; nothing clamped what
+    was already on disk. 232 of 1143 live items sat above the ceiling."""
+    from smartboi.dossier import DossierStore
+
+    _write_dossier(tmp_path, horizon_days=180)
+
+    clamped = DossierStore(tmp_path / "d", max_horizon_days=21).load("SIF")
+    assert clamped.evidence[0].horizon_days == 21
+
+
+def test_the_clamp_is_off_by_default_for_read_only_callers(tmp_path):
+    from smartboi.dossier import DossierStore
+
+    _write_dossier(tmp_path, horizon_days=180)
+
+    assert DossierStore(tmp_path / "d").load("SIF").evidence[0].horizon_days == 180
+
+
+def test_a_horizon_inside_the_ceiling_is_untouched(tmp_path):
+    from smartboi.dossier import DossierStore
+
+    _write_dossier(tmp_path, horizon_days=14)
+
+    assert DossierStore(tmp_path / "d", max_horizon_days=21).load("SIF").evidence[0].horizon_days == 14
+
+
+def test_the_clamp_is_what_lets_a_legacy_item_go_stale(tmp_path):
+    """The horizon is not inert data -- _stale_cutoff_days DOUBLES it. A
+    180-day record stays live for 360 days against a 21-day strategy; clamped,
+    it goes stale at 42."""
+    from smartboi.dossier import DossierStore, evidence_is_stale
+
+    _write_dossier(tmp_path, horizon_days=180)
+    at_100_days = datetime(2026, 11, 9, tzinfo=timezone.utc)   # 100 days after merge
+
+    unclamped = DossierStore(tmp_path / "d").load("SIF").evidence[0]
+    clamped = DossierStore(tmp_path / "d", max_horizon_days=21).load("SIF").evidence[0]
+
+    assert not evidence_is_stale(unclamped, at_100_days)   # still propping up the thesis
+    assert evidence_is_stale(clamped, at_100_days)
