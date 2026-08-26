@@ -41,6 +41,7 @@ from smartboi.news import redact_token, redact_url
 from smartboi.paper_journal import cost_buckets, trade_economics
 from smartboi.usage import CAT_RESEARCH, CATEGORIES
 from smartboi.status import (
+    gather_all_paper_trades,
     gather_dossiers,
     gather_graph_health,
     gather_paper_trade_stats,
@@ -58,7 +59,7 @@ from smartboi.forward_returns import (
     format_report,
     price_marks_by_symbol,
 )
-from smartboi.exit_analysis import format_report as format_exit_report
+from smartboi.exit_analysis import format_report as format_exit_report, reward_risk
 from smartboi.skeptic_report import analyze_skeptic_effect, format_skeptic_report
 from smartboi.screen import candidates_from_file, resolve_candidates_path
 from smartboi.universe import CompanySpec, spec_by_symbol
@@ -1604,6 +1605,15 @@ def run_diagnostics(engine) -> str:
         f"{stats.timeouts} held to horizon), win rate {stats.win_rate * 100:.0f}% "
         f"(95% CI {stats.win_rate_ci_low * 100:.0f}-{stats.win_rate_ci_high * 100:.0f}%), "
         f"avg R {stats.avg_r:.2f}")
+    # Positions that left the book WITHOUT reaching an outcome. Printed next
+    # to the closed count because the two are easy to confuse and the
+    # difference is the honest denominator: a large unscored count beside a
+    # small closed one means most of what was opened never got measured.
+    unscored = stats.thesis_flipped + stats.thesis_vetoed + stats.archived
+    if unscored:
+        add(f"    unscored (opened, never reached an outcome): {unscored} "
+            f"({stats.thesis_flipped} thesis flipped, {stats.thesis_vetoed} thesis vetoed, "
+            f"{stats.archived} archived) -- excluded from every figure above")
     # By direction: a win is net-of-cost R>0, so a SHORT is no longer penalised
     # by a 100%-take-profit target it could only reach at price 0.
     if stats.closed_long or stats.closed_short:
@@ -1661,6 +1671,24 @@ def run_diagnostics(engine) -> str:
     add("  ^^ break-even is the hit rate at which this grid nets zero AFTER costs, not 33%.")
     add("     (it assumes a win is the +target and a loss the -stop; the win rate above counts ANY "
         "net-of-cost profit as a win, so the two ratios are not directly comparable.)")
+    # Every figure above assumes the loss leg lands exactly on the stop. The
+    # record says otherwise: a gap through the stop books worse than -1R, and
+    # nothing capped a win above the target, so the realized payoff ratio is
+    # strictly worse than the modelled one. Printing only the model understated
+    # the bar by 17 points on the live record (37% modelled vs 54% realized).
+    # The FULL ledger, not gather_paper_trade_stats's last-20 slice --
+    # reward_risk filters to resolved statuses itself.
+    rr = reward_risk(gather_all_paper_trades(log_dir / "paper_trades.jsonl"))
+    avg_win_r, avg_loss_r = rr["avg_win_r"], rr["avg_loss_r"]
+    if avg_win_r is not None and avg_loss_r:
+        realized_be = -avg_loss_r / (avg_win_r - avg_loss_r)
+        add(f"  REALIZED (from {stats.wins}W/{stats.losses}L actually closed): "
+            f"win {avg_win_r:+.2f}R, loss {avg_loss_r:+.2f}R, break-even win rate "
+            f"{realized_be * 100:.0f}%")
+        add("     ^^ this is the bar that counts. The modelled rows above assume every loss stops "
+            "at the stop; a gap through it books worse, and no win books above the target, so the")
+        add("     realized loss leg is the fatter one. Small n -- read it as a direction, not a "
+            "constant.")
     if any(
         trade_economics(s.stop_loss_pct, s.take_profit_pct,
                         max(bps, s.transaction_cost_bps_per_side) * 2).breakeven_win_rate >= 0.55

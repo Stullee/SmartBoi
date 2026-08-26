@@ -63,16 +63,17 @@ _BORROW_RISK_CAP_MUSD = 500.0
 # accountable for". Every win-rate, average-R and P&L figure counts these
 # and ONLY these.
 #
-# THESIS_FLIPPED and ARCHIVED are deliberately outside it. Neither reached
-# a level: one was abandoned because the evidence turned against it, the
-# other because a runtime reset retired it. Counting them would answer
+# THESIS_FLIPPED, THESIS_VETOED and ARCHIVED are deliberately outside it.
+# None reached a level: the first was abandoned because the evidence turned
+# against it, the second because the whole-body pass ruled the move already
+# priced, the third because a runtime reset retired it. Counting them would answer
 # "what happened to positions we opened" with a number that is supposed to
 # answer "does the strategy pick well" -- and counting an ARCHIVED row as
 # a loss because its mark happened to be red would be inventing an outcome
 # outright. They are recorded so the exclusion is visible; they are not
 # scored.
 RESOLVED_STATUSES = ("WIN", "LOSS", "TIMEOUT")
-UNSCORED_STATUSES = ("THESIS_FLIPPED", "ARCHIVED")
+UNSCORED_STATUSES = ("THESIS_FLIPPED", "THESIS_VETOED", "ARCHIVED")
 
 
 def cost_buckets(profile: str = "institutional") -> tuple[tuple[float, float], ...]:
@@ -231,7 +232,7 @@ class PaperTrade:
     # recoverable from the trade record -- only from signals.jsonl, which
     # needed the join key above to reach.
     magnitude: float = 0.0
-    status: str = "OPEN"  # OPEN | WIN | LOSS | TIMEOUT | THESIS_FLIPPED | ARCHIVED
+    status: str = "OPEN"  # OPEN | WIN | LOSS | TIMEOUT | THESIS_FLIPPED | THESIS_VETOED | ARCHIVED
     closed_at: str | None = None
     exit_price: float | None = None
     r_multiple: float | None = None            # NET of transaction costs
@@ -677,6 +678,29 @@ class PaperTradeJournal:
         if trade is None:
             return None
         self._close(trade, "THESIS_FLIPPED", price, now or datetime.now(timezone.utc))
+        return trade
+
+    def close_on_thesis_vetoed(
+        self, symbol: str, price: float, now: datetime | None = None
+    ) -> PaperTrade | None:
+        """Closes an open trade because the whole-body synthesis pass has
+        ruled, repeatedly, that the move it was opened for is already priced.
+
+        Distinct from THESIS_FLIPPED: nothing turned against the thesis, the
+        pass simply says there is no repricing left to capture. Both are
+        unscored for the same reason -- neither reached a level -- but they are
+        different failures and folding them together would hide which one the
+        strategy actually suffers from.
+
+        Callers decide when a veto has STOOD long enough to act on (see
+        engine._VETO_EXIT_CONFIRMATIONS); this method only books it.
+
+        Returns the closed trade, or None if the symbol had no open
+        position."""
+        trade = self.open_trades.get(symbol)
+        if trade is None:
+            return None
+        self._close(trade, "THESIS_VETOED", price, now or datetime.now(timezone.utc))
         return trade
 
     def _append_to_log(self, trade: PaperTrade) -> None:

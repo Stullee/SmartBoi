@@ -59,6 +59,7 @@ class PaperTradeStats:
     # a large archived count next to a small closed one is the signature of
     # a record that has been reset out from under itself.
     thesis_flipped: int = 0
+    thesis_vetoed: int = 0
     archived: int = 0
     # Closed SHORTs whose borrow was never verifiable (small/unknown-cap
     # names are routinely hard-to-borrow -- see paper_journal.assumes_borrow)
@@ -652,6 +653,7 @@ def gather_paper_trade_stats(
                             max_concurrent_positions=max_concurrent_positions,
                             peak_concurrent=_peak_concurrent(all_rows),
                             thesis_flipped=sum(1 for r in all_rows if r.get("status") == "THESIS_FLIPPED"),
+                            thesis_vetoed=sum(1 for r in all_rows if r.get("status") == "THESIS_VETOED"),
                             archived=sum(1 for r in all_rows if r.get("status") == "ARCHIVED"))
     if rows:
         # A win is net-of-cost profit (realized R > 0), not a target hit -- so
@@ -761,6 +763,16 @@ def gather_strategy_generations(
     ]
     gens.sort(key=lambda g: (not g.is_current, g.legacy, -g.closed))
     return gens
+
+
+def gather_all_paper_trades(log_path: Path) -> list[dict]:
+    """Every row in the paper-trade ledger, untruncated.
+
+    gather_paper_trade_stats returns only `all_rows[-20:]` alongside its
+    stats -- fine for a "recent trades" table, wrong for any figure that
+    claims to describe the record, which would silently become "the last 20"
+    once the ledger passes twenty rows."""
+    return _read_jsonl(log_path)
 
 
 def gather_recent_signals(log_path: Path, limit: int = 25) -> list[dict]:
