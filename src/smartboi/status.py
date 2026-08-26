@@ -765,6 +765,16 @@ def gather_strategy_generations(
     return gens
 
 
+def gather_all_paper_trades(log_path: Path) -> list[dict]:
+    """Every row in the paper-trade ledger, untruncated.
+
+    gather_paper_trade_stats returns only `all_rows[-20:]` alongside its
+    stats -- fine for a "recent trades" table, wrong for any figure that
+    claims to describe the record, which would silently become "the last 20"
+    once the ledger passes twenty rows."""
+    return _read_jsonl(log_path)
+
+
 def gather_recent_signals(log_path: Path, limit: int = 25) -> list[dict]:
     return _read_jsonl(log_path)[-limit:]
 

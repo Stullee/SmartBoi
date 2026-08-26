@@ -447,3 +447,54 @@ async def test_the_full_diagnostics_download_requires_the_csrf_header():
     async with TestClient(TestServer(create_app(bare))) as client:  # no header
         response = await client.post("/api/tools/full-diagnostics", json={})
         assert response.status == 403
+
+
+async def test_diagnostics_print_the_REALIZED_break_even_beside_the_modelled_one(engine):
+    """Every modelled row assumes the loss leg lands exactly on the stop. The
+    record says otherwise -- a gap through the stop books worse than -1R while
+    nothing books a win above the target -- so the realized bar is strictly
+    higher. On the live ledger the printed 37% should have read 54%."""
+    import json
+
+    rows = [
+        {"symbol": "A", "direction": "LONG", "status": "WIN", "r_multiple": 1.60,
+         "entry_price": 100.0, "exit_price": 116.0},
+        {"symbol": "B", "direction": "LONG", "status": "WIN", "r_multiple": 1.60,
+         "entry_price": 100.0, "exit_price": 116.0},
+        # Both gap THROUGH the stop: -2.0R, not the -1.0R the model assumes.
+        {"symbol": "C", "direction": "LONG", "status": "LOSS", "r_multiple": -2.00,
+         "entry_price": 100.0, "exit_price": 84.0},
+        {"symbol": "D", "direction": "LONG", "status": "LOSS", "r_multiple": -2.00,
+         "entry_price": 100.0, "exit_price": 84.0},
+    ]
+    engine.journal.log_path.parent.mkdir(parents=True, exist_ok=True)
+    engine.journal.log_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with _client(engine) as client:
+        report = (await (await client.post("/api/tools/diagnostics", json={})).json())["report"]
+
+    # -(-2.0) / (1.6 - -2.0) = 0.5556 -> 56%
+    assert "REALIZED (from 2W/2L actually closed): win +1.60R, loss -2.00R" in report
+    assert "break-even win rate 56%" in report
+
+
+async def test_the_realized_break_even_reads_the_WHOLE_ledger(engine):
+    """gather_paper_trade_stats returns only all_rows[-20:]. Computing the
+    realized bar off that slice would silently turn "the record" into "the
+    last 20" the moment the ledger passes twenty rows."""
+    import json
+
+    # 21 rows: twenty tiny wins, then one huge loss. If only the last 20 are
+    # read, the first row is invisible and the numbers shift.
+    rows = [{"symbol": "W", "direction": "LONG", "status": "WIN", "r_multiple": 1.00,
+         "entry_price": 100.0, "exit_price": 108.0}]
+    rows += [{"symbol": "L", "direction": "LONG", "status": "LOSS", "r_multiple": -1.00,
+          "entry_price": 100.0, "exit_price": 92.0} for _ in range(20)]
+    engine.journal.log_path.parent.mkdir(parents=True, exist_ok=True)
+    engine.journal.log_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with _client(engine) as client:
+        report = (await (await client.post("/api/tools/diagnostics", json={})).json())["report"]
+
+    # The single WIN is row 1 of 21 -- only visible if the whole file is read.
+    assert "REALIZED (from 1W/20L actually closed)" in report
