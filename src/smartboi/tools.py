@@ -56,6 +56,7 @@ from smartboi.event_study import (
 from smartboi.forward_returns import (
     compute_forward_return,
     dedup_snapshots,
+    format_calibration,
     format_report,
     price_marks_by_symbol,
 )
@@ -759,6 +760,26 @@ MAX_LOG_BACKUPS = 5
 # A record starts with "2026-08-11 14:24:02 UTC | LEVEL | logger | ...".
 # Anything else is a continuation of the record above it.
 _LOG_RECORD_START = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC \| ")
+
+
+def _calibration_lines(log_dir, horizon_days: int) -> list[str]:
+    """The decision-variable calibration table, or one line saying why not.
+
+    Never raises: a diagnostics dump that dies on its own analysis section is
+    worse than one that says the analysis is not available yet."""
+    try:
+        snapshots = dedup_snapshots(read_jsonl(log_dir / "dossier_snapshots.jsonl"))
+        price_marks = price_marks_by_symbol(read_jsonl(log_dir / "price_marks.jsonl"))
+        rows = [
+            r for r in (compute_forward_return(s, price_marks, horizon_days) for s in snapshots)
+            if r is not None and not r["already_priced_in"]
+        ]
+        if not rows:
+            return ["-- Decision-variable calibration --",
+                    f"  Nothing joinable at {horizon_days}d yet (forward data takes that long to exist)."]
+        return format_calibration(rows, horizon_days)
+    except Exception as exc:  # noqa: BLE001 - a diagnostics section must not kill the dump
+        return ["-- Decision-variable calibration --", f"  unavailable: {exc}"]
 
 
 def _jsonl_span(rows: list[dict], key: str) -> str:
@@ -1727,6 +1748,17 @@ def run_diagnostics(engine) -> str:
     add(f"  dossier_snapshots.jsonl : {_jsonl_span(read_jsonl(log_dir / 'dossier_snapshots.jsonl'), 'snapshotted_at')}")
     add(f"  price_marks.jsonl       : {_jsonl_span(read_jsonl(log_dir / 'price_marks.jsonl'), 'marked_at')}")
     add(f"  decisions.jsonl         : {_jsonl_span(read_jsonl(log_dir / 'decisions.jsonl'), 'at')}")
+
+    # Does the thing the bar is set on actually predict? Printed here, without
+    # being asked for, because it is the only question that decides whether any
+    # of the numbers above can ever become profit -- and because it went
+    # unasked for the system's whole life while every threshold in it was tuned
+    # by hand. The forward-returns TOOL had the machinery and only ever pointed
+    # it at `score`; the strongest relationship in the capture turned out to be
+    # in a variable `score` does not contain.
+    add("")
+    for line in _calibration_lines(log_dir, 10):
+        add(line)
 
     # WHEN each daily pass last ran, not just what it produced. Each is gated
     # on "24h since its own last run", so the passes drift independently and
